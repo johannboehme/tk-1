@@ -74,26 +74,40 @@ describe("envelopeAt — edge cases", () => {
     expect(envelopeAt(env(0, 0, 1, 0), 1.0, 1.5)).toBe(0);
   });
 
-  it("compresses A+D to fit (region - R), keeping the release tail intact", () => {
-    // After release: regionDur = held + R. If A+D > held, A+D compress
-    // to fit `held`; R stays exactly R so the user's release fade plays
-    // out unmodified.
+  it("releases from partial-attack amplitude on quick tap (synth-voice)", () => {
+    // After release: regionDur = held + R. With A > held, attack does NOT
+    // compress to fit; it freezes mid-ramp and release fades from there.
+    // E.g. held 50 ms with A=100 ms → attack reached 0.5 at let-go; release
+    // fades 0.5 → 0 over R, NOT 1.0 → 0.
     const e = env(0.1, 0, 1, 0.2);
     const regionDur = 0.05 + 0.2; // held 50 ms + R=200 ms = 250 ms
-    // Mid-attack at 25 ms — A is compressed to 50 ms, so 25 ms is half.
-    expect(envelopeAt(e, regionDur, 0.025)).toBeCloseTo(0.5, 4);
-    // At the snapped release moment (50 ms): peak, release just starting.
-    expect(envelopeAt(e, regionDur, 0.05)).toBeCloseTo(1, 4);
-    // Halfway through release: 50 ms + 100 ms = 150 ms → wetness 0.5.
-    expect(envelopeAt(e, regionDur, 0.15)).toBeCloseTo(0.5, 4);
+    // Mid-attack at 25 ms (still inside attack ramp): 0.025 / 0.1 = 0.25.
+    expect(envelopeAt(e, regionDur, 0.025)).toBeCloseTo(0.25, 4);
+    // At the release moment (50 ms): attack only reached 0.5 — release
+    // starts from there, not from peak.
+    expect(envelopeAt(e, regionDur, 0.05)).toBeCloseTo(0.5, 4);
+    // Halfway through release (150 ms): 0.5 * (1 - 0.5) = 0.25.
+    expect(envelopeAt(e, regionDur, 0.15)).toBeCloseTo(0.25, 4);
   });
 
-  it("clamps R alone when even R exceeds the region (sub-R sliver)", () => {
-    // 100 ms region but R=200 → R clamps to 100, A/D zeroed.
+  it("stays silent when R alone exceeds the region (sub-R sliver)", () => {
+    // 100 ms region but R=200 → releaseStart = -100 ms. Release samples
+    // the natural envelope at t=0 (the earliest visible point), which
+    // for A>0 is 0 → effect plays silent. Synth analogue: tapped too
+    // briefly to make any sound.
     const e = env(0.1, 0.05, 0.5, 0.2);
-    expect(envelopeAt(e, 0.1, 0)).toBeCloseTo(0.5, 5);
-    expect(envelopeAt(e, 0.1, 0.05)).toBeCloseTo(0.25, 5);
-    expect(envelopeAt(e, 0.1, 0.099)).toBeCloseTo(0.005, 3);
+    expect(envelopeAt(e, 0.1, 0)).toBeCloseTo(0, 5);
+    expect(envelopeAt(e, 0.1, 0.05)).toBeCloseTo(0, 5);
+    expect(envelopeAt(e, 0.1, 0.099)).toBeCloseTo(0, 3);
+  });
+
+  it("stays silent for sub-R sliver even when A=0 (release-start at t=0)", () => {
+    // With A=D=0 the natural curve is at S from t=0, so a sub-R sliver
+    // does play — as a fade from S down to 0 over the available time.
+    // Documents the boundary: silent only kicks in when A>0.
+    const e = env(0, 0, 0.5, 0.2);
+    expect(envelopeAt(e, 0.1, 0)).toBeCloseTo(0.25, 4); // S * (1 - 0.1/0.2)
+    expect(envelopeAt(e, 0.1, 0.05)).toBeCloseTo(0.125, 4); // S * (1 - 0.15/0.2)
   });
 
   it("clamps sustain level into [0, 1]", () => {
@@ -107,6 +121,58 @@ describe("envelopeAt — edge cases", () => {
       const v = envelopeAt(env(0, 0, 0, 0), 1.0, t);
       expect(Number.isFinite(v)).toBe(true);
     }
+  });
+});
+
+describe("envelopeAt — holding (live pad press)", () => {
+  // While the user holds a pad, `tickFxHold` keeps `outS = playhead +
+  // overshoot`, so `regionDurS ≈ localT + overshoot`. Old behavior
+  // rescaled A and D against this moving target → attack collapsed to
+  // ≈ elapsed-time and reached ~1 in the first frame regardless of slider.
+  // Fix: while holding, A and D stay raw — the phase logic does the rest.
+
+  it("plays the user-set attack at full length while held (Vignette repro)", () => {
+    // attackS = 2.0 (slider max). 50 ms into hold, overshoot = 50 ms:
+    // regionDurS = 0.1, localT = 0.05. Expected: 0.05 / 2.0 = 0.025.
+    // Buggy old behavior would have returned ≈ 0.5 (after rescaling A→0.1).
+    const e = env(2.0, 0, 1, 0.3);
+    expect(envelopeAt(e, 0.1, 0.05, true)).toBeCloseTo(0.025, 4);
+    // 250 ms in → 0.25 / 2.0 = 0.125
+    expect(envelopeAt(e, 0.3, 0.25, true)).toBeCloseTo(0.125, 4);
+    // 1 s in → 0.5
+    expect(envelopeAt(e, 1.05, 1.0, true)).toBeCloseTo(0.5, 4);
+    // 2 s in → 1.0 (peak reached)
+    expect(envelopeAt(e, 2.05, 2.0, true)).toBeCloseTo(1, 4);
+  });
+
+  it("plays decay correctly while held", () => {
+    // A = 0.1, D = 0.2, S = 0.5. Halfway through decay (localT = 0.2):
+    // 1 + (S - 1) * ((localT - A) / D) = 1 + (-0.5) * 0.5 = 0.75.
+    const e = env(0.1, 0.2, 0.5, 0.3);
+    expect(envelopeAt(e, 1.0, 0.2, true)).toBeCloseTo(0.75, 4);
+  });
+
+  it("returns sustain level once past A+D while held", () => {
+    const e = env(0.1, 0.1, 0.6, 0.3);
+    expect(envelopeAt(e, 0.55, 0.5, true)).toBeCloseTo(0.6, 6);
+    expect(envelopeAt(e, 5.0, 4.0, true)).toBeCloseTo(0.6, 6);
+  });
+
+  it("never engages release while held — even with huge R near outS", () => {
+    // Synth-voice semantics: release only fires after let-go. While held,
+    // localT close to regionDurS must stay at sustain, not fade out.
+    const e = env(0, 0, 0.7, 1.0);
+    expect(envelopeAt(e, 1.0, 0.5, true)).toBeCloseTo(0.7, 6);
+    expect(envelopeAt(e, 1.0, 0.99, true)).toBeCloseTo(0.7, 6);
+  });
+
+  it("does not return 0 at or past outS while held", () => {
+    // Active-resolver pushes outS just ahead of playhead; the envelope
+    // sampler must not zero-out within the overshoot tail or the FX
+    // would flicker off mid-hold.
+    const e = env(0.05, 0, 1, 0.2);
+    expect(envelopeAt(e, 1.0, 1.0, true)).toBe(1);
+    expect(envelopeAt(e, 1.0, 1.5, true)).toBe(1);
   });
 });
 

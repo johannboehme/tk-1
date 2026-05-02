@@ -4,9 +4,12 @@
  * dass die Hard-Edges an `inS`/`outS` weich werden, ohne dass jeder Effekt-
  * Kind eigene "off"-Definition kennt.
  *
- * Zeit-Encoding ist absolut (Sekunden). Wenn A+D+R die Region-Dauer
- * übersteigt, werden alle drei proportional auf die Region skaliert
- * (Sustain-Länge wird dann 0).
+ * Synth-Voice-Semantik: A, D, R bleiben unverändert wie der User sie
+ * gesetzt hat — keine Stauchung auf die Region. Tippt der User kürzer
+ * als A, friert die Attack mid-ramp ein und Release fadet vom erreichten
+ * Pegel (nicht vom Peak) auf 0. Wenn R länger ist als die Region, beginnt
+ * das Release effektiv vor t=0 → Effekt bleibt stumm (echter Synth: zu
+ * kurz angespielt zum Hören).
  */
 
 export interface ADSREnvelope {
@@ -36,19 +39,24 @@ const clamp01 = (v: number): number => (v < 0 ? 0 : v > 1 ? 1 : v);
  * Sampled die Hüllkurve bei lokaler Zeit `localT` (relativ zur Region-
  * Start `inS`). Returns ∈ [0, 1].
  *
- *  Phasen (zeitlich aufeinanderfolgend):
- *    [0, A)               Attack:   linear 0 → 1
- *    [A, A+D)             Decay:    linear 1 → S
- *    [A+D, regionDur-R)   Sustain:  konstant S
- *    [regionDur-R, regionDur)  Release: linear S → 0
- *    >= regionDur         Out:      0
+ *  Phasen (zeitlich aufeinanderfolgend, A/D/R = User-Werte, ungestaucht):
+ *    [0, A)                       Attack:   linear 0 → 1
+ *    [A, A+D)                     Decay:    linear 1 → S
+ *    [A+D, regionDurS - R)        Sustain:  konstant S
+ *    [regionDurS - R, regionDurS) Release:  linear releaseAmp → 0
+ *    >= regionDurS                Out:      0
  *
- *  `holding`: while the user is still holding the pad/key for this fx,
- *  the release phase MUST NOT engage — the effect should hold at sustain
- *  level until they let go, like a synth voice. While held, `outS` is
- *  the live-extended end-of-region (overshoots the playhead by a few ms)
- *  which would otherwise put us inside the release window the entire
- *  time and the effect would never settle into sustain.
+ *  `releaseAmp` ist die natürliche Hüllkurven-Amplitude am Moment des
+ *  Release-Beginns (`regionDurS - R`). Tippt der User kürzer als A,
+ *  bricht die Attack mid-ramp ab und Release fadet von dem Teilpegel —
+ *  exakt wie eine Synth-Voice. Sub-R-Sliver (regionDurS < R, üblicherweise
+ *  nur durch manuelles Trimmen) lässt releaseStart < 0 werden und die
+ *  Hüllkurve sampled am Punkt 0 → 0 → Effekt stumm.
+ *
+ *  `holding`: solange der User den Pad/Key hält, läuft nur die natürliche
+ *  Kurve (Attack→Decay→Sustain), Release engagiert nicht. Wichtig, weil
+ *  während des Haltens `outS` ein paar ms vor den Playhead geschoben wird
+ *  (siehe store.tickFxHold) — sonst säßen wir permanent im Release-Window.
  */
 export function envelopeAt(
   env: ADSREnvelope,
@@ -60,44 +68,25 @@ export function envelopeAt(
   if (localT < 0) return 0;
   if (!holding && localT >= regionDurS) return 0;
 
-  let A = env.attackS;
-  let D = env.decayS;
-  let R = env.releaseS;
+  const A = env.attackS;
+  const D = env.decayS;
+  const R = env.releaseS;
   const S = clamp01(env.sustain);
 
-  // Fit-to-region. Release is the protected slot — the user has just
-  // let go and explicitly asked for a fade-out, so R stays R as much as
-  // possible. Attack + Decay get compressed to fit the remaining space.
-  // Only when even R alone exceeds the region (a sub-R sliver) do we
-  // clamp R itself and zero out A/D.
-  if (!holding) {
-    if (R >= regionDurS) {
-      R = regionDurS;
-      A = 0;
-      D = 0;
-    } else {
-      const adSpace = regionDurS - R;
-      const adSum = A + D;
-      if (adSum > adSpace && adSum > 0) {
-        const k = adSpace / adSum;
-        A *= k;
-        D *= k;
-      }
-    }
-  } else {
-    // Holding → only A+D matter (release isn't sampled).
-    const sum = A + D;
-    if (sum > regionDurS && sum > 0) {
-      const k = regionDurS / sum;
-      A *= k;
-      D *= k;
-    }
-  }
+  // Natürliche Hüllkurven-Amplitude bei lokaler Zeit `t` — ohne Release.
+  // Hierfür werden A und D NICHT auf die Region gestaucht; eine kurz
+  // angespielte Note bricht ihre Attack mid-ramp ab.
+  const ampAt = (t: number): number => {
+    if (t < A) return A > 0 ? t / A : 1;
+    if (t < A + D) return D > 0 ? 1 + (S - 1) * ((t - A) / D) : S;
+    return S;
+  };
 
-  if (localT < A) return A > 0 ? localT / A : 1;
-  if (localT < A + D) return D > 0 ? 1 + (S - 1) * ((localT - A) / D) : S;
-  if (holding) return S;
+  if (holding) return ampAt(localT);
+
   const releaseStart = regionDurS - R;
-  if (localT < releaseStart) return S;
-  return R > 0 ? S * (1 - (localT - releaseStart) / R) : 0;
+  if (localT < releaseStart) return ampAt(localT);
+  if (R <= 0) return 0;
+  const releaseAmp = ampAt(Math.max(0, releaseStart));
+  return releaseAmp * (1 - (localT - releaseStart) / R);
 }
