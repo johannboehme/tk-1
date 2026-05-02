@@ -324,6 +324,34 @@ export function Timeline({
     updateLaneScroll();
   }, [clips.length]);
 
+  // Global drag terminator. setPointerCapture on the canvas SHOULD
+  // route a pointerup to us regardless of where the cursor lands, but
+  // in practice the up event can be lost (cursor leaves the browser
+  // window, OS swallows the up, capture interrupted by a layout
+  // change). When that happens the dragRef stays armed and the next
+  // pointermove over the canvas snaps the trim/clip to the cursor as
+  // if the user were still holding the button — the bug the user
+  // reports as "stays in zieh-modus". Listening on window covers the
+  // off-canvas releases too. Pairs with the `e.buttons === 0` guard
+  // in onPointerMove for re-entry without a release event at all.
+  useEffect(() => {
+    function clearStaleDrag() {
+      if (dragRef.current) {
+        dragRef.current = null;
+        setActiveClipMoveDragId(null);
+        frozenTimelineRangeRef.current = null;
+      }
+    }
+    window.addEventListener("pointerup", clearStaleDrag);
+    window.addEventListener("pointercancel", clearStaleDrag);
+    window.addEventListener("blur", clearStaleDrag);
+    return () => {
+      window.removeEventListener("pointerup", clearStaleDrag);
+      window.removeEventListener("pointercancel", clearStaleDrag);
+      window.removeEventListener("blur", clearStaleDrag);
+    };
+  }, [setActiveClipMoveDragId]);
+
   // ---- Per-cam thumbnail Image objects ----
   // Video clips: load the frames-strip (multiple stills laid out
   // horizontally). Image clips: load the image asset itself so the lane
@@ -673,6 +701,18 @@ export function Timeline({
     return null;
   }
 
+  /** Lane-only hit-test: returns the clip whose lane band contains `y`,
+   *  regardless of whether the pointer's `x` lands inside the pill. Used
+   *  to make the WHOLE row a selection target so the user can park the
+   *  playhead with a normal click and still send I/O to that clip. */
+  function findLaneAt(y: number): { clip: Clip; band: { top: number; bottom: number } } | null {
+    for (let i = 0; i < clips.length; i++) {
+      const band = videoBands[i];
+      if (y >= band.top && y < band.bottom) return { clip: clips[i], band };
+    }
+    return null;
+  }
+
   /** Edge-handle hit-test for clip resizing. Detects whether the pointer
    *  is on the LEFT or RIGHT edge of a clip's pill (within HANDLE_HIT px).
    *  Image clips: both edges are draggable. Video clips: trim handles on
@@ -888,7 +928,13 @@ export function Timeline({
         dragRef.current = { kind: "playhead" };
       }
     } else {
-      setSelectedClipId(null);
+      // Empty area inside a video lane → still treat the lane as a
+      // selection target so I/O hotkeys (and any per-clip controls) can
+      // address that clip without forcing the playhead onto its pill.
+      // Falls back to deselecting only if the pointer is outside any
+      // lane band.
+      const lane = findLaneAt(y);
+      setSelectedClipId(lane ? lane.clip.id : null);
       seek(snapped(tRaw, e));
       dragRef.current = { kind: "playhead" };
     }
@@ -898,6 +944,17 @@ export function Timeline({
     const rect = e.currentTarget.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
+
+    // Stale-drag guard. If we have a pending drag but the pointer is
+    // moving WITHOUT any mouse button pressed, the pointerup must have
+    // fired outside our capture (e.g. user released the mouse off-canvas
+    // or in a place where the OS swallowed the up event). Clear the drag
+    // so the next move doesn't snap the trim/clip back to the cursor.
+    // `e.buttons` is a bitmask of currently-held buttons — 0 means none.
+    if (dragRef.current && e.buttons === 0) {
+      onPointerUp();
+      return;
+    }
 
     // Update tracked pointer position whenever the pointer is captured
     // here. The map only contains pointers that went through the
