@@ -189,6 +189,31 @@ export function meetsMinRequirements(caps: Capabilities): MinRequirementsResult 
 }
 
 /**
+ * Whether the browser can decode media files that exceed Chromium's
+ * ~2 GiB single-ArrayBuffer cap. Streaming the encoded bytes off disk
+ * (`File.stream()` → mp4box chunked → WebCodecs `AudioDecoder` /
+ * `VideoDecoder`) is the only path that scales past that limit; without
+ * BOTH WebCodecs decoders we have no way to handle multi-GB files.
+ *
+ * Browsers that fail this check today (May 2026):
+ *   - Safari (AudioDecoder is in Technology Preview but not yet stable)
+ *   - Firefox (full WebCodecs support is still landing)
+ *
+ * Smaller files still work in those browsers via the existing
+ * `decodeAudioData` + ffmpeg.wasm fast path.
+ */
+export function supportsLargeMediaFiles(caps: Capabilities): boolean {
+  return caps.audioDecoder && caps.videoDecoder;
+}
+
+/**
+ * Per-file hard cap when `supportsLargeMediaFiles(caps) === false`.
+ * Set well below Chromium's ~2 GiB ArrayBuffer ceiling so the fallback
+ * decoders (`decodeAudioData`, ffmpeg.wasm MEMFS) have room to copy.
+ */
+export const LEGACY_BROWSER_MAX_FILE_BYTES = 1.9 * 1024 * 1024 * 1024;
+
+/**
  * Menschenlesbares Label für jede Capability — verwendet auf der Error-Page
  * und im Settings-Capability-Report.
  */

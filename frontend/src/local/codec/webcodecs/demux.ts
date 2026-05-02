@@ -1,14 +1,28 @@
 /**
  * mp4box.js demux wrapper.
  *
- * Provides the two operations the rest of the app needs:
- *   * `demuxVideoTrack` — pulls out all encoded video chunks plus the
- *     decoder config required by both VideoDecoder and the muxer (avcC).
- *   * `demuxAudioTrackInfo` — pulls just metadata + decoder config for the
- *     audio track, used when we want to re-mux audio passthrough (rare for
- *     us; we usually re-encode).
+ * Provides two operations the rest of the app needs:
+ *   * `openVideoDemux` — returns track info + an AsyncIterable of
+ *     encoded chunks. Streaming-friendly on the consumer side (chunks
+ *     yielded one at a time so callers can apply backpressure on the
+ *     decoder). The producer currently loads the whole source into
+ *     mp4box in one shot — see notes below for why true streaming
+ *     demux for moov-last big files isn't wired in yet.
+ *   * `demuxVideoTrack` — convenience wrapper that materialises the
+ *     AsyncIterable to a chunks array. Suitable for small files /
+ *     fixtures; for large sources prefer `openVideoDemux` and iterate.
  *
- * mp4box.js is callback-based; this module wraps it in promises.
+ * Big-file note: for files above the WebCodecs-AudioDecoder streaming
+ * threshold (~500 MiB), `source.arrayBuffer()` will throw a RangeError
+ * (Chromium ArrayBuffer cap). The audio-only sync path uses a
+ * dedicated streaming MP4 audio decoder
+ * (`streaming/streaming-mp4-audio.ts`) that works for arbitrarily
+ * large files via mp4box's chunked appendBuffer + moov-prefetch.
+ * Wiring the same trick into the video-side `openVideoDemux` is
+ * tracked as future work — mp4box's `processSamples` for the video
+ * track currently doesn't fire after a moov-prefetched chunked feed
+ * even though it does fire reliably for the audio track from the
+ * same file (root cause TBD).
  */
 
 import { createFile, DataStream, type Movie, type Sample, type ISOFile } from "mp4box";
@@ -72,44 +86,101 @@ export interface VideoDemuxResult {
   chunks: VideoChunk[];
 }
 
+/** Streaming-friendly view of a demuxed video track. Iterate samples
+ *  via `for await`; the iterator is single-pass. Call `cancel()` if
+ *  you want to stop early so the underlying file reader can close. */
+export interface DemuxedVideoStream {
+  info: VideoTrackInfo;
+  samples: AsyncIterable<VideoChunk>;
+  cancel(): Promise<void>;
+}
+
 interface MP4BoxFileBuffer extends ArrayBuffer {
   fileStart: number;
 }
 
 /**
- * Reads an MP4/MOV and returns the first video track's chunks + decoder
- * config. Returns null if there is no video track.
+ * Open a demuxer. Loads the whole source into mp4box in one shot;
+ * exposes the resulting samples as an `AsyncIterable<VideoChunk>` so
+ * consumers can apply backpressure on the decoder. Returns null when
+ * the source has no parsable video track.
+ *
+ * For sources above ~2 GiB, `source.arrayBuffer()` will throw a
+ * RangeError (Chromium ArrayBuffer cap). The audio-extraction path for
+ * the sync algorithm uses a separate streaming decoder that handles
+ * arbitrarily large files; video-side streaming demux is future work.
  */
-export async function demuxVideoTrack(
+export async function openVideoDemux(
   source: Blob | ArrayBuffer,
-): Promise<VideoDemuxResult | null> {
-  const ab = source instanceof ArrayBuffer ? source : await source.arrayBuffer();
+): Promise<DemuxedVideoStream | null> {
+  const eagerBytes: ArrayBuffer =
+    source instanceof ArrayBuffer ? source : await source.arrayBuffer();
 
-  return await new Promise<VideoDemuxResult | null>((resolve, reject) => {
-    const file = createFile();
-    let info: VideoTrackInfo | null = null;
-    const chunks: VideoChunk[] = [];
+  const file = createFile();
 
-    file.onError = (err: string) => reject(new Error(`mp4box: ${err}`));
+  // ---- Pump samples into a queue read by an async iterator. ----
+  type QueueEvent =
+    | { kind: "chunk"; chunk: VideoChunk; sampleNumber: number }
+    | { kind: "done" }
+    | { kind: "error"; err: Error };
 
-    file.onReady = (movie: Movie) => {
+  const queue: QueueEvent[] = [];
+  const waiters: Array<() => void> = [];
+  let cancelled = false;
+  let fileError: Error | null = null;
+
+  function pushEvent(ev: QueueEvent): void {
+    queue.push(ev);
+    const w = waiters.shift();
+    if (w) w();
+  }
+
+  // Async-resolved once mp4box has parsed moov + we have track info.
+  // Resolves to null for sources without a video track (mirrors the
+  // old behavior).
+  let resolveInfo!: (v: VideoTrackInfo | null) => void;
+  let rejectInfo!: (err: Error) => void;
+  const infoPromise = new Promise<VideoTrackInfo | null>((res, rej) => {
+    resolveInfo = res;
+    rejectInfo = rej;
+  });
+
+  let trackId: number | null = null;
+
+  file.onError = (err: string) => {
+    fileError = new Error(`mp4box: ${err}`);
+    rejectInfo(fileError);
+    pushEvent({ kind: "error", err: fileError });
+  };
+
+  file.onReady = (movie: Movie) => {
+    try {
       const videoTrack = movie.videoTracks?.[0] ?? null;
       if (!videoTrack) {
-        resolve(null);
+        resolveInfo(null);
+        // Push a `done` so any iterator that started consuming gets a
+        // clean end. Callers usually check `info === null` first and
+        // never iterate, but be defensive.
+        pushEvent({ kind: "done" });
         return;
       }
       const desc = extractDecoderDescription(file, videoTrack.id);
       if (!desc) {
-        reject(new Error("Could not extract video decoder description (avcC)."));
+        const err = new Error("Could not extract video decoder description (avcC).");
+        fileError = err;
+        rejectInfo(err);
+        pushEvent({ kind: "error", err });
         return;
       }
-
       const videoMeta = videoTrack.video;
       if (!videoMeta) {
-        reject(new Error("Video track has no `video` metadata."));
+        const err = new Error("Video track has no `video` metadata.");
+        fileError = err;
+        rejectInfo(err);
+        pushEvent({ kind: "error", err });
         return;
       }
-      info = {
+      const info: VideoTrackInfo = {
         trackId: videoTrack.id,
         codec: videoTrack.codec,
         width: videoMeta.width,
@@ -123,41 +194,154 @@ export async function demuxVideoTrack(
         ),
         description: desc,
       };
-
+      trackId = videoTrack.id;
       file.setExtractionOptions(videoTrack.id, null, { nbSamples: 1000 });
       file.start();
-    };
+      resolveInfo(info);
+    } catch (e) {
+      const err = e instanceof Error ? e : new Error(String(e));
+      fileError = err;
+      rejectInfo(err);
+      pushEvent({ kind: "error", err });
+    }
+  };
 
-    file.onSamples = (_id: number, _user: unknown, samples: Sample[]) => {
-      for (const s of samples) {
-        chunks.push({
+  file.onSamples = (id: number, _user: unknown, samples: Sample[]) => {
+    if (cancelled || trackId === null || id !== trackId) return;
+    let lastNumber = -1;
+    for (const s of samples) {
+      pushEvent({
+        kind: "chunk",
+        sampleNumber: s.number,
+        chunk: {
           timestampUs: (s.cts * 1_000_000) / s.timescale,
           durationUs: (s.duration * 1_000_000) / s.timescale,
           isKey: s.is_sync,
-          data: new Uint8Array(s.data as unknown as ArrayBufferLike),
-        });
-      }
-    };
+          data: new Uint8Array(s.data as unknown as ArrayBuffer),
+        },
+      });
+      lastNumber = s.number;
+    }
+    if (lastNumber >= 0) {
+      file.releaseUsedSamples(trackId, lastNumber + 1);
+    }
+  };
 
-    // mp4box requires the appended buffer to expose a fileStart property.
-    const buf = ab as MP4BoxFileBuffer;
-    buf.fileStart = 0;
-    file.appendBuffer(buf as never);
-    file.flush();
+  // ---- Drive the mp4box feed. Single eager appendBuffer; the
+  //      AsyncIterable on the consumer side still gives us
+  //      backpressure-friendly semantics for the decoder pipeline. ----
 
-    // Resolve once we've received onReady AND processed all samples.
-    // mp4box delivers samples synchronously after start() in our flow
-    // (entire file is in memory), so we can resolve at the end of the
-    // microtask queue.
-    queueMicrotask(() => {
-      if (info === null) {
-        // onReady never fired — file had no parsable moov.
-        resolve(null);
-      } else {
-        resolve({ info, chunks });
+  let cancelFeeder: () => Promise<void>;
+  const feedPromise = (async () => {
+    try {
+      const buf = eagerBytes as MP4BoxFileBuffer;
+      buf.fileStart = 0;
+      file.appendBuffer(buf as never);
+      file.flush();
+      // mp4box delivers samples synchronously after start() in our flow
+      // (entire file is in memory), so we yield to the microtask queue
+      // and then signal end-of-stream.
+      await Promise.resolve();
+      pushEvent({ kind: "done" });
+    } catch (e) {
+      const err = e instanceof Error ? e : new Error(String(e));
+      if (!fileError) {
+        fileError = err;
+        try { rejectInfo(err); } catch { /* already settled */ }
       }
-    });
-  });
+      pushEvent({ kind: "error", err });
+    }
+  })();
+  cancelFeeder = async () => {
+    // Eager feed already finished (or will finish synchronously) — just
+    // mark cancelled so the iterator returns done on its next call.
+    cancelled = true;
+  };
+
+  // Block until we know the info (or it failed).
+  let info: VideoTrackInfo | null;
+  try {
+    info = await infoPromise;
+  } catch (e) {
+    // Make sure the feeder finishes (it might be mid-flight) before we
+    // bubble. Don't await its promise rejection.
+    void feedPromise.catch(() => undefined);
+    throw e;
+  }
+  if (info === null) {
+    // No video track. Iterator will end immediately.
+    void feedPromise.catch(() => undefined);
+    return null;
+  }
+
+  // ---- Async iterator that drains the queue. ----
+  const iterableInfo = info;
+  const samples: AsyncIterable<VideoChunk> = {
+    [Symbol.asyncIterator](): AsyncIterator<VideoChunk> {
+      return {
+        async next(): Promise<IteratorResult<VideoChunk>> {
+          for (;;) {
+            if (queue.length > 0) {
+              const ev = queue.shift()!;
+              if (ev.kind === "chunk") {
+                return { value: ev.chunk, done: false };
+              }
+              if (ev.kind === "done") {
+                return { value: undefined as unknown as VideoChunk, done: true };
+              }
+              throw ev.err;
+            }
+            if (cancelled) {
+              return { value: undefined as unknown as VideoChunk, done: true };
+            }
+            await new Promise<void>((res) => waiters.push(res));
+          }
+        },
+        async return(): Promise<IteratorResult<VideoChunk>> {
+          cancelled = true;
+          await cancelFeeder();
+          // Wake any sleeping iterator users.
+          const w = waiters.shift();
+          if (w) w();
+          return { value: undefined as unknown as VideoChunk, done: true };
+        },
+      };
+    },
+  };
+
+  return {
+    info: iterableInfo,
+    samples,
+    async cancel(): Promise<void> {
+      cancelled = true;
+      await cancelFeeder();
+      // Wake any sleeping iterator users.
+      while (waiters.length > 0) {
+        const w = waiters.shift();
+        if (w) w();
+      }
+    },
+  };
+}
+
+/**
+ * Reads an MP4/MOV and returns the first video track's chunks + decoder
+ * config. Returns null if there is no video track.
+ *
+ * Convenience wrapper around `openVideoDemux` for callers that want all
+ * chunks materialised as an array. Suitable for files small enough that
+ * holding every chunk in RAM is acceptable (tests, fixtures, the
+ * sub-streaming-threshold path). For large sources prefer
+ * `openVideoDemux` and iterate the `samples` AsyncIterable.
+ */
+export async function demuxVideoTrack(
+  source: Blob | ArrayBuffer,
+): Promise<VideoDemuxResult | null> {
+  const stream = await openVideoDemux(source);
+  if (!stream) return null;
+  const chunks: VideoChunk[] = [];
+  for await (const c of stream.samples) chunks.push(c);
+  return { info: stream.info, chunks };
 }
 
 /**

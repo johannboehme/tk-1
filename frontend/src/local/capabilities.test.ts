@@ -2,6 +2,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   detectCapabilities,
   meetsMinRequirements,
+  supportsLargeMediaFiles,
+  LEGACY_BROWSER_MAX_FILE_BYTES,
   type Capabilities,
 } from "./capabilities";
 
@@ -180,6 +182,42 @@ describe("meetsMinRequirements", () => {
       webgpu: true,
     });
     expect(result.ok).toBe(true);
+  });
+});
+
+describe("supportsLargeMediaFiles", () => {
+  function caps(overrides: Partial<Capabilities> = {}): Capabilities {
+    return {
+      webAssembly: true,
+      sharedArrayBuffer: true,
+      crossOriginIsolated: true,
+      opfs: true,
+      audioDecoder: true,
+      videoDecoder: true,
+      audioEncoder: true,
+      videoEncoder: true,
+      fileSystemAccess: true,
+      webgl2: true,
+      webgpu: false,
+      ...overrides,
+    };
+  }
+
+  it("true when both AudioDecoder and VideoDecoder are present", () => {
+    expect(supportsLargeMediaFiles(caps())).toBe(true);
+  });
+
+  it("false when AudioDecoder is missing (Safari 18- without TP)", () => {
+    expect(supportsLargeMediaFiles(caps({ audioDecoder: false }))).toBe(false);
+  });
+
+  it("false when VideoDecoder is missing", () => {
+    expect(supportsLargeMediaFiles(caps({ videoDecoder: false }))).toBe(false);
+  });
+
+  it("LEGACY_BROWSER_MAX_FILE_BYTES is below the Chromium ArrayBuffer cap", () => {
+    expect(LEGACY_BROWSER_MAX_FILE_BYTES).toBeLessThan(2 * 1024 * 1024 * 1024);
+    expect(LEGACY_BROWSER_MAX_FILE_BYTES).toBeGreaterThan(1.5 * 1024 * 1024 * 1024);
   });
 });
 

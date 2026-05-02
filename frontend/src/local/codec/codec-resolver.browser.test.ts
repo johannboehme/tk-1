@@ -1,11 +1,18 @@
 import { describe, it, expect } from "vitest";
 import { decodeAudioToMonoPcm } from "./index";
+import { opfs } from "../../storage/opfs";
 
 const FIXTURE_URL = "/__test_fixtures__/tone-3s.mp4";
 
 async function fetchFixture(): Promise<Blob> {
   const r = await fetch(FIXTURE_URL);
   return await r.blob();
+}
+
+async function opfsFixture(name: string): Promise<File> {
+  const blob = await fetchFixture();
+  await opfs.writeFile(`__codec_resolver_test__/${name}`, blob);
+  return await opfs.readFile(`__codec_resolver_test__/${name}`);
 }
 
 describe("codec resolver: decodeAudioToMonoPcm (real Chromium)", () => {
@@ -51,6 +58,42 @@ describe("codec resolver: decodeAudioToMonoPcm (real Chromium)", () => {
       expect(bZc).toBeLessThan(460);
     },
     120_000, // ffmpeg.wasm cold start can be slow
+  );
+
+  it("WebCodecs path decodes a plain MP3 (ID3v2.4, 128k, 48kHz mono)", async () => {
+    // Sanity check that our WebCodecs/decodeAudioData path handles a
+    // real-world MP3 without falling back to ffmpeg.wasm. If a user reports
+    // `[decoding-studio-audio]` failures with a normal-looking MP3, this
+    // test passing means the bug is in their specific file (truncated,
+    // weird VBR header, unusual sample rate, or actually an M4A renamed
+    // .mp3) rather than a regression in our decoder pipeline.
+    const r = await fetch("/__test_fixtures__/studio-mp3.mp3");
+    const blob = await r.blob();
+    const result = await decodeAudioToMonoPcm(blob, 22050);
+    expect(result.backend).toBe("webcodecs");
+    expect(result.sampleRate).toBe(22050);
+    expect(result.pcm.length).toBeGreaterThan(0);
+  });
+
+  it(
+    "ffmpeg.wasm fallback works on an OPFS-backed File (regression: legacy FileReader path)",
+    async () => {
+      // Repro for: a job whose master audio came from `<input type=file>`,
+      // got persisted to OPFS, then surfaces as `await handle.getFile()`. If
+      // the WebCodecs decoder rejects (corrupt header, unsupported codec,
+      // etc.), the resolver falls back to ffmpeg.wasm — which used to call
+      // @ffmpeg/util's `fetchFile`, internally `FileReader.readAsArrayBuffer`.
+      // FileReader rejects on OPFS-backed Files in some Chromium builds with
+      // the opaque "File could not be read! Code=-1" message. The fix routes
+      // the bytes through `source.arrayBuffer()` instead.
+      const file = await opfsFixture("tone-from-opfs.mp4");
+      const result = await decodeAudioToMonoPcm(file, 22050, {
+        forceBackend: "ffmpeg-wasm",
+      });
+      expect(result.backend).toBe("ffmpeg-wasm");
+      expect(result.pcm.length).toBeGreaterThan(22050 * 2.5);
+    },
+    120_000,
   );
 });
 

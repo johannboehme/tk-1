@@ -15,16 +15,23 @@
  *    `.close()` on them. Older frames are auto-freed on the next call.
  *  - End-of-source returns the very last frame for any targetUs >= last
  *    frame's timestamp.
+ *
+ * Streaming-friendly: encoded chunks are pulled from the demuxer's
+ * AsyncIterable on demand, not materialised up-front, so the source
+ * file's encoded bytes are only ever resident in the mp4box internal
+ * state (released as we drain) plus the decoder's pending queue.
  */
 import {
-  demuxVideoTrack,
-  type VideoDemuxResult,
+  openVideoDemux,
+  type DemuxedVideoStream,
+  type VideoChunk,
 } from "../codec/webcodecs/demux";
 
 export class CamFrameStream {
   private decoder: VideoDecoder;
-  private readonly chunks: VideoDemuxResult["chunks"];
-  private nextChunkIdx = 0;
+  private readonly demuxStream: DemuxedVideoStream;
+  private readonly samplesIter: AsyncIterator<VideoChunk>;
+  private samplesDone = false;
   private pending: VideoFrame[] = [];
   private decoderError: Error | null = null;
   private flushed = false;
@@ -36,13 +43,14 @@ export class CamFrameStream {
   readonly durationS: number;
 
   static async create(source: Blob | ArrayBuffer): Promise<CamFrameStream> {
-    const demux = await demuxVideoTrack(source);
+    const demux = await openVideoDemux(source);
     if (!demux) throw new Error("CamFrameStream: source has no video track");
     return new CamFrameStream(demux);
   }
 
-  private constructor(demux: VideoDemuxResult) {
-    this.chunks = demux.chunks;
+  private constructor(demux: DemuxedVideoStream) {
+    this.demuxStream = demux;
+    this.samplesIter = demux.samples[Symbol.asyncIterator]();
     this.width = demux.info.width;
     this.height = demux.info.height;
     this.fps = demux.info.fps;
@@ -98,13 +106,19 @@ export class CamFrameStream {
         this.pending = this.pending.slice(bestIdx);
         return this.pending[0];
       }
-      // Need to decode more — feed chunks until we hit backpressure.
-      if (this.nextChunkIdx < this.chunks.length) {
+      // Need to decode more — pull chunks from the demuxer until we hit
+      // backpressure on the decoder.
+      if (!this.samplesDone) {
         while (
-          this.nextChunkIdx < this.chunks.length &&
+          !this.samplesDone &&
           this.decoder.decodeQueueSize < 6
         ) {
-          const c = this.chunks[this.nextChunkIdx++];
+          const r = await this.samplesIter.next();
+          if (r.done) {
+            this.samplesDone = true;
+            break;
+          }
+          const c = r.value;
           this.decoder.decode(
             new EncodedVideoChunk({
               type: c.isKey ? "key" : "delta",
@@ -142,5 +156,8 @@ export class CamFrameStream {
     } catch {
       /* already closed */
     }
+    // Cancel the demuxer feeder so mp4box releases its buffers and the
+    // file stream reader closes.
+    void this.demuxStream.cancel();
   }
 }

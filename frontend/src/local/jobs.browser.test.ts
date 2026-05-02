@@ -77,7 +77,8 @@ function waitForJobStatus(
         resolve();
       } else if (detail.job.status === "failed") {
         jobEvents.removeEventListener("update", onUpdate);
-        reject(new Error("Job failed"));
+        const reason = (detail.job as { error?: string }).error ?? "(no reason)";
+        reject(new Error(`Job failed: ${reason}`));
       }
     };
     jobEvents.addEventListener("update", onUpdate);

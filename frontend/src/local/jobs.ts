@@ -218,9 +218,16 @@ export async function createJob(
 
   // Kick off sync without awaiting — UI subscribes for results.
   void runSync(jobId, audioExt).catch(async (err) => {
+    // Preserve the stage the job was in when it threw — without this the
+    // banner just shows the raw decoder message and the user can't tell
+    // whether the master audio or a specific cam was the culprit.
+    const cur = await jobsDb.getJob(jobId);
+    const stage = cur?.progress?.stage;
+    const raw = err instanceof Error ? err.message : String(err);
+    const error = stage ? `[${stage}] ${raw}` : raw;
     const failed = await jobsDb.updateJob(jobId, {
       status: "failed",
-      error: err instanceof Error ? err.message : String(err),
+      error,
       progress: { pct: 100, stage: "failed" },
     });
     emitJobUpdate(failed);

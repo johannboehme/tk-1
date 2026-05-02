@@ -7,7 +7,7 @@
  * laid out left-to-right, exactly the layout `Timeline.tsx` already expects.
  */
 
-import { demuxVideoTrack } from "../../codec/webcodecs/demux";
+import { openVideoDemux } from "../../codec/webcodecs/demux";
 import { planTileStrip } from "./strategy";
 import type { FrameStripResult } from "./types";
 
@@ -26,11 +26,11 @@ export async function extractFrameStripWebcodecs(
   source: Blob | ArrayBuffer,
   opts: WebcodecsFrameStripOptions = {},
 ): Promise<FrameStripResult> {
-  const demuxed = await demuxVideoTrack(source);
+  const demuxed = await openVideoDemux(source);
   if (!demuxed) {
     throw new Error("Frame extraction: source has no video track");
   }
-  const { info, chunks } = demuxed;
+  const { info, samples } = demuxed;
 
   const plan = planTileStrip({
     durationS: info.durationS,
@@ -112,15 +112,26 @@ export async function extractFrameStripWebcodecs(
     description: info.description,
   });
 
-  // Feed chunks with backpressure so we don't pile up VideoFrames in flight.
-  for (const c of chunks) {
+  // Feed chunks with backpressure so we don't pile up VideoFrames in
+  // flight. Pull samples from the demuxer's AsyncIterable on demand —
+  // for big files mp4box releases each batch's bytes after we consume
+  // them, so the encoded-side memory footprint stays bounded.
+  let stoppedEarly = false;
+  for await (const c of samples) {
     if (pendingError) throw pendingError;
-    if (nextTargetIdx >= targetsUs.length) break; // all targets drawn
+    if (nextTargetIdx >= targetsUs.length) {
+      stoppedEarly = true;
+      break;
+    }
     while (decoder.decodeQueueSize > 8) {
       await new Promise((r) => setTimeout(r, 1));
       if (pendingError) throw pendingError;
-      if (nextTargetIdx >= targetsUs.length) break;
+      if (nextTargetIdx >= targetsUs.length) {
+        stoppedEarly = true;
+        break;
+      }
     }
+    if (stoppedEarly) break;
     decoder.decode(
       new EncodedVideoChunk({
         type: c.isKey ? "key" : "delta",
@@ -129,6 +140,10 @@ export async function extractFrameStripWebcodecs(
         data: c.data,
       }),
     );
+  }
+  if (stoppedEarly) {
+    // Tell mp4box we don't need the rest so it stops buffering.
+    await demuxed.cancel();
   }
   await decoder.flush();
   decoder.close();

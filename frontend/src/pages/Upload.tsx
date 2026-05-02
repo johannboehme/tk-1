@@ -1,9 +1,14 @@
-import { FormEvent, useState } from "react";
+import { FormEvent, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ChunkyButton } from "../editor/components/ChunkyButton";
 import { RuleStrip } from "../editor/components/RuleStrip";
 import { formatBytes } from "../components/ProgressBar";
 import { createJob } from "../local/jobs";
+import {
+  getCapabilities,
+  LEGACY_BROWSER_MAX_FILE_BYTES,
+  supportsLargeMediaFiles,
+} from "../local/capabilities";
 
 export default function Upload() {
   const navigate = useNavigate();
@@ -13,7 +18,23 @@ export default function Upload() {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
+  // Snapshot once at mount: capabilities are static within a tab.
+  const caps = useMemo(getCapabilities, []);
+  const supportsBig = supportsLargeMediaFiles(caps);
+
   const ready = audio !== null && videos.length > 0 && !busy;
+
+  function rejectIfTooBigForBrowser(file: File, kind: "audio" | "video"): string | null {
+    if (supportsBig) return null;
+    if (file.size <= LEGACY_BROWSER_MAX_FILE_BYTES) return null;
+    return (
+      `${kind === "audio" ? "Audio" : "Video"} file "${file.name}" is ` +
+      `${formatGiB(file.size)} — your browser caps each file at ` +
+      `${formatGiB(LEGACY_BROWSER_MAX_FILE_BYTES)} because WebCodecs ` +
+      `decoders aren't available. Try Chrome / Edge / Brave for files ` +
+      `over 2 GB, or re-encode at a lower bitrate.`
+    );
+  }
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -29,9 +50,29 @@ export default function Upload() {
     }
   }
 
+  function setAudioGuarded(file: File | null) {
+    if (file) {
+      const msg = rejectIfTooBigForBrowser(file, "audio");
+      if (msg) {
+        setErr(msg);
+        return;
+      }
+    }
+    setErr(null);
+    setAudio(file);
+  }
+
   function addVideos(files: FileList | null) {
     if (!files) return;
     const next = Array.from(files);
+    for (const f of next) {
+      const msg = rejectIfTooBigForBrowser(f, "video");
+      if (msg) {
+        setErr(msg);
+        return;
+      }
+    }
+    setErr(null);
     setVideos((prev) => [...prev, ...next]);
   }
 
@@ -69,9 +110,18 @@ export default function Upload() {
         </aside>
       </header>
 
+      {!supportsBig && (
+        <div className="mb-6 border-l-2 border-cobalt pl-3 py-2 text-sm text-ink-2 font-mono">
+          Heads-up: this browser can only decode files up to{" "}
+          {formatGiB(LEGACY_BROWSER_MAX_FILE_BYTES)} each (no WebCodecs
+          AudioDecoder/VideoDecoder yet). Chrome, Edge or Brave handle
+          arbitrarily large files via streaming decode.
+        </div>
+      )}
+
       <form onSubmit={handleSubmit} className="flex flex-col gap-6">
         <div className="grid lg:grid-cols-[1fr_1.6fr] gap-3 items-stretch">
-          <AudioDropZone file={audio} onChange={setAudio} />
+          <AudioDropZone file={audio} onChange={setAudioGuarded} />
           <VideoDropList files={videos} onAdd={addVideos} onRemove={removeVideo} />
         </div>
 
@@ -266,6 +316,10 @@ function ReadinessStatus({
       </span>
     </div>
   );
+}
+
+function formatGiB(bytes: number): string {
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`;
 }
 
 function Dot({ ok, label }: { ok: boolean; label: string }) {

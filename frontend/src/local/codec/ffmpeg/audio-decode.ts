@@ -10,7 +10,6 @@
  * WebCodecs can't handle directly: .mkv, .avi, ProRes audio, AC-3, etc.
  */
 
-import { fetchFile } from "@ffmpeg/util";
 import type { DecodedAudio } from "../webcodecs/audio-decode";
 import { getFfmpeg } from "./ffmpeg-loader";
 
@@ -25,7 +24,15 @@ export async function decodeAudioToMonoPcmFfmpeg(
   const inputName = `input-${Date.now()}.bin`;
   const outputName = `output-${Date.now()}.wav`;
 
-  const data = source instanceof ArrayBuffer ? new Uint8Array(source) : await fetchFile(source);
+  // We deliberately avoid @ffmpeg/util's `fetchFile` here: it routes through
+  // a legacy `FileReader.readAsArrayBuffer`, which on some Chromium builds
+  // rejects OPFS-backed Files with the opaque "File could not be read!
+  // Code=-1". `Blob.arrayBuffer()` (Streams API) handles OPFS Files
+  // reliably and is what the WebCodecs path already uses on the same source.
+  const data =
+    source instanceof ArrayBuffer
+      ? new Uint8Array(source)
+      : new Uint8Array(await source.arrayBuffer());
   await ffmpeg.writeFile(inputName, data);
 
   // Transcode to mono 32-bit float WAV at target sample rate.
