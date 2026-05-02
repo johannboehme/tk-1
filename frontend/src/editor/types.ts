@@ -45,12 +45,39 @@ export type ExportPreset = "web" | "archive" | "mobile" | "custom";
 
 export type QualityStep = "tiny" | "low" | "good" | "high" | "pristine" | "custom";
 
+export type AspectRatio = "16:9" | "9:16" | "1:1" | "4:3" | "21:9" | "custom";
+
+/**
+ * Per-element placement on the Stage (output frame).
+ *
+ * The default (cover-fit) is the identity `{ scale: 1, x: 0, y: 0 }`.
+ * `scale` is a multiplier on top of cover-fit (1 = element exactly
+ * covers the stage). `x` and `y` are pixel offsets in stage-coordinate
+ * space, applied AFTER the scale, around the cover-fit centre.
+ *
+ * Optional on clips — `undefined` means "use the default" (also the
+ * reset state when the user double-clicks the element in the preview).
+ */
+export interface ViewportTransform {
+  scale: number;
+  x: number;
+  y: number;
+}
+
 export interface ExportSpec {
   preset: ExportPreset;
   /** Output container. Currently only MP4 (mp4-muxer constraint). */
   format?: "mp4";
-  /** Output dimensions, or "source" to keep the source's. */
+  /** Output dimensions, or "source" to keep the source's. Concrete dims
+   *  are the source of truth — `aspectRatio` + `resolutionLongSide`
+   *  are picker UI hints kept in sync via the store. */
   resolution?: { w: number; h: number } | "source";
+  /** UI hint: aspect picker selection. Stays in sync with `resolution`
+   *  via the store. `undefined` until first set. */
+  aspectRatio?: AspectRatio;
+  /** UI hint: long-side resolution preset (px). Combined with
+   *  `aspectRatio` derives `resolution`. `undefined` until first set. */
+  resolutionLongSide?: number;
   video_codec?: "h264" | "h265";
   audio_codec?: "aac" | "opus";
   video_bitrate_kbps?: number;
@@ -140,6 +167,8 @@ export interface VideoClip {
    *  as `rotation` (rotate-then-flip in the compositor). */
   flipX?: boolean;
   flipY?: boolean;
+  /** Per-element placement on the Stage. `undefined` = cover-fit default. */
+  viewportTransform?: ViewportTransform;
 }
 
 /**
@@ -167,6 +196,8 @@ export interface ImageClip {
   rotation?: number;
   flipX?: boolean;
   flipY?: boolean;
+  /** Per-element placement on the Stage. `undefined` = cover-fit default. */
+  viewportTransform?: ViewportTransform;
 }
 
 export type Clip = VideoClip | ImageClip;

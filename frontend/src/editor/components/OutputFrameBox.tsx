@@ -84,17 +84,80 @@ export function OutputFrameBox({ children, showIndicator = true }: Props) {
         }}
       >
         {showIndicator && boxResolved && (
-          <div
-            aria-hidden
-            className="absolute inset-0 pointer-events-none"
-            style={{
-              outline: "1px dashed rgba(255,255,255,0.18)",
-              outlineOffset: -1,
-            }}
-          />
+          <>
+            <div
+              aria-hidden
+              className="absolute inset-0 pointer-events-none"
+              style={{
+                outline: "1px dashed rgba(255,255,255,0.18)",
+                outlineOffset: -1,
+              }}
+            />
+            <StageCornerMarks />
+          </>
         )}
         {children}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Subtle white L-shaped corner marks anchored to the Stage corners. TE-
+ * spirit: like the registration marks on a print template — they say
+ * "this is the frame" without screaming it. Active-element corners get
+ * the orange treatment in `StageInteractionOverlay` instead.
+ */
+function StageCornerMarks() {
+  const SIZE = 10; // px schenkel
+  const W = 1.5; // px stroke
+  const COLOR = "rgba(255,255,255,0.45)";
+  const corners: Array<{ pos: React.CSSProperties; lines: [string, string] }> = [
+    {
+      pos: { left: 0, top: 0 },
+      lines: [
+        // horizontal arm (top edge)
+        `width:${SIZE}px;height:${W}px;left:0;top:0`,
+        // vertical arm (left edge)
+        `width:${W}px;height:${SIZE}px;left:0;top:0`,
+      ],
+    },
+    {
+      pos: { right: 0, top: 0 },
+      lines: [
+        `width:${SIZE}px;height:${W}px;right:0;top:0`,
+        `width:${W}px;height:${SIZE}px;right:0;top:0`,
+      ],
+    },
+    {
+      pos: { left: 0, bottom: 0 },
+      lines: [
+        `width:${SIZE}px;height:${W}px;left:0;bottom:0`,
+        `width:${W}px;height:${SIZE}px;left:0;bottom:0`,
+      ],
+    },
+    {
+      pos: { right: 0, bottom: 0 },
+      lines: [
+        `width:${SIZE}px;height:${W}px;right:0;bottom:0`,
+        `width:${W}px;height:${SIZE}px;right:0;bottom:0`,
+      ],
+    },
+  ];
+  return (
+    <div aria-hidden className="absolute inset-0 pointer-events-none">
+      {corners.map((c, i) => (
+        <div key={i} className="absolute" style={c.pos}>
+          {c.lines.map((s, j) => {
+            const styleObj: Record<string, string> = { backgroundColor: COLOR, position: "absolute" };
+            for (const part of s.split(";")) {
+              const [k, v] = part.split(":");
+              styleObj[k.trim()] = v.trim();
+            }
+            return <div key={j} style={styleObj as React.CSSProperties} />;
+          })}
+        </div>
+      ))}
     </div>
   );
 }

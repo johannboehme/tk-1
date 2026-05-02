@@ -1231,4 +1231,123 @@ describe("useEditorStore", () => {
       });
     });
   });
+
+  describe("Stage auto-init from first clip dims", () => {
+    test("first clip's dims seed exportSpec.resolution + aspect + longSide", () => {
+      useEditorStore.getState().loadJob(baseJobMeta, {
+        clips: [
+          {
+            id: "cam-1",
+            filename: "a.mp4",
+            color: "#fff",
+            sourceDurationS: 10,
+            syncOffsetMs: 0,
+          },
+        ],
+      });
+      // Initially the resolution is the "source" sentinel (default).
+      expect(useEditorStore.getState().exportSpec.resolution).toBe("source");
+
+      useEditorStore.getState().setClipDisplayDims("cam-1", 1920, 1080);
+      const spec = useEditorStore.getState().exportSpec;
+      expect(spec.resolution).toEqual({ w: 1920, h: 1080 });
+      expect(spec.aspectRatio).toBe("16:9");
+      expect(spec.resolutionLongSide).toBe(1920);
+    });
+
+    test("portrait video → 9:16 aspect, longSide=1920", () => {
+      useEditorStore.getState().loadJob(baseJobMeta, {
+        clips: [
+          {
+            id: "cam-1",
+            filename: "a.mp4",
+            color: "#fff",
+            sourceDurationS: 10,
+            syncOffsetMs: 0,
+          },
+        ],
+      });
+      useEditorStore.getState().setClipDisplayDims("cam-1", 1080, 1920);
+      const spec = useEditorStore.getState().exportSpec;
+      expect(spec.resolution).toEqual({ w: 1080, h: 1920 });
+      expect(spec.aspectRatio).toBe("9:16");
+      expect(spec.resolutionLongSide).toBe(1920);
+    });
+
+    test("once user sets a concrete resolution, second clip dims do NOT overwrite", () => {
+      useEditorStore.getState().loadJob(baseJobMeta, {
+        clips: [
+          {
+            id: "cam-1",
+            filename: "a.mp4",
+            color: "#fff",
+            sourceDurationS: 10,
+            syncOffsetMs: 0,
+          },
+        ],
+      });
+      useEditorStore.getState().setClipDisplayDims("cam-1", 1920, 1080);
+      // User changes the export to portrait via the panel.
+      useEditorStore.getState().setExport({
+        resolution: { w: 1080, h: 1920 },
+        aspectRatio: "9:16",
+        resolutionLongSide: 1920,
+      });
+
+      // A second clip arriving with new dims must NOT undo the user's choice.
+      useEditorStore.getState().updateClip({
+        id: "cam-2",
+        filename: "b.mp4",
+        color: "#fff",
+        sourceDurationS: 10,
+        syncOffsetMs: 0,
+      });
+      useEditorStore.getState().setClipDisplayDims("cam-2", 3840, 2160);
+      const spec = useEditorStore.getState().exportSpec;
+      expect(spec.resolution).toEqual({ w: 1080, h: 1920 });
+      expect(spec.aspectRatio).toBe("9:16");
+    });
+  });
+
+  describe("setClipViewportTransform / reset", () => {
+    function loadOneCam() {
+      useEditorStore.getState().loadJob(baseJobMeta, {
+        clips: [
+          {
+            id: "cam-1",
+            filename: "a.mp4",
+            color: "#fff",
+            sourceDurationS: 10,
+            syncOffsetMs: 0,
+          },
+        ],
+      });
+    }
+
+    test("merges partial into a fresh DEFAULT_VIEWPORT_TRANSFORM", () => {
+      loadOneCam();
+      useEditorStore.getState().setClipViewportTransform("cam-1", { x: 50 });
+      const t = useEditorStore.getState().clips[0].viewportTransform;
+      expect(t).toEqual({ scale: 1, x: 50, y: 0 });
+    });
+
+    test("subsequent partials merge with the existing transform", () => {
+      loadOneCam();
+      useEditorStore.getState().setClipViewportTransform("cam-1", { scale: 2, x: 10 });
+      useEditorStore.getState().setClipViewportTransform("cam-1", { y: -20 });
+      expect(useEditorStore.getState().clips[0].viewportTransform).toEqual({
+        scale: 2,
+        x: 10,
+        y: -20,
+      });
+    });
+
+    test("resetClipViewportTransform drops the transform back to undefined", () => {
+      loadOneCam();
+      useEditorStore.getState().setClipViewportTransform("cam-1", { scale: 1.5 });
+      expect(useEditorStore.getState().clips[0].viewportTransform).toBeDefined();
+      useEditorStore.getState().resetClipViewportTransform("cam-1");
+      expect(useEditorStore.getState().clips[0].viewportTransform).toBeUndefined();
+    });
+  });
 });

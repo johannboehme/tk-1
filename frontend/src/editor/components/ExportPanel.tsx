@@ -1,10 +1,16 @@
-// Studio-Console export dialog. Source → Output is the hero element; the
-// rest are modifiers.
+// Studio-Console export dialog.
 //
-// Three orthogonal axes a user might want to touch:
-//   1. WHERE — destination preset (Web / Archive / Mobile / Custom).
-//   2. HOW MUCH — Quality slider, mapped to bitrate via `qualityToBitrates`.
-//   3. WHAT KIND — Advanced drawer: resolution, codec, bitrate, audio codec.
+// V2 layout (post Stage redesign — see plan file):
+//   1. ASPECT picker — picks Stage shape independently of pixels.
+//   2. RESOLUTION picker — long-side presets, derived from aspect.
+//   3. Big mono LCD readout — "1920 × 1080" so the user always sees
+//      the concrete pixels they will get.
+//   4. PRESET (Web/Archive/Mobile/Custom) — bitrate + codec recipe.
+//   5. QUALITY slider — bitrate ladder.
+//   6. Advanced drawer — codecs, bitrates, filename.
+//
+// IOReadout (Source vs Output) is gone. There's no single "source" in
+// a multi-clip edit — the Stage shape is what the user picks here.
 //
 // Everything reads/writes through the editor store's `exportSpec`. The
 // onSubmit handler in `Editor.tsx` translates the spec to the renderer's
@@ -13,16 +19,18 @@
 import { useEffect, useMemo } from "react";
 import {
   applyPreset,
+  classifyAspectRatio,
+  deriveResolution,
   estimateFileSizeBytes,
   qualityToBitrates,
   resolveResolution,
 } from "../exportPresets";
 import { useEditorStore } from "../store";
-import type { ExportPreset, ExportSpec, QualityStep } from "../types";
+import type { AspectRatio, ExportPreset, ExportSpec, QualityStep } from "../types";
 import { AdvancedDrawer } from "./AdvancedDrawer";
+import { AspectPicker } from "./AspectPicker";
 import { ChunkyButton } from "./ChunkyButton";
 import { FilenameInput } from "./FilenameInput";
-import { IOReadout } from "./IOReadout";
 import { QualitySlider } from "./QualitySlider";
 import { ResolutionPicker } from "./ResolutionPicker";
 import { SegmentedControl } from "./SegmentedControl";
@@ -39,6 +47,10 @@ export function ExportPanel({ onSubmit, submitting }: Props) {
   const setExport = useEditorStore((s) => s.setExport);
   const jobMeta = useEditorStore((s) => s.jobMeta);
 
+  // Source dims are still needed for `applyPreset` (preset's bitrate
+  // ladder scales with output area, and a "source pass-through" preset
+  // needs *some* concrete fallback dims). When no clip has reported its
+  // dims yet we fall back to the legacy job meta — typically 1920×1080.
   const source = useMemo(
     () => ({
       w: jobMeta?.width ?? 1920,
@@ -89,7 +101,7 @@ export function ExportPanel({ onSubmit, submitting }: Props) {
   });
 
   function selectPreset(p: ExportPreset) {
-    setExport(applyPreset(p, source));
+    setExport(applyPreset(p, exportSpec));
   }
 
   function selectQuality(q: Exclude<QualityStep, "custom">) {
@@ -101,8 +113,47 @@ export function ExportPanel({ onSubmit, submitting }: Props) {
     });
   }
 
-  function setResolution(dims: { w: number; h: number }) {
-    setExport({ resolution: dims, preset: "custom" });
+  // Aspect change: keep the existing long-side, derive new {w,h}.
+  function pickAspect(a: AspectRatio) {
+    if (a === "custom") {
+      // Custom means: use whatever {w,h} is currently set. Just flip
+      // the picker state — don't touch resolution.
+      setExport({ aspectRatio: "custom", preset: "custom" });
+      return;
+    }
+    const longSide =
+      exportSpec.resolutionLongSide ?? Math.max(output.w, output.h);
+    const dims = deriveResolution(a, longSide);
+    setExport({
+      aspectRatio: a,
+      resolutionLongSide: longSide,
+      resolution: dims,
+      preset: "custom",
+    });
+  }
+
+  // Long-side change: re-derive {w,h} from active aspect.
+  function pickLongSide(longSide: number) {
+    const aspect = exportSpec.aspectRatio;
+    if (!aspect || aspect === "custom") return;
+    const dims = deriveResolution(aspect, longSide);
+    setExport({
+      resolutionLongSide: longSide,
+      resolution: dims,
+      preset: "custom",
+    });
+  }
+
+  // Manual W/H: flips aspect to "custom" because the dims may not match
+  // any preset.
+  function setCustomDims(dims: { w: number; h: number }) {
+    const matched = classifyAspectRatio(dims);
+    setExport({
+      resolution: dims,
+      aspectRatio: matched,
+      resolutionLongSide: Math.max(dims.w, dims.h),
+      preset: "custom",
+    });
   }
 
   function setVideoCodec(c: ExportSpec["video_codec"]) {
@@ -130,14 +181,12 @@ export function ExportPanel({ onSubmit, submitting }: Props) {
       <header>
         <h2 className="font-display text-lg leading-none">Export</h2>
         <p className="text-xs text-ink-2 mt-1">
-          Pick a destination, dial in the quality, hit render.
+          Pick the Stage shape, dial in the size, hit render.
         </p>
       </header>
 
-      <IOReadout source={source} output={output} />
-
       <SegmentedControl
-        label="Destination"
+        label="Preset"
         value={exportSpec.preset}
         options={[
           { value: "web", label: "WEB" },
@@ -147,6 +196,15 @@ export function ExportPanel({ onSubmit, submitting }: Props) {
         ]}
         onChange={selectPreset}
         fullWidth
+      />
+
+      <AspectPicker value={exportSpec.aspectRatio} onChange={pickAspect} />
+
+      <ResolutionPicker
+        aspect={exportSpec.aspectRatio}
+        value={output}
+        onPickLongSide={pickLongSide}
+        onCustomDims={setCustomDims}
       />
 
       <QualitySlider
@@ -163,12 +221,6 @@ export function ExportPanel({ onSubmit, submitting }: Props) {
       />
 
       <AdvancedDrawer>
-        <ResolutionPicker
-          source={source}
-          value={output}
-          onChange={setResolution}
-        />
-
         <FormField label="Video codec">
           <SegmentedControl
             value={exportSpec.video_codec ?? "h264"}
@@ -248,3 +300,4 @@ function FormField({ label, children }: { label: string; children: React.ReactNo
     </div>
   );
 }
+

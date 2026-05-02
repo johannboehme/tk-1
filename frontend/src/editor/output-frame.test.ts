@@ -71,13 +71,23 @@ describe("resolveOutputDims", () => {
     expect(dims).toEqual({ w: 1920, h: 1080 });
   });
 
-  it("returns max(W) × max(H) bounding-box across clips", () => {
-    // portrait 1080×1920 + landscape 1920×1080 → 1920×1920 box.
+  it("falls back to FIRST clip's dims (sorted by startS) — no bbox", () => {
+    // First by startS = "a" (startOffsetS 0). Second clip dims must NOT
+    // affect output — even if larger.
     const dims = resolveOutputDims(
-      [videoClip("a", 1080, 1920), videoClip("b", 1920, 1080)],
+      [videoClip("a", 1080, 1920), videoClip("b", 3840, 2160)],
       undefined,
     );
-    expect(dims).toEqual({ w: 1920, h: 1920 });
+    expect(dims).toEqual({ w: 1080, h: 1920 });
+  });
+
+  it("respects timeline order — earliest clip wins", () => {
+    const a = videoClip("a", 1920, 1080);
+    a.startOffsetS = 10;
+    const b = videoClip("b", 1080, 1920);
+    b.startOffsetS = 0;
+    // 'b' is earlier on the master timeline — its dims define the stage.
+    expect(resolveOutputDims([a, b], "source")).toEqual({ w: 1080, h: 1920 });
   });
 
   it("falls back to a single clip's dims when only one has them", () => {
@@ -86,6 +96,14 @@ describe("resolveOutputDims", () => {
       "source",
     );
     expect(dims).toEqual({ w: 1080, h: 1920 });
+  });
+
+  it("skips clips without dims and uses the first that has them", () => {
+    const a = videoClip("a"); // no dims
+    const b = videoClip("b", 1920, 1080); // earlier on tl, but no dims wins later
+    a.startOffsetS = 0;
+    b.startOffsetS = 5;
+    expect(resolveOutputDims([a, b], "source")).toEqual({ w: 1920, h: 1080 });
   });
 
   it("returns null when no clip has dims yet and no explicit resolution", () => {
@@ -103,13 +121,13 @@ describe("resolveOutputAspectRatio", () => {
     expect(ar).toBeCloseTo(16 / 9, 6);
   });
 
-  it("derives AR from the bounding-box of clips", () => {
+  it("derives AR from the FIRST clip on the timeline", () => {
     const ar = resolveOutputAspectRatio({
       resolution: "source",
       clips: [videoClip("a", 1080, 1920), videoClip("b", 1920, 1080)],
     });
-    // bbox 1920×1920 → 1.
-    expect(ar).toBe(1);
+    // first clip = portrait 1080×1920 → 9:16.
+    expect(ar).toBeCloseTo(1080 / 1920, 6);
   });
 
   it("returns null when nothing is known", () => {

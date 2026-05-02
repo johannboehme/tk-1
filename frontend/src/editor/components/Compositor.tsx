@@ -20,6 +20,7 @@ import { getCapabilities } from "../../local/capabilities";
 import { MasterAudio } from "./MasterAudio";
 import { TestPattern } from "./TestPattern";
 import { OutputFrameBox } from "./OutputFrameBox";
+import { StageInteractionOverlay } from "./StageInteractionOverlay";
 import { PreviewRuntime, type ClipUrlMap } from "../render/preview-runtime";
 import { COMPOSITOR_INITIAL_SCALE } from "../render/feature-flag";
 
@@ -49,6 +50,7 @@ export function Compositor({ cams, audioUrl }: Props) {
 
       <OutputFrameBox>
         <CompositorCanvas cams={cams} />
+        <StageInteractionOverlay />
       </OutputFrameBox>
     </div>
   );

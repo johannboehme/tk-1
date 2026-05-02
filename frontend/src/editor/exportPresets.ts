@@ -11,6 +11,7 @@
  */
 
 import type {
+  AspectRatio,
   ExportPreset,
   ExportSpec,
   QualityStep,
@@ -75,53 +76,104 @@ export function resolveResolution(
   return resolution;
 }
 
-/**
- * Cap the long side of a source to `maxLong`, preserving aspect ratio.
- * Always rounds dims to even pixels — most encoders demand it.
- */
-function capLongSide(source: { w: number; h: number }, maxLong: number) {
-  const long = Math.max(source.w, source.h);
-  if (long <= maxLong) {
-    return { w: roundEven(source.w), h: roundEven(source.h) };
-  }
-  const scale = maxLong / long;
-  return {
-    w: roundEven(source.w * scale),
-    h: roundEven(source.h * scale),
-  };
-}
-
 function roundEven(n: number): number {
   const r = Math.round(n);
   return r % 2 === 0 ? r : r - 1;
 }
 
 /**
- * Build an ExportSpec for a preset, given the source the user uploaded.
+ * Aspect-ratio presets shown in the Export panel's AspectPicker.
+ * Order = display order in the picker. "custom" requires the caller to
+ * supply explicit w/h instead of going through `deriveResolution`.
+ */
+export const ASPECT_RATIO_PRESETS: Exclude<AspectRatio, "custom">[] = [
+  "16:9",
+  "9:16",
+  "1:1",
+  "4:3",
+  "21:9",
+];
+
+/**
+ * Long-side resolution presets (in pixels). Combined with an
+ * `AspectRatio` they produce the concrete output dimensions via
+ * {@link deriveResolution}.
+ */
+export const RESOLUTION_LONG_SIDE_PRESETS = [3840, 2560, 1920, 1280, 854] as const;
+
+/** Parse `"16:9"` → `[16, 9]`. */
+function parseAspect(a: Exclude<AspectRatio, "custom">): [number, number] {
+  const [w, h] = a.split(":").map(Number);
+  return [w, h];
+}
+
+/**
+ * Compute concrete pixel dims from an aspect-ratio preset + the long
+ * side in pixels. Always rounds to even pixels (encoder requirement).
+ */
+export function deriveResolution(
+  aspect: Exclude<AspectRatio, "custom">,
+  longSide: number,
+): { w: number; h: number } {
+  const [wRatio, hRatio] = parseAspect(aspect);
+  if (wRatio >= hRatio) {
+    return {
+      w: roundEven(longSide),
+      h: roundEven((longSide * hRatio) / wRatio),
+    };
+  }
+  return {
+    w: roundEven((longSide * wRatio) / hRatio),
+    h: roundEven(longSide),
+  };
+}
+
+/**
+ * Best-fit AspectRatio preset for given dims. Used to seed the picker
+ * when the user (or an auto-default) sets a `resolution` directly.
+ * Returns `"custom"` if no preset matches within a small tolerance.
+ */
+export function classifyAspectRatio(dims: {
+  w: number;
+  h: number;
+}): AspectRatio {
+  if (dims.w <= 0 || dims.h <= 0) return "custom";
+  const ar = dims.w / dims.h;
+  for (const preset of ASPECT_RATIO_PRESETS) {
+    const [wRatio, hRatio] = parseAspect(preset);
+    const presetAr = wRatio / hRatio;
+    if (Math.abs(ar - presetAr) < 0.01) return preset;
+  }
+  return "custom";
+}
+
+/**
+ * Build an ExportSpec for a preset. Presets are OPINIONATED — they set
+ * aspect, resolution, codec, AND bitrate so the user gets one consistent
+ * recipe with one click.
  *
- * - WEB: long-side capped at 1920, H.264, Good quality.
- * - ARCHIVE: source unchanged, H.265, Pristine quality.
- * - MOBILE: long-side capped at 1920, H.264, Low quality. Aspect preserved
- *   (was hardcoded 1280×720 — that's the bug).
- * - CUSTOM: returns only the preset discriminator. Callers keep the prior
- *   ExportSpec so the user's manual settings aren't reset by switching tabs.
+ * - WEB: 16:9 · 1920×1080 · H.264 · Good
+ * - ARCHIVE: keep current aspect + dims, switch codec to H.265 · Pristine
+ * - MOBILE: 9:16 · 1080×1920 · H.264 · Low
+ * - CUSTOM: discriminator only — what the user lands on after manual edits.
  */
 export function applyPreset(
   preset: ExportPreset,
-  source: SourceProbe,
+  current: ExportSpec,
 ): Partial<ExportSpec> & { preset: ExportPreset } {
   if (preset === "custom") {
     return { preset: "custom" };
   }
-  const sourceRes = { w: source.w, h: source.h };
   switch (preset) {
     case "web": {
-      const res = capLongSide(sourceRes, 1920);
-      const { videoKbps, audioKbps } = qualityToBitrates("good", res);
+      const dims = deriveResolution("16:9", 1920);
+      const { videoKbps, audioKbps } = qualityToBitrates("good", dims);
       return {
         preset: "web",
         format: "mp4",
-        resolution: res,
+        aspectRatio: "16:9",
+        resolutionLongSide: 1920,
+        resolution: dims,
         video_codec: "h264",
         audio_codec: "aac",
         video_bitrate_kbps: videoKbps,
@@ -130,12 +182,24 @@ export function applyPreset(
       };
     }
     case "archive": {
-      const res = { w: roundEven(source.w), h: roundEven(source.h) };
-      const { videoKbps, audioKbps } = qualityToBitrates("pristine", res);
+      // Keep the user's aspect + dims (their high-quality master). Only
+      // flip codec/quality. Fallback for first-touch: 16:9 4K.
+      const aspect: AspectRatio =
+        current.aspectRatio && current.aspectRatio !== "custom"
+          ? current.aspectRatio
+          : "16:9";
+      const longSide = current.resolutionLongSide ?? 3840;
+      const dims =
+        current.resolution && current.resolution !== "source"
+          ? current.resolution
+          : deriveResolution(aspect, longSide);
+      const { videoKbps, audioKbps } = qualityToBitrates("pristine", dims);
       return {
         preset: "archive",
         format: "mp4",
-        resolution: res,
+        aspectRatio: aspect,
+        resolutionLongSide: longSide,
+        resolution: dims,
         video_codec: "h265",
         audio_codec: "aac",
         video_bitrate_kbps: videoKbps,
@@ -144,12 +208,14 @@ export function applyPreset(
       };
     }
     case "mobile": {
-      const res = capLongSide(sourceRes, 1920);
-      const { videoKbps, audioKbps } = qualityToBitrates("low", res);
+      const dims = deriveResolution("9:16", 1920);
+      const { videoKbps, audioKbps } = qualityToBitrates("low", dims);
       return {
         preset: "mobile",
         format: "mp4",
-        resolution: res,
+        aspectRatio: "9:16",
+        resolutionLongSide: 1920,
+        resolution: dims,
         video_codec: "h264",
         audio_codec: "aac",
         video_bitrate_kbps: videoKbps,

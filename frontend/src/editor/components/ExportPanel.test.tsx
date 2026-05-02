@@ -22,44 +22,49 @@ describe("<ExportPanel />", () => {
     mountAt(1920, 1080);
   });
 
-  test("default preset is web with H.264 and the Good-quality bitrate at 1080p", () => {
+  test("default preset is custom — Stage shape derives from the first clip", () => {
     render(<ExportPanel onSubmit={() => undefined} submitting={false} />);
     const ex = useEditorStore.getState().exportSpec;
-    expect(ex.preset).toBe("web");
+    expect(ex.preset).toBe("custom");
     expect(ex.video_codec).toBe("h264");
-    // Good @ 1080p = 3500 kbps (see exportPresets.qualityToBitrates).
+  });
+
+  test("WEB preset always sets 16:9 1920×1080 + H.264 + Good", async () => {
+    mountAt(1080, 1920);
+    render(<ExportPanel onSubmit={() => undefined} submitting={false} />);
+    const webTab = screen.getByRole("tab", { name: /WEB/i });
+    await userEvent.click(webTab);
+    const ex = useEditorStore.getState().exportSpec;
+    expect(ex.preset).toBe("web");
+    expect(ex.aspectRatio).toBe("16:9");
+    expect(ex.resolution).toEqual({ w: 1920, h: 1080 });
+    expect(ex.video_codec).toBe("h264");
     expect(ex.video_bitrate_kbps).toBe(3500);
   });
 
-  test("MOBILE preset preserves aspect for portrait sources (the bug fix)", async () => {
-    mountAt(1080, 1920);
+  test("MOBILE preset always sets 9:16 1080×1920 + H.264 + Low", async () => {
+    mountAt(3840, 2160);
     render(<ExportPanel onSubmit={() => undefined} submitting={false} />);
     const mobileTab = screen.getByRole("tab", { name: /MOBILE/i });
     await userEvent.click(mobileTab);
     const ex = useEditorStore.getState().exportSpec;
     expect(ex.preset).toBe("mobile");
-    // Portrait source within the long-side cap stays 1080×1920 — the old
-    // hardcoded 1280×720 was wrong for portrait phone footage.
+    expect(ex.aspectRatio).toBe("9:16");
     expect(ex.resolution).toEqual({ w: 1080, h: 1920 });
+    expect(ex.video_codec).toBe("h264");
+    expect(ex.quality).toBe("low");
   });
 
-  test("MOBILE preset caps a 4K landscape source on its long side", async () => {
+  test("ARCHIVE preset keeps the user's aspect + dims, switches to H.265", async () => {
     mountAt(3840, 2160);
     render(<ExportPanel onSubmit={() => undefined} submitting={false} />);
-    const mobileTab = screen.getByRole("tab", { name: /MOBILE/i });
-    await userEvent.click(mobileTab);
-    const ex = useEditorStore.getState().exportSpec;
-    expect(ex.resolution).toEqual({ w: 1920, h: 1080 });
-  });
-
-  test("ARCHIVE preset switches to H.265 and keeps source dimensions", async () => {
-    mountAt(3840, 2160);
-    render(<ExportPanel onSubmit={() => undefined} submitting={false} />);
+    // Without prior aspect/dims set, archive falls back to 16:9 4K.
     const archiveTab = screen.getByRole("tab", { name: /ARCHIVE/i });
     await userEvent.click(archiveTab);
     const ex = useEditorStore.getState().exportSpec;
     expect(ex.preset).toBe("archive");
     expect(ex.video_codec).toBe("h265");
+    expect(ex.aspectRatio).toBe("16:9");
     expect(ex.resolution).toEqual({ w: 3840, h: 2160 });
   });
 

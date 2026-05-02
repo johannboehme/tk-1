@@ -55,15 +55,17 @@ export function SegmentedControl<V extends string>({
     null,
   );
 
-  const activeIndex = Math.max(
-    0,
-    options.findIndex((o) => o.value === value),
-  );
+  const matchedIndex = options.findIndex((o) => o.value === value);
+  const activeIndex = matchedIndex; // -1 when no chip matches → no pill
+  const showPill = matchedIndex >= 0;
 
   const measure = useCallback(() => {
     const c = containerRef.current;
     const btn = buttonRefs.current[activeIndex];
-    if (!c || !btn) return;
+    if (!c || !btn) {
+      setPill(null);
+      return;
+    }
     const cb = c.getBoundingClientRect();
     const bb = btn.getBoundingClientRect();
     setPill({ left: bb.left - cb.left, width: bb.width });
@@ -100,7 +102,7 @@ export function SegmentedControl<V extends string>({
           fullWidth ? "w-full" : "",
         ].join(" ")}
       >
-        {pill && (
+        {pill && showPill && (
           <motion.span
             aria-hidden
             className="absolute rounded-[5px] bg-ink shadow-emboss pointer-events-none"

@@ -46,6 +46,7 @@ export function buildPersistPatch(
         rotation: clip.rotation,
         flipX: clip.flipX,
         flipY: clip.flipY,
+        viewportTransform: clip.viewportTransform,
       };
     }
     if (!isVideoClip(clip)) return v; // shouldn't happen, defensive
@@ -59,6 +60,7 @@ export function buildPersistPatch(
       rotation: clip.rotation,
       flipX: clip.flipX,
       flipY: clip.flipY,
+      viewportTransform: clip.viewportTransform,
     };
   });
 
@@ -82,6 +84,7 @@ export function buildPersistPatch(
     trim: { in: s.trim.in, out: s.trim.out },
     fx: s.fx,
     audioVolume: s.audioVolume,
+    exportSpec: s.exportSpec,
   };
 }
 
@@ -136,7 +139,8 @@ export function useAutoPersist(jobId: string | null): void {
         state.jobMeta.beatsPerBar !== prev.jobMeta?.beatsPerBar ||
         state.jobMeta.barOffsetBeats !== prev.jobMeta?.barOffsetBeats ||
         state.fx !== prev.fx ||
-        state.audioVolume !== prev.audioVolume
+        state.audioVolume !== prev.audioVolume ||
+        state.exportSpec !== prev.exportSpec
       ) {
         schedule();
       }

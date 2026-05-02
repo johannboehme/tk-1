@@ -30,6 +30,7 @@ import { buildAss } from "./ass-builder";
 import { renderOverlays } from "./ass-renderer";
 import type { Visualizer } from "./visualizer/types";
 import type { PunchFx } from "../../editor/fx/types";
+import type { ViewportTransform } from "../../editor/types";
 import { activeFxAt } from "../../editor/fx/active";
 import { fxCatalog } from "../../editor/fx/catalog";
 import { envelopeAt, INSTANT_ENVELOPE } from "../../editor/fx/envelope";
@@ -43,6 +44,10 @@ import type {
   SourcesMap,
 } from "../../editor/render/backend";
 import { WebGPUBackend } from "../../editor/render/webgpu-backend";
+import {
+  buildElementFitRect,
+  DEFAULT_VIEWPORT_TRANSFORM,
+} from "../../editor/render/element-transform";
 import type {
   FrameDescriptor,
   FrameFx,
@@ -69,25 +74,10 @@ export interface CompositorOptions {
   fx?: readonly PunchFx[];
 }
 
-function computeFitRect(
-  srcW: number,
-  srcH: number,
-  dstW: number,
-  dstH: number,
-): { x: number; y: number; w: number; h: number; fillsCanvas: boolean } {
-  const srcAspect = srcW / srcH;
-  const dstAspect = dstW / dstH;
-  const aspectMatch = Math.abs(srcAspect - dstAspect) < 1e-3;
-  if (aspectMatch) {
-    return { x: 0, y: 0, w: dstW, h: dstH, fillsCanvas: true };
-  }
-  if (srcAspect > dstAspect) {
-    const h = dstW / srcAspect;
-    return { x: 0, y: (dstH - h) / 2, w: dstW, h, fillsCanvas: false };
-  }
-  const w = dstH * srcAspect;
-  return { x: (dstW - w) / 2, y: 0, w, h: dstH, fillsCanvas: false };
-}
+// Per-element placement is shared with the live preview via
+// `buildElementFitRect` from `editor/render/element-transform.ts` —
+// don't reintroduce a local letterbox helper here. The two pipelines
+// MUST stay byte-identical on placement.
 
 export class Compositor {
   /** Final 2D output canvas — blitted backend output + visualizers +
@@ -173,7 +163,15 @@ export class Compositor {
     timestampUs: number,
     durationUs: number,
     rotationDeg: 0 | 90 | 180 | 270 = 0,
-    userTransform: { rotation?: number; flipX?: boolean; flipY?: boolean } = {},
+    userTransform: {
+      rotation?: number;
+      flipX?: boolean;
+      flipY?: boolean;
+      /** Per-element Stage placement (cover-fit + scale + translate).
+       *  Shared with the live preview via `buildElementFitRect` so the
+       *  two pipelines never drift on placement. */
+      viewportTransform?: ViewportTransform;
+    } = {},
     /**
      * Master-timeline time in seconds for FX lookup. **Must be passed
      * by callers that use segments**, because `timestampUs` is the
@@ -193,7 +191,11 @@ export class Compositor {
     const swap = rot === 90 || rot === 270;
     const dispW = swap ? srcH : srcW;
     const dispH = swap ? srcW : srcH;
-    const fit = computeFitRect(dispW, dispH, this.opts.width, this.opts.height);
+    const fit = buildElementFitRect(
+      { w: dispW, h: dispH },
+      { w: this.opts.width, h: this.opts.height },
+      userTransform.viewportTransform ?? DEFAULT_VIEWPORT_TRANSFORM,
+    );
 
     const t = timestampUs / 1_000_000;
     // FX live on the master timeline (e.g. fx.inS = 13.43s). When the
@@ -206,7 +208,7 @@ export class Compositor {
       layerId: "src",
       source: { kind: "video", clipId: "src", sourceTimeS: 0, sourceDurS: 0 },
       weight: 1,
-      fitRect: { x: fit.x, y: fit.y, w: fit.w, h: fit.h },
+      fitRect: fit,
       rotationDeg: rot,
       flipX,
       flipY,

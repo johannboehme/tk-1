@@ -20,6 +20,10 @@ import { fxCatalog } from "../fx/catalog";
 import { envelopeAt, INSTANT_ENVELOPE, type ADSREnvelope } from "../fx/envelope";
 import { camSourceTimeS } from "../../local/timing/cam-time";
 import { resolveOutputDims } from "../output-frame";
+import {
+  buildElementFitRect,
+  DEFAULT_VIEWPORT_TRANSFORM,
+} from "./element-transform";
 import type {
   FitRect,
   FrameDescriptor,
@@ -135,7 +139,11 @@ function buildPreviewLayers(
   const dispW = swap ? baseH : baseW;
   const dispH = swap ? baseW : baseH;
 
-  const fitRect = computeFitRect(dispW, dispH, output.w, output.h);
+  const fitRect: FitRect = buildElementFitRect(
+    { w: dispW, h: dispH },
+    { w: output.w, h: output.h },
+    clip.viewportTransform ?? DEFAULT_VIEWPORT_TRANSFORM,
+  );
 
   const source = isImageClip(clip)
     ? { kind: "image" as const, clipId: clip.id }
@@ -251,29 +259,7 @@ function buildFx(
   return out;
 }
 
-/** Letterbox/pillarbox fit — same shape as compositor.ts's helper but
- *  exposed here so the descriptor stays self-contained. Integer-pixel
- *  snapped to keep parity with OutputFrameBox's CSS rounding. */
-export function computeFitRect(
-  srcW: number,
-  srcH: number,
-  dstW: number,
-  dstH: number,
-): FitRect {
-  if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) {
-    return { x: 0, y: 0, w: 0, h: 0 };
-  }
-  const srcAspect = srcW / srcH;
-  const dstAspect = dstW / dstH;
-  if (Math.abs(srcAspect - dstAspect) < 1e-3) {
-    return { x: 0, y: 0, w: dstW, h: dstH };
-  }
-  if (srcAspect > dstAspect) {
-    // Source wider → fit width, letterbox top/bottom.
-    const h = dstW / srcAspect;
-    return { x: 0, y: (dstH - h) / 2, w: dstW, h };
-  }
-  // Source taller → fit height, pillarbox left/right.
-  const w = dstH * srcAspect;
-  return { x: (dstW - w) / 2, y: 0, w, h: dstH };
-}
+// `buildElementFitRect` lives in `./element-transform` — re-exported there
+// so both preview (this file) and export (`local/render/compositor.ts`)
+// hit the same implementation. Don't add a second copy here.
+export { buildElementFitRect } from "./element-transform";

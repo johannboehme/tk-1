@@ -14,10 +14,14 @@ import {
   ExportSpec,
   MatchCandidate,
   TextOverlay,
+  ViewportTransform,
   VisualizerConfig,
+  clipEffectiveDisplayDims,
   clipRangeS,
   isVideoClip,
 } from "./types";
+import { classifyAspectRatio } from "./exportPresets";
+import { DEFAULT_VIEWPORT_TRANSFORM } from "./render/element-transform";
 import { LoopRegion, clampLoopRegion } from "./OffsetScheduler";
 import { activeCamAt, type CamRange } from "./cuts";
 import { gridStepSeconds, snapTime, type SnapMode } from "./snap";
@@ -169,8 +173,12 @@ export interface FxHoldEntry {
   priorFx: PunchFx[];
 }
 
+// Default preset = "custom" — meaning "derived from the first clip on
+// the timeline". The store's auto-init in `setClipDisplayDims` kicks in
+// the first time a clip reports its dims and seeds aspect + resolution
+// from that clip. Web/Archive/Mobile are opinionated overrides.
 const DEFAULT_EXPORT: ExportSpec = {
-  preset: "web",
+  preset: "custom",
   format: "mp4",
   resolution: "source",
   video_codec: "h264",
@@ -205,6 +213,8 @@ export interface VideoClipInit {
   rotation?: number;
   flipX?: boolean;
   flipY?: boolean;
+  /** Per-element Stage placement (cover-fit + scale + translate). */
+  viewportTransform?: ViewportTransform;
 }
 
 /** Initial data for an image clip. */
@@ -218,6 +228,8 @@ export interface ImageClipInit {
   rotation?: number;
   flipX?: boolean;
   flipY?: boolean;
+  /** Per-element Stage placement (cover-fit + scale + translate). */
+  viewportTransform?: ViewportTransform;
 }
 
 export type ClipInit = VideoClipInit | ImageClipInit;
@@ -404,6 +416,15 @@ interface EditorState {
   setClipFlip(camId: string, axis: "x" | "y", on: boolean): void;
   /** Reset a clip's rotation/flip back to defaults (0° / no flip). */
   resetClipTransform(camId: string): void;
+  /** Update a clip's per-element Stage transform (scale + translate).
+   *  Partial — undefined fields keep their current value. Creates the
+   *  transform from `DEFAULT_VIEWPORT_TRANSFORM` when none is set. */
+  setClipViewportTransform(
+    camId: string,
+    partial: Partial<ViewportTransform>,
+  ): void;
+  /** Drop a clip's viewport transform → cover-fit default. */
+  resetClipViewportTransform(camId: string): void;
   /** Master-audio playback gain. Clamped to [0, 4]. */
   setMasterAudioVolume(v: number): void;
   /** Resize an image clip's duration on the master timeline. Clamped to
@@ -680,6 +701,7 @@ function buildClips(inits: ClipInit[] | undefined, fallbackOverrideMs: number): 
         rotation: init.rotation ?? 0,
         flipX: init.flipX ?? false,
         flipY: init.flipY ?? false,
+        viewportTransform: init.viewportTransform,
       };
     }
     const candidates = init.candidates ?? [];
@@ -713,6 +735,7 @@ function buildClips(inits: ClipInit[] | undefined, fallbackOverrideMs: number): 
       rotation: init.rotation ?? 0,
       flipX: init.flipX ?? false,
       flipY: init.flipY ?? false,
+      viewportTransform: init.viewportTransform,
     };
   });
 }
@@ -932,14 +955,40 @@ export const useEditorStore = create<EditorState>()(
 
     setClipDisplayDims(camId, w, h) {
       if (w <= 0 || h <= 0) return;
-      const clips = get().clips;
+      const state = get();
+      const clips = state.clips;
       const idx = clips.findIndex((c) => c.id === camId);
       if (idx < 0) return;
       const cur = clips[idx];
       if (cur.displayW === w && cur.displayH === h) return;
       const next = clips.slice();
       next[idx] = { ...cur, displayW: w, displayH: h };
-      set({ clips: next });
+
+      // Auto-init the Stage from the FIRST clip (by timeline order) that
+      // reports its dims, while the user has not yet picked a resolution.
+      // Once any concrete resolution is set, this stops firing.
+      let nextExport: ExportSpec | null = null;
+      const spec = state.exportSpec;
+      const noUserResolution =
+        spec.resolution === undefined || spec.resolution === "source";
+      if (noUserResolution) {
+        const firstClip = [...next].sort(
+          (a, b) => clipRangeS(a).startS - clipRangeS(b).startS,
+        )[0];
+        const firstDims =
+          firstClip != null ? clipEffectiveDisplayDims(firstClip) : undefined;
+        if (firstDims) {
+          const aspect = classifyAspectRatio(firstDims);
+          nextExport = {
+            ...spec,
+            resolution: { w: firstDims.w, h: firstDims.h },
+            aspectRatio: aspect,
+            resolutionLongSide: Math.max(firstDims.w, firstDims.h),
+          };
+        }
+      }
+
+      set(nextExport ? { clips: next, exportSpec: nextExport } : { clips: next });
     },
 
     setCurrentTime(t) {
@@ -1355,6 +1404,29 @@ export const useEditorStore = create<EditorState>()(
       const clips = get().clips.map((c): Clip =>
         c.id === camId ? { ...c, rotation: 0, flipX: false, flipY: false } : c,
       );
+      set({ clips });
+    },
+    setClipViewportTransform(camId, partial) {
+      const clips = get().clips.map((c): Clip => {
+        if (c.id !== camId) return c;
+        const cur: ViewportTransform =
+          c.viewportTransform ?? DEFAULT_VIEWPORT_TRANSFORM;
+        const merged: ViewportTransform = {
+          scale: partial.scale ?? cur.scale,
+          x: partial.x ?? cur.x,
+          y: partial.y ?? cur.y,
+        };
+        return { ...c, viewportTransform: merged };
+      });
+      set({ clips });
+    },
+    resetClipViewportTransform(camId) {
+      const clips = get().clips.map((c): Clip => {
+        if (c.id !== camId) return c;
+        const { viewportTransform: _drop, ...rest } = c;
+        void _drop;
+        return rest as Clip;
+      });
       set({ clips });
     },
     setMasterAudioVolume(v) {

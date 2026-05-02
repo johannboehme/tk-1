@@ -70,6 +70,12 @@ export interface VideoAsset {
   /** Mirror the cam horizontally / vertically. Defaults false. */
   flipX?: boolean;
   flipY?: boolean;
+  /** Per-element Stage placement (cover-fit + scale + translate). */
+  viewportTransform?: {
+    scale: number;
+    x: number;
+    y: number;
+  };
 }
 
 /**
@@ -95,6 +101,12 @@ export interface ImageAsset {
   /** Mirror the image horizontally / vertically. Defaults false. */
   flipX?: boolean;
   flipY?: boolean;
+  /** Per-element Stage placement (cover-fit + scale + translate). */
+  viewportTransform?: {
+    scale: number;
+    x: number;
+    y: number;
+  };
 }
 
 export type MediaAsset = VideoAsset | ImageAsset;
@@ -226,6 +238,13 @@ export interface LocalJob {
    *  0 = muted, 2.0 = +6 dB. Applied at preview time and baked into the
    *  rendered output. Optional / undefined → default 1.0. */
   audioVolume?: number;
+
+  /** Persisted Export-Panel selections (Aspect, Resolution, codecs, …).
+   *  Round-trips through the editor so the user's Stage shape + bitrate
+   *  choices survive a reload. Stored as `unknown` to avoid coupling the
+   *  storage layer to the editor's `ExportSpec` type — the editor
+   *  validates / ignores fields it doesn't recognise. */
+  exportSpec?: unknown;
 }
 
 /** Storage shape for a single Punch-in FX. Mirrors `PunchFx` from the

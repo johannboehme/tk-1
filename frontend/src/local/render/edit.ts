@@ -518,6 +518,9 @@ export interface CamSourceInput {
   /** Mirror horizontally / vertically (post-rotation). Defaults false. */
   flipX?: boolean;
   flipY?: boolean;
+  /** Per-element Stage placement (cover-fit + scale + translate). When
+   *  omitted, the compositor uses the cover-fit default. */
+  viewportTransform?: import("../../editor/types").ViewportTransform;
 }
 
 export interface MultiCamRenderInput
@@ -745,7 +748,12 @@ export async function editRenderMulti(
         let srcW: number;
         let srcH: number;
         let srcRot: 0 | 90 | 180 | 270 = 0;
-        let userTransform: { rotation?: number; flipX?: boolean; flipY?: boolean } = {};
+        let userTransform: {
+          rotation?: number;
+          flipX?: boolean;
+          flipY?: boolean;
+          viewportTransform?: import("../../editor/types").ViewportTransform;
+        } = {};
         if (camId) {
           const cam = demuxResults.find((d) => d.cam.id === camId)!;
           if (cam.kind === "image") {
@@ -758,6 +766,7 @@ export async function editRenderMulti(
               rotation: cam.cam.rotation,
               flipX: cam.cam.flipX,
               flipY: cam.cam.flipY,
+              viewportTransform: cam.cam.viewportTransform,
             };
           } else {
             const sourceTimeUs = camSourceTimeUs(tMaster, {
@@ -774,6 +783,7 @@ export async function editRenderMulti(
                 rotation: cam.cam.rotation,
                 flipX: cam.cam.flipX,
                 flipY: cam.cam.flipY,
+                viewportTransform: cam.cam.viewportTransform,
               };
             } else {
               source = testPattern;

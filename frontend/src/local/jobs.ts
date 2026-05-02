@@ -666,6 +666,7 @@ export interface EditSpecLocal {
     rotation?: number;
     flipX?: boolean;
     flipY?: boolean;
+    viewportTransform?: import("../editor/types").ViewportTransform;
   }>;
   /** Master-audio playback gain. 1.0 = source level. Picked up at render
    *  start from the store's `audioVolume`. Optional / undefined → 1.0. */
@@ -786,6 +787,7 @@ export async function runEditRender(
       const rotation = ov?.rotation ?? v.rotation ?? 0;
       const flipX = ov?.flipX ?? v.flipX ?? false;
       const flipY = ov?.flipY ?? v.flipY ?? false;
+      const viewportTransform = ov?.viewportTransform;
       if (isImageAsset(v)) {
         // Image cams have no sync offset and no drift — masterStartS is
         // the user-set placement, sourceDurationS is the user-set length.
@@ -800,6 +802,7 @@ export async function runEditRender(
           rotation,
           flipX,
           flipY,
+          viewportTransform,
         };
       }
       const algoMs = v.sync?.offsetMs ?? 0;
@@ -828,6 +831,7 @@ export async function runEditRender(
         rotation,
         flipX,
         flipY,
+        viewportTransform,
       };
     });
 

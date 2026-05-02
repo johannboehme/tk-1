@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildElementFitRect,
   buildPreviewFrameDescriptor,
-  computeFitRect,
   type EditorStoreSnapshot,
 } from "./build-descriptor";
 import type { Clip, ImageClip, VideoClip } from "../types";
@@ -60,13 +60,14 @@ describe("buildPreviewFrameDescriptor — output dims", () => {
     expect(d.layers).toEqual([]);
   });
 
-  it("uses bbox(maxW, maxH) over clips that have displayDims", () => {
+  it("uses FIRST clip's dims (by start time) as the Stage default", () => {
+    // No bbox anymore — first clip wins. Both at startOffsetS=0, so 'a' is first.
     const clips: Clip[] = [video("a", 1920, 1080), video("b", 720, 1280)];
     const d = buildPreviewFrameDescriptor(snap({ clips }), 0);
-    expect(d.output).toEqual({ w: 1920, h: 1280 });
+    expect(d.output).toEqual({ w: 1920, h: 1080 });
   });
 
-  it("explicit exportSpec.resolution overrides bbox", () => {
+  it("explicit exportSpec.resolution overrides the first-clip default", () => {
     const clips: Clip[] = [video("a", 1920, 1080)];
     const d = buildPreviewFrameDescriptor(
       snap({ clips, exportSpec: { preset: "custom", resolution: { w: 1280, h: 720 } } }),
@@ -184,27 +185,61 @@ describe("buildPreviewFrameDescriptor — layers", () => {
     expect(d.layers[0].rotationDeg).toBe(90);
   });
 
-  it("fitRect letterboxes when active cam is wider than output bbox", () => {
-    // bbox = max(1920, 720), max(1080, 1280) = 1920 × 1280
-    const clips: Clip[] = [video("a", 1920, 1080), video("b", 720, 1280)];
-    const d = buildPreviewFrameDescriptor(snap({ clips }), 0);
-    expect(d.output).toEqual({ w: 1920, h: 1280 });
-    const fr = d.layers[0].fitRect;
-    expect(fr.x).toBe(0);
-    expect(fr.w).toBe(1920);
-    expect(fr.h).toBeCloseTo(1080, 4);
-    expect(fr.y).toBeCloseTo((1280 - 1080) / 2, 4);
-  });
-
-  it("fitRect pillarboxes when active cam is taller than output bbox", () => {
+  it("cover-fits a portrait active cam into a landscape Stage (overflows top/bottom)", () => {
+    // First clip = 'a' landscape (Stage = 1920×1080). Cut to portrait 'b'.
     const clips: Clip[] = [video("a", 1920, 1080), video("b", 720, 1280)];
     const cuts: Cut[] = [{ atTimeS: 0, camId: "b" }];
     const d = buildPreviewFrameDescriptor(snap({ clips, cuts }), 0.5);
+    expect(d.output).toEqual({ w: 1920, h: 1080 });
     const fr = d.layers[0].fitRect;
+    // cover-fit: portrait 720×1280 in 1920×1080 Stage. Scale up to fill width
+    // (Stage is wider than the source), so dstW = 1920 and dstH overflows.
+    expect(fr.x).toBe(0);
+    expect(fr.w).toBe(1920);
+    // Source AR 720/1280 = 0.5625, dstH = 1920 / 0.5625 ≈ 3413
+    expect(fr.h).toBeCloseTo(1920 / (720 / 1280), 1);
+    // Vertically centered → negative y offset (overflow above & below).
+    expect(fr.y).toBeCloseTo((1080 - fr.h) / 2, 1);
+  });
+
+  it("cover-fits a landscape active cam into a portrait Stage (overflows sides)", () => {
+    // First clip = 'a' portrait (Stage = 720×1280).
+    const clips: Clip[] = [video("a", 720, 1280), video("b", 1920, 1080)];
+    const cuts: Cut[] = [{ atTimeS: 0, camId: "b" }];
+    const d = buildPreviewFrameDescriptor(snap({ clips, cuts }), 0.5);
+    expect(d.output).toEqual({ w: 720, h: 1280 });
+    const fr = d.layers[0].fitRect;
+    // Landscape 1920×1080 in portrait 720×1280: fill height (1280),
+    // dstW overflows sides.
     expect(fr.y).toBe(0);
     expect(fr.h).toBe(1280);
-    expect(fr.w).toBeCloseTo(720, 4);
-    expect(fr.x).toBeCloseTo((1920 - 720) / 2, 4);
+    expect(fr.w).toBeCloseTo(1280 * (1920 / 1080), 1);
+    expect(fr.x).toBeCloseTo((720 - fr.w) / 2, 1);
+  });
+
+  it("applies viewportTransform.scale on top of cover-fit", () => {
+    const clips: Clip[] = [
+      video("a", 1920, 1080, { viewportTransform: { scale: 2, x: 0, y: 0 } }),
+    ];
+    const d = buildPreviewFrameDescriptor(snap({ clips }), 0);
+    const fr = d.layers[0].fitRect;
+    // cover at 1920×1080 → 1920×1080. scale 2 → 3840×2160 around center.
+    expect(fr.w).toBe(3840);
+    expect(fr.h).toBe(2160);
+    expect(fr.x).toBe(-960);
+    expect(fr.y).toBe(-540);
+  });
+
+  it("applies viewportTransform.x/y as a translate on top of cover-fit", () => {
+    const clips: Clip[] = [
+      video("a", 1920, 1080, { viewportTransform: { scale: 1, x: 100, y: -50 } }),
+    ];
+    const d = buildPreviewFrameDescriptor(snap({ clips }), 0);
+    const fr = d.layers[0].fitRect;
+    expect(fr.x).toBe(100);
+    expect(fr.y).toBe(-50);
+    expect(fr.w).toBe(1920);
+    expect(fr.h).toBe(1080);
   });
 });
 
@@ -279,30 +314,53 @@ describe("buildPreviewFrameDescriptor — structural invariants", () => {
 
 // ----------------------------------------------------------------------
 
-describe("computeFitRect", () => {
-  it("fills full destination on AR match", () => {
-    expect(computeFitRect(1920, 1080, 1280, 720)).toEqual({ x: 0, y: 0, w: 1280, h: 720 });
+describe("buildElementFitRect (shared with export)", () => {
+  it("equal aspect → element exactly fills the Stage", () => {
+    expect(buildElementFitRect({ w: 1920, h: 1080 }, { w: 1280, h: 720 })).toEqual({
+      x: 0,
+      y: 0,
+      w: 1280,
+      h: 720,
+    });
   });
 
-  it("letterboxes when source is wider", () => {
-    const r = computeFitRect(1920, 1080, 1920, 1280);
-    expect(r.x).toBe(0);
-    expect(r.w).toBe(1920);
-    expect(r.h).toBeCloseTo(1080, 4);
-    expect(r.y).toBeCloseTo(100, 4);
-  });
-
-  it("pillarboxes when source is taller", () => {
-    const r = computeFitRect(720, 1280, 1920, 1280);
-    expect(r.y).toBe(0);
+  it("element wider than stage → fills height, overflows sides (cover)", () => {
+    // 1920×1080 in 1920×1280 stage: fill height (1280), dstW overflows.
+    const r = buildElementFitRect({ w: 1920, h: 1080 }, { w: 1920, h: 1280 });
     expect(r.h).toBe(1280);
-    expect(r.w).toBeCloseTo(720, 4);
-    expect(r.x).toBeCloseTo(600, 4);
+    // dstW = 1280 * (1920/1080) ≈ 2275.5
+    expect(r.w).toBeCloseTo(1280 * (1920 / 1080), 1);
+    expect(r.x).toBeCloseTo((1920 - r.w) / 2, 1);
+    expect(r.y).toBe(0);
+  });
+
+  it("element taller than stage → fills width, overflows top/bottom (cover)", () => {
+    const r = buildElementFitRect({ w: 720, h: 1280 }, { w: 1920, h: 1280 });
+    expect(r.w).toBe(1920);
+    expect(r.h).toBeCloseTo(1920 / (720 / 1280), 1);
+    expect(r.x).toBe(0);
+    expect(r.y).toBeCloseTo((1280 - r.h) / 2, 1);
   });
 
   it("returns zero rect for non-positive inputs", () => {
-    expect(computeFitRect(0, 1080, 1920, 1280)).toEqual({ x: 0, y: 0, w: 0, h: 0 });
-    expect(computeFitRect(1920, 0, 1920, 1280)).toEqual({ x: 0, y: 0, w: 0, h: 0 });
+    expect(buildElementFitRect({ w: 0, h: 1080 }, { w: 1920, h: 1280 })).toEqual({
+      x: 0,
+      y: 0,
+      w: 0,
+      h: 0,
+    });
+  });
+
+  it("respects an explicit ViewportTransform", () => {
+    const r = buildElementFitRect(
+      { w: 1920, h: 1080 },
+      { w: 1920, h: 1080 },
+      { scale: 0.5, x: 50, y: -30 },
+    );
+    expect(r.w).toBe(960);
+    expect(r.h).toBe(540);
+    expect(r.x).toBe(480 + 50);
+    expect(r.y).toBe(270 - 30);
   });
 });
 

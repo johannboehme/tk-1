@@ -1,19 +1,17 @@
 /**
  * Output-Frame-Berechnung für Live-Preview und Render-Pipeline.
  *
- * Es gibt keinen "Master-Cam". Der Output-Frame ist eine Bounding-Box
- * `(max(W_i), max(H_i))` über alle Clip-Display-Dims, sodass kein cam
- * jemals abgeschnitten wird. Cams mit anderer Aspect-Ratio werden
- * innerhalb der Box letterboxed/pillarboxed (`computeFitRect`-Helper im
- * Compositor). Wenn die User-ExportSpec eine explizite Resolution
- * vorgibt, gewinnt die.
+ * Output (Stage) ist EXPLIZIT in `exportSpec.resolution` festgelegt. Wenn
+ * der User noch nichts gewählt hat, fällt die Berechnung auf die dims
+ * des ERSTEN Clips auf der Timeline zurück (nach `startS` sortiert).
  *
- * Future: zusätzliche transparente Lanes (Alpha-Overlays über der
- * aktiven Cam) werden ebenfalls in dieselbe Box gefittet — der FX-
- * Overlay sitzt darüber on top.
+ * Die alte bbox-Logik `(max(W_i), max(H_i))` produzierte bei Multi-AR-
+ * Mixen unsinnige Ergebnisse (Widescreen + Portrait → quadratisch). Per-
+ * Element-Transform übernimmt jetzt die Per-Clip-Platzierung — siehe
+ * {@link applyViewportTransform}.
  */
 import type { Clip } from "./types";
-import { clipEffectiveDisplayDims } from "./types";
+import { clipEffectiveDisplayDims, clipRangeS } from "./types";
 import type { ExportSpec } from "./types";
 
 export interface OutputFrameBox {
@@ -33,10 +31,9 @@ export interface OutputDims {
 /**
  * Bestimmt die intendierten Output-Dimensionen.
  *
- * Wenn die ExportSpec eine explizite Resolution gesetzt hat → die.
- * Sonst: Bounding-Box `(max W, max H)` über alle Clips, die bereits
- * `displayW/displayH` reportet haben. Returns `null` solange noch kein
- * Clip seine dims gemeldet hat (caller hält den Compositor zurück).
+ * 1. Wenn `resolution` explizit gesetzt ist → die.
+ * 2. Sonst: dims des ERSTEN Clips auf der Timeline (nach `startS`).
+ * 3. `null` solange kein Clip seine `displayW/H` gemeldet hat.
  */
 export function resolveOutputDims(
   clips: readonly Clip[],
@@ -50,17 +47,16 @@ export function resolveOutputDims(
   ) {
     return { w: resolution.w, h: resolution.h };
   }
-  let maxW = 0;
-  let maxH = 0;
-  for (const c of clips) {
+  // First clip on the timeline (by start time on the master timeline)
+  // that has reported its dims. Image clips and video clips both count.
+  const sorted = [...clips].sort(
+    (a, b) => clipRangeS(a).startS - clipRangeS(b).startS,
+  );
+  for (const c of sorted) {
     const dims = clipEffectiveDisplayDims(c);
-    if (dims) {
-      if (dims.w > maxW) maxW = dims.w;
-      if (dims.h > maxH) maxH = dims.h;
-    }
+    if (dims) return { w: dims.w, h: dims.h };
   }
-  if (maxW <= 0 || maxH <= 0) return null;
-  return { w: maxW, h: maxH };
+  return null;
 }
 
 /** Convenience for callers that only care about the AR. */

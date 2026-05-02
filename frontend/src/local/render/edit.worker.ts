@@ -62,6 +62,9 @@ export interface CamWorkerInput {
   /** Mirror horizontally / vertically. Defaults false. */
   flipX?: boolean;
   flipY?: boolean;
+  /** Per-element Stage placement (cover-fit + scale + translate).
+   *  Plumbed through to the compositor so render = preview placement. */
+  viewportTransform?: import("../../editor/types").ViewportTransform;
 }
 
 export interface EditWorkerInput {
@@ -187,6 +190,7 @@ ctx.addEventListener("message", async (e: MessageEvent<EditWorkerMessage>) => {
           rotation: c.rotation,
           flipX: c.flipX,
           flipY: c.flipY,
+          viewportTransform: c.viewportTransform,
         })),
         cuts: input.cuts ?? [],
         masterDurationS: input.masterDurationS,

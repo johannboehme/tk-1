@@ -1,42 +1,41 @@
-// Resolution control for the advanced drawer. Five chips for common targets
-// + a "Custom" entry that reveals two number inputs and an aspect-lock toggle.
+// Resolution picker — long-side presets driven by the active AspectRatio.
 //
-// The picker is aspect-aware: when the lock is on, editing one dimension
-// scales the other to preserve the source aspect. This keeps the user out
-// of the trap of producing a stretched export.
+// V2 split: Aspect lives in `AspectPicker`; this component owns only the
+// pixel size of the long side. When the aspect changes, the picker
+// derives `{w, h}` via `deriveResolution` and pushes a single resolution
+// update to the parent. Custom W/H inputs let the user step outside the
+// preset grid; doing so flips the parent into `aspectRatio: "custom"`.
 
-import { useEffect, useMemo, useState } from "react";
-
-type Preset = "source" | "2160" | "1440" | "1080" | "720" | "480";
+import { useEffect, useState } from "react";
+import {
+  RESOLUTION_LONG_SIDE_PRESETS,
+  deriveResolution,
+} from "../exportPresets";
+import type { AspectRatio } from "../types";
 
 interface Props {
-  source: { w: number; h: number };
+  /** Active aspect, drives long-side → {w,h} derivation. `"custom"` =
+   *  user uses the W/H inputs directly. */
+  aspect: AspectRatio | undefined;
+  /** Concrete current dims. The source of truth. */
   value: { w: number; h: number };
-  onChange: (dims: { w: number; h: number }) => void;
+  /** User picked a preset long-side: parent should re-derive {w,h}
+   *  from `aspect` × `longSide` and store both. */
+  onPickLongSide: (longSide: number) => void;
+  /** User typed concrete dims — parent must flip aspect to "custom". */
+  onCustomDims: (dims: { w: number; h: number }) => void;
 }
 
-const PRESETS: { value: Preset; label: string }[] = [
-  { value: "source", label: "SRC" },
-  { value: "2160", label: "4K" },
-  { value: "1440", label: "1440" },
-  { value: "1080", label: "1080" },
-  { value: "720", label: "720" },
-  { value: "480", label: "480" },
-];
+const PRESET_LABELS: Record<number, string> = {
+  3840: "4K",
+  2560: "1440",
+  1920: "1080",
+  1280: "720",
+  854: "480",
+};
 
-function presetToDims(preset: Preset, source: { w: number; h: number }) {
-  if (preset === "source") return { w: source.w, h: source.h };
-  const longSide = parseInt(preset, 10);
-  const sourceLong = Math.max(source.w, source.h);
-  if (sourceLong <= longSide) {
-    // Source already fits — pass-through to avoid up-scaling.
-    return { w: source.w, h: source.h };
-  }
-  const scale = longSide / sourceLong;
-  return {
-    w: roundEven(source.w * scale),
-    h: roundEven(source.h * scale),
-  };
+function presetLabel(longSide: number): string {
+  return PRESET_LABELS[longSide] ?? String(longSide);
 }
 
 function roundEven(n: number): number {
@@ -44,81 +43,91 @@ function roundEven(n: number): number {
   return r % 2 === 0 ? r : r - 1;
 }
 
-function detectPreset(value: { w: number; h: number }, source: { w: number; h: number }): Preset | "custom" {
-  for (const p of PRESETS) {
-    const dims = presetToDims(p.value, source);
-    if (dims.w === value.w && dims.h === value.h) return p.value;
-  }
-  return "custom";
-}
-
-export function ResolutionPicker({ source, value, onChange }: Props) {
-  const detected = useMemo(() => detectPreset(value, source), [value, source]);
-  const [aspectLock, setAspectLock] = useState(true);
+export function ResolutionPicker({
+  aspect,
+  value,
+  onPickLongSide,
+  onCustomDims,
+}: Props) {
   const [wInput, setWInput] = useState(String(value.w));
   const [hInput, setHInput] = useState(String(value.h));
+  const [aspectLock, setAspectLock] = useState(true);
 
-  // Sync local input strings when the parent updates the value (e.g. via a
-  // preset chip click). We avoid one-way data flow into the input only when
-  // the user is actively editing — easiest approximation: always mirror.
+  // Mirror parent updates into the inputs (preset clicks / aspect flips).
   useEffect(() => {
     setWInput(String(value.w));
     setHInput(String(value.h));
   }, [value.w, value.h]);
 
-  const aspect = source.h === 0 ? 1 : source.w / source.h;
-
-  function pickPreset(p: Preset) {
-    onChange(presetToDims(p, source));
-  }
+  // Aspect-locked typing: derive the other dim from the typed one
+  // using the CURRENT value's aspect — that keeps the user's
+  // free-form ratio intact even when AspectRatio is "custom".
+  const ratio = value.h === 0 ? 1 : value.w / value.h;
+  const activeLong = Math.max(value.w, value.h);
 
   function commitW(raw: string) {
     const n = parseInt(raw, 10);
     if (!Number.isFinite(n) || n < 16) return;
     const w = roundEven(n);
-    const h = aspectLock ? roundEven(w / aspect) : value.h;
-    onChange({ w, h });
+    const h = aspectLock ? roundEven(w / ratio) : value.h;
+    onCustomDims({ w, h });
   }
 
   function commitH(raw: string) {
     const n = parseInt(raw, 10);
     if (!Number.isFinite(n) || n < 16) return;
     const h = roundEven(n);
-    const w = aspectLock ? roundEven(h * aspect) : value.w;
-    onChange({ w, h });
+    const w = aspectLock ? roundEven(h * ratio) : value.w;
+    onCustomDims({ w, h });
   }
 
   return (
     <div className="flex flex-col gap-2">
       <span className="label">Resolution</span>
       <div className="flex gap-1 flex-wrap">
-        {PRESETS.map((p) => {
-          const active = detected === p.value;
+        {RESOLUTION_LONG_SIDE_PRESETS.map((longSide) => {
+          // When aspect is custom, no preset can be "active" — the
+          // picker is purely for the W/H inputs in that mode.
+          const previewDims =
+            aspect && aspect !== "custom"
+              ? deriveResolution(aspect, longSide)
+              : null;
+          const active =
+            previewDims != null &&
+            previewDims.w === value.w &&
+            previewDims.h === value.h;
+          const disabled = aspect === "custom" || !aspect;
           return (
             <button
-              key={p.value}
+              key={longSide}
               type="button"
-              onClick={() => pickPreset(p.value)}
+              disabled={disabled}
+              onClick={() => onPickLongSide(longSide)}
               className={[
                 "h-8 px-2.5 rounded-md text-[11px] font-display tracking-label uppercase border",
                 active
                   ? "bg-ink text-paper-hi shadow-emboss border-rule/60"
+                  : disabled
+                  ? "bg-paper-deep text-ink-3 border-rule opacity-50 cursor-not-allowed"
                   : "bg-paper-hi text-ink-2 border-rule hover:bg-paper-deep",
               ].join(" ")}
+              title={
+                previewDims
+                  ? `${previewDims.w} × ${previewDims.h}`
+                  : `${longSide}px long side`
+              }
             >
-              {p.label}
+              {presetLabel(longSide)}
             </button>
           );
         })}
       </div>
 
       <div className="flex items-end gap-2">
-        {/* `min-w-0` on each column lets the input shrink inside the row.
-         *  Without it, type=number inputs default to their intrinsic
-         *  width (~120 px) and a 4-digit value pushes the Height input
-         *  off the right edge of the side panel. */}
         <div className="flex flex-col gap-1 flex-1 min-w-0">
-          <span className="text-[10px] font-mono tracking-label uppercase text-ink-3">Width</span>
+          <span className="text-[10px] font-mono tracking-label uppercase text-ink-3">
+            Width
+          </span>
           <input
             type="number"
             inputMode="numeric"
@@ -146,7 +155,9 @@ export function ResolutionPicker({ source, value, onChange }: Props) {
           {aspectLock ? "🔒" : "🔓"}
         </button>
         <div className="flex flex-col gap-1 flex-1 min-w-0">
-          <span className="text-[10px] font-mono tracking-label uppercase text-ink-3">Height</span>
+          <span className="text-[10px] font-mono tracking-label uppercase text-ink-3">
+            Height
+          </span>
           <input
             type="number"
             inputMode="numeric"
@@ -161,6 +172,13 @@ export function ResolutionPicker({ source, value, onChange }: Props) {
           />
         </div>
       </div>
+      {/* Long-side hint — explains why "1080" might mean 1920×1080 OR
+       *  1080×1920, depending on the aspect setting above. */}
+      {aspect && aspect !== "custom" && (
+        <span className="text-[10px] font-mono tracking-label uppercase text-ink-3">
+          Long-side · {activeLong}px
+        </span>
+      )}
     </div>
   );
 }

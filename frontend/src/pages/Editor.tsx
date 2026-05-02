@@ -36,6 +36,7 @@ import { computeWaveformPeaks } from "../local/waveform-peaks";
 import { exportSpecToRenderOpts } from "../editor/exportPresets";
 import { opfs } from "../storage/opfs";
 import type { ClipInit } from "../editor/store";
+import type { ExportSpec } from "../editor/types";
 import { useAutoPersist } from "../editor/useAutoPersist";
 import {
   getCachedAnalysis,
@@ -75,6 +76,7 @@ function assetToClipInit(v: MediaAsset): ClipInit {
       rotation: v.rotation,
       flipX: v.flipX,
       flipY: v.flipY,
+      viewportTransform: v.viewportTransform,
     };
   }
   const persistedCandidates = v.sync?.candidates?.map((c) => ({
@@ -108,6 +110,7 @@ function assetToClipInit(v: MediaAsset): ClipInit {
     rotation: v.rotation,
     flipX: v.flipX,
     flipY: v.flipY,
+    viewportTransform: v.viewportTransform,
   };
 }
 
@@ -722,6 +725,14 @@ export default function Editor() {
           store.setLanesLocked(j.ui.lanesLocked);
         }
       }
+      // Restore the persisted ExportSpec (Aspect, Resolution, codecs, …).
+      // Stored as `unknown` in the LocalJob — we trust the shape because
+      // it round-tripped through useAutoPersist.buildPersistPatch.
+      if (j.exportSpec && typeof j.exportSpec === "object") {
+        useEditorStore
+          .getState()
+          .setExport(j.exportSpec as Partial<ExportSpec>);
+      }
       if (j.trim) {
         // Clamp persisted trim to the current audio range — older jobs
         // were saved with trim values based on the cam-1 media-duration
@@ -883,6 +894,7 @@ export default function Editor() {
       rotation: c.rotation,
       flipX: c.flipX,
       flipY: c.flipY,
+      viewportTransform: c.viewportTransform,
     }));
     const cuts = liveState.cuts;
     await jobsDb.updateJob(id, { cuts });
