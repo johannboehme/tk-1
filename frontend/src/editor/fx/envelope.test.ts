@@ -74,26 +74,40 @@ describe("envelopeAt — edge cases", () => {
     expect(envelopeAt(env(0, 0, 1, 0), 1.0, 1.5)).toBe(0);
   });
 
-  it("compresses A+D to fit (region - R), keeping the release tail intact", () => {
-    // After release: regionDur = held + R. If A+D > held, A+D compress
-    // to fit `held`; R stays exactly R so the user's release fade plays
-    // out unmodified.
+  it("releases from partial-attack amplitude on quick tap (synth-voice)", () => {
+    // After release: regionDur = held + R. With A > held, attack does NOT
+    // compress to fit; it freezes mid-ramp and release fades from there.
+    // E.g. held 50 ms with A=100 ms → attack reached 0.5 at let-go; release
+    // fades 0.5 → 0 over R, NOT 1.0 → 0.
     const e = env(0.1, 0, 1, 0.2);
     const regionDur = 0.05 + 0.2; // held 50 ms + R=200 ms = 250 ms
-    // Mid-attack at 25 ms — A is compressed to 50 ms, so 25 ms is half.
-    expect(envelopeAt(e, regionDur, 0.025)).toBeCloseTo(0.5, 4);
-    // At the snapped release moment (50 ms): peak, release just starting.
-    expect(envelopeAt(e, regionDur, 0.05)).toBeCloseTo(1, 4);
-    // Halfway through release: 50 ms + 100 ms = 150 ms → wetness 0.5.
-    expect(envelopeAt(e, regionDur, 0.15)).toBeCloseTo(0.5, 4);
+    // Mid-attack at 25 ms (still inside attack ramp): 0.025 / 0.1 = 0.25.
+    expect(envelopeAt(e, regionDur, 0.025)).toBeCloseTo(0.25, 4);
+    // At the release moment (50 ms): attack only reached 0.5 — release
+    // starts from there, not from peak.
+    expect(envelopeAt(e, regionDur, 0.05)).toBeCloseTo(0.5, 4);
+    // Halfway through release (150 ms): 0.5 * (1 - 0.5) = 0.25.
+    expect(envelopeAt(e, regionDur, 0.15)).toBeCloseTo(0.25, 4);
   });
 
-  it("clamps R alone when even R exceeds the region (sub-R sliver)", () => {
-    // 100 ms region but R=200 → R clamps to 100, A/D zeroed.
+  it("stays silent when R alone exceeds the region (sub-R sliver)", () => {
+    // 100 ms region but R=200 → releaseStart = -100 ms. Release samples
+    // the natural envelope at t=0 (the earliest visible point), which
+    // for A>0 is 0 → effect plays silent. Synth analogue: tapped too
+    // briefly to make any sound.
     const e = env(0.1, 0.05, 0.5, 0.2);
-    expect(envelopeAt(e, 0.1, 0)).toBeCloseTo(0.5, 5);
-    expect(envelopeAt(e, 0.1, 0.05)).toBeCloseTo(0.25, 5);
-    expect(envelopeAt(e, 0.1, 0.099)).toBeCloseTo(0.005, 3);
+    expect(envelopeAt(e, 0.1, 0)).toBeCloseTo(0, 5);
+    expect(envelopeAt(e, 0.1, 0.05)).toBeCloseTo(0, 5);
+    expect(envelopeAt(e, 0.1, 0.099)).toBeCloseTo(0, 3);
+  });
+
+  it("stays silent for sub-R sliver even when A=0 (release-start at t=0)", () => {
+    // With A=D=0 the natural curve is at S from t=0, so a sub-R sliver
+    // does play — as a fade from S down to 0 over the available time.
+    // Documents the boundary: silent only kicks in when A>0.
+    const e = env(0, 0, 0.5, 0.2);
+    expect(envelopeAt(e, 0.1, 0)).toBeCloseTo(0.25, 4); // S * (1 - 0.1/0.2)
+    expect(envelopeAt(e, 0.1, 0.05)).toBeCloseTo(0.125, 4); // S * (1 - 0.15/0.2)
   });
 
   it("clamps sustain level into [0, 1]", () => {
