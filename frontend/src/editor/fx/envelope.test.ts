@@ -110,6 +110,58 @@ describe("envelopeAt — edge cases", () => {
   });
 });
 
+describe("envelopeAt — holding (live pad press)", () => {
+  // While the user holds a pad, `tickFxHold` keeps `outS = playhead +
+  // overshoot`, so `regionDurS ≈ localT + overshoot`. Old behavior
+  // rescaled A and D against this moving target → attack collapsed to
+  // ≈ elapsed-time and reached ~1 in the first frame regardless of slider.
+  // Fix: while holding, A and D stay raw — the phase logic does the rest.
+
+  it("plays the user-set attack at full length while held (Vignette repro)", () => {
+    // attackS = 2.0 (slider max). 50 ms into hold, overshoot = 50 ms:
+    // regionDurS = 0.1, localT = 0.05. Expected: 0.05 / 2.0 = 0.025.
+    // Buggy old behavior would have returned ≈ 0.5 (after rescaling A→0.1).
+    const e = env(2.0, 0, 1, 0.3);
+    expect(envelopeAt(e, 0.1, 0.05, true)).toBeCloseTo(0.025, 4);
+    // 250 ms in → 0.25 / 2.0 = 0.125
+    expect(envelopeAt(e, 0.3, 0.25, true)).toBeCloseTo(0.125, 4);
+    // 1 s in → 0.5
+    expect(envelopeAt(e, 1.05, 1.0, true)).toBeCloseTo(0.5, 4);
+    // 2 s in → 1.0 (peak reached)
+    expect(envelopeAt(e, 2.05, 2.0, true)).toBeCloseTo(1, 4);
+  });
+
+  it("plays decay correctly while held", () => {
+    // A = 0.1, D = 0.2, S = 0.5. Halfway through decay (localT = 0.2):
+    // 1 + (S - 1) * ((localT - A) / D) = 1 + (-0.5) * 0.5 = 0.75.
+    const e = env(0.1, 0.2, 0.5, 0.3);
+    expect(envelopeAt(e, 1.0, 0.2, true)).toBeCloseTo(0.75, 4);
+  });
+
+  it("returns sustain level once past A+D while held", () => {
+    const e = env(0.1, 0.1, 0.6, 0.3);
+    expect(envelopeAt(e, 0.55, 0.5, true)).toBeCloseTo(0.6, 6);
+    expect(envelopeAt(e, 5.0, 4.0, true)).toBeCloseTo(0.6, 6);
+  });
+
+  it("never engages release while held — even with huge R near outS", () => {
+    // Synth-voice semantics: release only fires after let-go. While held,
+    // localT close to regionDurS must stay at sustain, not fade out.
+    const e = env(0, 0, 0.7, 1.0);
+    expect(envelopeAt(e, 1.0, 0.5, true)).toBeCloseTo(0.7, 6);
+    expect(envelopeAt(e, 1.0, 0.99, true)).toBeCloseTo(0.7, 6);
+  });
+
+  it("does not return 0 at or past outS while held", () => {
+    // Active-resolver pushes outS just ahead of playhead; the envelope
+    // sampler must not zero-out within the overshoot tail or the FX
+    // would flicker off mid-hold.
+    const e = env(0.05, 0, 1, 0.2);
+    expect(envelopeAt(e, 1.0, 1.0, true)).toBe(1);
+    expect(envelopeAt(e, 1.0, 1.5, true)).toBe(1);
+  });
+});
+
 describe("envelopeAt — INSTANT_ENVELOPE default", () => {
   it("returns 1 for any localT in [0, regionDur)", () => {
     expect(envelopeAt(INSTANT_ENVELOPE, 1.0, 0)).toBe(1);

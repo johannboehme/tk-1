@@ -5,8 +5,12 @@
  * Kind eigene "off"-Definition kennt.
  *
  * Zeit-Encoding ist absolut (Sekunden). Wenn A+D+R die Region-Dauer
- * übersteigt, werden alle drei proportional auf die Region skaliert
- * (Sustain-Länge wird dann 0).
+ * übersteigt, ist Release der "protected slot" — R bleibt wie gesetzt,
+ * Attack+Decay werden auf den verbleibenden Raum (regionDurS - R)
+ * proportional komprimiert (Sustain-Länge wird dann 0). Nur wenn R allein
+ * die Region übersteigt, wird R selbst auf regionDurS geklemmt und A/D
+ * auf 0 gesetzt. Beim Halten (holding=true) findet keine Fit-Skalierung
+ * statt — A/D bleiben raw und Release wird nicht gesampled.
  */
 
 export interface ADSREnvelope {
@@ -70,6 +74,15 @@ export function envelopeAt(
   // possible. Attack + Decay get compressed to fit the remaining space.
   // Only when even R alone exceeds the region (a sub-R sliver) do we
   // clamp R itself and zero out A/D.
+  //
+  // Only applies when NOT holding: while the pad is still down,
+  // `regionDurS` tracks `localT + overshoot` (live-extended end-of-region,
+  // see store.tickFxHold), so any rescaling here would dynamically squeeze
+  // A onto the elapsed time and the attack would always reach ~1 within
+  // the first frame, regardless of slider. Synth-voice semantics: while
+  // held, A and D stay raw; the phase logic below handles the rest
+  // (release is short-circuited out by the `if (holding) return S` at
+  // the sustain check).
   if (!holding) {
     if (R >= regionDurS) {
       R = regionDurS;
@@ -83,14 +96,6 @@ export function envelopeAt(
         A *= k;
         D *= k;
       }
-    }
-  } else {
-    // Holding → only A+D matter (release isn't sampled).
-    const sum = A + D;
-    if (sum > regionDurS && sum > 0) {
-      const k = regionDurS / sum;
-      A *= k;
-      D *= k;
     }
   }
 
