@@ -735,6 +735,13 @@ function Encoder({ kind, param, tint }: EncoderProps) {
   const onPointerMove = useCallback(
     (e: ReactPointerEvent<HTMLDivElement>) => {
       if (!dragging) return;
+      // Stale-drag guard: if the up event was lost (cursor left the
+      // window during the drag) the next move would otherwise keep
+      // adjusting the knob without a button held.
+      if (e.buttons === 0) {
+        setDragging(false);
+        return;
+      }
       e.preventDefault();
       // Drag UP increases the value. 200 px maps to the full storage
       // range; Shift slows this 6×.
@@ -757,6 +764,24 @@ function Encoder({ kind, param, tint }: EncoderProps) {
   );
 
   const onPointerUp = useCallback(() => setDragging(false), []);
+
+  // Belt-and-suspenders for off-window releases. The local up handler
+  // never fires when the cursor lands outside the document, so we
+  // listen on window too.
+  useEffect(() => {
+    if (!dragging) return;
+    function clear() {
+      setDragging(false);
+    }
+    window.addEventListener("pointerup", clear);
+    window.addEventListener("pointercancel", clear);
+    window.addEventListener("blur", clear);
+    return () => {
+      window.removeEventListener("pointerup", clear);
+      window.removeEventListener("pointercancel", clear);
+      window.removeEventListener("blur", clear);
+    };
+  }, [dragging]);
 
   const onDoubleClick = useCallback(() => {
     setFxDefault(kind, param.id, param.defaultValue);
@@ -1924,6 +1949,27 @@ function useAdsrDrag(opts: {
     axis: AdsrAxis;
   } | null>(null);
 
+  // Belt-and-suspenders against stuck drags when the pointerup is lost
+  // off-window or off-element. Pairs with the `e.buttons === 0` guard
+  // in onPointerMove for re-entries that arrive without an up event.
+  const setActive = opts.setActive;
+  useEffect(() => {
+    function clearStaleDrag() {
+      if (startRef.current) {
+        startRef.current = null;
+        setActive(null);
+      }
+    }
+    window.addEventListener("pointerup", clearStaleDrag);
+    window.addEventListener("pointercancel", clearStaleDrag);
+    window.addEventListener("blur", clearStaleDrag);
+    return () => {
+      window.removeEventListener("pointerup", clearStaleDrag);
+      window.removeEventListener("pointercancel", clearStaleDrag);
+      window.removeEventListener("blur", clearStaleDrag);
+    };
+  }, [setActive]);
+
   const beginDrag = (axis: AdsrAxis, e: ReactPointerEvent<Element>) => {
     (e.target as Element).setPointerCapture?.(e.pointerId);
     startRef.current = {
@@ -1938,6 +1984,15 @@ function useAdsrDrag(opts: {
   const onPointerMove = (e: ReactPointerEvent<Element>) => {
     const start = startRef.current;
     if (!start) return;
+    // Stale-drag guard. setPointerCapture can lose the up event when
+    // the cursor leaves the browser window — without this, the next
+    // move snaps the knot back to the cursor as if the user were still
+    // holding the button. `e.buttons === 0` means no button is pressed.
+    if (e.buttons === 0) {
+      startRef.current = null;
+      opts.setActive(null);
+      return;
+    }
     const sens = e.shiftKey ? 6 : 1;
     const dxPx = (e.clientX - start.x) / sens;
     const dyPx = (e.clientY - start.y) / sens;

@@ -2,6 +2,12 @@
 import { useEffect } from "react";
 import { useEditorStore } from "../store";
 import { effectiveAudioStartS } from "../selectors/timing";
+import {
+  classifyIOTarget,
+  imageInAtPlayhead,
+  imageOutAtPlayhead,
+  videoSourceTimeAtPlayhead,
+} from "../io-points";
 import { useRegisterShortcut } from "../shortcuts/useRegisterShortcut";
 import { useIsNarrowViewport } from "../use-is-narrow";
 import { ChunkyButton } from "./ChunkyButton";
@@ -20,6 +26,31 @@ import {
   StepFwdIcon,
 } from "./icons";
 
+type IOContextKind = "loop" | "video" | "image" | "master";
+
+function ioInDescription(k: IOContextKind): string {
+  switch (k) {
+    case "loop":
+      return "Set loop in-point at the playhead";
+    case "video":
+    case "image":
+      return "Set clip in-point at the playhead";
+    case "master":
+      return "Set in-point at the playhead";
+  }
+}
+function ioOutDescription(k: IOContextKind): string {
+  switch (k) {
+    case "loop":
+      return "Set loop out-point at the playhead";
+    case "video":
+    case "image":
+      return "Set clip out-point at the playhead";
+    case "master":
+      return "Set out-point at the playhead";
+  }
+}
+
 export function TransportBar() {
   const meta = useEditorStore((s) => s.jobMeta);
   const isPlaying = useEditorStore((s) => s.playback.isPlaying);
@@ -36,6 +67,21 @@ export function TransportBar() {
   const seek = useEditorStore((s) => s.seek);
   const stepByActiveSnap = useEditorStore((s) => s.stepByActiveSnap);
   const shiftLoop = useEditorStore((s) => s.shiftLoop);
+  // Per-clip trim/placement actions: I/O routes here when a video or
+  // image clip is selected. Same store actions the move-mode drag
+  // handles call, so behavior + clamps stay identical.
+  const setVideoClipTrim = useEditorStore((s) => s.setVideoClipTrim);
+  const setImageClipDuration = useEditorStore((s) => s.setImageClipDuration);
+  const setClipStartOffset = useEditorStore((s) => s.setClipStartOffset);
+  // Read-only subscriptions to drive aria-labels + shortcut hints.
+  const selectedClipId = useEditorStore((s) => s.selectedClipId);
+  const ioContextKind = useEditorStore((s) => {
+    if (s.playback.loop) return "loop" as const;
+    if (s.selectedClipId === null) return "master" as const;
+    const clip = s.clips.find((c) => c.id === s.selectedClipId);
+    if (!clip) return "master" as const;
+    return clip.kind === "image" ? ("image" as const) : ("video" as const);
+  });
   // Phone-sized viewports get an aggressively compacted transport bar:
   // every transport stepper + Play + IN/OUT/LOOP collapses to xs
   // (h-8 ≈ 28 px wide icon-only, no min-w) so the entire 8-button
@@ -61,28 +107,74 @@ export function TransportBar() {
     seek(t + deltaSec);
   }
 
-  // IN/OUT semantics are modal: while a loop region is active they edit
-  // the loop boundaries (so the user can sculpt a practice loop with the
-  // playhead); otherwise they edit the trim/export region. Same logic in
-  // both the buttons and the I/O shortcuts.
+  // IN/OUT semantics are contextual:
+  //   loop active           → edit the loop boundaries
+  //   video clip selected   → edit that clip's source-trim (clamped to
+  //                            [0, sourceDurationS] by the store action)
+  //   image clip selected   → edit that clip's master-pill edges
+  //                            (mirror of the move-mode drag handles)
+  //   else                  → edit master trim (export region)
+  // Same logic for buttons and keyboard shortcuts.
   function setInPointAtPlayhead() {
-    const t = useEditorStore.getState().playback.currentTime;
-    if (loop) {
-      const newStart = t;
-      const newEnd = Math.max(loop.end, newStart + 1 / fps);
-      setLoop({ start: newStart, end: newEnd });
-    } else {
-      setTrim({ in: t, out: trim.out });
+    const s = useEditorStore.getState();
+    const t = s.playback.currentTime;
+    const target = classifyIOTarget({
+      loop,
+      selectedClipId: s.selectedClipId,
+      clips: s.clips,
+    });
+    switch (target.kind) {
+      case "loop": {
+        const newStart = t;
+        const newEnd = Math.max(loop!.end, newStart + 1 / fps);
+        setLoop({ start: newStart, end: newEnd });
+        return;
+      }
+      case "video": {
+        const sourceT = videoSourceTimeAtPlayhead(target.clip, t);
+        const outS = target.clip.trimOutS ?? target.clip.sourceDurationS;
+        setVideoClipTrim(target.clip.id, sourceT, outS);
+        return;
+      }
+      case "image": {
+        const next = imageInAtPlayhead(target.clip, t);
+        setClipStartOffset(target.clip.id, next.startOffsetS);
+        setImageClipDuration(target.clip.id, next.durationS);
+        return;
+      }
+      case "master":
+        setTrim({ in: t, out: trim.out });
+        return;
     }
   }
   function setOutPointAtPlayhead() {
-    const t = useEditorStore.getState().playback.currentTime;
-    if (loop) {
-      const newEnd = t;
-      const newStart = Math.min(loop.start, newEnd - 1 / fps);
-      setLoop({ start: newStart, end: newEnd });
-    } else {
-      setTrim({ in: trim.in, out: t });
+    const s = useEditorStore.getState();
+    const t = s.playback.currentTime;
+    const target = classifyIOTarget({
+      loop,
+      selectedClipId: s.selectedClipId,
+      clips: s.clips,
+    });
+    switch (target.kind) {
+      case "loop": {
+        const newEnd = t;
+        const newStart = Math.min(loop!.start, newEnd - 1 / fps);
+        setLoop({ start: newStart, end: newEnd });
+        return;
+      }
+      case "video": {
+        const sourceT = videoSourceTimeAtPlayhead(target.clip, t);
+        const inS = target.clip.trimInS ?? 0;
+        setVideoClipTrim(target.clip.id, inS, sourceT);
+        return;
+      }
+      case "image": {
+        setImageClipDuration(target.clip.id, imageOutAtPlayhead(target.clip, t));
+        return;
+      }
+      case "master":
+        setTrim({ in: trim.in, out: t });
+        return;
     }
   }
 
@@ -156,6 +248,10 @@ export function TransportBar() {
     setPlaying,
     setLoop,
     setTrim,
+    setVideoClipTrim,
+    setImageClipDuration,
+    setClipStartOffset,
+    selectedClipId,
     trim.in,
     trim.out,
     stepByActiveSnap,
@@ -186,18 +282,14 @@ export function TransportBar() {
   useRegisterShortcut({
     id: "transport.in",
     keys: ["I"],
-    description: loop
-      ? "Set loop in-point at the playhead"
-      : "Set trim in-point at the playhead",
+    description: ioInDescription(ioContextKind),
     group: "Transport",
     icon: <InIcon />,
   });
   useRegisterShortcut({
     id: "transport.out",
     keys: ["O"],
-    description: loop
-      ? "Set loop out-point at the playhead"
-      : "Set trim out-point at the playhead",
+    description: ioOutDescription(ioContextKind),
     group: "Transport",
     icon: <OutIcon />,
   });
@@ -293,7 +385,7 @@ export function TransportBar() {
           size={trimSize}
           onClick={setInPointAtPlayhead}
           iconLeft={<InIcon />}
-          aria-label={loop ? "Set loop in-point at the playhead" : "Set in-point at the playhead"}
+          aria-label={ioInDescription(ioContextKind)}
         >
           {!isNarrow && "IN"}
         </ChunkyButton>
@@ -302,7 +394,7 @@ export function TransportBar() {
           size={trimSize}
           onClick={setOutPointAtPlayhead}
           iconLeft={<OutIcon />}
-          aria-label={loop ? "Set loop out-point at the playhead" : "Set out-point at the playhead"}
+          aria-label={ioOutDescription(ioContextKind)}
         >
           {!isNarrow && "OUT"}
         </ChunkyButton>
