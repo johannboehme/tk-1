@@ -248,11 +248,11 @@ export function TriageTimeline() {
     const xPx = e.clientX - rect.left;
     const yPx = e.clientY - rect.top;
     const tRaw = xToTime(xPx);
-    const chunkLaneTop = TIME_RULER_HEIGHT + BAR_RULER_HEIGHT + waveformHeight;
+    const waveformTop = TIME_RULER_HEIGHT + BAR_RULER_HEIGHT;
+    const chunkLaneTop = waveformTop + waveformHeight;
 
-    // Click in the chunk lane on a chunk → focus it; that's the
-    // primary curation action there. We don't seek/scrub from the
-    // chunk lane to keep the focus interaction predictable.
+    // Click in the chunk lane on a chunk → focus it (no seek). The
+    // chunk-lane click is purely a curation action.
     if (yPx >= chunkLaneTop) {
       const hit = chunks.find(
         (c) => tRaw * 1000 >= c.startMs && tRaw * 1000 <= c.endMs,
@@ -261,7 +261,22 @@ export function TriageTimeline() {
         focusChunk(hit.id);
         return;
       }
-      // Fallthrough: empty area in chunk lane → playhead drag.
+      // Empty area in chunk lane → fall through to playhead scrub.
+    }
+
+    // Click anywhere in the WAVEFORM that lands inside a chunk's
+    // bounds also focuses that chunk — the user shouldn't have to
+    // hunt for the (sometimes thin) chunk-lane block to select it.
+    // Then continue with playhead scrub so the seek lands at the
+    // exact click position. focusChunk's seek to chunk start gets
+    // overwritten by the seek() below, which is what we want.
+    if (yPx >= waveformTop && yPx < chunkLaneTop) {
+      const hit = chunks.find(
+        (c) => tRaw * 1000 >= c.startMs && tRaw * 1000 <= c.endMs,
+      );
+      if (hit && hit.id !== focusedChunkId) {
+        focusChunk(hit.id);
+      }
     }
 
     // Playhead scrub — seek immediately + start tracking.
