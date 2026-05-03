@@ -351,17 +351,42 @@ export const useTriageStore = create<TriageState>((set, get) => ({
 
   focusRelative(delta) {
     const s = get();
-    if (s.chunks.length === 0) return;
-    const sorted = [...s.chunks].sort((a, b) => a.startMs - b.startMs);
-    const currentIdx = s.focusedChunkId
-      ? sorted.findIndex((c) => c.id === s.focusedChunkId)
-      : -1;
-    const nextIdx = Math.max(
-      0,
-      Math.min(sorted.length - 1, currentIdx + delta),
-    );
-    if (nextIdx === currentIdx) return;
-    s.focusChunk(sorted[nextIdx].id);
+    // Prev/Next walk only through ACCEPTED chunks — dropped chunks
+    // shouldn't waste keypresses. If the currently focused chunk
+    // happens to be rejected (focused via click then dropped), find
+    // the nearest accepted chunk in the requested direction.
+    const accepted = [...s.chunks]
+      .filter((c) => c.accepted)
+      .sort((a, b) => a.startMs - b.startMs);
+    if (accepted.length === 0) return;
+    const focused = s.focusedChunkId
+      ? s.chunks.find((c) => c.id === s.focusedChunkId) ?? null
+      : null;
+
+    let nextIdx: number;
+    if (!focused) {
+      nextIdx = delta > 0 ? 0 : accepted.length - 1;
+    } else {
+      const idxInAccepted = accepted.findIndex((c) => c.id === focused.id);
+      if (idxInAccepted >= 0) {
+        nextIdx = Math.max(
+          0,
+          Math.min(accepted.length - 1, idxInAccepted + delta),
+        );
+        if (nextIdx === idxInAccepted) return;
+      } else if (delta > 0) {
+        const found = accepted.findIndex((c) => c.startMs > focused.startMs);
+        nextIdx = found >= 0 ? found : accepted.length - 1;
+      } else {
+        let prev = -1;
+        for (let i = 0; i < accepted.length; i++) {
+          if (accepted[i].startMs < focused.startMs) prev = i;
+          else break;
+        }
+        nextIdx = prev >= 0 ? prev : 0;
+      }
+    }
+    s.focusChunk(accepted[nextIdx].id);
   },
 
   setSelectedCamId(id) {
