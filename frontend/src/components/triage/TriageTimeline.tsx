@@ -23,14 +23,17 @@ import {
 import { snapTime } from "../../editor/snap";
 import type { Chunk } from "../../storage/jobs-db";
 
-const TIME_RULER_HEIGHT = 22;
-const BAR_RULER_HEIGHT = 22;
+// Visual hierarchy (top to bottom):
+//   Time ruler — secondary, MM:SS for absolute reference, faint
+//   Bar ruler  — PRIMARY navigation surface, bar numbers + downbeats
+//   Waveform   — RMS envelope
+//   Chunk lane — chunk blocks
+const TIME_RULER_HEIGHT = 16;
+const BAR_RULER_HEIGHT = 30;
 const CHUNK_LANE_HEIGHT = 32;
-/** Cap on the waveform render height so the timeline strip stays
- *  compact even on tall monitors. The user only needs to recognise
- *  loud-vs-quiet regions; doubling that vertical space adds no info. */
 const MAX_WAVEFORM_HEIGHT = 110;
 const PLAYHEAD_COLOR = "#FF5722";
+const HOT_COLOR = "#FF5722";
 const TRIM_HANDLE_PX = 6;
 
 export function TriageTimeline() {
@@ -308,6 +311,12 @@ export function TriageTimeline() {
     viewEndS,
     pxPerSec,
   );
+  const audioStartMarkers = useAudioStartMarkers(
+    chunks,
+    focusedChunkId,
+    viewStartS,
+    viewEndS,
+  );
 
   // Waveform canvas.
   const waveformCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -384,63 +393,148 @@ export function TriageTimeline() {
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerUp}
     >
-      {/* Time ruler — its own strip so MM:SS labels never collide with
-       *  the bar markers below. */}
+      {/* Time ruler — secondary surface. Faint MM:SS for absolute
+       *  reference; visually subordinate to the bar ruler below so
+       *  the user's eye reads "musical grid" first. */}
       <div
-        className="absolute left-0 top-0 right-0 bg-paper-deep border-b border-rule pointer-events-none"
+        className="absolute left-0 top-0 right-0 bg-paper-bg border-b border-rule pointer-events-none"
         style={{ height: TIME_RULER_HEIGHT }}
       >
         {timeTicks.map((tick, i) => (
           <div
             key={`t-${i}`}
             className="absolute top-0 bottom-0 flex items-end pl-1"
-            style={{ left: timeToX(tick.t), color: tick.major ? "#221E1A" : "#A89F8B" }}
+            style={{
+              left: timeToX(tick.t),
+              color: tick.major ? "#A89F8B" : "#C9BFA6",
+            }}
           >
-            <span className="font-mono text-[10px] tracking-label uppercase pb-0.5">
+            <span
+              className="font-mono text-[8px] tracking-label uppercase pb-0.5 leading-none"
+              style={{ opacity: tick.major ? 0.85 : 0.55 }}
+            >
               {tick.label}
             </span>
             <span
               className="absolute right-0 bottom-0 w-px"
               style={{
-                background: tick.major ? "#221E1A" : "#A89F8B",
-                height: tick.major ? "100%" : "50%",
+                background: tick.major ? "#A89F8B" : "#C9BFA6",
+                height: tick.major ? "60%" : "30%",
+                opacity: tick.major ? 0.7 : 0.45,
               }}
             />
           </div>
         ))}
       </div>
 
-      {/* Bar ruler — own strip below the time ruler. Per-chunk grid:
-       *  each chunk renders bars/beats anchored at its own onset, at
-       *  its own effective tempo. */}
+      {/* Bar ruler — PRIMARY navigation surface. Per-chunk grid with
+       *  numbered downbeats; each chunk's bar 1 sits at its
+       *  audio-start onset. Beats between bars are thinner ticks at
+       *  high zoom. */}
       <div
-        className="absolute left-0 right-0 bg-paper-hi border-b border-rule pointer-events-none"
-        style={{ top: TIME_RULER_HEIGHT, height: BAR_RULER_HEIGHT }}
+        className="absolute left-0 right-0 bg-paper-deep border-b border-rule pointer-events-none"
+        style={{
+          top: TIME_RULER_HEIGHT,
+          height: BAR_RULER_HEIGHT,
+          boxShadow: "inset 0 1px 0 rgba(255,255,255,0.4), inset 0 -1px 0 rgba(0,0,0,0.08)",
+        }}
       >
         {barTicks.map((tick, i) => {
-          // Extension ticks (focused chunk's grid projected past its
-          // current bounds) render dimmer + slightly shorter so the
-          // user reads them as "potential snap targets" rather than
-          // "this is part of the chunk".
           const dim = tick.extension;
-          const downbeatHeight = dim ? "60%" : "85%";
-          const beatHeight = dim ? "30%" : "45%";
-          const downbeatColor = dim ? "#FF572255" : "#FF5722";
-          const beatColor = dim ? "#FF572233" : "#FF5722AA";
+          // Downbeats: thick, full-height. Beats: thin, half-height.
+          const isDownbeat = tick.downbeat;
+          const tickWidth = isDownbeat ? 2 : 1;
+          const tickHeight = isDownbeat ? "100%" : "45%";
+          const tickColor = isDownbeat
+            ? dim
+              ? "#FF572266"
+              : HOT_COLOR
+            : dim
+              ? "#FF572233"
+              : "#FF5722B0";
           return (
-            <span
-              key={`b-${i}`}
-              className="absolute bottom-0"
-              style={{
-                left: timeToX(tick.tS),
-                width: 1,
-                height: tick.downbeat ? downbeatHeight : beatHeight,
-                background: tick.downbeat ? downbeatColor : beatColor,
-              }}
-            />
+            <span key={`b-${i}`}>
+              <span
+                className="absolute bottom-0"
+                style={{
+                  left: timeToX(tick.tS),
+                  width: tickWidth,
+                  height: tickHeight,
+                  background: tickColor,
+                  marginLeft: -tickWidth / 2,
+                }}
+              />
+              {isDownbeat && (
+                <span
+                  className="absolute font-display tracking-[0.05em] uppercase tabular leading-none select-none"
+                  style={{
+                    left: timeToX(tick.tS) + 3,
+                    top: 3,
+                    fontSize: 9,
+                    color: dim ? "#FF572277" : "#1A1612",
+                    fontWeight: dim ? 400 : 700,
+                  }}
+                >
+                  {tick.barIndex}
+                </span>
+              )}
+            </span>
           );
         })}
       </div>
+
+      {/* Audio-start anchor markers — one per visible chunk at its
+       *  audioStartMs. A thin hot vertical line spans bar ruler →
+       *  waveform → chunk lane, plus a small filled flag glyph at the
+       *  top of the bar ruler. Makes "where bar 1 begins" obvious
+       *  even at high zoom or when the chunk extends across the
+       *  whole view. */}
+      {audioStartMarkers.map((marker) => {
+        const x = timeToX(marker.tS);
+        const opacity = marker.focused ? 1 : 0.55;
+        const lineTop = TIME_RULER_HEIGHT;
+        const lineBottom = TIME_RULER_HEIGHT + BAR_RULER_HEIGHT + waveformHeight;
+        return (
+          <div
+            key={`as-${marker.chunkId}`}
+            className="absolute pointer-events-none"
+            style={{
+              left: x,
+              top: lineTop,
+              height: lineBottom - lineTop,
+              width: 0,
+              zIndex: 3,
+              opacity,
+            }}
+          >
+            {/* Vertical anchor line through bar ruler + waveform. */}
+            <span
+              className="absolute"
+              style={{
+                left: -1,
+                top: 0,
+                bottom: 0,
+                width: 2,
+                background: HOT_COLOR,
+                boxShadow: "0 0 4px rgba(255,87,34,0.4)",
+              }}
+            />
+            {/* Flag at the top of the bar ruler. */}
+            <span
+              className="absolute font-display text-[7px] tracking-[0.1em] uppercase leading-none px-1 py-0.5 rounded-[2px] whitespace-nowrap"
+              style={{
+                left: 2,
+                top: 0,
+                background: HOT_COLOR,
+                color: "#FAF6EC",
+                boxShadow: "0 1px 1px rgba(0,0,0,0.2)",
+              }}
+            >
+              {marker.detected ? "▼1" : "1"}
+            </span>
+          </div>
+        );
+      })}
 
       <div
         className="absolute left-0 right-0"
@@ -611,11 +705,26 @@ function useTimeRuler(viewStartS: number, viewEndS: number, widthPx: number): Ru
 interface BarTick {
   tS: number;
   downbeat: boolean;
+  /** Bar number — 1 at the chunk's audio-start anchor, 2 at the next
+   *  downbeat, etc. Only meaningful for downbeats (beats inside a bar
+   *  share the same barIndex but we don't render it for them). */
+  barIndex: number;
   /** True when this tick lies outside the chunk's current bounds — a
    *  potential snap target if the user trims outwards. Rendered
    *  dimmer so the user sees where the next bar would land without
    *  confusing it with the chunk's "real" content. */
   extension: boolean;
+}
+
+interface AudioStartMarker {
+  tS: number;
+  chunkId: string;
+  focused: boolean;
+  /** Whether the chunk has its own per-chunk audio-start detection. If
+   *  false, the marker sits at the chunk's silence-detection start —
+   *  still useful as a "this is where the chunk begins" indicator,
+   *  just less musically meaningful. */
+  detected: boolean;
 }
 
 /** Per-chunk bar/beat ticks. Each chunk has its own anchor (audio-
@@ -660,7 +769,7 @@ function usePerChunkBarTicks(
       const showBeats = sPerBeat * pxPerSec >= minBeatPx;
       const anchorS = chunkBeatPhaseS(chunk);
 
-      // Forward sweep from anchor.
+      // Forward sweep from anchor (anchor = beat 0 = bar 1).
       let beat = 0;
       for (
         let t = anchorS;
@@ -671,7 +780,8 @@ function usePerChunkBarTicks(
         const isDownbeat = beat % beatsPerBar === 0;
         if (!showBeats && !isDownbeat) continue;
         const extension = isFocused && (t < startS || t > endS);
-        ticks.push({ tS: t, downbeat: isDownbeat, extension });
+        const barIndex = Math.floor(beat / beatsPerBar) + 1;
+        ticks.push({ tS: t, downbeat: isDownbeat, barIndex, extension });
       }
       // Backward sweep — start at beat -1 (anchor itself was emitted).
       beat = -1;
@@ -684,11 +794,39 @@ function usePerChunkBarTicks(
         const isDownbeat = ((beat % beatsPerBar) + beatsPerBar) % beatsPerBar === 0;
         if (!showBeats && !isDownbeat) continue;
         const extension = isFocused && (t < startS || t > endS);
-        ticks.push({ tS: t, downbeat: isDownbeat, extension });
+        const barIndex = Math.floor(beat / beatsPerBar) + 1;
+        ticks.push({ tS: t, downbeat: isDownbeat, barIndex, extension });
       }
     }
     return ticks;
   }, [chunks, focusedChunkId, jobBpm, beatsPerBar, viewStartS, viewEndS, pxPerSec]);
+}
+
+/** One marker per chunk at its audio-start anchor (= where bar 1
+ *  lives). Drawn as a vertical line spanning the timeline + a small
+ *  flag glyph in the bar ruler, so the user can see "where the
+ *  chunk's musical grid begins". */
+function useAudioStartMarkers(
+  chunks: Chunk[],
+  focusedChunkId: string | null,
+  viewStartS: number,
+  viewEndS: number,
+): AudioStartMarker[] {
+  return useMemo(() => {
+    const out: AudioStartMarker[] = [];
+    for (const c of chunks) {
+      const anchorMs = c.audioStartMs ?? c.startMs;
+      const tS = anchorMs / 1000;
+      if (tS < viewStartS || tS > viewEndS) continue;
+      out.push({
+        tS,
+        chunkId: c.id,
+        focused: c.id === focusedChunkId,
+        detected: c.audioStartMs !== undefined && c.audioStartMs !== c.startMs,
+      });
+    }
+    return out;
+  }, [chunks, focusedChunkId, viewStartS, viewEndS]);
 }
 
 function niceStep(raw: number): number {

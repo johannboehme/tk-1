@@ -301,7 +301,7 @@ export default function Triage() {
               className="flex-1 rounded-md overflow-hidden"
               style={{
                 boxShadow: "inset 0 2px 4px rgba(0,0,0,0.08)",
-                height: 186,
+                height: 188,
               }}
             >
               <TriageTimeline />
