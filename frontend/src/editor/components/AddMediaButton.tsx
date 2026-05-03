@@ -7,9 +7,10 @@
  *   - image/*  → addImageToJob (MATCH toggle is irrelevant)
  *   - video/*  → addVideoToJob with skipSync = !matchAudio
  */
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { motion } from "framer-motion";
 import { addImageToJob, addVideoToJob } from "../../local/jobs";
+import { pickVideoOrImageFiles } from "../../local/file-picker";
 import { useEditorStore } from "../store";
 
 interface Props {
@@ -20,31 +21,32 @@ interface Props {
   compact?: boolean;
 }
 
-const ACCEPT = "video/*,image/*";
-
 // Sized to align with the lane TAKE buttons (44 × 28 in the PROGRAM-strip
 // row's 32 px height — 4 px taller would clip the bottom border).
 const PLUS_W = 44;
 const PLUS_H = 24;
 
 export function AddMediaButton({ jobId, compact = false }: Props) {
-  const fileInputRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
   const [matchAudio, setMatchAudio] = useState(true);
   const pushNotice = useEditorStore((s) => s.pushNotice);
 
-  const onFiles = async (files: FileList | null) => {
-    if (!files || files.length === 0) return;
+  const onPick = async () => {
     setBusy(true);
     try {
+      const picks = await pickVideoOrImageFiles({ multiple: true });
+      if (picks.length === 0) {
+        // user cancelled — nothing to do, no toast
+        return;
+      }
       let videoCount = 0;
       let imageCount = 0;
-      for (const f of Array.from(files)) {
-        if (f.type.startsWith("image/")) {
-          await addImageToJob(jobId, f);
+      for (const p of picks) {
+        if (p.file.type.startsWith("image/")) {
+          await addImageToJob(jobId, p);
           imageCount++;
         } else {
-          await addVideoToJob(jobId, f, { skipSync: !matchAudio });
+          await addVideoToJob(jobId, p, { skipSync: !matchAudio });
           videoCount++;
         }
       }
@@ -60,7 +62,6 @@ export function AddMediaButton({ jobId, compact = false }: Props) {
       pushNotice(err instanceof Error ? err.message : "Add failed");
     } finally {
       setBusy(false);
-      if (fileInputRef.current) fileInputRef.current.value = "";
     }
   };
 
@@ -86,7 +87,7 @@ export function AddMediaButton({ jobId, compact = false }: Props) {
 
       <motion.button
         type="button"
-        onClick={() => fileInputRef.current?.click()}
+        onClick={onPick}
         disabled={busy}
         whileTap={{ scale: 0.96 }}
         aria-label={busy ? "Adding media" : "Add media (video or image)"}
@@ -115,15 +116,6 @@ export function AddMediaButton({ jobId, compact = false }: Props) {
         </span>
       </motion.button>
 
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept={ACCEPT}
-        multiple
-        className="sr-only"
-        onChange={(e) => onFiles(e.target.files)}
-        data-testid="add-media-input"
-      />
     </div>
   );
 }

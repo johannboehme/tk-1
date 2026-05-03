@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, act } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import Upload from "./Upload";
 import * as caps from "../local/capabilities";
+import * as picker from "../local/file-picker";
 
 vi.mock("../local/jobs", () => ({
   createJob: vi.fn(),
@@ -63,43 +64,39 @@ describe("Upload page — large-file capability handling", () => {
   it(
     "rejects an oversize video on legacy browsers with a clear message and " +
       "leaves the file list untouched",
-    () => {
+    async () => {
       vi.spyOn(caps, "getCapabilities").mockReturnValue(NO_WEBCODECS);
-      renderPage();
-      const input = document.getElementById("picker-videos") as HTMLInputElement;
-      expect(input).not.toBeNull();
-      // 3 GiB synthetic File — Blob lazy-allocates, so this is cheap.
+      // Mock the picker so a click on the picker-videos button returns a
+      // synthetic 3 GiB pick (no real file IO).
       const big = makeSyntheticFile("huge.mp4", 3 * 1024 * 1024 * 1024, "video/mp4");
-      act(() => {
-        Object.defineProperty(input, "files", {
-          value: makeFileList([big]),
-          configurable: true,
-        });
-        fireEvent.change(input);
+      vi.spyOn(picker, "pickVideoFiles").mockResolvedValue([
+        { file: big, handle: null },
+      ]);
+      renderPage();
+      const button = document.getElementById("picker-videos") as HTMLButtonElement;
+      expect(button).not.toBeNull();
+      fireEvent.click(button);
+      await waitFor(() => {
+        expect(screen.getByText(/Try Chrome \/ Edge \/ Brave/i)).toBeInTheDocument();
       });
-      expect(
-        screen.getByText(/Try Chrome \/ Edge \/ Brave/i),
-      ).toBeInTheDocument();
       // The file shouldn't have been added to the list.
       expect(screen.queryByText("huge.mp4")).toBeNull();
     },
   );
 
-  it("accepts the same oversize video on a WebCodecs-capable browser", () => {
+  it("accepts the same oversize video on a WebCodecs-capable browser", async () => {
     vi.spyOn(caps, "getCapabilities").mockReturnValue(FULL_SUPPORT);
-    renderPage();
-    const input = document.getElementById("picker-videos") as HTMLInputElement;
     const big = makeSyntheticFile("huge.mp4", 3 * 1024 * 1024 * 1024, "video/mp4");
-    act(() => {
-      Object.defineProperty(input, "files", {
-        value: makeFileList([big]),
-        configurable: true,
-      });
-      fireEvent.change(input);
+    vi.spyOn(picker, "pickVideoFiles").mockResolvedValue([
+      { file: big, handle: null },
+    ]);
+    renderPage();
+    const button = document.getElementById("picker-videos") as HTMLButtonElement;
+    fireEvent.click(button);
+    await waitFor(() => {
+      expect(screen.getByText("huge.mp4")).toBeInTheDocument();
     });
-    // No reject message; file shows up in the list.
     expect(screen.queryByText(/Try Chrome \/ Edge \/ Brave/i)).toBeNull();
-    expect(screen.getByText("huge.mp4")).toBeInTheDocument();
   });
 });
 
@@ -111,19 +108,4 @@ function makeSyntheticFile(name: string, size: number, type: string): File {
   const f = new File([new Uint8Array(1)], name, { type });
   Object.defineProperty(f, "size", { value: size, configurable: true });
   return f;
-}
-
-function makeFileList(files: File[]): FileList {
-  // Quick FileList shim — has length, indexed access, and item().
-  const list = {
-    length: files.length,
-    item: (i: number) => files[i] ?? null,
-    [Symbol.iterator]: function* () {
-      for (const f of files) yield f;
-    },
-  } as unknown as FileList;
-  files.forEach((f, i) => {
-    (list as unknown as Record<number, File>)[i] = f;
-  });
-  return list;
 }

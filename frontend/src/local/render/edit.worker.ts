@@ -26,6 +26,7 @@ import {
   type Segment,
 } from "./edit";
 import { opfs } from "../../storage/opfs";
+import { loadAsset } from "../asset-source";
 import type { BackendCapabilities } from "../../editor/render/factory";
 import { ShowwavesVisualizer } from "./visualizer/showwaves";
 import { ShowfreqsVisualizer } from "./visualizer/showfreqs";
@@ -41,7 +42,11 @@ export type VisualizerWorkerDescriptor =
 /** Per-cam input descriptor for the multi-source render path. */
 export interface CamWorkerInput {
   id: string;
-  opfsPath: string;
+  /** Where to read the cam's bytes from. Either an OPFS path (legacy /
+   *  fallback) or a `FileSystemFileHandle` to the user's original file
+   *  (no copy). The handle is structured-clone-transferable so it
+   *  survives the postMessage to the worker. */
+  source: import("../asset-source").AssetSource;
   /** Cam start position on the master timeline (seconds). The cam's
    *  source plays from source-time 0 at this point, regardless of
    *  trim — trim only narrows the *visible* window. */
@@ -69,8 +74,9 @@ export interface CamWorkerInput {
 
 export interface EditWorkerInput {
   /** Legacy single-cam path. Used when `cams` is omitted (or has length 1
-   *  and `cuts` is empty — the renderer fast-paths to the simpler pipeline). */
-  videoPath?: string;
+   *  and `cuts` is empty — the renderer fast-paths to the simpler pipeline).
+   *  Either an OPFS path or a `FileSystemFileHandle`. */
+  videoSource?: import("../asset-source").AssetSource;
   /** Multi-cam path. When present and (cams.length > 1 || cuts.length > 0)
    *  the worker dispatches to `editRenderMulti`. */
   cams?: CamWorkerInput[];
@@ -174,7 +180,7 @@ ctx.addEventListener("message", async (e: MessageEvent<EditWorkerMessage>) => {
       const camFiles = await Promise.all(
         cams.map(async (c) => ({
           ...c,
-          file: await opfs.readFile(c.opfsPath),
+          file: await loadAsset(c.source),
         })),
       );
       await editRenderMulti({
@@ -214,11 +220,11 @@ ctx.addEventListener("message", async (e: MessageEvent<EditWorkerMessage>) => {
         capabilities,
       });
     } else {
-      // Single-cam fast path. Either `videoPath` (legacy) or the only entry
-      // in `cams` provides the source.
-      const path = input.videoPath ?? input.cams?.[0]?.opfsPath;
-      if (!path) throw new Error("editWorker: no video source provided");
-      const videoFile = await opfs.readFile(path);
+      // Single-cam fast path. Either `videoSource` (legacy) or the only
+      // entry in `cams` provides the source.
+      const src = input.videoSource ?? input.cams?.[0]?.source;
+      if (!src) throw new Error("editWorker: no video source provided");
+      const videoFile = await loadAsset(src);
       await editRender({
         videoFile,
         audioPcm: input.audioPcm,

@@ -11,6 +11,7 @@ import { RecMark } from "./editor/components/RuleStrip";
 import { Footer } from "./components/Footer";
 import { Datenschutz } from "./pages/Datenschutz";
 import Editor from "./pages/Editor";
+import { JobPermissionRoute } from "./components/JobPermissionRoute";
 import History from "./pages/History";
 import { Impressum } from "./pages/Impressum";
 import JobPage from "./pages/JobPage";
@@ -77,9 +78,9 @@ export default function App() {
       <Routes>
         <Route path="/" element={<Upload />} />
         <Route path="/jobs" element={<History />} />
-        <Route path="/job/:id" element={<JobPage />} />
-        <Route path="/job/:id/edit" element={<Editor />} />
-        <Route path="/job/:id/render" element={<RenderScreen />} />
+        <Route path="/job/:id" element={<JobPermissionRoute><JobPage /></JobPermissionRoute>} />
+        <Route path="/job/:id/edit" element={<JobPermissionRoute><Editor /></JobPermissionRoute>} />
+        <Route path="/job/:id/render" element={<JobPermissionRoute><RenderScreen /></JobPermissionRoute>} />
         <Route path="/settings" element={<Settings caps={caps} />} />
         <Route path="/impressum" element={<Impressum />} />
         <Route path="/datenschutz" element={<Datenschutz />} />

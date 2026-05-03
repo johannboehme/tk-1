@@ -34,7 +34,7 @@ import { isVideoAsset, type MediaAsset } from "../storage/jobs-db";
 import { decodeAudioToMonoPcm } from "../local/codec";
 import { computeWaveformPeaks } from "../local/waveform-peaks";
 import { exportSpecToRenderOpts } from "../editor/exportPresets";
-import { opfs } from "../storage/opfs";
+import { loadAssetFile } from "../local/asset-source";
 import type { ClipInit } from "../editor/store";
 import type { ExportSpec } from "../editor/types";
 import { useAutoPersist } from "../editor/useAutoPersist";
@@ -608,12 +608,16 @@ export default function Editor() {
       let studioPcm: Float32Array | null = null;
       let studioSampleRate = 22050;
       try {
-        // Read the audio handle directly from OPFS so we don't fetch+blob it
-        // a second time over an object URL.
-        const ext = audioUrl.split("?")[0].split(".").pop() || "wav";
+        // Decode the master audio. v3+ jobs may hold a
+        // FileSystemFileHandle source; v2 jobs read from OPFS. As a
+        // last-ditch fallback we re-fetch the blob URL we already
+        // created for the <audio> element.
         let decodeSrc: Blob;
         try {
-          decodeSrc = await opfs.readFile(`jobs/${id}/audio.${ext}`);
+          decodeSrc = await loadAssetFile({
+            source: j.audioSource,
+            opfsPath: `jobs/${id}/audio.${audioUrl.split("?")[0].split(".").pop() || "wav"}`,
+          });
         } catch {
           decodeSrc = await fetch(audioUrl).then((r) => r.blob());
         }
