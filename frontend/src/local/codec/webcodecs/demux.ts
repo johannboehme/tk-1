@@ -95,12 +95,50 @@ export interface VideoDemuxResult {
   chunks: VideoChunk[];
 }
 
-/** Streaming-friendly view of a demuxed video track. Iterate samples
- *  via `for await`; the iterator is single-pass. Call `cancel()` if
- *  you want to stop early so any pending byte-fetch is abandoned. */
+/** Per-sample metadata extracted from the parsed `stbl` (no bytes —
+ *  use `loadSample(idx)` to fetch the encoded bytes for one sample on
+ *  demand). The array is in decode order; `cts` is in `timescale`
+ *  ticks. */
+export interface SampleMeta {
+  /** Byte offset in the source. */
+  offset: number;
+  /** Byte length of this sample's encoded data. */
+  size: number;
+  /** Composition timestamp (presentation order) in track-timescale ticks. */
+  cts: number;
+  /** Decode timestamp in track-timescale ticks. */
+  dts: number;
+  /** Sample duration in track-timescale ticks. */
+  duration: number;
+  /** Track timescale (ticks per second). */
+  timescale: number;
+  /** True for keyframes (RAP / sync samples) — every random-access
+   *  decoder restart point. Frame-strip extractors only ever need to
+   *  decode keyframes when tile spacing is wider than the keyframe
+   *  interval. */
+  isKey: boolean;
+}
+
+/** Streaming-friendly view of a demuxed video track.
+ *
+ * Two consumption modes:
+ *   - `samples` — single-pass `AsyncIterable<VideoChunk>` that yields
+ *     every encoded sample in decode order. Use this when you need
+ *     all chunks (full-file render).
+ *   - `sampleTable` + `loadSample(idx)` — sample metadata is parsed
+ *     upfront (cheap, sub-MB even for hour-long recordings); fetch
+ *     individual sample bytes on demand. Use this for sparse access:
+ *     thumbnail strips, scrubbing, keyframe-only browsing.
+ *
+ * Call `cancel()` to abandon any pending byte-fetches.
+ */
 export interface DemuxedVideoStream {
   info: VideoTrackInfo;
   samples: AsyncIterable<VideoChunk>;
+  /** All samples' metadata, in decode order. */
+  sampleTable: ReadonlyArray<SampleMeta>;
+  /** Fetch one sample's encoded bytes. Random-access, no buffering. */
+  loadSample(idx: number): Promise<VideoChunk>;
   cancel(): Promise<void>;
 }
 
@@ -208,14 +246,43 @@ export async function openVideoDemux(
 
   // Pull the sample table mp4box built when it parsed the stbl. This
   // gives us per-sample {offset, size, cts, dts, duration, is_sync,
-  // timescale} for every sample without ever reading mdat.
+  // timescale} for every sample without ever reading mdat. We project
+  // it into our slim `SampleMeta` shape so callers don't depend on
+  // mp4box's internal `Sample` type.
   const trak = file.getTrackById(trackId) as unknown as { samples?: Sample[] } | undefined;
-  const sampleTable = trak?.samples ?? [];
-  if (sampleTable.length === 0) {
+  const rawSamples = trak?.samples ?? [];
+  if (rawSamples.length === 0) {
     throw new Error("mp4box: video track has no samples in its sample table");
   }
+  const sampleTable: SampleMeta[] = rawSamples.map((s) => ({
+    offset: s.offset,
+    size: s.size,
+    cts: s.cts,
+    dts: s.dts,
+    duration: s.duration,
+    timescale: s.timescale,
+    isKey: s.is_sync,
+  }));
 
   let cancelled = false;
+
+  async function loadSample(idx: number): Promise<VideoChunk> {
+    if (idx < 0 || idx >= sampleTable.length) {
+      throw new RangeError(
+        `loadSample: idx ${idx} out of range [0..${sampleTable.length})`,
+      );
+    }
+    const s = sampleTable[idx];
+    const data = new Uint8Array(
+      await blob.slice(s.offset, s.offset + s.size).arrayBuffer(),
+    );
+    return {
+      timestampUs: (s.cts * 1_000_000) / s.timescale,
+      durationUs: (s.duration * 1_000_000) / s.timescale,
+      isKey: s.isKey,
+      data,
+    };
+  }
 
   const samples: AsyncIterable<VideoChunk> = {
     [Symbol.asyncIterator](): AsyncIterator<VideoChunk> {
@@ -226,21 +293,7 @@ export async function openVideoDemux(
             if (cancelled) {
               return { value: undefined as unknown as VideoChunk, done: true };
             }
-            const s = sampleTable[i++];
-            // Random-access read of just this sample's bytes. mp4box
-            // never sees these — its buffer stays at moov-only size.
-            const data = new Uint8Array(
-              await blob.slice(s.offset, s.offset + s.size).arrayBuffer(),
-            );
-            return {
-              value: {
-                timestampUs: (s.cts * 1_000_000) / s.timescale,
-                durationUs: (s.duration * 1_000_000) / s.timescale,
-                isKey: s.is_sync,
-                data,
-              },
-              done: false,
-            };
+            return { value: await loadSample(i++), done: false };
           }
           return { value: undefined as unknown as VideoChunk, done: true };
         },
@@ -255,6 +308,8 @@ export async function openVideoDemux(
   return {
     info,
     samples,
+    sampleTable,
+    loadSample,
     async cancel(): Promise<void> {
       cancelled = true;
     },
