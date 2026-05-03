@@ -717,26 +717,23 @@ interface BarTick {
   extension: boolean;
 }
 
-/** Per-chunk bar/beat ticks with adaptive density.
+/** Bar/beat ticks for the FOCUSED chunk only.
  *
- *  Each chunk has its own anchor (audio-start onset) and uses the
- *  song-global BPM (or its own detected value as fallback). The
- *  marker scale adapts to the current zoom so the ruler stays
- *  legible at every level:
+ *  Long-form sessions with dozens of chunks turned the ruler into a
+ *  festival of "1" labels — each chunk's bar 1 sat at its own anchor,
+ *  and at low zoom they all fired at once and collided. Bar markers
+ *  are a per-chunk-context tool anyway: the user only cares about the
+ *  bar grid of whatever they're trimming or scrubbing. Other chunks
+ *  show up as colored lane blocks below; that's enough to navigate.
  *
- *  - High zoom (`pxPerBeat ≥ 8`):    every bar labeled, every beat as a tick
- *  - Mid zoom  (`pxPerBar ≥ 56`):    every bar labeled, no beats
- *  - Low zoom: pick the smallest power-of-2 stride such that labeled
- *    bars sit at least 56 px apart. Unlabeled bars in between render
- *    as minor ticks while there's still room (≥ 6 px); below that the
- *    minors collapse and only the labeled stride remains.
+ *  Density is adaptive to zoom — picks the smallest power-of-2 stride
+ *  such that labeled downbeats sit at least 56 px apart. In between
+ *  we render minor unlabeled bar ticks while there's room (≥ 6 px),
+ *  and beat sub-ticks only at high zoom (≥ 8 px per beat).
  *
- *  Visibility rules:
- *  - Non-focused chunks: ticks only within the chunk's current bounds.
- *  - Focused chunk: ticks render across the FULL visible view (with
- *    `extension: true` flag) so the user sees snap targets while
- *    trim-dragging outwards.
- */
+ *  When a chunk is focused, its grid projects across the FULL view
+ *  with `extension: true` flag for ticks outside the chunk's current
+ *  bounds — so trim-dragging outwards has visible snap targets. */
 const TARGET_LABEL_PX = 56;
 const MIN_MINOR_BAR_PX = 6;
 const MIN_BEAT_PX = 8;
@@ -758,55 +755,54 @@ function usePerChunkBarTicks(
   pxPerSec: number,
 ): BarTick[] {
   return useMemo(() => {
+    if (!focusedChunkId) return [];
+    const chunk = chunks.find((c) => c.id === focusedChunkId);
+    if (!chunk) return [];
+    const bpm = effectiveChunkBpm(chunk, jobBpm);
+    if (bpm <= 0) return [];
+
+    const sPerBeat = 60 / bpm;
+    const sPerBar = sPerBeat * beatsPerBar;
+    const pxPerBar = sPerBar * pxPerSec;
+    const pxPerBeat = sPerBeat * pxPerSec;
+    if (pxPerBar < 0.25) return [];
+
+    const stride = pickBarStride(pxPerBar);
+    const showMinorBars = stride > 1 && pxPerBar >= MIN_MINOR_BAR_PX;
+    const showBeats = stride === 1 && pxPerBeat >= MIN_BEAT_PX;
+
+    const startS = chunk.startMs / 1000;
+    const endS = chunk.endMs / 1000;
+    // The focused chunk's grid projects across the full visible view
+    // so trim-dragging outwards has visible snap targets.
+    const renderStart = viewStartS;
+    const renderEnd = viewEndS;
+    const anchorS = chunkBeatPhaseS(chunk);
+
     const ticks: BarTick[] = [];
-    for (const chunk of chunks) {
-      const bpm = effectiveChunkBpm(chunk, jobBpm);
-      if (bpm <= 0) continue;
-      const sPerBeat = 60 / bpm;
-      const sPerBar = sPerBeat * beatsPerBar;
-      const pxPerBar = sPerBar * pxPerSec;
-      const pxPerBeat = sPerBeat * pxPerSec;
-      // Skip when even the labeled stride would draw sub-pixel —
-      // useless and would just smear into a band.
-      if (pxPerBar < 0.25) continue;
+    const firstBeatI = Math.ceil((renderStart - anchorS) / sPerBeat - 1e-9);
+    const lastBeatI = Math.floor((renderEnd - anchorS) / sPerBeat + 1e-9);
+    for (let i = firstBeatI; i <= lastBeatI; i++) {
+      const t = anchorS + i * sPerBeat;
+      if (t < renderStart - 1e-9 || t > renderEnd + 1e-9) continue;
+      const beatInBar = ((i % beatsPerBar) + beatsPerBar) % beatsPerBar;
+      const isDownbeat = beatInBar === 0;
+      const barIndex = Math.floor(i / beatsPerBar) + 1;
+      const isLabeled =
+        isDownbeat && (((barIndex - 1) % stride) + stride) % stride === 0;
 
-      const stride = pickBarStride(pxPerBar);
-      const showMinorBars = stride > 1 && pxPerBar >= MIN_MINOR_BAR_PX;
-      const showBeats = stride === 1 && pxPerBeat >= MIN_BEAT_PX;
-
-      const startS = chunk.startMs / 1000;
-      const endS = chunk.endMs / 1000;
-      const isFocused = chunk.id === focusedChunkId;
-      const renderStart = isFocused ? viewStartS : Math.max(startS, viewStartS);
-      const renderEnd = isFocused ? viewEndS : Math.min(endS, viewEndS);
-      if (renderEnd < viewStartS || renderStart > viewEndS) continue;
-      const anchorS = chunkBeatPhaseS(chunk);
-
-      // Iterate every beat in the visible span.
-      const firstBeatI = Math.ceil((renderStart - anchorS) / sPerBeat - 1e-9);
-      const lastBeatI = Math.floor((renderEnd - anchorS) / sPerBeat + 1e-9);
-      for (let i = firstBeatI; i <= lastBeatI; i++) {
-        const t = anchorS + i * sPerBeat;
-        if (t < renderStart - 1e-9 || t > renderEnd + 1e-9) continue;
-        const beatInBar = ((i % beatsPerBar) + beatsPerBar) % beatsPerBar;
-        const isDownbeat = beatInBar === 0;
-        const barIndex = Math.floor(i / beatsPerBar) + 1;
-        const isLabeled =
-          isDownbeat && (((barIndex - 1) % stride) + stride) % stride === 0;
-
-        let kind: BarTick["kind"];
-        if (isLabeled) kind = "bar-major";
-        else if (isDownbeat) {
-          if (!showMinorBars) continue;
-          kind = "bar-minor";
-        } else {
-          if (!showBeats) continue;
-          kind = "beat";
-        }
-
-        const extension = isFocused && (t < startS || t > endS);
-        ticks.push({ tS: t, kind, barIndex, extension });
+      let kind: BarTick["kind"];
+      if (isLabeled) kind = "bar-major";
+      else if (isDownbeat) {
+        if (!showMinorBars) continue;
+        kind = "bar-minor";
+      } else {
+        if (!showBeats) continue;
+        kind = "beat";
       }
+
+      const extension = t < startS || t > endS;
+      ticks.push({ tS: t, kind, barIndex, extension });
     }
     return ticks;
   }, [chunks, focusedChunkId, jobBpm, beatsPerBar, viewStartS, viewEndS, pxPerSec]);
