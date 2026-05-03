@@ -13,17 +13,33 @@
  * strip mit Phase-Breadcrumb + Continue, der Rest ist Werkzeug-Fläche.
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { ChunkyButton } from "../editor/components/ChunkyButton";
 import { jobsDb } from "../local/jobs";
 import type { LocalJob } from "../local/jobs";
 import { jobRoutePath } from "../local/jobs-routing";
+import {
+  DEFAULT_SILENCE_CONFIG,
+  runChunkDetectionForJob,
+  type RunChunkDetectionResult,
+  type TriageStageProgress,
+} from "../local/triage/triage-orchestrator";
+
+type DetectionState =
+  | { kind: "idle" }
+  | { kind: "running"; stage: TriageStageProgress["stage"] }
+  | { kind: "ready"; result: RunChunkDetectionResult }
+  | { kind: "error"; message: string };
 
 export default function Triage() {
   const { id = "" } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const [job, setJob] = useState<LocalJob | null>(null);
+  const [detection, setDetection] = useState<DetectionState>({ kind: "idle" });
+  // Guard against double-firing the detection effect under StrictMode and
+  // against re-runs when the persisted chunks come back in via setJob().
+  const detectionStartedRef = useRef(false);
 
   useEffect(() => {
     if (!id) return;
@@ -35,6 +51,46 @@ export default function Triage() {
       active = false;
     };
   }, [id]);
+
+  // Kick off chunk detection when the job is synced and we don't yet
+  // have any chunks. Idempotent — runs at most once per page mount.
+  useEffect(() => {
+    if (!job || job.status !== "synced") return;
+    if (detectionStartedRef.current) return;
+    if (detection.kind !== "idle") return;
+    if (job.chunks && job.chunks.length > 0) return;
+
+    detectionStartedRef.current = true;
+    let cancelled = false;
+    setDetection({ kind: "running", stage: "decoding" });
+    runChunkDetectionForJob(job.id, job.silenceConfig ?? DEFAULT_SILENCE_CONFIG, {
+      onStage: (p) => {
+        if (!cancelled) setDetection({ kind: "running", stage: p.stage });
+      },
+    })
+      .then((result) => {
+        if (cancelled) return;
+        setDetection({ kind: "ready", result });
+        // Refresh the job snapshot so chunks/silenceConfig come from
+        // the persisted source of truth.
+        jobsDb.getJob(job.id).then((j) => {
+          if (!cancelled && j) setJob(j);
+        });
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setDetection({
+          kind: "error",
+          message: err instanceof Error ? err.message : String(err),
+        });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [job, detection.kind]);
+
+  const status = jobStatusLabel(job, detection);
 
   return (
     <div className="flex-1 flex flex-col min-h-0 paper-bg">
@@ -52,21 +108,53 @@ export default function Triage() {
           <p className="font-mono text-xs tracking-label uppercase mb-3">
             ◇ Triage UI · under construction
           </p>
-          <p className="text-ink-2 leading-relaxed text-sm">
-            Hier landet die Stille-Erkennung + Chunk-Auswahl mit
-            Waveform-Overview, Cam-Switcher und Per-Chunk-Refinement.
-            Aktuell nur ein Placeholder, damit die Navigation getestet
-            werden kann.
+          <p className="text-ink-2 leading-relaxed text-sm mb-4">
+            Detection-Backend läuft, UI kommt im nächsten Phasen-Schritt.
           </p>
-          {job && (
-            <p className="font-mono text-[11px] mt-4 tabular">
-              mode={job.mode ?? "direct"} · chunks={job.chunks?.length ?? 0}
-            </p>
-          )}
+          <div className="font-mono text-[11px] tabular space-y-1 text-left inline-block bg-paper-hi border border-rule rounded-md px-4 py-3">
+            <div>job: {job ? job.title ?? job.id.slice(0, 8) : "loading…"}</div>
+            <div>status: {status}</div>
+            {detection.kind === "ready" && (
+              <>
+                <div>chunks: {detection.result.chunks.length}</div>
+                <div>
+                  envelope: {detection.result.envelope.length} samples @{" "}
+                  {detection.result.envelopeHz} Hz
+                </div>
+                <div>
+                  pcm: {(detection.result.pcm.length / detection.result.sampleRate).toFixed(1)} s @{" "}
+                  {detection.result.sampleRate} Hz
+                </div>
+              </>
+            )}
+            {detection.kind === "error" && (
+              <div className="text-danger">error: {detection.message}</div>
+            )}
+          </div>
         </div>
       </main>
     </div>
   );
+}
+
+function jobStatusLabel(
+  job: LocalJob | null,
+  detection: DetectionState,
+): string {
+  if (!job) return "—";
+  if (job.status !== "synced") return `waiting · ${job.status}`;
+  switch (detection.kind) {
+    case "idle":
+      return job.chunks && job.chunks.length > 0
+        ? `cached · ${job.chunks.length} chunks`
+        : "ready to detect";
+    case "running":
+      return `detecting · ${detection.stage}`;
+    case "ready":
+      return `detected · ${detection.result.chunks.length} chunks`;
+    case "error":
+      return "error";
+  }
 }
 
 // -----------------------------------------------------------------------------
