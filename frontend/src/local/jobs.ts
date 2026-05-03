@@ -19,6 +19,7 @@ import {
   isImageAsset,
   isVideoAsset,
   jobsDb,
+  type JobMode,
   type JobProgress,
   type LocalJob,
   type SyncResult,
@@ -197,6 +198,9 @@ async function persistImageCam(
 interface CreateJobOptions {
   /** Optional title; falls back to the video file name. */
   title?: string | null;
+  /** Workflow-Pfad. Default `"direct"` für die Legacy-Sync-Flow.
+   *  `"longform"` schaltet den Triage → Arrange → Editor-Pfad frei. */
+  mode?: JobMode;
 }
 
 /**
@@ -255,6 +259,7 @@ export async function createJob(
     schemaVersion: 3,
     videos,
     cuts: [],
+    mode: options.mode ?? "direct",
   };
   await jobsDb.saveJob(job);
   emitJobUpdate(job);
@@ -1221,4 +1226,4 @@ export async function removeCamFromJob(
 }
 
 export { jobsDb };
-export type { LocalJob, SyncResult, JobProgress, Segment, TextOverlay };
+export type { JobMode, LocalJob, SyncResult, JobProgress, Segment, TextOverlay };

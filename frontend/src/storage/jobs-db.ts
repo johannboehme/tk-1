@@ -158,6 +158,73 @@ export type JobStatus =
   | "rendered"
   | "failed";
 
+/**
+ * Workflow-Pfad nach dem Upload.
+ *  - "direct"   — fertiges Stück + Video(s) → direkt in den Editor.
+ *  - "longform" — Session-Mitschnitt → Triage → Arrange → Editor.
+ *
+ * Optional auf `LocalJob`; fehlende Werte werden als `"direct"` behandelt
+ * (rückwärtskompatibel mit allen Pre-Triage-Jobs).
+ */
+export type JobMode = "direct" | "longform";
+
+/** Stille-Detector-Parameter. Live anpassbar in der Triage-UI. */
+export interface SilenceConfig {
+  /** Threshold in dBFS (negativ; z.B. -50). Audio ≤ dieser Lautstärke
+   *  zählt als Stille. */
+  thresholdDb: number;
+  /** Mindestpausenlänge (ms) — kürzere Pausen werden ignoriert (vermeidet
+   *  Mikro-Splits zwischen Drum-Hits). */
+  minPauseMs: number;
+}
+
+/**
+ * Ein erkanntes Audio-Stück im Long-Form-Master. Wird in der Triage-Phase
+ * vom Detection-Worker erzeugt und kann pro Chunk vom User akzeptiert,
+ * verworfen, getrimmt oder im BPM angepasst werden.
+ *
+ * Stable IDs überleben eine erneute Detection (re-running threshold/min-
+ * pause behält bestehende Chunk-IDs für noch existierende Bereiche bei).
+ */
+export interface Chunk {
+  id: string;
+  /** Master-Audio-Zeit in ms. */
+  startMs: number;
+  endMs: number;
+  /** Vom Detection-Worker erkanntes BPM, falls verfügbar. */
+  detectedBpm?: number;
+  /** User-Override für Half/Double-Time. -1 → ÷2, 0 → unverändert,
+   *  1 → ×2. Wird auf `detectedBpm` angewendet, ergibt `effectiveBpm`. */
+  bpmOctaveShift: -1 | 0 | 1;
+  /** Tatsächlich für Bar-Berechnung verwendetes BPM. Default = detectedBpm
+   *  * 2^bpmOctaveShift, oder Session-BPM falls vom User erzwungen. */
+  effectiveBpm: number;
+  /** Berechnete Bar-Anzahl (Dauer / Sekunden-pro-Bar). Optional — UI
+   *  kann das auf der Fly berechnen falls nicht persistiert. */
+  bars?: number;
+  /** Time-Signature-Numerator (default 4). */
+  beatsPerBar: number;
+  /** Im Arrangement enthalten? Cherry-Pick passiert in Triage. */
+  accepted: boolean;
+  /** Snap-Modus für In/Out-Drag. */
+  trimMode: "auto" | "bar" | "free";
+  /** Optional: User-getrimmte Boundaries, falls abweichend von der
+   *  ursprünglichen Detection. */
+  trimStartMs?: number;
+  trimEndMs?: number;
+}
+
+/**
+ * Eintrag in der Arrange-Phase: referenziert einen Chunk (per ID) und
+ * gibt ihm seinen Platz in der finalen Reihenfolge. Ein Chunk kann
+ * mehrfach im Arrangement vorkommen (Duplicate-Funktion); jede Instanz
+ * hat ihre eigene `ArrangementItem.id` für Stable-Editor-Edits.
+ */
+export interface ArrangementItem {
+  id: string;
+  chunkId: string;
+}
+
 export interface LocalJob {
   id: string;
   title: string | null;
@@ -262,6 +329,29 @@ export interface LocalJob {
    *  storage layer to the editor's `ExportSpec` type — the editor
    *  validates / ignores fields it doesn't recognise. */
   exportSpec?: unknown;
+
+  // ---- Long-Form Triage Workflow ----
+
+  /** Workflow-Pfad. Fehlt bei Pre-Triage-Jobs → wird als `"direct"`
+   *  behandelt. Beim Upload gesetzt; ändert sich danach nicht mehr. */
+  mode?: JobMode;
+
+  /** Letzte vom User justierten Detection-Parameter. Werden in der
+   *  Triage-UI live mutiert; persistiert damit ein Reload an derselben
+   *  Stelle weitermacht. Nur sinnvoll für `mode === "longform"`. */
+  silenceConfig?: SilenceConfig;
+
+  /** Session-weite BPM-Erzwingung. Wenn gesetzt, gilt dieser Wert für
+   *  alle Chunks ohne eigenen Octave-Shift. */
+  sessionBpmOverride?: number;
+
+  /** Erkannte (und vom User kuratierte) Audio-Chunks. Nur für
+   *  Long-Form-Jobs; bei Direct bleibt das undefined. */
+  chunks?: Chunk[];
+
+  /** Geordnete Sequenz von Chunks (mit möglichen Duplikaten) für die
+   *  Editor-Pre-Population. Wird in der Arrange-Phase gefüllt. */
+  arrangement?: ArrangementItem[];
 }
 
 /** Storage shape for a single Punch-in FX. Mirrors `PunchFx` from the

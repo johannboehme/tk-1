@@ -10,6 +10,7 @@ import { HelpOverlay } from "./editor/components/HelpOverlay";
 import { RecMark } from "./editor/components/RuleStrip";
 import { Footer } from "./components/Footer";
 import { Datenschutz } from "./pages/Datenschutz";
+import Arrange from "./pages/Arrange";
 import Editor from "./pages/Editor";
 import { JobPermissionRoute } from "./components/JobPermissionRoute";
 import History from "./pages/History";
@@ -18,6 +19,7 @@ import JobPage from "./pages/JobPage";
 import RenderScreen from "./pages/RenderScreen";
 import { Settings } from "./pages/Settings";
 import { BrowserTooOld } from "./pages/BrowserTooOld";
+import Triage from "./pages/Triage";
 import Upload from "./pages/Upload";
 
 export default function App() {
@@ -79,6 +81,8 @@ export default function App() {
         <Route path="/" element={<Upload />} />
         <Route path="/jobs" element={<History />} />
         <Route path="/job/:id" element={<JobPermissionRoute><JobPage /></JobPermissionRoute>} />
+        <Route path="/job/:id/triage" element={<JobPermissionRoute><Triage /></JobPermissionRoute>} />
+        <Route path="/job/:id/arrange" element={<JobPermissionRoute><Arrange /></JobPermissionRoute>} />
         <Route path="/job/:id/edit" element={<JobPermissionRoute><Editor /></JobPermissionRoute>} />
         <Route path="/job/:id/render" element={<JobPermissionRoute><RenderScreen /></JobPermissionRoute>} />
         <Route path="/settings" element={<Settings caps={caps} />} />

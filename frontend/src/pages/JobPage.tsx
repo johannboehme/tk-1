@@ -13,6 +13,7 @@ import {
   runQuickRender,
   type LocalJob,
 } from "../local/jobs";
+import { jobRoutePath, nextRouteForJob } from "../local/jobs-routing";
 import { isVideoAsset, type VideoAsset } from "../storage/jobs-db";
 
 export default function JobPage() {
@@ -147,9 +148,9 @@ export default function JobPage() {
           <ChunkyButton
             variant="secondary"
             size="lg"
-            onClick={() => navigate(`/job/${job.id}/edit`)}
+            onClick={() => navigate(jobRoutePath(job.id, nextRouteForJob(job)))}
           >
-            Open editor
+            {nextRouteLabel(nextRouteForJob(job))}
           </ChunkyButton>
           {downloadUrl && (
             <a
@@ -177,6 +178,18 @@ export default function JobPage() {
       )}
     </main>
   );
+}
+
+function nextRouteLabel(route: ReturnType<typeof nextRouteForJob>): string {
+  switch (route) {
+    case "triage":
+      return "Continue → Triage";
+    case "arrange":
+      return "Continue → Arrange";
+    case "edit":
+    default:
+      return "Open editor";
+  }
 }
 
 function StatusBadge({ status }: { status: string }) {
