@@ -13,6 +13,7 @@
  */
 import { useEffect } from "react";
 import { ChunkyButton } from "../../editor/components/ChunkyButton";
+import { TransportClockView } from "../../editor/components/TransportClockView";
 import { useRegisterShortcut } from "../../editor/shortcuts/useRegisterShortcut";
 import {
   PauseIcon,
@@ -117,18 +118,25 @@ export function TriageTransportBar() {
   return (
     <div
       className={[
-        "grid items-center gap-2 px-3 py-2 bg-paper-hi border-t border-rule",
-        // Symmetric side-rails (10rem each) keep the centered cluster
-        // visually balanced AND reserve right-edge space for the
-        // floating Footer overlay (impressum / datenschutz) so Keep
-        // and Drop never sit underneath it.
-        "grid-cols-[10rem_1fr_10rem]",
+        "grid items-center gap-3 px-3 py-2 bg-paper-hi border-t border-rule",
+        // Equal-fraction side rails make the centered cluster
+        // mathematically centered in the viewport regardless of how
+        // wide the brass-plate clock or counter become. The right
+        // rail also doubles as clearance for the floating Footer
+        // overlay (impressum / datenschutz).
+        "grid-cols-[1fr_auto_1fr]",
       ].join(" ")}
     >
-      {/* Left rail — clock readout */}
-      <TransportClock audioDuration={audioDuration} />
+      {/* Left rail — TE-style brass clock, reused from the editor.
+       *  Subscribed via TriageClock so the rest of the bar doesn't
+       *  re-render every RAF tick. */}
+      <div className="justify-self-start">
+        <TriageClock duration={audioDuration} />
+      </div>
 
-      {/* Centered transport cluster */}
+      {/* Centered transport cluster. Loop sits at the far right
+       *  because it's the least-used control — keep it out of the
+       *  hot-path between Play and Keep/Drop. */}
       <div className="flex justify-center items-center gap-2 sm:gap-3">
         <ChunkyButton
           variant="secondary"
@@ -174,19 +182,6 @@ export function TriageTransportBar() {
         <span className="h-6 w-px bg-rule mx-1" aria-hidden />
 
         <ChunkyButton
-          variant={loopEnabled ? "primary" : "secondary"}
-          size="sm"
-          onClick={() => setLoopEnabled(!loopEnabled)}
-          title={loopEnabled ? "Loop on · L to disable" : "Loop off · L to enable"}
-          aria-label={loopEnabled ? "Disable loop" : "Enable loop"}
-          aria-pressed={loopEnabled}
-        >
-          ⟲ Loop
-        </ChunkyButton>
-
-        <span className="h-6 w-px bg-rule mx-1" aria-hidden />
-
-        <ChunkyButton
           variant="secondary"
           size="sm"
           onClick={() => acceptFocused()}
@@ -206,37 +201,37 @@ export function TriageTransportBar() {
         >
           Drop
         </ChunkyButton>
+
+        <span className="h-6 w-px bg-rule mx-1" aria-hidden />
+
+        <ChunkyButton
+          variant={loopEnabled ? "primary" : "secondary"}
+          size="sm"
+          onClick={() => setLoopEnabled(!loopEnabled)}
+          title={loopEnabled ? "Loop on · L to disable" : "Loop off · L to enable"}
+          aria-label={loopEnabled ? "Disable loop" : "Enable loop"}
+          aria-pressed={loopEnabled}
+        >
+          ⟲ Loop
+        </ChunkyButton>
       </div>
 
-      {/* Right rail — kept counter (footer overlay floats over this
-       *  same area; the counter is unimportant enough to be partially
-       *  obscured if the user has nothing focused). */}
-      <span className="font-mono text-[10px] tracking-label uppercase text-ink-3 tabular text-right hidden md:inline-block">
+      {/* Right rail — kept counter (the floating Footer overlay sits
+       *  at bottom-right and may partially obscure this on narrow
+       *  viewports; the counter is non-essential, the deck-strip
+       *  shows the same number more prominently). */}
+      <span className="justify-self-end font-mono text-[10px] tracking-label uppercase text-ink-3 tabular hidden md:inline-block">
         {acceptedCount} / {chunks.length} kept
       </span>
     </div>
   );
 }
 
-function TransportClock({ audioDuration }: { audioDuration: number }) {
+/** Local wrapper that subscribes to `playback.currentTime` so only this
+ *  component re-renders on every RAF tick — the rest of the
+ *  TransportBar stays static. Forwards into the editor's brass-plate
+ *  TransportClockView. */
+function TriageClock({ duration }: { duration: number }) {
   const currentTime = useTriageStore((s) => s.playback.currentTime);
-  return (
-    <span className="font-mono text-xs tabular text-ink ml-2 sm:ml-4">
-      {formatTimeMs(currentTime)} <span className="text-ink-3">/</span>{" "}
-      {formatTime(audioDuration)}
-    </span>
-  );
-}
-
-function formatTimeMs(s: number): string {
-  if (!Number.isFinite(s) || s < 0) return "0:00.00";
-  const m = Math.floor(s / 60);
-  const sec = s % 60;
-  return `${m}:${sec.toFixed(2).padStart(5, "0")}`;
-}
-function formatTime(s: number): string {
-  if (!Number.isFinite(s) || s < 0) return "0:00";
-  const m = Math.floor(s / 60);
-  const sec = Math.floor(s % 60);
-  return `${m}:${sec.toString().padStart(2, "0")}`;
+  return <TransportClockView currentTime={currentTime} duration={duration} />;
 }
