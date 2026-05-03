@@ -26,6 +26,10 @@ import type { Chunk } from "../../storage/jobs-db";
 const TIME_RULER_HEIGHT = 22;
 const BAR_RULER_HEIGHT = 22;
 const CHUNK_LANE_HEIGHT = 32;
+/** Cap on the waveform render height so the timeline strip stays
+ *  compact even on tall monitors. The user only needs to recognise
+ *  loud-vs-quiet regions; doubling that vertical space adds no info. */
+const MAX_WAVEFORM_HEIGHT = 110;
 const PLAYHEAD_COLOR = "#FF5722";
 const TRIM_HANDLE_PX = 6;
 
@@ -67,9 +71,12 @@ export function TriageTimeline() {
     return () => ro.disconnect();
   }, []);
 
-  const waveformHeight = Math.max(
-    80,
-    size.height - TIME_RULER_HEIGHT - BAR_RULER_HEIGHT - CHUNK_LANE_HEIGHT,
+  const waveformHeight = Math.min(
+    MAX_WAVEFORM_HEIGHT,
+    Math.max(
+      60,
+      size.height - TIME_RULER_HEIGHT - BAR_RULER_HEIGHT - CHUNK_LANE_HEIGHT,
+    ),
   );
 
   const visibleDuration = audioDuration > 0 ? audioDuration / view.zoom : 60;

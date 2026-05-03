@@ -42,7 +42,6 @@ import { TRIAGE_ENVELOPE_HZ } from "../local/triage/chunk-detect";
 import { useTriageStore } from "../local/triage/triage-store";
 import { useTriagePersist } from "../local/triage/useTriagePersist";
 import { getCachedAnalysis } from "../local/render/audio-analysis";
-import { SyncPatchPanel } from "../components/sync/SyncPatchPanel";
 import { TriageTimeline } from "../components/triage/TriageTimeline";
 import { TriageTransportBar } from "../components/triage/TriageTransportBar";
 import { DetectionPanel } from "../components/triage/DetectionPanel";
@@ -65,10 +64,6 @@ export default function Triage() {
   const detectionStartedRef = useRef(false);
   const initFromJob = useTriageStore((s) => s.initFromJob);
   const reset = useTriageStore((s) => s.reset);
-  const setSelectedCamId = useTriageStore((s) => s.setSelectedCamId);
-  const selectedCamId = useTriageStore((s) => s.selectedCamId);
-  const nudgeCamSync = useTriageStore((s) => s.nudgeCamSyncOverride);
-  const cams = useTriageStore((s) => s.cams);
   const snapMode = useTriageStore((s) => s.snapMode);
   const setSnapMode = useTriageStore((s) => s.setSnapMode);
   const hasBpm = useTriageStore((s) => Boolean(s.jobBpm?.value));
@@ -248,33 +243,21 @@ export default function Triage() {
         <NotReady job={job} detection={detection} />
       ) : (
         <>
-          {/* ─── ControlRow — three equal-height columns ─────────── */}
+          {/* ─── ControlRow — three equal-height columns. Grows on
+           *  tall viewports (flex-1 with min) so the cam preview gets
+           *  more room when there is room to give. */}
           <section
             className={[
-              "flex-none px-3 pt-3",
+              "flex-1 min-h-[18rem] px-3 pt-3",
               "grid grid-cols-1 gap-3",
               "lg:grid-cols-[minmax(420px,1.5fr)_minmax(360px,1.1fr)_minmax(220px,0.6fr)]",
-              "lg:h-80",
             ].join(" ")}
           >
-            {/* Col 1 — Monitor (Cam + SyncPatch) */}
-            <div className="flex flex-col gap-3 min-h-0">
-              <div className="flex-none">
-                <CamPreview />
-              </div>
-              {job && (
-                <div className="flex-1 min-h-0 overflow-y-auto">
-                  <SyncPatchPanel
-                    job={job}
-                    selectedCamId={selectedCamId}
-                    onSelectCam={(id) => setSelectedCamId(id)}
-                    onNudgeCam={(id, deltaMs) => nudgeCamSync(id, deltaMs)}
-                    syncOverrides={Object.fromEntries(
-                      cams.map((c) => [c.id, c.syncOverrideMs ?? 0]),
-                    )}
-                  />
-                </div>
-              )}
+            {/* Col 1 — Cam preview only. The corner badge is a
+             *  dropdown for cam-switching; per-cam sync nudging lives
+             *  in the editor where it actually matters for cuts. */}
+            <div className="min-h-0">
+              <CamPreview />
             </div>
 
             {/* Col 2 — Inspector (BPM in header, body fills) */}
@@ -308,12 +291,16 @@ export default function Triage() {
             <DetectionPanel />
           </section>
 
-          {/* ─── Timeline — fills remaining space ───────────────── */}
-          <section className="flex-1 min-h-0 px-3 pt-3 pb-3 flex">
+          {/* ─── Timeline — compact, sits directly above transport.
+           *  Fixed-ish height (waveform internally capped) so it
+           *  doesn't bloat on tall monitors. Extra vertical real
+           *  estate goes to the ControlRow above. */}
+          <section className="flex-none px-3 pt-3 pb-3 flex">
             <div
-              className="flex-1 min-h-[280px] rounded-md overflow-hidden"
+              className="flex-1 rounded-md overflow-hidden"
               style={{
                 boxShadow: "inset 0 2px 4px rgba(0,0,0,0.08)",
+                height: 220,
               }}
             >
               <TriageTimeline />

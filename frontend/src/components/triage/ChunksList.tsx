@@ -95,8 +95,14 @@ function ChunkRow({ chunk, index, focused, onFocus }: RowProps) {
           <span className="font-display font-semibold text-[10px] tracking-label uppercase text-ink shrink-0">
             #{(index + 1).toString().padStart(2, "0")}
           </span>
-          <span className="font-mono tabular text-[10px] text-ink truncate">
+          <span className="font-mono tabular text-[10px] text-ink shrink-0">
             {formatTime(chunk.startMs / 1000)}
+          </span>
+          <span className="font-mono text-[10px] text-ink-3 shrink-0" aria-hidden>
+            →
+          </span>
+          <span className="font-mono tabular text-[10px] text-ink shrink-0">
+            {formatTime(chunk.endMs / 1000)}
           </span>
         </div>
         <div className="flex items-center gap-1.5 font-mono text-[10px] tabular text-ink-3 shrink-0">
