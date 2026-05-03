@@ -2,30 +2,39 @@
  * mp4box.js demux wrapper.
  *
  * Provides two operations the rest of the app needs:
- *   * `openVideoDemux` — returns track info + an AsyncIterable of
- *     encoded chunks. Streaming-friendly on the consumer side (chunks
- *     yielded one at a time so callers can apply backpressure on the
- *     decoder). The producer currently loads the whole source into
- *     mp4box in one shot — see notes below for why true streaming
- *     demux for moov-last big files isn't wired in yet.
+ *   * `openVideoDemux` — returns track info + an `AsyncIterable<VideoChunk>`
+ *     that streams encoded samples from disk. Bounded memory regardless of
+ *     source size: we only ever hold one sample's worth of bytes (~hundreds
+ *     of KB for high-bitrate H.264) plus mp4box's parsed moov state.
  *   * `demuxVideoTrack` — convenience wrapper that materialises the
- *     AsyncIterable to a chunks array. Suitable for small files /
- *     fixtures; for large sources prefer `openVideoDemux` and iterate.
+ *     AsyncIterable to a chunks array. Suitable for small fixtures /
+ *     tests; for large sources prefer `openVideoDemux` and iterate.
  *
- * Big-file note: for files above the WebCodecs-AudioDecoder streaming
- * threshold (~500 MiB), `source.arrayBuffer()` will throw a RangeError
- * (Chromium ArrayBuffer cap). The audio-only sync path uses a
- * dedicated streaming MP4 audio decoder
- * (`streaming/streaming-mp4-audio.ts`) that works for arbitrarily
- * large files via mp4box's chunked appendBuffer + moov-prefetch.
- * Wiring the same trick into the video-side `openVideoDemux` is
- * tracked as future work — mp4box's `processSamples` for the video
- * track currently doesn't fire after a moov-prefetched chunked feed
- * even though it does fire reliably for the audio track from the
- * same file (root cause TBD).
+ * Architecture:
+ *   1. Probe the head (64 KiB) and tail of the source to locate the
+ *      `moov` box. Phone recordings and screen recorders write `mdat`
+ *      first and `moov` last.
+ *   2. Feed mp4box ONLY [head] + [moov bytes] (out of order via
+ *      `appendBuffer({fileStart})`) so it can parse the track structure.
+ *      We never hand it the multi-GB mdat body.
+ *   3. After `onReady`, read the per-track sample table directly from
+ *      mp4box's parsed structure (`trakBox.samples[]`). Each entry
+ *      carries `{offset, size, cts, dts, duration, is_sync, timescale}`.
+ *   4. The AsyncIterable yields each sample by `source.slice(offset,
+ *      offset+size).arrayBuffer()` — random-access reads, no buffering.
+ *
+ * Why we bypass mp4box's `processSamples` / `onSamples` for the video
+ * track: it requires contiguous bytes from byte 0 onward to fire (audio
+ * tracks happen to work via moov-prefetched chunked feed, video doesn't
+ * — root cause is in mp4box's per-track sample dispatcher and would need
+ * fixing upstream). Reading sample bytes via `Blob.slice` is what mp4box
+ * itself would do internally; we just skip its buffer-tracking layer.
  */
 
 import { createFile, DataStream, type Movie, type Sample, type ISOFile } from "mp4box";
+import { locateMoov } from "../streaming/mp4-moov-locator";
+
+const HEAD_PROBE_BYTES = 64 * 1024;
 
 export interface VideoTrackInfo {
   trackId: number;
@@ -88,7 +97,7 @@ export interface VideoDemuxResult {
 
 /** Streaming-friendly view of a demuxed video track. Iterate samples
  *  via `for await`; the iterator is single-pass. Call `cancel()` if
- *  you want to stop early so the underlying file reader can close. */
+ *  you want to stop early so any pending byte-fetch is abandoned. */
 export interface DemuxedVideoStream {
   info: VideoTrackInfo;
   samples: AsyncIterable<VideoChunk>;
@@ -100,57 +109,30 @@ interface MP4BoxFileBuffer extends ArrayBuffer {
 }
 
 /**
- * Open a demuxer. Loads the whole source into mp4box in one shot;
- * exposes the resulting samples as an `AsyncIterable<VideoChunk>` so
- * consumers can apply backpressure on the decoder. Returns null when
- * the source has no parsable video track.
- *
- * For sources above ~2 GiB, `source.arrayBuffer()` will throw a
- * RangeError (Chromium ArrayBuffer cap). The audio-extraction path for
- * the sync algorithm uses a separate streaming decoder that handles
- * arbitrarily large files; video-side streaming demux is future work.
+ * Open a demuxer. Memory-bounded for arbitrarily-sized sources: only
+ * the head + moov are buffered for parsing; sample bytes are read on
+ * demand via `Blob.slice`. Returns null when the source has no
+ * parsable video track.
  */
 export async function openVideoDemux(
   source: Blob | ArrayBuffer,
 ): Promise<DemuxedVideoStream | null> {
-  const eagerBytes: ArrayBuffer =
-    source instanceof ArrayBuffer ? source : await source.arrayBuffer();
+  const blob = source instanceof Blob ? source : new Blob([source]);
 
   const file = createFile();
 
-  // ---- Pump samples into a queue read by an async iterator. ----
-  type QueueEvent =
-    | { kind: "chunk"; chunk: VideoChunk; sampleNumber: number }
-    | { kind: "done" }
-    | { kind: "error"; err: Error };
-
-  const queue: QueueEvent[] = [];
-  const waiters: Array<() => void> = [];
-  let cancelled = false;
-  let fileError: Error | null = null;
-
-  function pushEvent(ev: QueueEvent): void {
-    queue.push(ev);
-    const w = waiters.shift();
-    if (w) w();
-  }
-
-  // Async-resolved once mp4box has parsed moov + we have track info.
-  // Resolves to null for sources without a video track (mirrors the
-  // old behavior).
-  let resolveInfo!: (v: VideoTrackInfo | null) => void;
+  // Block until mp4box parses the moov — we listen via onReady.
+  let resolveInfo!: (v: { info: VideoTrackInfo; trackId: number } | null) => void;
   let rejectInfo!: (err: Error) => void;
-  const infoPromise = new Promise<VideoTrackInfo | null>((res, rej) => {
-    resolveInfo = res;
-    rejectInfo = rej;
-  });
-
-  let trackId: number | null = null;
+  const infoPromise = new Promise<{ info: VideoTrackInfo; trackId: number } | null>(
+    (res, rej) => {
+      resolveInfo = res;
+      rejectInfo = rej;
+    },
+  );
 
   file.onError = (err: string) => {
-    fileError = new Error(`mp4box: ${err}`);
-    rejectInfo(fileError);
-    pushEvent({ kind: "error", err: fileError });
+    rejectInfo(new Error(`mp4box: ${err}`));
   };
 
   file.onReady = (movie: Movie) => {
@@ -158,26 +140,16 @@ export async function openVideoDemux(
       const videoTrack = movie.videoTracks?.[0] ?? null;
       if (!videoTrack) {
         resolveInfo(null);
-        // Push a `done` so any iterator that started consuming gets a
-        // clean end. Callers usually check `info === null` first and
-        // never iterate, but be defensive.
-        pushEvent({ kind: "done" });
         return;
       }
       const desc = extractDecoderDescription(file, videoTrack.id);
       if (!desc) {
-        const err = new Error("Could not extract video decoder description (avcC).");
-        fileError = err;
-        rejectInfo(err);
-        pushEvent({ kind: "error", err });
+        rejectInfo(new Error("Could not extract video decoder description (avcC)."));
         return;
       }
       const videoMeta = videoTrack.video;
       if (!videoMeta) {
-        const err = new Error("Video track has no `video` metadata.");
-        fileError = err;
-        rejectInfo(err);
-        pushEvent({ kind: "error", err });
+        rejectInfo(new Error("Video track has no `video` metadata."));
         return;
       }
       const info: VideoTrackInfo = {
@@ -194,115 +166,86 @@ export async function openVideoDemux(
         ),
         description: desc,
       };
-      trackId = videoTrack.id;
-      file.setExtractionOptions(videoTrack.id, null, { nbSamples: 1000 });
-      file.start();
-      resolveInfo(info);
+      resolveInfo({ info, trackId: videoTrack.id });
     } catch (e) {
-      const err = e instanceof Error ? e : new Error(String(e));
-      fileError = err;
-      rejectInfo(err);
-      pushEvent({ kind: "error", err });
+      rejectInfo(e instanceof Error ? e : new Error(String(e)));
     }
   };
 
-  file.onSamples = (id: number, _user: unknown, samples: Sample[]) => {
-    if (cancelled || trackId === null || id !== trackId) return;
-    let lastNumber = -1;
-    for (const s of samples) {
-      pushEvent({
-        kind: "chunk",
-        sampleNumber: s.number,
-        chunk: {
-          timestampUs: (s.cts * 1_000_000) / s.timescale,
-          durationUs: (s.duration * 1_000_000) / s.timescale,
-          isKey: s.is_sync,
-          data: new Uint8Array(s.data as unknown as ArrayBuffer),
-        },
-      });
-      lastNumber = s.number;
-    }
-    if (lastNumber >= 0) {
-      file.releaseUsedSamples(trackId, lastNumber + 1);
-    }
-  };
+  // Feed mp4box only what it needs to parse the moov.
+  // 1. Head (ftyp + start of mdat header).
+  // 2. moov bytes (probably at the tail for phone recordings).
+  // For moov-first files, the head probe alone may already include moov;
+  // in that case `locateMoov` returns offset < headSize and we skip the
+  // out-of-order append.
+  const headSize = Math.min(HEAD_PROBE_BYTES, blob.size);
+  const head = new Uint8Array(await blob.slice(0, headSize).arrayBuffer());
+  appendBytes(file, head, 0);
 
-  // ---- Drive the mp4box feed. Single eager appendBuffer; the
-  //      AsyncIterable on the consumer side still gives us
-  //      backpressure-friendly semantics for the decoder pipeline. ----
-
-  let cancelFeeder: () => Promise<void>;
-  const feedPromise = (async () => {
-    try {
-      const buf = eagerBytes as MP4BoxFileBuffer;
-      buf.fileStart = 0;
-      file.appendBuffer(buf as never);
-      file.flush();
-      // mp4box delivers samples synchronously after start() in our flow
-      // (entire file is in memory), so we yield to the microtask queue
-      // and then signal end-of-stream.
-      await Promise.resolve();
-      pushEvent({ kind: "done" });
-    } catch (e) {
-      const err = e instanceof Error ? e : new Error(String(e));
-      if (!fileError) {
-        fileError = err;
-        try { rejectInfo(err); } catch { /* already settled */ }
-      }
-      pushEvent({ kind: "error", err });
+  // If onReady already fired (moov was inside head), we don't need to
+  // locate it. Use Promise.race with a microtask check to avoid an
+  // unnecessary tail fetch.
+  let infoOrNull = await Promise.race([
+    infoPromise,
+    Promise.resolve(undefined),
+  ]);
+  if (infoOrNull === undefined) {
+    // Need more bytes. Locate moov in the tail and feed it.
+    const moov = await locateMoov(blob);
+    if (moov && moov.offset >= headSize) {
+      appendBytes(file, moov.bytes, moov.offset);
+    } else if (!moov) {
+      throw new Error("mp4box: moov box not found in source");
     }
-  })();
-  cancelFeeder = async () => {
-    // Eager feed already finished (or will finish synchronously) — just
-    // mark cancelled so the iterator returns done on its next call.
-    cancelled = true;
-  };
-
-  // Block until we know the info (or it failed).
-  let info: VideoTrackInfo | null;
-  try {
-    info = await infoPromise;
-  } catch (e) {
-    // Make sure the feeder finishes (it might be mid-flight) before we
-    // bubble. Don't await its promise rejection.
-    void feedPromise.catch(() => undefined);
-    throw e;
-  }
-  if (info === null) {
-    // No video track. Iterator will end immediately.
-    void feedPromise.catch(() => undefined);
-    return null;
+    file.flush();
+    infoOrNull = await infoPromise;
+  } else {
+    file.flush();
   }
 
-  // ---- Async iterator that drains the queue. ----
-  const iterableInfo = info;
+  if (infoOrNull === null) return null;
+  const { info, trackId } = infoOrNull;
+
+  // Pull the sample table mp4box built when it parsed the stbl. This
+  // gives us per-sample {offset, size, cts, dts, duration, is_sync,
+  // timescale} for every sample without ever reading mdat.
+  const trak = file.getTrackById(trackId) as unknown as { samples?: Sample[] } | undefined;
+  const sampleTable = trak?.samples ?? [];
+  if (sampleTable.length === 0) {
+    throw new Error("mp4box: video track has no samples in its sample table");
+  }
+
+  let cancelled = false;
+
   const samples: AsyncIterable<VideoChunk> = {
     [Symbol.asyncIterator](): AsyncIterator<VideoChunk> {
+      let i = 0;
       return {
         async next(): Promise<IteratorResult<VideoChunk>> {
-          for (;;) {
-            if (queue.length > 0) {
-              const ev = queue.shift()!;
-              if (ev.kind === "chunk") {
-                return { value: ev.chunk, done: false };
-              }
-              if (ev.kind === "done") {
-                return { value: undefined as unknown as VideoChunk, done: true };
-              }
-              throw ev.err;
-            }
+          while (i < sampleTable.length) {
             if (cancelled) {
               return { value: undefined as unknown as VideoChunk, done: true };
             }
-            await new Promise<void>((res) => waiters.push(res));
+            const s = sampleTable[i++];
+            // Random-access read of just this sample's bytes. mp4box
+            // never sees these — its buffer stays at moov-only size.
+            const data = new Uint8Array(
+              await blob.slice(s.offset, s.offset + s.size).arrayBuffer(),
+            );
+            return {
+              value: {
+                timestampUs: (s.cts * 1_000_000) / s.timescale,
+                durationUs: (s.duration * 1_000_000) / s.timescale,
+                isKey: s.is_sync,
+                data,
+              },
+              done: false,
+            };
           }
+          return { value: undefined as unknown as VideoChunk, done: true };
         },
         async return(): Promise<IteratorResult<VideoChunk>> {
           cancelled = true;
-          await cancelFeeder();
-          // Wake any sleeping iterator users.
-          const w = waiters.shift();
-          if (w) w();
           return { value: undefined as unknown as VideoChunk, done: true };
         },
       };
@@ -310,16 +253,10 @@ export async function openVideoDemux(
   };
 
   return {
-    info: iterableInfo,
+    info,
     samples,
     async cancel(): Promise<void> {
       cancelled = true;
-      await cancelFeeder();
-      // Wake any sleeping iterator users.
-      while (waiters.length > 0) {
-        const w = waiters.shift();
-        if (w) w();
-      }
     },
   };
 }
@@ -329,10 +266,9 @@ export async function openVideoDemux(
  * config. Returns null if there is no video track.
  *
  * Convenience wrapper around `openVideoDemux` for callers that want all
- * chunks materialised as an array. Suitable for files small enough that
- * holding every chunk in RAM is acceptable (tests, fixtures, the
- * sub-streaming-threshold path). For large sources prefer
- * `openVideoDemux` and iterate the `samples` AsyncIterable.
+ * chunks materialised as an array. Suitable for small files / fixtures
+ * where the chunk array fits comfortably in memory; for large sources
+ * prefer `openVideoDemux` and iterate the `samples` AsyncIterable.
  */
 export async function demuxVideoTrack(
   source: Blob | ArrayBuffer,
@@ -342,6 +278,13 @@ export async function demuxVideoTrack(
   const chunks: VideoChunk[] = [];
   for await (const c of stream.samples) chunks.push(c);
   return { info: stream.info, chunks };
+}
+
+function appendBytes(file: ISOFile, bytes: Uint8Array, fileStart: number): void {
+  const ab = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(ab).set(bytes);
+  (ab as MP4BoxFileBuffer).fileStart = fileStart;
+  file.appendBuffer(ab as never);
 }
 
 /**

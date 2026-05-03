@@ -22,22 +22,27 @@ export interface TileStripPlanOptions {
   sourceHeight: number;
   /** Tile height in pixels. Default 80 — matches the pre-frontend setup. */
   tileHeight?: number;
-  /** Hard upper bound on tile count. Default 200. */
+  /** Hard upper bound on tile count. Default 100 — keeps decode work
+   *  bounded for very long files (a 16-min recording at 100 tiles is
+   *  ~9.6 s/tile, still useful for the timeline). */
   maxTiles?: number;
 }
 
 /**
  * Pick the sampling interval that mirrors the pre-frontend Python:
  *
- *   ≤ 60s   → every 0.5s
- *   ≤ 600s  → every 1.0s
- *   > 600s  → every 2.0s
+ *   ≤ 60s    → every 0.5s   (dense for short clips)
+ *   ≤ 600s   → every 1.0s
+ *   ≤ 1800s  → every 5.0s
+ *   > 1800s  → every 10.0s
  *
- * Then enforce maxTiles by widening the step as needed.
+ * Then enforce maxTiles by widening the step as needed. The bigger
+ * defaults for long files exist because we'd otherwise hit the cap
+ * anyway and the wider native step gives us a deterministic floor.
  */
 export function planTileStrip(opts: TileStripPlanOptions): TileStripPlan {
   const tileHeight = opts.tileHeight ?? 80;
-  const maxTiles = opts.maxTiles ?? 200;
+  const maxTiles = opts.maxTiles ?? 100;
   if (opts.durationS <= 0 || opts.sourceWidth <= 0 || opts.sourceHeight <= 0) {
     return { timestampsS: [], tileWidth: tileHeight, tileHeight };
   }
@@ -45,7 +50,8 @@ export function planTileStrip(opts: TileStripPlanOptions): TileStripPlan {
   let step: number;
   if (opts.durationS <= 60) step = 0.5;
   else if (opts.durationS <= 600) step = 1.0;
-  else step = 2.0;
+  else if (opts.durationS <= 1800) step = 5.0;
+  else step = 10.0;
 
   let count = Math.max(1, Math.floor(opts.durationS / step));
   if (count > maxTiles) {
