@@ -311,13 +311,6 @@ export function TriageTimeline() {
     viewEndS,
     pxPerSec,
   );
-  const audioStartMarkers = useAudioStartMarkers(
-    chunks,
-    focusedChunkId,
-    viewStartS,
-    viewEndS,
-  );
-
   // Waveform canvas.
   const waveformCanvasRef = useRef<HTMLCanvasElement | null>(null);
   useEffect(() => {
@@ -482,59 +475,6 @@ export function TriageTimeline() {
           );
         })}
       </div>
-
-      {/* Audio-start anchor markers — one per visible chunk at its
-       *  audioStartMs. A thin hot vertical line spans bar ruler →
-       *  waveform → chunk lane, plus a small filled flag glyph at the
-       *  top of the bar ruler. Makes "where bar 1 begins" obvious
-       *  even at high zoom or when the chunk extends across the
-       *  whole view. */}
-      {audioStartMarkers.map((marker) => {
-        const x = timeToX(marker.tS);
-        const opacity = marker.focused ? 1 : 0.55;
-        const lineTop = TIME_RULER_HEIGHT;
-        const lineBottom = TIME_RULER_HEIGHT + BAR_RULER_HEIGHT + waveformHeight;
-        return (
-          <div
-            key={`as-${marker.chunkId}`}
-            className="absolute pointer-events-none"
-            style={{
-              left: x,
-              top: lineTop,
-              height: lineBottom - lineTop,
-              width: 0,
-              zIndex: 3,
-              opacity,
-            }}
-          >
-            {/* Vertical anchor line through bar ruler + waveform. */}
-            <span
-              className="absolute"
-              style={{
-                left: -1,
-                top: 0,
-                bottom: 0,
-                width: 2,
-                background: HOT_COLOR,
-                boxShadow: "0 0 4px rgba(255,87,34,0.4)",
-              }}
-            />
-            {/* Flag at the top of the bar ruler. */}
-            <span
-              className="absolute font-display text-[7px] tracking-[0.1em] uppercase leading-none px-1 py-0.5 rounded-[2px] whitespace-nowrap"
-              style={{
-                left: 2,
-                top: 0,
-                background: HOT_COLOR,
-                color: "#FAF6EC",
-                boxShadow: "0 1px 1px rgba(0,0,0,0.2)",
-              }}
-            >
-              {marker.detected ? "▼1" : "1"}
-            </span>
-          </div>
-        );
-      })}
 
       <div
         className="absolute left-0 right-0"
@@ -716,17 +656,6 @@ interface BarTick {
   extension: boolean;
 }
 
-interface AudioStartMarker {
-  tS: number;
-  chunkId: string;
-  focused: boolean;
-  /** Whether the chunk has its own per-chunk audio-start detection. If
-   *  false, the marker sits at the chunk's silence-detection start —
-   *  still useful as a "this is where the chunk begins" indicator,
-   *  just less musically meaningful. */
-  detected: boolean;
-}
-
 /** Per-chunk bar/beat ticks. Each chunk has its own anchor (audio-
  *  start onset) and uses the song-global BPM (or its own detected
  *  value as fallback). Chunks with no BPM info anywhere are skipped.
@@ -800,33 +729,6 @@ function usePerChunkBarTicks(
     }
     return ticks;
   }, [chunks, focusedChunkId, jobBpm, beatsPerBar, viewStartS, viewEndS, pxPerSec]);
-}
-
-/** One marker per chunk at its audio-start anchor (= where bar 1
- *  lives). Drawn as a vertical line spanning the timeline + a small
- *  flag glyph in the bar ruler, so the user can see "where the
- *  chunk's musical grid begins". */
-function useAudioStartMarkers(
-  chunks: Chunk[],
-  focusedChunkId: string | null,
-  viewStartS: number,
-  viewEndS: number,
-): AudioStartMarker[] {
-  return useMemo(() => {
-    const out: AudioStartMarker[] = [];
-    for (const c of chunks) {
-      const anchorMs = c.audioStartMs ?? c.startMs;
-      const tS = anchorMs / 1000;
-      if (tS < viewStartS || tS > viewEndS) continue;
-      out.push({
-        tS,
-        chunkId: c.id,
-        focused: c.id === focusedChunkId,
-        detected: c.audioStartMs !== undefined && c.audioStartMs !== c.startMs,
-      });
-    }
-    return out;
-  }, [chunks, focusedChunkId, viewStartS, viewEndS]);
 }
 
 function niceStep(raw: number): number {
