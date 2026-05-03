@@ -624,13 +624,18 @@ function ChunkBlock({
 
   const left = timeToX(startS);
   const right = timeToX(endS);
-  const widthPx = Math.max(2, right - left);
+  // Width tracks the actual chunk duration — no min-clamp, so very
+  // short chunks read as truly thin slivers when zoomed out instead
+  // of inflating to a misleading minimum.
+  const widthPx = right - left;
 
   const bg = chunk.accepted ? "#FF5722" : "#5D5546";
   const fg = chunk.accepted ? "#FAF6EC" : "#A89F8B";
 
-  const showLabel = widthPx >= 28;
-  const showFullDetail = widthPx >= 120;
+  // Only emit the in-block text when there's room for the full
+  // readout. No intermediate "●"/"✕" placeholder — the bg color +
+  // strikethrough already convey accept/reject state at any size.
+  const showLabel = widthPx >= 120;
   const showHandles = widthPx >= TRIM_HANDLE_PX * 3;
 
   return (
@@ -658,13 +663,9 @@ function ChunkBlock({
       )}
       {showLabel && (
         <span className="font-mono text-[10px] tracking-label uppercase truncate relative">
-          {showFullDetail
-            ? `${formatTime(startS)} · ${(endS - startS).toFixed(1)}s${
-                chunk.detectedBpm ? ` · ${chunk.detectedBpm.toFixed(0)}` : ""
-              }`
-            : chunk.accepted
-              ? "●"
-              : "✕"}
+          {`${formatTime(startS)} · ${(endS - startS).toFixed(1)}s${
+            chunk.detectedBpm ? ` · ${chunk.detectedBpm.toFixed(0)}` : ""
+          }`}
         </span>
       )}
       {showHandles && (
