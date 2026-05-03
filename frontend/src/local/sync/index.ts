@@ -157,10 +157,15 @@ async function awaitGate(): Promise<void> {
 // Worker dispatch
 // -----------------------------------------------------------------------------
 
+/** Callback fired between WASM pipeline stages. `fraction` is in [0, 1]
+ *  and monotonically non-decreasing across calls within one match. */
+export type SyncProgressFn = (stage: string, fraction: number) => void;
+
 function runMatchInWorker(
   refPcm: Float32Array,
   queryPcm: Float32Array,
   sampleRate: number,
+  onProgress?: SyncProgressFn,
 ): Promise<RawSyncResult> {
   return new Promise<RawSyncResult>((resolve, reject) => {
     const worker = new Worker(new URL("./sync.worker.ts", import.meta.url), {
@@ -173,6 +178,12 @@ function runMatchInWorker(
       "message",
       (e: MessageEvent<SyncWorkerResponse>) => {
         const msg = e.data;
+        if (msg.type === "progress") {
+          // Don't terminate the worker on progress — keep listening for
+          // the eventual "result" / "error" message.
+          onProgress?.(msg.stage, msg.fraction);
+          return;
+        }
         if (msg.type === "result") {
           resolve(msg.result);
         } else {
@@ -204,12 +215,15 @@ function runMatchInWorker(
   });
 }
 
-export async function syncAudio(input: SyncInput): Promise<SyncResult> {
+export async function syncAudio(
+  input: SyncInput,
+  opts?: { onProgress?: SyncProgressFn },
+): Promise<SyncResult> {
   const [refPcm, queryPcm] = await Promise.all([
     ensurePcm(input.refSource),
     ensurePcm(input.querySource),
   ]);
   await awaitGate();
-  const raw = await runMatchInWorker(refPcm, queryPcm, TARGET_SR);
+  const raw = await runMatchInWorker(refPcm, queryPcm, TARGET_SR, opts?.onProgress);
   return mapWasmResult(raw);
 }
