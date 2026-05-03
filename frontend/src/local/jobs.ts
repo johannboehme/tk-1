@@ -373,10 +373,25 @@ async function runCamPrep(
       detail: `${cam.id} · ${cam.filename}`,
     });
 
-    const result = await syncAudio({
-      refSource: videoMonoPcm.pcm,
-      querySource: studioPcm,
-    });
+    // Sync gets the 0.4 → 0.55 slice of the per-cam progress band. The
+    // WASM pipeline calls back per stage (envelope→chroma→onset→ncc→
+    // phat→consensus→drift), so the bar moves continuously through the
+    // ~5-s match instead of freezing at 40 %.
+    const result = await syncAudio(
+      {
+        refSource: videoMonoPcm.pcm,
+        querySource: studioPcm,
+      },
+      {
+        onProgress: (stage, frac) => {
+          void reportProgress(jobId, {
+            pct: opts.mapPct(0.4 + frac * 0.15),
+            stage: `syncing-${cam.id}`,
+            detail: `${cam.id} · ${cam.filename} · ${stage}`,
+          });
+        },
+      },
+    );
     sync = {
       offsetMs: result.offsetMs,
       driftRatio: result.driftRatio,

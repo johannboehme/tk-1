@@ -10,6 +10,12 @@
  * Decoding (WebAudio → mono PCM) stays on the main thread because
  * OfflineAudioContext has Safari-side caveats inside workers; we transfer
  * the resulting Float32Array buffers into the worker zero-copy instead.
+ *
+ * Progress: the WASM pipeline calls `syncAudioPcmWithProgress` with a
+ * Rust→JS closure that fires per pipeline stage (envelope, chroma,
+ * onset, ncc, phat, consensus, drift). Each fire becomes a `progress`
+ * postMessage so the main thread can paint a smooth bar instead of a
+ * 5-s frozen "40%".
  */
 
 interface RawCandidate {
@@ -36,6 +42,7 @@ export type SyncWorkerRequest = {
 
 export type SyncWorkerResponse =
   | { type: "result"; result: RawSyncResult }
+  | { type: "progress"; stage: string; fraction: number }
   | { type: "error"; message: string };
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope;
@@ -58,10 +65,19 @@ ctx.addEventListener("message", async (e: MessageEvent<SyncWorkerRequest>) => {
   if (msg.type !== "match") return;
   try {
     const wasm = await loadWasm();
-    const result = wasm.syncAudioPcm(
+    // Bridge WASM stage callbacks → main-thread progress events. The
+    // WASM call is synchronous from the worker's point of view, but
+    // postMessage is non-blocking so each stage update reaches the UI
+    // immediately even though the worker is otherwise pegged.
+    const onStage = (stage: string, fraction: number) => {
+      const evt: SyncWorkerResponse = { type: "progress", stage, fraction };
+      ctx.postMessage(evt);
+    };
+    const result = wasm.syncAudioPcmWithProgress(
       msg.refPcm,
       msg.queryPcm,
       msg.sampleRate,
+      onStage,
     ) as RawSyncResult;
     const evt: SyncWorkerResponse = { type: "result", result };
     ctx.postMessage(evt);

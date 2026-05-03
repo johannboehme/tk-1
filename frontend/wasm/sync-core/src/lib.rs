@@ -7,11 +7,14 @@
 //!     refinement) and returns a JS object matching the `SyncResult` shape.
 
 pub mod chroma;
+pub mod consensus;
 pub mod drift;
 pub mod dtw;
+pub mod envelope;
 pub mod ncc;
 pub mod onset;
 pub mod phat;
+pub mod salience;
 pub mod sync;
 pub mod util;
 pub mod xcorr;
@@ -101,6 +104,36 @@ pub fn sync_audio_pcm_js(
         ..Default::default()
     };
     let result = sync::sync_audio_pcm(ref_pcm, query_pcm, opts);
+    let dto = SyncResultDto::from(result);
+    serde_wasm_bindgen::to_value(&dto).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Same as `syncAudioPcm` but invokes `progress(stage, fraction)`
+/// between each pipeline stage. Lets the caller render a smooth
+/// progress bar (otherwise the pipeline blocks for ~5 s with no
+/// updates).
+#[wasm_bindgen(js_name = syncAudioPcmWithProgress)]
+pub fn sync_audio_pcm_with_progress_js(
+    ref_pcm: &[f32],
+    query_pcm: &[f32],
+    sample_rate: u32,
+    progress: &js_sys::Function,
+) -> Result<JsValue, JsValue> {
+    let opts = sync::SyncOptions {
+        sr: sample_rate,
+        ..Default::default()
+    };
+    let cb = |stage: &str, frac: f64| {
+        // Errors from the callback are intentionally swallowed —
+        // pipeline correctness shouldn't depend on the UI thread
+        // accepting the message.
+        let _ = progress.call2(
+            &JsValue::NULL,
+            &JsValue::from_str(stage),
+            &JsValue::from_f64(frac),
+        );
+    };
+    let result = sync::sync_audio_pcm_with_progress(ref_pcm, query_pcm, opts, &cb);
     let dto = SyncResultDto::from(result);
     serde_wasm_bindgen::to_value(&dto).map_err(|e| JsValue::from_str(&e.to_string()))
 }
