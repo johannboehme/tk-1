@@ -364,9 +364,9 @@ function SliderRow({ label, value, min, max, step, unit, onChange }: SliderRowPr
   );
 }
 
-/** Small LCD-style readout that mirrors the BpmReadout brass plate
- *  language. Bonded visually to the deck strip so the user reads it as
- *  a meter, not a label. */
+/** Brass-bezel LCD readout with vertical "KEPT" stencil. Visual
+ *  vocabulary matches the MinBarsFilter trigger so the two sit
+ *  side-by-side on the deck strip as a matched pair. */
 function KeptCounter({
   chunkCount,
   keptCount,
@@ -376,20 +376,41 @@ function KeptCounter({
   keptCount: number;
   totalMs: number;
 }) {
+  const bezel: React.CSSProperties = {
+    background:
+      "linear-gradient(180deg, #FAF6EC 0%, #E8E1D0 50%, #C9BFA6 100%)",
+    boxShadow: [
+      "inset 0 1px 0 rgba(255,255,255,0.85)",
+      "inset 0 -1px 0 rgba(0,0,0,0.18)",
+      "0 1px 2px rgba(0,0,0,0.18)",
+    ].join(", "),
+    borderRadius: 6,
+    padding: "5px 6px",
+  };
   return (
-    <div className="flex flex-col items-end shrink-0">
-      <span className="font-display text-[8px] tracking-[0.18em] text-ink-3 uppercase mb-0.5">
-        Kept
+    <div
+      className="inline-flex items-center gap-2 self-center shrink-0"
+      style={bezel}
+    >
+      <span
+        aria-hidden
+        className="font-display text-[8px] tracking-[0.18em] text-ink-2 leading-tight uppercase"
+        style={{
+          writingMode: "vertical-rl",
+          transform: "rotate(180deg)",
+          letterSpacing: "0.18em",
+        }}
+      >
+        KEPT
       </span>
       <div
-        className="font-mono tabular px-2 rounded-[3px] inline-flex items-center gap-1.5"
+        className="font-mono tabular px-2 rounded-[3px] inline-flex items-center gap-1.5 border border-black/40"
         style={{
-          height: 26,
+          height: 28,
           background: LCD_BG,
           boxShadow: LCD_SHADOW,
           color: LCD_GREEN,
           textShadow: GLOW_GREEN,
-          border: "1px solid rgba(0,0,0,0.5)",
         }}
       >
         <span className="text-[12px]">{keptCount}</span>
