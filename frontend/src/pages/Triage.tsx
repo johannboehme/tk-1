@@ -227,7 +227,7 @@ export default function Triage() {
   }, [job, detection.kind, initFromJob]);
 
   return (
-    <div className="h-full flex flex-col min-h-0 paper-bg overflow-hidden">
+    <div className="h-screen flex flex-col min-h-0 paper-bg overflow-hidden">
       <PhaseStrip
         phase="triage"
         jobTitle={job?.title ?? null}
@@ -291,16 +291,17 @@ export default function Triage() {
             <DetectionPanel />
           </section>
 
-          {/* ─── Timeline — compact, sits directly above transport.
-           *  Fixed-ish height (waveform internally capped) so it
-           *  doesn't bloat on tall monitors. Extra vertical real
-           *  estate goes to the ControlRow above. */}
-          <section className="flex-none px-3 pt-3 pb-3 flex">
+          {/* ─── Timeline — compact strip directly above transport.
+           *  Height matches the timeline content exactly (rulers +
+           *  capped waveform + chunk lane) so there's no dead paper-
+           *  hi space inside the frame. Extra vertical real estate
+           *  flows to ControlRow above. */}
+          <section className="flex-none px-3 py-2 flex">
             <div
               className="flex-1 rounded-md overflow-hidden"
               style={{
                 boxShadow: "inset 0 2px 4px rgba(0,0,0,0.08)",
-                height: 220,
+                height: 186,
               }}
             >
               <TriageTimeline />
