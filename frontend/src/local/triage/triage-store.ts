@@ -45,6 +45,11 @@ export interface TriageState {
   // ─── Triage-specific ─────────────────────────────────────────────────
   chunks: Chunk[];
   silenceConfig: SilenceConfig;
+  /** Session-wide BPM override (optional). When set, all chunks adopt
+   *  this BPM in their bar-grid math regardless of their detected
+   *  value. The user explicitly opts in — auto-detect remains the
+   *  default. */
+  sessionBpmOverride: number | null;
   /** ID of the focused chunk for inspector + loop playback. Null = no
    *  focus, transport plays linearly. */
   focusedChunkId: string | null;
@@ -63,6 +68,7 @@ export interface TriageState {
     cams: VideoAsset[];
     chunks: Chunk[];
     silenceConfig: SilenceConfig;
+    sessionBpmOverride: number | null;
     pcm: Float32Array;
     pcmSampleRate: number;
     envelope: Float32Array;
@@ -72,7 +78,13 @@ export interface TriageState {
 
   setChunks(chunks: Chunk[]): void;
   updateChunk(id: string, patch: Partial<Chunk>): void;
+  /** Extend or shrink a chunk's bounds by a number of bars at the
+   *  chunk's own effective-BPM. Sign convention: positive `barsBack`
+   *  pushes startMs back (longer chunk on the left); positive
+   *  `barsFwd` pushes endMs forward. */
+  extendChunkBars(id: string, barsBack: number, barsFwd: number): void;
   setSilenceConfig(config: SilenceConfig): void;
+  setSessionBpm(bpm: number | null): void;
   focusChunk(id: string | null): void;
   acceptFocused(autoAdvance?: boolean): void;
   rejectFocused(autoAdvance?: boolean): void;
@@ -80,6 +92,9 @@ export interface TriageState {
   focusRelative(delta: -1 | 1): void;
 
   setSelectedCamId(id: string | null): void;
+  /** Adjust the user-override sync offset for one cam by a delta in
+   *  ms. Mirrors the editor's `nudgeClipSyncOverride` action. */
+  nudgeCamSyncOverride(camId: string, deltaMs: number): void;
 
   // Playback actions (mirror editor shape).
   setPlaying(p: boolean): void;
@@ -121,6 +136,7 @@ export const useTriageStore = create<TriageState>((set, get) => ({
 
   chunks: [],
   silenceConfig: DEFAULT_SILENCE_CONFIG_STORE,
+  sessionBpmOverride: null,
   focusedChunkId: null,
   selectedCamId: null,
 
@@ -134,6 +150,7 @@ export const useTriageStore = create<TriageState>((set, get) => ({
       cams: args.cams,
       chunks: args.chunks,
       silenceConfig: args.silenceConfig,
+      sessionBpmOverride: args.sessionBpmOverride,
       pcm: args.pcm,
       pcmSampleRate: args.pcmSampleRate,
       envelope: args.envelope,
@@ -156,6 +173,7 @@ export const useTriageStore = create<TriageState>((set, get) => ({
       envelope: null,
       cams: [],
       chunks: [],
+      sessionBpmOverride: null,
       focusedChunkId: null,
       selectedCamId: null,
       playback: INITIAL_PLAYBACK,
@@ -175,6 +193,34 @@ export const useTriageStore = create<TriageState>((set, get) => ({
 
   setSilenceConfig(config) {
     set({ silenceConfig: config });
+  },
+
+  extendChunkBars(id, barsBack, barsFwd) {
+    const s = get();
+    const chunk = s.chunks.find((c) => c.id === id);
+    if (!chunk) return;
+    const bpm = effectiveChunkBpm(chunk, s.sessionBpmOverride);
+    if (bpm <= 0) return;
+    const msPerBar = (60_000 / bpm) * chunk.beatsPerBar;
+    const nextStart = Math.max(0, Math.round(chunk.startMs - barsBack * msPerBar));
+    const nextEnd = Math.max(
+      nextStart + 100,
+      Math.min(s.audioDuration * 1000, Math.round(chunk.endMs + barsFwd * msPerBar)),
+    );
+    s.updateChunk(id, { startMs: nextStart, endMs: nextEnd, trimMode: "bar" });
+    // If this chunk is the loop region, follow the new bounds.
+    if (s.focusedChunkId === id) {
+      set({
+        playback: {
+          ...s.playback,
+          loop: { start: nextStart / 1000, end: nextEnd / 1000 },
+        },
+      });
+    }
+  },
+
+  setSessionBpm(bpm) {
+    set({ sessionBpmOverride: bpm });
   },
 
   focusChunk(id) {
@@ -230,6 +276,16 @@ export const useTriageStore = create<TriageState>((set, get) => ({
     set({ selectedCamId: id });
   },
 
+  nudgeCamSyncOverride(camId, deltaMs) {
+    set((s) => ({
+      cams: s.cams.map((c) =>
+        c.id === camId
+          ? { ...c, syncOverrideMs: (c.syncOverrideMs ?? 0) + deltaMs }
+          : c,
+      ),
+    }));
+  },
+
   setPlaying(p) {
     set((s) => ({ playback: { ...s.playback, isPlaying: p } }));
   },
@@ -261,3 +317,17 @@ export const useTriageStore = create<TriageState>((set, get) => ({
     set((s) => ({ view: { ...s.view, scrollX: Math.max(0, x) } }));
   },
 }));
+
+/** Resolve the BPM that should drive a chunk's bar grid: session
+ *  override (if set) takes precedence; otherwise the chunk's own
+ *  detected BPM × octave shift. Returns 0 when no BPM is available. */
+export function effectiveChunkBpm(
+  chunk: Chunk,
+  sessionBpmOverride: number | null,
+): number {
+  if (sessionBpmOverride && sessionBpmOverride > 0) return sessionBpmOverride;
+  if (chunk.detectedBpm) {
+    return chunk.detectedBpm * Math.pow(2, chunk.bpmOctaveShift);
+  }
+  return chunk.effectiveBpm > 0 ? chunk.effectiveBpm : 0;
+}

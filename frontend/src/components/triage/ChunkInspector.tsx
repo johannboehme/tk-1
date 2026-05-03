@@ -8,13 +8,18 @@
  * core layout is stable.
  */
 import { ChunkyButton } from "../../editor/components/ChunkyButton";
-import { useTriageStore } from "../../local/triage/triage-store";
+import {
+  effectiveChunkBpm,
+  useTriageStore,
+} from "../../local/triage/triage-store";
 import type { Chunk } from "../../storage/jobs-db";
 
 export function ChunkInspector() {
   const focusedId = useTriageStore((s) => s.focusedChunkId);
   const chunks = useTriageStore((s) => s.chunks);
+  const sessionBpm = useTriageStore((s) => s.sessionBpmOverride);
   const updateChunk = useTriageStore((s) => s.updateChunk);
+  const extendChunkBars = useTriageStore((s) => s.extendChunkBars);
   const acceptFocused = useTriageStore((s) => s.acceptFocused);
   const rejectFocused = useTriageStore((s) => s.rejectFocused);
   const sortedIdx =
@@ -43,9 +48,11 @@ export function ChunkInspector() {
       ) : (
         <ChunkBody
           chunk={focused}
+          sessionBpm={sessionBpm}
           onAccept={() => acceptFocused(false)}
           onReject={() => rejectFocused(false)}
           onUpdate={(patch) => updateChunk(focused.id, patch)}
+          onExtend={(back, fwd) => extendChunkBars(focused.id, back, fwd)}
         />
       )}
     </section>
@@ -54,18 +61,19 @@ export function ChunkInspector() {
 
 interface BodyProps {
   chunk: Chunk;
+  sessionBpm: number | null;
   onAccept: () => void;
   onReject: () => void;
   onUpdate: (patch: Partial<Chunk>) => void;
+  onExtend: (barsBack: number, barsFwd: number) => void;
 }
 
-function ChunkBody({ chunk, onAccept, onReject, onUpdate }: BodyProps) {
+function ChunkBody({ chunk, sessionBpm, onAccept, onReject, onUpdate, onExtend }: BodyProps) {
   const lengthMs = chunk.endMs - chunk.startMs;
   const lengthS = lengthMs / 1000;
-  const effectiveBpm = chunk.detectedBpm
-    ? chunk.detectedBpm * Math.pow(2, chunk.bpmOctaveShift)
-    : chunk.effectiveBpm;
+  const effectiveBpm = effectiveChunkBpm(chunk, sessionBpm);
   const bars = effectiveBpm > 0 ? (lengthS * effectiveBpm) / 60 / chunk.beatsPerBar : 0;
+  const canExtend = effectiveBpm > 0;
 
   return (
     <div className="p-3 space-y-3 text-sm">
@@ -130,6 +138,65 @@ function ChunkBody({ chunk, onAccept, onReject, onUpdate }: BodyProps) {
             </ChunkyButton>
           </div>
         )}
+      </div>
+
+      {/* Bar extend / shrink — modulates chunk boundaries by one bar
+       *  at the chunk's effective BPM. Disabled when no BPM info. */}
+      <div className="border-t border-rule pt-2">
+        <div className="flex items-baseline justify-between mb-1">
+          <span className="font-display tracking-label uppercase text-[10px] text-ink-2">
+            Trim by bar
+          </span>
+          <span className="font-mono text-[10px] tabular text-ink-3">
+            {canExtend ? "snap = bar" : "needs BPM"}
+          </span>
+        </div>
+        <div className="grid grid-cols-2 gap-1.5">
+          <div className="grid grid-cols-2 gap-1">
+            <ChunkyButton
+              variant="secondary"
+              size="xs"
+              disabled={!canExtend}
+              onClick={() => onExtend(1, 0)}
+              title="Extend start back by one bar"
+              aria-label="Extend chunk start back"
+            >
+              ⟸ in
+            </ChunkyButton>
+            <ChunkyButton
+              variant="secondary"
+              size="xs"
+              disabled={!canExtend}
+              onClick={() => onExtend(-1, 0)}
+              title="Pull start forward by one bar"
+              aria-label="Pull chunk start forward"
+            >
+              in ⟹
+            </ChunkyButton>
+          </div>
+          <div className="grid grid-cols-2 gap-1">
+            <ChunkyButton
+              variant="secondary"
+              size="xs"
+              disabled={!canExtend}
+              onClick={() => onExtend(0, -1)}
+              title="Pull end back by one bar"
+              aria-label="Pull chunk end back"
+            >
+              ⟸ out
+            </ChunkyButton>
+            <ChunkyButton
+              variant="secondary"
+              size="xs"
+              disabled={!canExtend}
+              onClick={() => onExtend(0, 1)}
+              title="Extend end forward by one bar"
+              aria-label="Extend chunk end forward"
+            >
+              out ⟹
+            </ChunkyButton>
+          </div>
+        </div>
       </div>
 
       {/* Accept / Reject */}

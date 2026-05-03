@@ -25,9 +25,24 @@ interface Props {
    *  highlighted border. Omit for the read-only display. */
   selectedCamId?: string | null;
   onSelectCam?: (camId: string) => void;
+  /** When provided, each row gets ◀▶ buttons for nudging the cam's
+   *  user-override sync offset by the given delta (positive = later).
+   *  Two delta sizes (1 ms fine, 100 ms coarse) are exposed via the
+   *  modifier-click on the buttons. */
+  onNudgeCam?: (camId: string, deltaMs: number) => void;
+  /** Per-cam current syncOverrideMs (additive on top of the algorithm
+   *  offset). Lets the panel surface the user's correction without
+   *  having to re-fetch the job. */
+  syncOverrides?: Record<string, number>;
 }
 
-export function SyncPatchPanel({ job, selectedCamId, onSelectCam }: Props) {
+export function SyncPatchPanel({
+  job,
+  selectedCamId,
+  onSelectCam,
+  onNudgeCam,
+  syncOverrides,
+}: Props) {
   // Image cams have no sync result — they're not part of this panel.
   const videos: VideoAsset[] = (job.videos ?? []).filter(isVideoAsset);
 
@@ -47,13 +62,21 @@ export function SyncPatchPanel({ job, selectedCamId, onSelectCam }: Props) {
         </span>
         <RuleStrip count={20} className="text-rule flex-1 max-w-[180px]" />
       </div>
-      {/* Desktop / wider tablets: 5-column grid. */}
-      <div className="hidden sm:grid sm:grid-cols-[auto_1fr_auto_auto_auto] gap-x-4">
+      {/* Desktop / wider tablets: 5-column grid (+ nudge col when onNudgeCam given). */}
+      <div
+        className={[
+          "hidden sm:grid gap-x-4",
+          onNudgeCam
+            ? "sm:grid-cols-[auto_1fr_auto_auto_auto_auto]"
+            : "sm:grid-cols-[auto_1fr_auto_auto_auto]",
+        ].join(" ")}
+      >
         <HeaderCell>CAM</HeaderCell>
         <HeaderCell>SOURCE</HeaderCell>
         <HeaderCell align="right">OFFSET</HeaderCell>
         <HeaderCell align="right">DRIFT</HeaderCell>
         <HeaderCell align="right">CONF</HeaderCell>
+        {onNudgeCam && <HeaderCell align="right">NUDGE</HeaderCell>}
         {videos.map((cam, i) => (
           <SyncRow
             key={cam.id}
@@ -63,6 +86,8 @@ export function SyncPatchPanel({ job, selectedCamId, onSelectCam }: Props) {
             selected={selectedCamId === cam.id}
             interactive={Boolean(onSelectCam)}
             onSelect={onSelectCam ? () => onSelectCam(cam.id) : undefined}
+            overrideMs={syncOverrides?.[cam.id] ?? cam.syncOverrideMs ?? 0}
+            onNudge={onNudgeCam ? (delta) => onNudgeCam(cam.id, delta) : undefined}
           />
         ))}
       </div>
@@ -78,6 +103,8 @@ export function SyncPatchPanel({ job, selectedCamId, onSelectCam }: Props) {
             selected={selectedCamId === cam.id}
             interactive={Boolean(onSelectCam)}
             onSelect={onSelectCam ? () => onSelectCam(cam.id) : undefined}
+            overrideMs={syncOverrides?.[cam.id] ?? cam.syncOverrideMs ?? 0}
+            onNudge={onNudgeCam ? (delta) => onNudgeCam(cam.id, delta) : undefined}
           />
         ))}
       </div>
@@ -111,9 +138,20 @@ interface RowProps {
   selected: boolean;
   interactive: boolean;
   onSelect?: () => void;
+  overrideMs?: number;
+  onNudge?: (deltaMs: number) => void;
 }
 
-function SyncRow({ cam, index, last, selected, interactive, onSelect }: RowProps) {
+function SyncRow({
+  cam,
+  index,
+  last,
+  selected,
+  interactive,
+  onSelect,
+  overrideMs,
+  onNudge,
+}: RowProps) {
   const sync = cam.sync;
   const border = last ? "" : "border-b border-rule/50";
   // Selected rows get a cobalt left-edge accent — distinct from the
@@ -167,12 +205,25 @@ function SyncRow({ cam, index, last, selected, interactive, onSelect }: RowProps
       >
         {cam.filename}
       </div>
-      {/* OFFSET */}
+      {/* OFFSET — algorithm + user override displayed as one number;
+       *  override-portion shown in muted text when non-zero. */}
       <div
         className={`${cellCls} text-right font-mono tabular text-ink self-center`}
         onClick={sharedClick}
       >
-        {sync ? `${sync.offsetMs.toFixed(1)} ms` : "—"}
+        {sync ? (
+          <>
+            {(sync.offsetMs + (overrideMs ?? 0)).toFixed(1)} ms
+            {(overrideMs ?? 0) !== 0 && (
+              <span className="block text-[9px] text-cobalt">
+                {(overrideMs ?? 0) > 0 ? "+" : ""}
+                {(overrideMs ?? 0).toFixed(1)} nudge
+              </span>
+            )}
+          </>
+        ) : (
+          "—"
+        )}
       </div>
       {/* DRIFT */}
       <div
@@ -189,6 +240,12 @@ function SyncRow({ cam, index, last, selected, interactive, onSelect }: RowProps
           <span className="font-mono text-ink-3">—</span>
         )}
       </div>
+      {/* NUDGE — only rendered when interactive nudging was wired in. */}
+      {onNudge && (
+        <div className={`${cellCls} self-center`}>
+          <NudgeButtons onNudge={onNudge} />
+        </div>
+      )}
     </>
   );
 }
@@ -198,7 +255,16 @@ function SyncRow({ cam, index, last, selected, interactive, onSelect }: RowProps
  * label-value pairs flow vertically so OFFSET/DRIFT/CONF can never push
  * the row past the viewport on a narrow phone.
  */
-function SyncCard({ cam, index, last, selected, interactive, onSelect }: RowProps) {
+function SyncCard({
+  cam,
+  index,
+  last,
+  selected,
+  interactive,
+  onSelect,
+  overrideMs,
+  onNudge,
+}: RowProps) {
   const sync = cam.sync;
   const border = last ? "" : "border-b border-rule/50";
   const selectedCls = selected ? "bg-cobalt/10" : interactive ? "hover:bg-paper-deep cursor-pointer" : "";
@@ -240,7 +306,13 @@ function SyncCard({ cam, index, last, selected, interactive, onSelect }: RowProp
       <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-[11px] pl-3.5">
         <span className="font-display tracking-label uppercase text-ink-3">Offset</span>
         <span className="font-mono tabular text-ink text-right">
-          {sync ? `${sync.offsetMs.toFixed(1)} ms` : "—"}
+          {sync ? `${(sync.offsetMs + (overrideMs ?? 0)).toFixed(1)} ms` : "—"}
+          {sync && (overrideMs ?? 0) !== 0 && (
+            <span className="block text-[9px] text-cobalt">
+              {(overrideMs ?? 0) > 0 ? "+" : ""}
+              {(overrideMs ?? 0).toFixed(1)} nudge
+            </span>
+          )}
         </span>
         <span className="font-display tracking-label uppercase text-ink-3">Drift</span>
         <span className="font-mono tabular text-ink text-right">
@@ -250,8 +322,49 @@ function SyncCard({ cam, index, last, selected, interactive, onSelect }: RowProp
         <span className="text-right">
           {sync ? <ConfidenceLeds value={sync.confidence} /> : <span className="font-mono text-ink-3">—</span>}
         </span>
+        {onNudge && (
+          <>
+            <span className="font-display tracking-label uppercase text-ink-3">Nudge</span>
+            <span className="text-right">
+              <NudgeButtons onNudge={onNudge} />
+            </span>
+          </>
+        )}
       </div>
     </div>
+  );
+}
+
+/** Symmetric ◀▶ stepper with an Alt-modifier for coarse 100 ms nudges
+ *  (vs. 1 ms default). Mirrors the editor's SyncTuner nudge controls
+ *  but lifted out so SyncPatchPanel rows can drive them per cam. */
+function NudgeButtons({ onNudge }: { onNudge: (deltaMs: number) => void }) {
+  function go(sign: -1 | 1, e: React.MouseEvent) {
+    e.stopPropagation();
+    const coarse = e.altKey || e.shiftKey;
+    onNudge(sign * (coarse ? 100 : 1));
+  }
+  return (
+    <span className="inline-flex gap-1">
+      <button
+        type="button"
+        onClick={(e) => go(-1, e)}
+        title="Nudge ⁠–1 ms (Alt for ⁠–100 ms)"
+        aria-label="Nudge earlier"
+        className="h-6 w-6 inline-flex items-center justify-center rounded border border-rule bg-paper-hi hover:bg-paper-deep active:translate-y-px font-mono text-[10px] text-ink"
+      >
+        ◀
+      </button>
+      <button
+        type="button"
+        onClick={(e) => go(1, e)}
+        title="Nudge +1 ms (Alt for +100 ms)"
+        aria-label="Nudge later"
+        className="h-6 w-6 inline-flex items-center justify-center rounded border border-rule bg-paper-hi hover:bg-paper-deep active:translate-y-px font-mono text-[10px] text-ink"
+      >
+        ▶
+      </button>
+    </span>
   );
 }
 

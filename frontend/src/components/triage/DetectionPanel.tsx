@@ -123,8 +123,60 @@ export function DetectionPanel() {
           <Stat label="Kept" value={`${acceptedCount} chunk${acceptedCount === 1 ? "" : "s"}`} />
           <Stat label="Time" value={formatDuration(acceptedDurationMs)} />
         </div>
+        <div className="border-t border-rule pt-2">
+          <SessionBpmRow />
+        </div>
       </div>
     </section>
+  );
+}
+
+function SessionBpmRow() {
+  const sessionBpm = useTriageStore((s) => s.sessionBpmOverride);
+  const setSessionBpm = useTriageStore((s) => s.setSessionBpm);
+  // Local edit buffer so the user can type freely without the store
+  // bouncing values back at every keystroke.
+  return (
+    <div>
+      <div className="flex items-baseline justify-between mb-1">
+        <span className="font-display tracking-label uppercase text-[10px] text-ink-2">
+          Session BPM
+        </span>
+        <span className="font-mono text-[10px] tabular text-ink-3">
+          {sessionBpm ? "forced" : "auto per chunk"}
+        </span>
+      </div>
+      <div className="flex items-center gap-2">
+        <input
+          type="number"
+          min={40}
+          max={240}
+          step={0.5}
+          value={sessionBpm ?? ""}
+          placeholder="auto"
+          onChange={(e) => {
+            const v = e.target.value;
+            if (v === "") {
+              setSessionBpm(null);
+              return;
+            }
+            const n = Number(v);
+            if (Number.isFinite(n) && n > 0) setSessionBpm(n);
+          }}
+          className="flex-1 h-8 bg-paper-deep border border-rule rounded px-2 font-mono tabular text-sm text-ink focus:outline-none focus:border-cobalt"
+        />
+        {sessionBpm !== null && (
+          <button
+            type="button"
+            onClick={() => setSessionBpm(null)}
+            className="font-mono text-[10px] tracking-label uppercase text-ink-3 hover:text-ink"
+            title="Revert to per-chunk auto-detected BPM"
+          >
+            auto
+          </button>
+        )}
+      </div>
+    </div>
   );
 }
 

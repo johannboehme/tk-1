@@ -27,6 +27,7 @@ import {
   type TriageStageProgress,
 } from "../local/triage/triage-orchestrator";
 import { useTriageStore } from "../local/triage/triage-store";
+import { useTriagePersist } from "../local/triage/useTriagePersist";
 import { SyncPatchPanel } from "../components/sync/SyncPatchPanel";
 import { TriageTimeline } from "../components/triage/TriageTimeline";
 import { TriageTransportBar } from "../components/triage/TriageTransportBar";
@@ -52,6 +53,11 @@ export default function Triage() {
   const reset = useTriageStore((s) => s.reset);
   const setSelectedCamId = useTriageStore((s) => s.setSelectedCamId);
   const selectedCamId = useTriageStore((s) => s.selectedCamId);
+  const nudgeCamSync = useTriageStore((s) => s.nudgeCamSyncOverride);
+  const cams = useTriageStore((s) => s.cams);
+  // Persist hook — writes chunks/silenceConfig/sessionBpm/cam-sync
+  // changes back to the job row in IDB (debounced).
+  useTriagePersist();
 
   // Load the job snapshot.
   useEffect(() => {
@@ -100,6 +106,7 @@ export default function Triage() {
           cams: videos,
           chunks: chunksToUse,
           silenceConfig: job.silenceConfig ?? DEFAULT_SILENCE_CONFIG,
+          sessionBpmOverride: job.sessionBpmOverride ?? null,
           pcm: result.pcm,
           pcmSampleRate: result.sampleRate,
           envelope: result.envelope,
@@ -148,6 +155,10 @@ export default function Triage() {
                   job={job}
                   selectedCamId={selectedCamId}
                   onSelectCam={(id) => setSelectedCamId(id)}
+                  onNudgeCam={(id, deltaMs) => nudgeCamSync(id, deltaMs)}
+                  syncOverrides={Object.fromEntries(
+                    cams.map((c) => [c.id, c.syncOverrideMs ?? 0]),
+                  )}
                 />
               )}
             </aside>
