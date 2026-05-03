@@ -95,6 +95,11 @@ export default function JobPage() {
   // sync data lets the user re-enter the editor or kick off another
   // render attempt without redoing the upload + analysis.
   const canRetry = isFailed && Boolean(job.sync);
+  // Quick render is the "drop video + audio → aligned MP4" shortcut —
+  // skips the editor entirely. Doesn't fit the long-form workflow
+  // (chunks need to be triaged, arranged, then composed in the editor),
+  // so we hide it for that path.
+  const showQuickRender = job.mode !== "longform";
 
   return (
     <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6 sm:py-10">
@@ -142,11 +147,13 @@ export default function JobPage() {
 
       {(isDone || canRetry) && (
         <div className="flex flex-wrap gap-3 border-t border-rule pt-5">
-          <ChunkyButton variant="primary" size="lg" onClick={onQuickRender}>
-            {canRetry ? "Retry quick render" : "Quick render"}
-          </ChunkyButton>
+          {showQuickRender && (
+            <ChunkyButton variant="primary" size="lg" onClick={onQuickRender}>
+              {canRetry ? "Retry quick render" : "Quick render"}
+            </ChunkyButton>
+          )}
           <ChunkyButton
-            variant="secondary"
+            variant={showQuickRender ? "secondary" : "primary"}
             size="lg"
             onClick={() => navigate(jobRoutePath(job.id, nextRouteForJob(job)))}
           >
