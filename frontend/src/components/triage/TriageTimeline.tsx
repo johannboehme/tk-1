@@ -486,11 +486,13 @@ export function TriageTimeline() {
       >
         {barTicks.map((tick, i) => {
           const dim = tick.extension;
-          // Three tiers of marker, each with its own stroke + height
-          // so the eye reads the hierarchy at any zoom:
-          //   bar-major: 2px, full height, labeled with bar number
-          //   bar-minor: 1.5px, ~70% height, no label
-          //   beat:      1px, ~40% height, no label
+          // Five tiers of marker, each with its own stroke + height so
+          // the eye reads the hierarchy at every zoom:
+          //   bar-major: 2px,   100%, labeled with bar number
+          //   bar-minor: 1.5px,  70%, no label
+          //   beat:      1px,    40%
+          //   div8:      1px,    25%
+          //   div16:     1px,    15%
           let tickWidth = 1;
           let tickHeight = "40%";
           let tickColor = dim ? "#FF572233" : "#FF5722B0";
@@ -502,6 +504,12 @@ export function TriageTimeline() {
             tickWidth = 1.5;
             tickHeight = "70%";
             tickColor = dim ? "#FF572255" : "#FF5722CC";
+          } else if (tick.kind === "div8") {
+            tickHeight = "25%";
+            tickColor = dim ? "#FF572222" : "#FF572288";
+          } else if (tick.kind === "div16") {
+            tickHeight = "15%";
+            tickColor = dim ? "#FF572218" : "#FF572266";
           }
           const x = timeToX(tick.tS);
           return (
@@ -706,9 +714,11 @@ interface BarTick {
   /** Visual category — drives stroke + label rendering.
    *  - "bar-major": labeled downbeat (e.g. bar 1, 5, 9 at stride 4)
    *  - "bar-minor": unlabeled downbeat between major bars
-   *  - "beat":      sub-bar beat tick (high zoom only)
+   *  - "beat":      sub-bar beat tick (mid–high zoom)
+   *  - "div8":      half-beat tick (high zoom)
+   *  - "div16":     quarter-beat tick (very high zoom)
    */
-  kind: "bar-major" | "bar-minor" | "beat";
+  kind: "bar-major" | "bar-minor" | "beat" | "div8" | "div16";
   /** Bar number — 1 at the chunk's audio-start anchor. Only rendered
    *  for `bar-major` ticks. */
   barIndex: number;
@@ -737,6 +747,8 @@ interface BarTick {
 const TARGET_LABEL_PX = 56;
 const MIN_MINOR_BAR_PX = 6;
 const MIN_BEAT_PX = 8;
+const MIN_DIV8_PX = 32; // px per beat — enough room to slot a 1/8 tick mid-beat
+const MIN_DIV16_PX = 64; // px per beat — room for 1/16 quarters
 
 function pickBarStride(pxPerBar: number): number {
   if (pxPerBar >= TARGET_LABEL_PX) return 1;
@@ -770,6 +782,8 @@ function usePerChunkBarTicks(
     const stride = pickBarStride(pxPerBar);
     const showMinorBars = stride > 1 && pxPerBar >= MIN_MINOR_BAR_PX;
     const showBeats = stride === 1 && pxPerBeat >= MIN_BEAT_PX;
+    const showDiv8 = stride === 1 && pxPerBeat >= MIN_DIV8_PX;
+    const showDiv16 = stride === 1 && pxPerBeat >= MIN_DIV16_PX;
 
     const startS = chunk.startMs / 1000;
     const endS = chunk.endMs / 1000;
@@ -784,25 +798,48 @@ function usePerChunkBarTicks(
     const lastBeatI = Math.floor((renderEnd - anchorS) / sPerBeat + 1e-9);
     for (let i = firstBeatI; i <= lastBeatI; i++) {
       const t = anchorS + i * sPerBeat;
-      if (t < renderStart - 1e-9 || t > renderEnd + 1e-9) continue;
       const beatInBar = ((i % beatsPerBar) + beatsPerBar) % beatsPerBar;
       const isDownbeat = beatInBar === 0;
       const barIndex = Math.floor(i / beatsPerBar) + 1;
       const isLabeled =
         isDownbeat && (((barIndex - 1) % stride) + stride) % stride === 0;
 
-      let kind: BarTick["kind"];
-      if (isLabeled) kind = "bar-major";
-      else if (isDownbeat) {
-        if (!showMinorBars) continue;
-        kind = "bar-minor";
-      } else {
-        if (!showBeats) continue;
-        kind = "beat";
+      // Beat-aligned tick (bar-major / bar-minor / beat).
+      if (t >= renderStart - 1e-9 && t <= renderEnd + 1e-9) {
+        let kind: BarTick["kind"] | null = null;
+        if (isLabeled) kind = "bar-major";
+        else if (isDownbeat) {
+          if (showMinorBars) kind = "bar-minor";
+        } else {
+          if (showBeats) kind = "beat";
+        }
+        if (kind) {
+          const extension = t < startS || t > endS;
+          ticks.push({ tS: t, kind, barIndex, extension });
+        }
       }
 
-      const extension = t < startS || t > endS;
-      ticks.push({ tS: t, kind, barIndex, extension });
+      // Sub-beat ticks (1/8 + 1/16 subdivisions) only emit when zoom
+      // gives them enough room to be readable.
+      if (showDiv8) {
+        const halfT = t + sPerBeat / 2;
+        if (halfT >= renderStart - 1e-9 && halfT <= renderEnd + 1e-9) {
+          const extension = halfT < startS || halfT > endS;
+          ticks.push({ tS: halfT, kind: "div8", barIndex, extension });
+        }
+      }
+      if (showDiv16) {
+        const q1 = t + sPerBeat / 4;
+        const q3 = t + (3 * sPerBeat) / 4;
+        if (q1 >= renderStart - 1e-9 && q1 <= renderEnd + 1e-9) {
+          const extension = q1 < startS || q1 > endS;
+          ticks.push({ tS: q1, kind: "div16", barIndex, extension });
+        }
+        if (q3 >= renderStart - 1e-9 && q3 <= renderEnd + 1e-9) {
+          const extension = q3 < startS || q3 > endS;
+          ticks.push({ tS: q3, kind: "div16", barIndex, extension });
+        }
+      }
     }
     return ticks;
   }, [chunks, focusedChunkId, jobBpm, beatsPerBar, viewStartS, viewEndS, pxPerSec]);
