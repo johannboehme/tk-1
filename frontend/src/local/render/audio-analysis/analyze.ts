@@ -45,6 +45,25 @@ const MAX_BPM = 200;
 // Beat-tracking weight on the period prior (higher = more rigid tempo).
 const BEAT_PRIOR_ALPHA = 100;
 
+// Perceptual-tempo prior centre (BPM). Autocorrelation peaks tend to
+// alias across tempo octaves: a track at 85 BPM shows a strong peak at
+// 170 BPM too (every onset = 2 × 85), and the unweighted picker
+// frequently lands on the wrong octave. A Rayleigh prior centred near
+// the typical music range (~100–110 BPM) softly biases the picker
+// toward perceptually-natural tempos without hard-cutting any region
+// of the search space — drum'n'bass at 170 still wins if its AC is
+// strong enough, but a lo-fi-hip-hop track that quietly autocorrelates
+// at 180 lands on its true 90 BPM. Klapuri / Davies-style construction.
+const TEMPO_PRIOR_SIGMA_BPM = 110;
+const TEMPO_PRIOR_NORM = Math.exp(0.5); // so prior(σ) = 1.
+
+/** Rayleigh-shaped weighting in [0, 1]; peaks at σ. */
+function tempoPrior(bpm: number): number {
+  const sigma = TEMPO_PRIOR_SIGMA_BPM;
+  const x = bpm / sigma;
+  return TEMPO_PRIOR_NORM * x * Math.exp(-(x * x) / 2);
+}
+
 export interface AnalyzeOptions {
   /** Override frames-per-second target (default 30). Mostly for tests. */
   framesPerSec?: number;
@@ -485,12 +504,16 @@ function detectTempo(strength: number[], framesPerSec: number): Tempo | null {
 
   // Octave voting: combine ac[lag] with ac[2*lag] and ac[lag/2] (downscaled)
   // to bias toward the perceptual tempo and avoid tempo-half/double errors.
+  // Then multiply by a Rayleigh-shaped tempo prior so the picker softly
+  // prefers musically-typical tempos without hard-cutting fast or slow
+  // material — see TEMPO_PRIOR_SIGMA_BPM rationale at top of file.
   const voted = new Array<number>(maxLag + 1).fill(0);
   for (let lag = minLag; lag <= maxLag; lag++) {
     let v = ac[lag];
     if (2 * lag <= maxLag) v += 0.5 * ac[2 * lag];
     if (lag % 2 === 0) v += 0.3 * ac[lag / 2];
-    voted[lag] = v;
+    const bpm = (60 / lag) * framesPerSec;
+    voted[lag] = v * tempoPrior(bpm);
   }
 
   // Pick the peak.
