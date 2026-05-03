@@ -28,7 +28,9 @@ export default function App() {
   // (the editor and the render screen).
   const isFullBleed =
     /^\/job\/[^/]+\/edit/.test(location.pathname) ||
-    /^\/job\/[^/]+\/render$/.test(location.pathname);
+    /^\/job\/[^/]+\/render$/.test(location.pathname) ||
+    /^\/job\/[^/]+\/triage$/.test(location.pathname) ||
+    /^\/job\/[^/]+\/arrange$/.test(location.pathname);
   // `caps` starts with the sync probe (webgpu=false) and gets the
   // async-probed `webgpu` merged in once `initCapabilities()` resolves.
   // Both Settings (display) and any render-backend consumer that reads

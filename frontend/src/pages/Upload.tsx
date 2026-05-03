@@ -4,7 +4,6 @@ import { RuleStrip } from "../editor/components/RuleStrip";
 import { formatBytes } from "../components/ProgressBar";
 import { createJob } from "../local/jobs";
 import type { JobMode } from "../local/jobs";
-import { jobRoutePath } from "../local/jobs-routing";
 import type { PickedAsset } from "../local/asset-source";
 import {
   pickAudioFile,
@@ -53,11 +52,13 @@ export default function Upload() {
         title: title || null,
         mode,
       });
-      // Direct mode lands on /job/:id (which redirects to /edit once
-      // sync completes); long-form jumps straight to /triage so the
-      // user can configure detection while sync runs in the background.
-      const dest = mode === "longform" ? jobRoutePath(jobId, "triage") : `/job/${jobId}`;
-      navigate(dest);
+      // Both modes go to /job/:id first — sync needs to run before
+      // any further phase. Triage's silence detection wants the
+      // decoded master audio, BPM-per-chunk wants audio analysis,
+      // and Cam-Preview wants the per-cam frame strips. JobPage's
+      // "Continue → Triage" / "Open editor" button (driven by
+      // nextRouteForJob) takes over once sync completes.
+      navigate(`/job/${jobId}`);
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Could not start the project");
       setBusy(false);
@@ -213,13 +214,12 @@ export default function Upload() {
                 </>
               }
               path={
-                <span className="leading-tight">
-                  <span className="text-ink-3">●━┓ ┏━▶</span>{" "}
+                <>
+                  <span className="text-ink-3">●━━▶</span>{" "}
+                  <span className="text-ink-2 group-hover:text-hot transition-colors">TRIAGE</span>{" "}
+                  <span className="text-ink-3">━▶</span>{" "}
                   <span className="text-ink-2 group-hover:text-hot transition-colors">EDITOR</span>
-                  <br />
-                  <span className="text-ink-3 pl-[2.4ch]">┗━┛</span>{" "}
-                  <span className="text-ink-2 group-hover:text-hot transition-colors">TRIAGE</span>
-                </span>
+                </>
               }
               onClick={() => handleSubmit("longform")}
               disabled={!ready}

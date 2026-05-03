@@ -6,15 +6,17 @@
  *
  * Placeholder für Phase 1: Routing + Job-State-Machine. Echte Arrange-UI
  * kommt in Phase 5 dazu.
+ *
+ * Layout: Full-bleed (TopBar wird in App.tsx ausgeblendet). Wiederverwendet
+ * den PhaseStrip von Triage.
  */
 
 import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { ChunkyButton } from "../editor/components/ChunkyButton";
-import { RuleStrip } from "../editor/components/RuleStrip";
 import { jobsDb } from "../local/jobs";
 import type { LocalJob } from "../local/jobs";
 import { jobRoutePath } from "../local/jobs-routing";
+import { PhaseStrip } from "./Triage";
 
 export default function Arrange() {
   const { id = "" } = useParams<{ id: string }>();
@@ -33,54 +35,33 @@ export default function Arrange() {
   }, [id]);
 
   return (
-    <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6 sm:py-10">
-      <header className="mb-8">
-        <div className="flex items-center gap-3 mb-3">
-          <span className="font-mono text-xs tracking-label uppercase text-ink-2">
-            STEP 02 · ARRANGE · SEQUENCE
-          </span>
-          <RuleStrip count={32} className="text-rule flex-1 max-w-[220px]" />
-        </div>
-        <h1 className="font-display font-semibold text-[clamp(32px,4vw,52px)] leading-[1] tracking-tight text-ink">
-          Order the cuts.<br />
-          <span className="text-hot">Build the song.</span>
-        </h1>
-      </header>
+    <div className="flex-1 flex flex-col min-h-0 paper-bg">
+      <PhaseStrip
+        phase="arrange"
+        jobTitle={job?.title ?? null}
+        jobId={id}
+        onBack={() => navigate(jobRoutePath(id, "triage"))}
+        onContinue={() => navigate(jobRoutePath(id, "edit"))}
+        continueLabel="Continue → Editor"
+      />
 
-      <div className="rounded-lg border-2 border-dashed border-rule bg-paper-hi p-8 mb-6 min-h-[320px] flex items-center justify-center">
-        <div className="text-center max-w-md">
-          <p className="font-mono text-xs tracking-label uppercase text-ink-3 mb-3">
-            ◇ ARRANGE UI · UNDER CONSTRUCTION
+      <main className="flex-1 min-h-0 grid place-items-center px-4 py-6">
+        <div className="text-center max-w-md text-ink-3">
+          <p className="font-mono text-xs tracking-label uppercase mb-3">
+            ◇ Arrange UI · under construction
           </p>
-          <p className="text-ink-2 leading-relaxed">
+          <p className="text-ink-2 leading-relaxed text-sm">
             Hier landet der Mini-Arranger zum Sortieren / Duplizieren der
             Chunks. Placeholder für die Routing-Verkabelung.
           </p>
           {job && (
-            <p className="font-mono text-[11px] text-ink-3 mt-4 tabular">
-              Job: {job.title ?? job.id} · chunks={job.chunks?.length ?? 0}
+            <p className="font-mono text-[11px] mt-4 tabular">
+              chunks={job.chunks?.length ?? 0} ·
+              arrangement={job.arrangement?.length ?? 0}
             </p>
           )}
         </div>
-      </div>
-
-      <div className="flex justify-between gap-3">
-        <ChunkyButton
-          variant="ghost"
-          size="lg"
-          onClick={() => navigate(jobRoutePath(id, "triage"))}
-        >
-          ← Back to Triage
-        </ChunkyButton>
-        <ChunkyButton
-          variant="primary"
-          size="lg"
-          onClick={() => navigate(jobRoutePath(id, "edit"))}
-          className="min-w-[200px]"
-        >
-          Continue → Editor
-        </ChunkyButton>
-      </div>
-    </main>
+      </main>
+    </div>
   );
 }
