@@ -26,6 +26,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { ChunkyButton } from "../editor/components/ChunkyButton";
+import { HelpIcon } from "../editor/components/icons";
 import { SnapModeButtonsView } from "../editor/components/SnapModeButtonsView";
 import { jobsDb } from "../local/jobs";
 import type { LocalJob } from "../local/jobs";
@@ -449,6 +450,23 @@ export function PhaseStrip({
       >
         {jobTitle ?? jobId.slice(0, 8)}
       </span>
+      {/* Help button — dispatches a synthetic "?" keydown so the
+       *  globally-mounted HelpOverlay opens. Same pattern the editor
+       *  uses; no separate state to manage. */}
+      <ChunkyButton
+        variant="secondary"
+        size="sm"
+        className="aspect-square"
+        aria-label="Show keyboard shortcuts"
+        title="Keyboard shortcuts · ?"
+        onClick={() =>
+          window.dispatchEvent(
+            new KeyboardEvent("keydown", { key: "?", bubbles: true }),
+          )
+        }
+      >
+        <HelpIcon />
+      </ChunkyButton>
       <ChunkyButton variant="primary" size="sm" onClick={onContinue}>
         {continueLabel}
       </ChunkyButton>
