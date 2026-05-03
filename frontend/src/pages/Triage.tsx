@@ -62,6 +62,31 @@ export default function Triage() {
   // changes back to the job row in IDB (debounced).
   useTriagePersist();
 
+  // Continue → Arrange handler: seed `arrangement` with the user's
+  // accepted chunks (chronological order). On re-entry, only newly-
+  // accepted chunks get appended — preserves any custom ordering the
+  // user already did.
+  async function continueToArrange() {
+    const state = useTriageStore.getState();
+    if (!state.jobId) return;
+    const fresh = await jobsDb.getJob(state.jobId);
+    const existing = fresh?.arrangement ?? [];
+    const inArrangement = new Set(existing.map((a) => a.chunkId));
+    const acceptedSorted = [...state.chunks]
+      .filter((c) => c.accepted)
+      .sort((a, b) => a.startMs - b.startMs);
+    const additions = acceptedSorted
+      .filter((c) => !inArrangement.has(c.id))
+      .map((c, i) => ({
+        id: `arr-${c.id}-${Date.now()}-${i}`,
+        chunkId: c.id,
+      }));
+    await jobsDb.updateJob(state.jobId, {
+      arrangement: [...existing, ...additions],
+    });
+    navigate(jobRoutePath(id, "arrange"));
+  }
+
   // Load the job snapshot.
   useEffect(() => {
     if (!id) return;
@@ -181,7 +206,7 @@ export default function Triage() {
         jobTitle={job?.title ?? null}
         jobId={id}
         onBack={() => navigate(`/job/${id}`)}
-        onContinue={() => navigate(jobRoutePath(id, "arrange"))}
+        onContinue={continueToArrange}
         continueLabel="Continue → Arrange"
       />
 

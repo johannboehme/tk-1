@@ -48,18 +48,12 @@ export default function Arrange() {
       <main className="flex-1 min-h-0 grid place-items-center px-4 py-6">
         <div className="text-center max-w-md text-ink-3">
           <p className="font-mono text-xs tracking-label uppercase mb-3">
-            ◇ Arrange UI · under construction
+            ◇ Arrange · coming next
           </p>
           <p className="text-ink-2 leading-relaxed text-sm">
-            Hier landet der Mini-Arranger zum Sortieren / Duplizieren der
-            Chunks. Placeholder für die Routing-Verkabelung.
+            The mini-arranger lands here once Triage is fully signed
+            off. For now, navigate back to keep curating.
           </p>
-          {job && (
-            <p className="font-mono text-[11px] mt-4 tabular">
-              chunks={job.chunks?.length ?? 0} ·
-              arrangement={job.arrangement?.length ?? 0}
-            </p>
-          )}
         </div>
       </main>
     </div>

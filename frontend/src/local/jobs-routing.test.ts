@@ -27,17 +27,12 @@ describe("nextRouteForJob", () => {
     expect(nextRouteForJob(job)).toBe("edit");
   });
 
-  it("routes longform jobs without chunks to /triage", () => {
+  it("routes longform without arrangement to /triage (even if chunks auto-detected)", () => {
     const job = baseJob({ mode: "longform" });
     expect(nextRouteForJob(job)).toBe("triage");
   });
 
-  it("routes longform jobs with empty chunks[] to /triage", () => {
-    const job = baseJob({ mode: "longform", chunks: [] });
-    expect(nextRouteForJob(job)).toBe("triage");
-  });
-
-  it("routes longform with chunks but no arrangement to /arrange", () => {
+  it("treats auto-detected chunks alone as 'still in triage'", () => {
     const job = baseJob({
       mode: "longform",
       chunks: [
@@ -53,10 +48,10 @@ describe("nextRouteForJob", () => {
         },
       ],
     });
-    expect(nextRouteForJob(job)).toBe("arrange");
+    expect(nextRouteForJob(job)).toBe("triage");
   });
 
-  it("routes longform with chunks and empty arrangement[] to /arrange", () => {
+  it("treats arrangement === [] as 'triage done, arrange empty' → /arrange", () => {
     const job = baseJob({
       mode: "longform",
       chunks: [
@@ -76,7 +71,7 @@ describe("nextRouteForJob", () => {
     expect(nextRouteForJob(job)).toBe("arrange");
   });
 
-  it("routes longform with chunks and arrangement to /edit", () => {
+  it("routes longform with arrangement items to /edit", () => {
     const job = baseJob({
       mode: "longform",
       chunks: [
@@ -94,13 +89,5 @@ describe("nextRouteForJob", () => {
       arrangement: [{ id: "a1", chunkId: "c1" }],
     });
     expect(nextRouteForJob(job)).toBe("edit");
-  });
-
-  it("ignores arrangement when chunks are missing (defensive)", () => {
-    const job = baseJob({
-      mode: "longform",
-      arrangement: [{ id: "a1", chunkId: "c1" }],
-    });
-    expect(nextRouteForJob(job)).toBe("triage");
   });
 });
