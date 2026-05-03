@@ -5,12 +5,13 @@
  * BPM/Beat-Grid pro Chunk. User akzeptiert/verwirft pro Chunk und kann
  * Boundaries Bar-genau verschieben.
  *
- * Diese Datei ist aktuell ein Placeholder für Phase 1: Routing +
- * Job-State-Machine. Die echte Triage-UI (Waveform-Overview, Cam-
- * Switcher, Per-Chunk Refinement) baut Phase 3+4 darauf.
- *
  * Layout: Full-bleed (TopBar wird in App.tsx ausgeblendet). Thin top
  * strip mit Phase-Breadcrumb + Continue, der Rest ist Werkzeug-Fläche.
+ *
+ * Desktop (≥ lg): 3-Spalten-Layout — Cam-Preview + Sync links, Timeline
+ * Mitte, Detection + Inspector + Chunks-List rechts.
+ * Mobile (< lg): vertikaler Stack — Timeline → Transport → Inspector
+ * (sticky) → Chunks-List → Sync/Detection als Accordions.
  */
 
 import { useEffect, useRef, useState } from "react";
@@ -19,17 +20,26 @@ import { ChunkyButton } from "../editor/components/ChunkyButton";
 import { jobsDb } from "../local/jobs";
 import type { LocalJob } from "../local/jobs";
 import { jobRoutePath } from "../local/jobs-routing";
+import { isVideoAsset } from "../storage/jobs-db";
 import {
   DEFAULT_SILENCE_CONFIG,
   runChunkDetectionForJob,
-  type RunChunkDetectionResult,
   type TriageStageProgress,
 } from "../local/triage/triage-orchestrator";
+import { useTriageStore } from "../local/triage/triage-store";
+import { SyncPatchPanel } from "../components/sync/SyncPatchPanel";
+import { TriageTimeline } from "../components/triage/TriageTimeline";
+import { TriageTransportBar } from "../components/triage/TriageTransportBar";
+import { DetectionPanel } from "../components/triage/DetectionPanel";
+import { ChunkInspector } from "../components/triage/ChunkInspector";
+import { ChunksList } from "../components/triage/ChunksList";
+import { CamPreview } from "../components/triage/CamPreview";
+import { TriageAudioMaster } from "../components/triage/useTriageAudio";
 
 type DetectionState =
   | { kind: "idle" }
   | { kind: "running"; stage: TriageStageProgress["stage"] }
-  | { kind: "ready"; result: RunChunkDetectionResult }
+  | { kind: "ready" }
   | { kind: "error"; message: string };
 
 export default function Triage() {
@@ -37,10 +47,13 @@ export default function Triage() {
   const navigate = useNavigate();
   const [job, setJob] = useState<LocalJob | null>(null);
   const [detection, setDetection] = useState<DetectionState>({ kind: "idle" });
-  // Guard against double-firing the detection effect under StrictMode and
-  // against re-runs when the persisted chunks come back in via setJob().
   const detectionStartedRef = useRef(false);
+  const initFromJob = useTriageStore((s) => s.initFromJob);
+  const reset = useTriageStore((s) => s.reset);
+  const setSelectedCamId = useTriageStore((s) => s.setSelectedCamId);
+  const selectedCamId = useTriageStore((s) => s.selectedCamId);
 
+  // Load the job snapshot.
   useEffect(() => {
     if (!id) return;
     let active = true;
@@ -52,15 +65,21 @@ export default function Triage() {
     };
   }, [id]);
 
-  // Kick off chunk detection when the job is synced and we don't yet
-  // have any chunks. Idempotent — runs at most once per page mount.
+  // Reset triage store on unmount so PCM doesn't pin memory after
+  // navigation away.
+  useEffect(() => {
+    return () => {
+      reset();
+    };
+  }, [reset]);
+
+  // Kick off detection (or load cached chunks) when the job is synced.
   useEffect(() => {
     if (!job || job.status !== "synced") return;
     if (detectionStartedRef.current) return;
     if (detection.kind !== "idle") return;
-    if (job.chunks && job.chunks.length > 0) return;
-
     detectionStartedRef.current = true;
+
     let cancelled = false;
     setDetection({ kind: "running", stage: "decoding" });
     runChunkDetectionForJob(job.id, job.silenceConfig ?? DEFAULT_SILENCE_CONFIG, {
@@ -70,12 +89,23 @@ export default function Triage() {
     })
       .then((result) => {
         if (cancelled) return;
-        setDetection({ kind: "ready", result });
-        // Refresh the job snapshot so chunks/silenceConfig come from
-        // the persisted source of truth.
-        jobsDb.getJob(job.id).then((j) => {
-          if (!cancelled && j) setJob(j);
+        const videos = (job.videos ?? []).filter(isVideoAsset);
+        // If the job already had stored chunks (returning to triage),
+        // prefer them over the freshly-detected — they carry user
+        // accept/reject decisions.
+        const chunksToUse = job.chunks && job.chunks.length > 0 ? job.chunks : result.chunks;
+        initFromJob({
+          jobId: job.id,
+          audioDuration: job.durationS ?? result.pcm.length / result.sampleRate,
+          cams: videos,
+          chunks: chunksToUse,
+          silenceConfig: job.silenceConfig ?? DEFAULT_SILENCE_CONFIG,
+          pcm: result.pcm,
+          pcmSampleRate: result.sampleRate,
+          envelope: result.envelope,
+          envelopeHz: result.envelopeHz,
         });
+        setDetection({ kind: "ready" });
       })
       .catch((err) => {
         if (cancelled) return;
@@ -88,9 +118,7 @@ export default function Triage() {
     return () => {
       cancelled = true;
     };
-  }, [job, detection.kind]);
-
-  const status = jobStatusLabel(job, detection);
+  }, [job, detection.kind, initFromJob]);
 
   return (
     <div className="flex-1 flex flex-col min-h-0 paper-bg">
@@ -103,64 +131,92 @@ export default function Triage() {
         continueLabel="Continue → Arrange"
       />
 
-      <main className="flex-1 min-h-0 grid place-items-center px-4 py-6">
-        <div className="text-center max-w-md text-ink-3">
-          <p className="font-mono text-xs tracking-label uppercase mb-3">
-            ◇ Triage UI · under construction
-          </p>
-          <p className="text-ink-2 leading-relaxed text-sm mb-4">
-            Detection-Backend läuft, UI kommt im nächsten Phasen-Schritt.
-          </p>
-          <div className="font-mono text-[11px] tabular space-y-1 text-left inline-block bg-paper-hi border border-rule rounded-md px-4 py-3">
-            <div>job: {job ? job.title ?? job.id.slice(0, 8) : "loading…"}</div>
-            <div>status: {status}</div>
-            {detection.kind === "ready" && (
-              <>
-                <div>chunks: {detection.result.chunks.length}</div>
-                <div>
-                  envelope: {detection.result.envelope.length} samples @{" "}
-                  {detection.result.envelopeHz} Hz
+      {/* Hidden audio element drives the master clock. */}
+      {detection.kind === "ready" && <TriageAudioMaster />}
+
+      {detection.kind !== "ready" ? (
+        <NotReady job={job} detection={detection} />
+      ) : (
+        <>
+          {/* Desktop layout: 3-col split. Mobile: vertical stack. */}
+          <main className="flex-1 min-h-0 grid lg:grid-cols-[300px_1fr_320px] gap-3 px-3 py-3 overflow-y-auto lg:overflow-hidden">
+            {/* Left column — Cam preview + sync */}
+            <aside className="flex flex-col gap-3 min-h-0 order-1 lg:order-1">
+              <CamPreview />
+              {job && (
+                <SyncPatchPanel
+                  job={job}
+                  selectedCamId={selectedCamId}
+                  onSelectCam={(id) => setSelectedCamId(id)}
+                />
+              )}
+            </aside>
+
+            {/* Middle column — Timeline + Transport */}
+            <section className="flex flex-col gap-3 min-h-0 order-3 lg:order-2">
+              <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
+                <div className="flex-1 min-h-0 grid place-items-stretch">
+                  <TriageTimeline />
                 </div>
-                <div>
-                  pcm: {(detection.result.pcm.length / detection.result.sampleRate).toFixed(1)} s @{" "}
-                  {detection.result.sampleRate} Hz
-                </div>
-              </>
-            )}
-            {detection.kind === "error" && (
-              <div className="text-danger">error: {detection.message}</div>
-            )}
-          </div>
-        </div>
-      </main>
+              </div>
+              <ChunksList />
+            </section>
+
+            {/* Right column — Detection + Inspector */}
+            <aside className="flex flex-col gap-3 min-h-0 order-2 lg:order-3">
+              <DetectionPanel />
+              <ChunkInspector />
+            </aside>
+          </main>
+
+          {/* Sticky bottom transport */}
+          <TriageTransportBar />
+        </>
+      )}
     </div>
   );
 }
 
-function jobStatusLabel(
-  job: LocalJob | null,
-  detection: DetectionState,
-): string {
-  if (!job) return "—";
-  if (job.status !== "synced") return `waiting · ${job.status}`;
-  switch (detection.kind) {
-    case "idle":
-      return job.chunks && job.chunks.length > 0
-        ? `cached · ${job.chunks.length} chunks`
-        : "ready to detect";
-    case "running":
-      return `detecting · ${detection.stage}`;
-    case "ready":
-      return `detected · ${detection.result.chunks.length} chunks`;
-    case "error":
-      return "error";
-  }
+// ─── Shared loading / error state UI ────────────────────────────────────
+
+function NotReady({
+  job,
+  detection,
+}: {
+  job: LocalJob | null;
+  detection: DetectionState;
+}) {
+  const stageLabel =
+    detection.kind === "running"
+      ? `${detection.stage}…`
+      : detection.kind === "error"
+        ? "error"
+        : job?.status !== "synced"
+          ? `waiting · ${job?.status ?? "loading"}`
+          : "ready to detect";
+  return (
+    <main className="flex-1 min-h-0 grid place-items-center px-4 py-6">
+      <div className="text-center max-w-md text-ink-3">
+        <p className="font-mono text-xs tracking-label uppercase mb-3">
+          ◇ Triage · {stageLabel}
+        </p>
+        {detection.kind === "error" ? (
+          <p className="text-danger leading-relaxed text-sm font-mono">
+            {detection.message}
+          </p>
+        ) : (
+          <p className="text-ink-2 leading-relaxed text-sm">
+            {job?.status !== "synced"
+              ? "Waiting for sync to complete before chunk detection can run."
+              : "Decoding master audio + detecting chunks…"}
+          </p>
+        )}
+      </div>
+    </main>
+  );
 }
 
-// -----------------------------------------------------------------------------
-// PhaseStrip — shared thin top bar for Triage + Arrange (and later phases).
-// Lives here for now; promote to its own file once Arrange also wants it.
-// -----------------------------------------------------------------------------
+// ─── PhaseStrip (shared with Arrange) ───────────────────────────────────
 
 interface PhaseStripProps {
   phase: "triage" | "arrange";
