@@ -12,25 +12,16 @@
  * BPM lives on the brass plate inside ChunkInspector — this panel
  * is purely about "where do chunks begin and end".
  */
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { detectChunksFromEnvelope } from "../../local/triage/chunk-detect";
 import { jobsDb } from "../../local/jobs";
 import {
   isChunkEffectivelyAccepted,
   useTriageStore,
 } from "../../local/triage/triage-store";
-import { HardwarePopover } from "../../editor/components/HardwarePopover";
 import type { SilenceConfig } from "../../storage/jobs-db";
 
-/** Bar-length threshold options for the min-bars filter. 0 = off. */
-const MIN_BARS_OPTIONS: ReadonlyArray<{ value: number; label: string; short: string }> = [
-  { value: 0, label: "OFF", short: "OFF" },
-  { value: 1, label: "≥ 1", short: "≥1" },
-  { value: 2, label: "≥ 2", short: "≥2" },
-  { value: 4, label: "≥ 4", short: "≥4" },
-  { value: 8, label: "≥ 8", short: "≥8" },
-  { value: 16, label: "≥ 16", short: "≥16" },
-];
+const MIN_BARS_FILTER_MAX = 999;
 
 const LCD_BG = `
   repeating-linear-gradient(0deg, rgba(255,255,255,0.04) 0 1px, transparent 1px 3px),
@@ -173,11 +164,10 @@ export function DetectionPanel() {
   );
 }
 
-/** Brass-bezel LCD readout + chip-grid popover for the min-bars
- *  filter. Visual vocabulary mirrors the BpmReadout / counter LCDs:
- *  cream bezel, scanline-screen LCD, mint-green when off, amber when
- *  the filter is engaged. The chip grid uses the same pattern as the
- *  time-signature picker. */
+/** Brass-bezel LCD with click-to-edit number input — same edit
+ *  pattern as the BpmReadout. User can type any positive integer
+ *  (no power-of-2 restriction); 0 or empty turns the filter off.
+ *  LCD reads mint-green when off, amber when engaged. */
 function MinBarsFilter({
   value,
   onChange,
@@ -185,12 +175,41 @@ function MinBarsFilter({
   value: number;
   onChange: (n: number) => void;
 }) {
-  const [open, setOpen] = useState(false);
-  const triggerRef = useRef<HTMLButtonElement | null>(null);
-  const matched = MIN_BARS_OPTIONS.find((o) => o.value === value);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (editing) {
+      inputRef.current?.focus();
+      inputRef.current?.select();
+    }
+  }, [editing]);
+
+  function startEdit() {
+    setDraft(value > 0 ? String(value) : "");
+    setEditing(true);
+  }
+  function commit() {
+    const trimmed = draft.trim();
+    if (trimmed === "") {
+      onChange(0);
+    } else {
+      const n = Math.floor(Number(trimmed));
+      if (Number.isFinite(n) && n >= 0 && n <= MIN_BARS_FILTER_MAX) {
+        onChange(n);
+      }
+    }
+    setEditing(false);
+  }
+  function cancel() {
+    setEditing(false);
+  }
+
   const isDefault = value === 0;
   const lcdColor = isDefault ? LCD_GREEN : LCD_AMBER;
   const lcdGlow = isDefault ? GLOW_GREEN : GLOW_AMBER;
+  const display = isDefault ? "OFF" : `≥${value}`;
 
   const bezel: React.CSSProperties = {
     background:
@@ -203,6 +222,20 @@ function MinBarsFilter({
     borderRadius: 6,
     padding: "5px 6px",
   };
+
+  const lcdShared: React.CSSProperties = {
+    height: 28,
+    background: LCD_BG,
+    boxShadow: LCD_SHADOW,
+    color: lcdColor,
+    textShadow: lcdGlow,
+  };
+  const lcdClass = [
+    "font-mono tabular tracking-[0.05em]",
+    "text-base px-2 rounded-[3px] w-[68px]",
+    "border border-black/40",
+    "inline-flex items-center justify-center leading-none",
+  ].join(" ");
 
   return (
     <div
@@ -218,116 +251,42 @@ function MinBarsFilter({
           letterSpacing: "0.18em",
         }}
       >
-        BARS
+        MIN
       </span>
-      <button
-        ref={triggerRef}
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        aria-haspopup="dialog"
-        aria-expanded={open}
-        aria-label={`Min bars filter ${matched?.label ?? "off"} — click to change`}
-        title="Hide chunks shorter than this many bars"
-        className={[
-          "font-mono tabular tracking-[0.05em]",
-          "text-base px-2 rounded-[3px] w-[58px]",
-          "relative cursor-pointer transition",
-          "border border-black/40 hover:brightness-110",
-          "inline-flex items-center justify-center leading-none",
-        ].join(" ")}
-        style={{
-          height: 28,
-          background: LCD_BG,
-          boxShadow: LCD_SHADOW,
-          color: lcdColor,
-          textShadow: lcdGlow,
-        }}
-      >
-        {matched?.short ?? "OFF"}
-      </button>
-      <HardwarePopover
-        open={open}
-        onClose={() => setOpen(false)}
-        triggerRef={triggerRef}
-        align="center"
-        ariaLabel="Choose minimum bar length"
-      >
-        <MinBarsGrid
-          value={value}
-          onPick={(n) => {
-            onChange(n);
-            setOpen(false);
+      {editing ? (
+        <input
+          ref={inputRef}
+          type="number"
+          min={0}
+          max={MIN_BARS_FILTER_MAX}
+          step={1}
+          value={draft}
+          placeholder="0"
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commit}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commit();
+            else if (e.key === "Escape") cancel();
+          }}
+          className={`${lcdClass} text-right outline-none focus:border-hot`}
+          style={{
+            ...lcdShared,
+            paddingTop: 0,
+            paddingBottom: 0,
           }}
         />
-      </HardwarePopover>
-    </div>
-  );
-}
-
-function MinBarsGrid({
-  value,
-  onPick,
-}: {
-  value: number;
-  onPick: (n: number) => void;
-}) {
-  return (
-    <div className="flex flex-col gap-1.5" style={{ minWidth: 240 }}>
-      <div className="flex items-baseline justify-between px-0.5">
-        <span className="font-display text-[9px] tracking-[0.18em] uppercase text-ink-2">
-          Min bars
-        </span>
-        <span className="font-mono text-[9px] text-ink-3">
-          hide chunks below
-        </span>
-      </div>
-      <div
-        className="grid gap-1.5"
-        style={{ gridTemplateColumns: "repeat(3, minmax(0, 1fr))" }}
-      >
-        {MIN_BARS_OPTIONS.map((o) => {
-          const selected = o.value === value;
-          const isOff = o.value === 0;
-          const lcdColor = isOff ? LCD_GREEN : LCD_AMBER;
-          const lcdGlow = isOff ? GLOW_GREEN : GLOW_AMBER;
-          return (
-            <button
-              key={o.value}
-              type="button"
-              onClick={() => onPick(o.value)}
-              aria-pressed={selected}
-              className={[
-                "h-9 min-w-[60px] rounded-[3px] font-mono tabular tracking-[0.05em] text-sm",
-                "transition active:translate-y-[1px]",
-                selected ? "" : "hover:brightness-105",
-              ].join(" ")}
-              style={
-                selected
-                  ? {
-                      background: LCD_BG,
-                      boxShadow: LCD_SHADOW,
-                      color: lcdColor,
-                      textShadow: lcdGlow,
-                      border: "1px solid rgba(0,0,0,0.5)",
-                    }
-                  : {
-                      background:
-                        "linear-gradient(180deg, #FBF8EE 0%, #ECE3CE 100%)",
-                      boxShadow: [
-                        "inset 0 1px 0 rgba(255,255,255,0.9)",
-                        "inset 0 -1px 0 rgba(0,0,0,0.15)",
-                        "0 1px 1px rgba(0,0,0,0.15)",
-                      ].join(", "),
-                      color: "#1A1816",
-                      border: "1px solid rgba(0,0,0,0.18)",
-                    }
-              }
-            >
-              {o.label}
-            </button>
-          );
-        })}
-      </div>
+      ) : (
+        <button
+          type="button"
+          onClick={startEdit}
+          aria-label={`Min bars filter ${display} — click to change`}
+          title="Hide chunks shorter than this many bars (0 = off)"
+          className={`${lcdClass} cursor-pointer transition hover:brightness-110`}
+          style={lcdShared}
+        >
+          {display}
+        </button>
+      )}
     </div>
   );
 }
