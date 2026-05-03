@@ -1,22 +1,21 @@
 /**
  * Triage-Phase (Step 1 von 3 für Long-Form-Session-Jobs).
  *
- * Identifiziert Audio-Chunks im Master-Audio per Stille-Erkennung +
- * BPM/Beat-Grid pro Chunk. User akzeptiert/verwirft pro Chunk und kann
- * Boundaries Bar-genau verschieben.
+ * Identifiziert Audio-Chunks im Master-Audio per Stille-Erkennung. BPM
+ * + Time-Signature kommen aus der Master-Audio-Analyse und gelten
+ * song-global — alle Chunks teilen sich denselben Bar-Grid, weil sie
+ * downstream auf Bars geschnitten und zu einem Song zusammengefügt
+ * werden.
  *
- * Layout: Full-bleed (TopBar wird in App.tsx ausgeblendet). Thin top
- * strip mit Phase-Breadcrumb + Continue, der Rest ist Werkzeug-Fläche.
- *
- * Desktop (≥ lg): 3-Spalten-Layout — Cam-Preview + Sync links, Timeline
- * Mitte, Detection + Inspector + Chunks-List rechts.
- * Mobile (< lg): vertikaler Stack — Timeline → Transport → Inspector
- * (sticky) → Chunks-List → Sync/Detection als Accordions.
+ * Layout (Desktop): Top-Strip mit Cam + Inspector + Chunk-Liste,
+ * darunter SnapModeButtons-Plate, dann Timeline volle Breite, ganz
+ * unten der Transport. Mobile: vertikaler Stack.
  */
 
 import { useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { ChunkyButton } from "../editor/components/ChunkyButton";
+import { SnapModeButtonsView } from "../editor/components/SnapModeButtonsView";
 import { jobsDb } from "../local/jobs";
 import type { LocalJob } from "../local/jobs";
 import { jobRoutePath } from "../local/jobs-routing";
@@ -31,6 +30,7 @@ import { decodeAudioToMonoPcm } from "../local/codec";
 import { TRIAGE_ENVELOPE_HZ } from "../local/triage/chunk-detect";
 import { useTriageStore } from "../local/triage/triage-store";
 import { useTriagePersist } from "../local/triage/useTriagePersist";
+import { getCachedAnalysis } from "../local/render/audio-analysis";
 import { SyncPatchPanel } from "../components/sync/SyncPatchPanel";
 import { TriageTimeline } from "../components/triage/TriageTimeline";
 import { TriageTransportBar } from "../components/triage/TriageTransportBar";
@@ -58,14 +58,11 @@ export default function Triage() {
   const selectedCamId = useTriageStore((s) => s.selectedCamId);
   const nudgeCamSync = useTriageStore((s) => s.nudgeCamSyncOverride);
   const cams = useTriageStore((s) => s.cams);
-  // Persist hook — writes chunks/silenceConfig/sessionBpm/cam-sync
-  // changes back to the job row in IDB (debounced).
+  const snapMode = useTriageStore((s) => s.snapMode);
+  const setSnapMode = useTriageStore((s) => s.setSnapMode);
+  const hasBpm = useTriageStore((s) => Boolean(s.jobBpm?.value));
   useTriagePersist();
 
-  // Continue → Arrange handler: seed `arrangement` with the user's
-  // accepted chunks (chronological order). On re-entry, only newly-
-  // accepted chunks get appended — preserves any custom ordering the
-  // user already did.
   async function continueToArrange() {
     const state = useTriageStore.getState();
     if (!state.jobId) return;
@@ -87,7 +84,6 @@ export default function Triage() {
     navigate(jobRoutePath(id, "arrange"));
   }
 
-  // Load the job snapshot.
   useEffect(() => {
     if (!id) return;
     let active = true;
@@ -99,24 +95,12 @@ export default function Triage() {
     };
   }, [id]);
 
-  // Reset triage store on unmount so PCM doesn't pin memory after
-  // navigation away.
   useEffect(() => {
     return () => {
       reset();
     };
   }, [reset]);
 
-  // Two paths into the Triage UI:
-  //
-  //   (A) Fast-path — sync already produced chunks + envelope (new
-  //       longform-mode jobs go through this). The page renders
-  //       instantly with the cached data; PCM is decoded in the
-  //       background only for live slider re-runs.
-  //
-  //   (B) Slow-path fallback — chunks/envelope are missing (older
-  //       longform jobs synced before detection moved into the sync
-  //       pipeline). Run detection inline like before.
   useEffect(() => {
     if (!job || job.status !== "synced") return;
     if (detectionStartedRef.current) return;
@@ -130,55 +114,94 @@ export default function Triage() {
 
     let cancelled = false;
 
-    if (hasCached) {
-      // (A) Fast path — use cached results immediately.
-      const videos = (job.videos ?? []).filter(isVideoAsset);
-      initFromJob({
-        jobId: job.id,
-        audioDuration: job.durationS ?? 0,
-        cams: videos,
-        chunks: job.chunks!,
-        silenceConfig: job.silenceConfig ?? DEFAULT_SILENCE_CONFIG,
-        sessionBpmOverride: job.sessionBpmOverride ?? null,
-        // PCM is `null` initially. Decoded below in background. Triage
-        // UI components handle the missing-PCM state gracefully (live
-        // re-detection waits until decode finishes).
-        pcm: new Float32Array(0),
-        pcmSampleRate: 22050,
-        envelope: job.triageEnvelope!,
-        envelopeHz: TRIAGE_ENVELOPE_HZ,
-      });
-      setDetection({ kind: "ready" });
+    async function loadTimingFields(): Promise<{
+      jobBpm: ReturnType<typeof toBpmValue> | null;
+      detectedBpm: { value: number; confidence: number } | null;
+      beatsPerBar: number;
+      barOffsetBeats: number;
+      beatPhaseS: number;
+    }> {
+      // Pull cached audio analysis for the auto-detected reference;
+      // job.bpm carries the current (possibly user-overridden) value.
+      const analysis = await getCachedAnalysis(job!.id).catch(() => undefined);
+      const detectedTempo = analysis?.tempo;
+      const detectedBpm = detectedTempo
+        ? { value: detectedTempo.bpm, confidence: detectedTempo.confidence }
+        : null;
+      const persistedBpm = job!.bpm;
+      const jobBpm = persistedBpm
+        ? toBpmValue(persistedBpm)
+        : detectedBpm
+          ? { value: detectedBpm.value, confidence: detectedBpm.confidence, manualOverride: false }
+          : null;
+      return {
+        jobBpm,
+        detectedBpm,
+        beatsPerBar: job!.beatsPerBar ?? 4,
+        barOffsetBeats: job!.barOffsetBeats ?? 0,
+        beatPhaseS: analysis?.audioStartS ?? persistedBpm?.phase ?? 0,
+      };
+    }
 
-      // Background PCM decode so silence-slider re-runs work later.
-      void decodePcmInBackground(job).then((pcm) => {
-        if (cancelled || !pcm) return;
-        // Update store fields directly without resetting other state.
-        useTriageStore.setState({ pcm: pcm.pcm, pcmSampleRate: pcm.sampleRate });
+    if (hasCached) {
+      void loadTimingFields().then((timing) => {
+        if (cancelled) return;
+        const videos = (job!.videos ?? []).filter(isVideoAsset);
+        initFromJob({
+          jobId: job!.id,
+          audioDuration: job!.durationS ?? 0,
+          cams: videos,
+          chunks: job!.chunks!,
+          silenceConfig: job!.silenceConfig ?? DEFAULT_SILENCE_CONFIG,
+          jobBpm: timing.jobBpm,
+          detectedBpm: timing.detectedBpm,
+          beatsPerBar: timing.beatsPerBar,
+          barOffsetBeats: timing.barOffsetBeats,
+          beatPhaseS: timing.beatPhaseS,
+          snapMode: job!.ui?.snapMode ?? "1",
+          loopEnabled: true,
+          pcm: new Float32Array(0),
+          pcmSampleRate: 22050,
+          envelope: job!.triageEnvelope!,
+          envelopeHz: TRIAGE_ENVELOPE_HZ,
+        });
+        setDetection({ kind: "ready" });
+
+        void decodePcmInBackground(job!).then((pcm) => {
+          if (cancelled || !pcm) return;
+          useTriageStore.setState({ pcm: pcm.pcm, pcmSampleRate: pcm.sampleRate });
+        });
       });
       return () => {
         cancelled = true;
       };
     }
 
-    // (B) Slow-path fallback — detection inline.
     setDetection({ kind: "running", stage: "decoding" });
     runChunkDetectionForJob(job.id, job.silenceConfig ?? DEFAULT_SILENCE_CONFIG, {
       onStage: (p) => {
         if (!cancelled) setDetection({ kind: "running", stage: p.stage });
       },
     })
-      .then((result) => {
+      .then(async (result) => {
         if (cancelled) return;
-        const videos = (job.videos ?? []).filter(isVideoAsset);
-        const chunksToUse = job.chunks && job.chunks.length > 0 ? job.chunks : result.chunks;
+        const timing = await loadTimingFields();
+        if (cancelled) return;
+        const videos = (job!.videos ?? []).filter(isVideoAsset);
+        const chunksToUse = job!.chunks && job!.chunks.length > 0 ? job!.chunks : result.chunks;
         initFromJob({
-          jobId: job.id,
-          audioDuration: job.durationS ?? result.pcm.length / result.sampleRate,
+          jobId: job!.id,
+          audioDuration: job!.durationS ?? result.pcm.length / result.sampleRate,
           cams: videos,
           chunks: chunksToUse,
-          silenceConfig: job.silenceConfig ?? DEFAULT_SILENCE_CONFIG,
-          sessionBpmOverride: job.sessionBpmOverride ?? null,
+          silenceConfig: job!.silenceConfig ?? DEFAULT_SILENCE_CONFIG,
+          jobBpm: timing.jobBpm,
+          detectedBpm: timing.detectedBpm,
+          beatsPerBar: timing.beatsPerBar,
+          barOffsetBeats: timing.barOffsetBeats,
+          beatPhaseS: timing.beatPhaseS,
+          snapMode: job!.ui?.snapMode ?? "1",
+          loopEnabled: true,
           pcm: result.pcm,
           pcmSampleRate: result.sampleRate,
           envelope: result.envelope,
@@ -210,17 +233,17 @@ export default function Triage() {
         continueLabel="Continue → Arrange"
       />
 
-      {/* Hidden audio element drives the master clock. */}
       {detection.kind === "ready" && <TriageAudioMaster />}
 
       {detection.kind !== "ready" ? (
         <NotReady job={job} detection={detection} />
       ) : (
         <>
-          {/* Desktop layout: 3-col split. Mobile: vertical stack. */}
-          <main className="flex-1 min-h-0 grid lg:grid-cols-[300px_1fr_320px] gap-3 px-3 py-3 overflow-y-auto lg:overflow-hidden">
-            {/* Left column — Cam preview + sync */}
-            <aside className="flex flex-col gap-3 min-h-0 order-1 lg:order-1">
+          {/* Top tools row — Cam preview + Inspector + Chunks list,
+           *  arranged so the Cam preview gets the most width on
+           *  desktop. */}
+          <div className="flex-none px-3 pt-3 grid gap-3 grid-cols-1 lg:grid-cols-[minmax(360px,1.2fr)_minmax(320px,1fr)_minmax(220px,0.8fr)]">
+            <div className="flex flex-col gap-3 min-h-0">
               <CamPreview />
               {job && (
                 <SyncPatchPanel
@@ -233,26 +256,35 @@ export default function Triage() {
                   )}
                 />
               )}
-            </aside>
-
-            {/* Middle column — Timeline + Transport */}
-            <section className="flex flex-col gap-3 min-h-0 order-3 lg:order-2">
-              <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
-                <div className="flex-1 min-h-0 grid place-items-stretch">
-                  <TriageTimeline />
-                </div>
-              </div>
-              <ChunksList />
-            </section>
-
-            {/* Right column — Detection + Inspector */}
-            <aside className="flex flex-col gap-3 min-h-0 order-2 lg:order-3">
-              <DetectionPanel />
+            </div>
+            <div className="flex flex-col gap-3 min-h-0">
               <ChunkInspector />
-            </aside>
-          </main>
+              <DetectionPanel />
+            </div>
+            <div className="min-h-0">
+              <ChunksList />
+            </div>
+          </div>
 
-          {/* Sticky bottom transport */}
+          {/* Snap-mode plate — sits between the tools row and the
+           *  timeline so it visibly governs trim drags below. */}
+          <div className="flex-none px-3 pt-3 flex items-center justify-center">
+            <SnapModeButtonsView
+              snapMode={snapMode}
+              onSnapModeChange={setSnapMode}
+              hasBpm={hasBpm}
+            />
+          </div>
+
+          {/* Full-width timeline. Sits directly above the transport
+           *  bar — that's where the action is, so it gets the breathing
+           *  room. */}
+          <div className="flex-1 min-h-0 px-3 py-3 flex flex-col">
+            <div className="flex-1 min-h-0">
+              <TriageTimeline />
+            </div>
+          </div>
+
           <TriageTransportBar />
         </>
       )}
@@ -262,10 +294,18 @@ export default function Triage() {
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
-/** Decode the master audio for live silence-slider re-runs. Runs in
- *  the background after the page has already rendered with cached
- *  chunks + envelope. Best-effort: a decode failure just means the
- *  user can't tweak Threshold / Min-Pause until the page reloads. */
+function toBpmValue(persisted: NonNullable<LocalJob["bpm"]>): {
+  value: number;
+  confidence: number;
+  manualOverride: boolean;
+} {
+  return {
+    value: persisted.value,
+    confidence: persisted.confidence,
+    manualOverride: Boolean(persisted.manualOverride),
+  };
+}
+
 async function decodePcmInBackground(
   job: LocalJob,
 ): Promise<{ pcm: Float32Array; sampleRate: number } | null> {
@@ -279,8 +319,6 @@ async function decodePcmInBackground(
     return null;
   }
 }
-
-// ─── Shared loading / error state UI ────────────────────────────────────
 
 function NotReady({
   job,
@@ -318,8 +356,6 @@ function NotReady({
     </main>
   );
 }
-
-// ─── PhaseStrip (shared with Arrange) ───────────────────────────────────
 
 interface PhaseStripProps {
   phase: "triage" | "arrange";

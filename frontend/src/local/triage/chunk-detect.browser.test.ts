@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { detectChunks, dbToLinear, TRIAGE_ENVELOPE_HZ } from "./chunk-detect";
+import {
+  detectChunks,
+  dbToLinear,
+  pickGlobalBpm,
+  TRIAGE_ENVELOPE_HZ,
+} from "./chunk-detect";
 import type { SilenceConfig } from "../../storage/jobs-db";
 
 /** Build a PCM buffer made of tone/silence segments at a given BPM.
@@ -95,18 +100,13 @@ describe("detectChunks", () => {
     expect(result.chunks.length).toBe(0);
   }, 15_000);
 
-  it("populates detectedBpm for chunks long enough to detect tempo", async () => {
-    // 8-second tone block at 120 BPM → 16 clicks → enough for the
-    // autocorrelation to lock onto the half-second period.
+  it("populates detectedBpm + audioStartMs for chunks long enough to detect tempo", async () => {
     const pcm = buildPcm([{ kind: "tone", secs: 8 }], SAMPLE_RATE, 120);
     const config: SilenceConfig = { thresholdDb: -50, minPauseMs: 1500 };
     const result = await detectChunks(pcm, SAMPLE_RATE, config);
     expect(result.chunks.length).toBe(1);
     const chunk = result.chunks[0];
     expect(chunk.detectedBpm).toBeDefined();
-    // Detector may pick perceptual tempo (could be 120 or 60 / 240
-    // depending on octave voting). Accept any of the standard
-    // octave-shifted variants of 120.
     const candidates = [60, 120, 240];
     const closeEnough = candidates.some(
       (c) => Math.abs((chunk.detectedBpm ?? 0) - c) < 5,
@@ -116,17 +116,22 @@ describe("detectChunks", () => {
       `detectedBpm=${chunk.detectedBpm} not within 5 BPM of 60/120/240`,
     ).toBe(true);
     expect(chunk.effectiveBpm).toBe(chunk.detectedBpm);
+    expect(chunk.audioStartMs).toBeDefined();
+    // The first click sits at t=0 within the chunk, so audioStartMs
+    // should land near the chunk's startMs.
+    expect(chunk.audioStartMs!).toBeGreaterThanOrEqual(chunk.startMs);
+    expect(chunk.audioStartMs! - chunk.startMs).toBeLessThan(500);
   }, 30_000);
 
   it("leaves detectedBpm undefined for chunks shorter than the BPM-detection floor", async () => {
-    // 1-second tone — too short for autocorrelation to lock. Threshold
-    // detection still finds it.
     const pcm = buildPcm([{ kind: "tone", secs: 1.5 }], SAMPLE_RATE, 120);
     const config: SilenceConfig = { thresholdDb: -50, minPauseMs: 500 };
     const result = await detectChunks(pcm, SAMPLE_RATE, config);
     expect(result.chunks.length).toBe(1);
     expect(result.chunks[0].detectedBpm).toBeUndefined();
     expect(result.chunks[0].effectiveBpm).toBe(0);
+    // No analysis ran, so audioStartMs falls back to startMs.
+    expect(result.chunks[0].audioStartMs).toBe(result.chunks[0].startMs);
   }, 15_000);
 
   it("threshold parameter changes which chunks are kept", async () => {
@@ -158,6 +163,46 @@ describe("detectChunks", () => {
     expect(looseRes.chunks.length).toBeGreaterThanOrEqual(1);
     expect(looseRes.chunks.length).toBeGreaterThan(strictRes.chunks.length);
   }, 30_000);
+});
+
+describe("pickGlobalBpm", () => {
+  it("returns null when no chunk has a detected BPM", () => {
+    expect(pickGlobalBpm([])).toBeNull();
+    expect(
+      pickGlobalBpm([
+        { detectedBpm: undefined, startMs: 0, endMs: 1000 },
+      ]),
+    ).toBeNull();
+  });
+
+  it("picks the most-common BPM (mode)", () => {
+    const result = pickGlobalBpm([
+      { detectedBpm: 120, startMs: 0, endMs: 5_000 },
+      { detectedBpm: 120, startMs: 6_000, endMs: 11_000 },
+      { detectedBpm: 60, startMs: 12_000, endMs: 17_000 },
+    ]);
+    expect(result).not.toBeNull();
+    expect(result!.value).toBe(120);
+    // 2 of 3 chunks agree → 0.66 confidence.
+    expect(result!.confidence).toBeCloseTo(2 / 3, 2);
+  });
+
+  it("rounds before bucketing — 119.7 and 120.3 vote for 120", () => {
+    const result = pickGlobalBpm([
+      { detectedBpm: 119.7, startMs: 0, endMs: 5_000 },
+      { detectedBpm: 120.3, startMs: 6_000, endMs: 11_000 },
+    ]);
+    expect(result!.value).toBe(120);
+  });
+
+  it("breaks ties by total chunk-duration weight", () => {
+    const result = pickGlobalBpm([
+      { detectedBpm: 120, startMs: 0, endMs: 5_000 }, // 5s
+      { detectedBpm: 90, startMs: 6_000, endMs: 36_000 }, // 30s
+    ]);
+    // Same count (1 each), so the longer chunk wins.
+    expect(result!.value).toBe(90);
+  });
 });
 
 describe("dbToLinear", () => {

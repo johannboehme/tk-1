@@ -4,9 +4,9 @@
  * envelope (cheap, sub-ms) and write the new chunks back to the
  * Triage store + IDB.
  *
- * The actual per-chunk BPM detection only re-runs when chunk
- * boundaries change AND the chunk is long enough — handled inside
- * `detectChunksFromEnvelope`.
+ * BPM lives on the brass plate inside ChunkInspector — global value,
+ * with per-chunk octave-shift for outliers. This panel is purely about
+ * "where do chunks begin and end".
  */
 import { useCallback, useRef } from "react";
 import {
@@ -29,23 +29,19 @@ export function DetectionPanel() {
   const liveDebounceRef = useRef<number | null>(null);
   const persistDebounceRef = useRef<number | null>(null);
 
-  // Re-detect on slider change. Debounced (50 ms) so dragging stays
-  // smooth — re-detection on the cached envelope is fast but the
-  // per-chunk BPM analysis isn't free.
   const reDetect = useCallback(
     (config: SilenceConfig) => {
       const state = useTriageStore.getState();
-      if (!state.pcm || !state.envelope || !state.jobId) return;
+      if (!state.envelope || !state.jobId) return;
       void detectChunksFromEnvelope(
-        state.pcm,
+        state.pcm ?? new Float32Array(0),
         state.pcmSampleRate,
         state.envelope,
         config,
       ).then((result) => {
-        // Preserve existing user decisions + previously-detected BPM
-        // (so background-decoded BPM doesn't get clobbered when the
-        // user drags a slider before PCM is ready). Boundaries that
-        // didn't match an existing chunk start default-accepted.
+        // Preserve user decisions + previously-detected per-chunk BPM
+        // and audio-start across slider drags. New boundaries that
+        // don't match an existing chunk start default-accepted.
         const merged = result.chunks.map((c) => {
           const prev = state.chunks.find(
             (p) => p.startMs === c.startMs && p.endMs === c.endMs,
@@ -57,6 +53,7 @@ export function DetectionPanel() {
               bpmOctaveShift: prev.bpmOctaveShift,
               detectedBpm: c.detectedBpm ?? prev.detectedBpm,
               effectiveBpm: c.detectedBpm ? c.effectiveBpm : prev.effectiveBpm,
+              audioStartMs: c.audioStartMs ?? prev.audioStartMs,
             };
           }
           return c;
@@ -67,8 +64,6 @@ export function DetectionPanel() {
     [setChunks],
   );
 
-  // Persist to IDB at a slower cadence (250 ms) so we don't hammer
-  // IndexedDB on every slider tick.
   const persist = useCallback((config: SilenceConfig) => {
     const state = useTriageStore.getState();
     if (!state.jobId) return;
@@ -107,7 +102,7 @@ export function DetectionPanel() {
           {chunks.length} chunks
         </span>
       </header>
-      <div className="p-3 space-y-4">
+      <div className="p-3 space-y-3">
         <SliderRow
           label="Threshold"
           value={silenceConfig.thresholdDb}
@@ -130,60 +125,8 @@ export function DetectionPanel() {
           <Stat label="Kept" value={`${acceptedCount} chunk${acceptedCount === 1 ? "" : "s"}`} />
           <Stat label="Time" value={formatDuration(acceptedDurationMs)} />
         </div>
-        <div className="border-t border-rule pt-2">
-          <SessionBpmRow />
-        </div>
       </div>
     </section>
-  );
-}
-
-function SessionBpmRow() {
-  const sessionBpm = useTriageStore((s) => s.sessionBpmOverride);
-  const setSessionBpm = useTriageStore((s) => s.setSessionBpm);
-  // Local edit buffer so the user can type freely without the store
-  // bouncing values back at every keystroke.
-  return (
-    <div>
-      <div className="flex items-baseline justify-between mb-1">
-        <span className="font-display tracking-label uppercase text-[10px] text-ink-2">
-          Session BPM
-        </span>
-        <span className="font-mono text-[10px] tabular text-ink-3">
-          {sessionBpm ? "forced" : "auto per chunk"}
-        </span>
-      </div>
-      <div className="flex items-center gap-2">
-        <input
-          type="number"
-          min={40}
-          max={240}
-          step={0.5}
-          value={sessionBpm ?? ""}
-          placeholder="auto"
-          onChange={(e) => {
-            const v = e.target.value;
-            if (v === "") {
-              setSessionBpm(null);
-              return;
-            }
-            const n = Number(v);
-            if (Number.isFinite(n) && n > 0) setSessionBpm(n);
-          }}
-          className="flex-1 h-8 bg-paper-deep border border-rule rounded px-2 font-mono tabular text-sm text-ink focus:outline-none focus:border-cobalt"
-        />
-        {sessionBpm !== null && (
-          <button
-            type="button"
-            onClick={() => setSessionBpm(null)}
-            className="font-mono text-[10px] tracking-label uppercase text-ink-3 hover:text-ink"
-            title="Revert to per-chunk auto-detected BPM"
-          >
-            auto
-          </button>
-        )}
-      </div>
-    </div>
   );
 }
 

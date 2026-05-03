@@ -1,11 +1,12 @@
 /**
- * Vertical scrollable list of chunks. Primary mobile interaction
- * surface; on desktop it's auxiliary to the timeline.
+ * Compact chunk overview list. Read-only navigation aid — tap a row to
+ * focus the chunk in the timeline. The timeline itself is the visual
+ * source of truth for status; this list is for linear scanning of long
+ * sessions and a glanceable accept/reject summary.
  *
- * Each row: chunk index, time-range, length, BPM, accept-state. Tap
- * to focus (also scrolls + starts loop). Inline keep/drop buttons.
+ * No inline Keep/Drop buttons — actions live on the TransportBar
+ * (Enter/Backspace) so the user always knows where to go.
  */
-import { ChunkyButton } from "../../editor/components/ChunkyButton";
 import { useTriageStore } from "../../local/triage/triage-store";
 import type { Chunk } from "../../storage/jobs-db";
 
@@ -13,26 +14,29 @@ export function ChunksList() {
   const chunks = useTriageStore((s) => s.chunks);
   const focusedId = useTriageStore((s) => s.focusedChunkId);
   const focusChunk = useTriageStore((s) => s.focusChunk);
-  const updateChunk = useTriageStore((s) => s.updateChunk);
 
   const sorted = [...chunks].sort((a, b) => a.startMs - b.startMs);
+  const keptCount = sorted.filter((c) => c.accepted).length;
 
   if (sorted.length === 0) {
     return (
-      <div className="rounded-md border border-rule bg-paper-hi p-6 text-center font-mono text-[11px] tracking-label uppercase text-ink-3">
-        ◇ no chunks detected — adjust threshold or min-pause
-      </div>
+      <section className="rounded-md border border-rule bg-paper-hi p-4 text-center font-mono text-[10px] tracking-label uppercase text-ink-3">
+        ◇ no chunks — adjust threshold
+      </section>
     );
   }
 
   return (
-    <section className="rounded-md border border-rule overflow-hidden bg-paper-hi shadow-panel">
-      <header className="bg-paper-panel border-b border-rule px-3 py-2 flex items-center justify-between">
+    <section className="rounded-md border border-rule overflow-hidden bg-paper-hi shadow-panel flex flex-col h-full min-h-0">
+      <header className="flex-none bg-paper-panel border-b border-rule px-3 py-2 flex items-center justify-between">
         <span className="font-display tracking-label uppercase text-[10px] text-ink-2">
           Chunks · {sorted.length}
         </span>
+        <span className="font-mono text-[10px] tabular text-ink-3">
+          {keptCount} kept
+        </span>
       </header>
-      <ul className="max-h-[60vh] overflow-y-auto">
+      <ul className="flex-1 min-h-0 overflow-y-auto">
         {sorted.map((chunk, i) => (
           <ChunkRow
             key={chunk.id}
@@ -40,8 +44,6 @@ export function ChunksList() {
             index={i}
             focused={chunk.id === focusedId}
             onFocus={() => focusChunk(chunk.id)}
-            onAccept={() => updateChunk(chunk.id, { accepted: true })}
-            onReject={() => updateChunk(chunk.id, { accepted: false })}
           />
         ))}
       </ul>
@@ -54,32 +56,24 @@ interface RowProps {
   index: number;
   focused: boolean;
   onFocus: () => void;
-  onAccept: () => void;
-  onReject: () => void;
 }
 
-function ChunkRow({ chunk, index, focused, onFocus, onAccept, onReject }: RowProps) {
+function ChunkRow({ chunk, index, focused, onFocus }: RowProps) {
   const lengthS = (chunk.endMs - chunk.startMs) / 1000;
-  const effectiveBpm = chunk.detectedBpm
-    ? chunk.detectedBpm * Math.pow(2, chunk.bpmOctaveShift)
-    : null;
-
-  // Solid colors per state — no opacity tricks. Background tints the
-  // entire row so accept/reject is unmissable scanning the list.
-  const rowBg = chunk.accepted
-    ? focused
-      ? "bg-hot/15"
-      : "bg-paper-hi"
-    : focused
-      ? "bg-paper-deep"
-      : "bg-paper-deep";
+  // Solid colors per state — no opacity tricks (memory: solid status,
+  // no alpha). Stripe carries the state, body stays neutral.
   const stateStripe = chunk.accepted ? "#FF5722" : "#5D5546";
+  const rowBg = focused
+    ? chunk.accepted
+      ? "bg-hot/15"
+      : "bg-paper-deep"
+    : "bg-paper-hi hover:bg-paper-deep";
 
   return (
     <li
-      className={`relative grid grid-cols-[6px_1fr_auto] items-center gap-3 border-b border-rule/60 px-3 py-2.5 cursor-pointer transition-colors ${rowBg} ${
-        focused ? "outline outline-2 outline-cobalt outline-offset-[-2px] z-10" : "hover:bg-paper-deep"
-      } min-h-[60px]`}
+      className={`relative grid grid-cols-[4px_1fr] items-center gap-2 border-b border-rule/60 px-2 py-1.5 cursor-pointer transition-colors ${rowBg} ${
+        focused ? "outline outline-2 outline-cobalt outline-offset-[-2px] z-10" : ""
+      }`}
       onClick={onFocus}
       role="button"
       aria-pressed={focused}
@@ -91,79 +85,31 @@ function ChunkRow({ chunk, index, focused, onFocus, onAccept, onReject }: RowPro
         }
       }}
     >
-      {/* State stripe — full color, no transparency */}
       <span
-        className="self-stretch w-1.5 rounded-sm"
+        className="self-stretch w-1 rounded-sm"
         style={{ background: stateStripe }}
         aria-hidden
       />
-
-      {/* Body */}
-      <div className="min-w-0 flex flex-col gap-0.5">
-        <div className="flex items-baseline gap-2">
-          <span className="font-display font-semibold text-xs tracking-label uppercase text-ink shrink-0">
+      <div className="min-w-0 flex items-center justify-between gap-2">
+        <div className="flex items-baseline gap-2 min-w-0">
+          <span className="font-display font-semibold text-[10px] tracking-label uppercase text-ink shrink-0">
             #{(index + 1).toString().padStart(2, "0")}
           </span>
-          <span className="font-mono tabular text-xs text-ink truncate">
-            {formatTime(chunk.startMs / 1000)} → {formatTime(chunk.endMs / 1000)}
+          <span className="font-mono tabular text-[10px] text-ink truncate">
+            {formatTime(chunk.startMs / 1000)}
           </span>
+        </div>
+        <div className="flex items-center gap-1.5 font-mono text-[10px] tabular text-ink-3 shrink-0">
+          <span>{lengthS.toFixed(1)}s</span>
           {!chunk.accepted && (
             <span
-              className="font-mono text-[9px] tracking-label uppercase text-paper-hi bg-ink-2 px-1 rounded shrink-0"
+              className="font-mono text-[8px] tracking-label uppercase text-paper-hi bg-ink-2 px-1 rounded"
               aria-label="Dropped"
             >
-              DROPPED
+              DROP
             </span>
           )}
         </div>
-        <div className="flex items-center gap-2 font-mono text-[10px] tabular text-ink-3">
-          <span>{lengthS.toFixed(1)}s</span>
-          {effectiveBpm && (
-            <>
-              <span>·</span>
-              <span>
-                {effectiveBpm.toFixed(0)} BPM
-                {chunk.bpmOctaveShift !== 0 && (
-                  <span className="ml-0.5 text-ink-3">
-                    ({chunk.bpmOctaveShift > 0 ? "×" : "÷"}2)
-                  </span>
-                )}
-              </span>
-            </>
-          )}
-        </div>
-      </div>
-
-      {/* Inline accept/reject — visible always so the user doesn't
-       *  have to focus first to act. */}
-      <div className="flex gap-1.5 shrink-0">
-        {chunk.accepted ? (
-          <ChunkyButton
-            variant="secondary"
-            size="xs"
-            onClick={(e) => {
-              e.stopPropagation();
-              onReject();
-            }}
-            title="Drop"
-            aria-label="Drop chunk"
-          >
-            Drop
-          </ChunkyButton>
-        ) : (
-          <ChunkyButton
-            variant="primary"
-            size="xs"
-            onClick={(e) => {
-              e.stopPropagation();
-              onAccept();
-            }}
-            title="Keep"
-            aria-label="Keep chunk"
-          >
-            Keep
-          </ChunkyButton>
-        )}
       </div>
     </li>
   );

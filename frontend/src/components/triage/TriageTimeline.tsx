@@ -1,49 +1,45 @@
 /**
  * TriageTimeline — the main visual surface of the Triage workflow.
  *
- * Three stacked layers, all sharing the same time-window mapping:
- *   1. Bar-ruler strip (top, ~26 px) — beat / bar ticks per chunk's BPM
- *      where chunks have BPM info, fall-back to plain MM:SS marks
- *      between chunks.
- *   2. Waveform (Canvas2D, ~120 px) — RMS envelope as vertical bars.
- *      Above the silence-threshold = ink, below = ink-3.
- *   3. Chunk lane (~32 px) — solid-color bars per chunk. Accepted = hot,
- *      rejected = ink-2 with a strikethrough line, focused = cobalt
- *      outline. Drag the left/right edge to trim (snap-to-bar when
- *      the chunk has BPM, otherwise free drag).
+ * Stacked layers (all share the same time-window mapping):
+ *   1. Time ruler (~22 px) — MM:SS marks, agnostic to musical timing
+ *   2. Bar ruler (~22 px) — per-chunk beat/bar ticks, anchored at each
+ *      chunk's `audioStartMs` and stepping at that chunk's effective
+ *      tempo. Chunks are not aligned to each other.
+ *   3. Waveform (Canvas2D) — RMS envelope as vertical bars
+ *   4. Chunk lane (~32 px) — solid-color bars per chunk
  *
- * Plus a playhead overlay and zoom/pan affordances:
- *   - mouse-wheel = zoom anchored at cursor x
- *   - shift+drag or middle-mouse = pan
- *   - pinch (touch) = zoom anchored at the centroid; one-finger drag = pan
- *   - click on the lane = focus the chunk under cursor
- *   - click on the waveform / ruler = seek the playhead
+ * Trim drag uses the editor's `snapTime` helper with the active
+ * `snapMode` from the store, anchored at the chunk's own `audioStartMs`.
  *
- * No transparency tricks — chunk states are solid colors so the
- * accept/reject distinction reads at any background.
+ * Plus a playhead overlay and zoom/pan affordances.
  */
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { Chunk } from "../../storage/jobs-db";
 import {
+  chunkBeatPhaseS,
   effectiveChunkBpm,
   useTriageStore,
 } from "../../local/triage/triage-store";
+import { snapTime } from "../../editor/snap";
+import type { Chunk } from "../../storage/jobs-db";
 
-const BAR_RULER_HEIGHT = 24;
-const WAVEFORM_HEIGHT = 120;
+const TIME_RULER_HEIGHT = 22;
+const BAR_RULER_HEIGHT = 22;
 const CHUNK_LANE_HEIGHT = 32;
 const PLAYHEAD_COLOR = "#FF5722";
 const TRIM_HANDLE_PX = 6;
 
 export function TriageTimeline() {
   const wrapperRef = useRef<HTMLDivElement | null>(null);
-  const [width, setWidth] = useState(800);
+  const [size, setSize] = useState({ width: 800, height: 320 });
 
   const audioDuration = useTriageStore((s) => s.audioDuration);
   const envelope = useTriageStore((s) => s.envelope);
   const envelopeHz = useTriageStore((s) => s.envelopeHz);
   const chunks = useTriageStore((s) => s.chunks);
-  const sessionBpm = useTriageStore((s) => s.sessionBpmOverride);
+  const jobBpm = useTriageStore((s) => s.jobBpm);
+  const beatsPerBar = useTriageStore((s) => s.beatsPerBar);
+  const snapMode = useTriageStore((s) => s.snapMode);
   const silenceConfig = useTriageStore((s) => s.silenceConfig);
   const focusedChunkId = useTriageStore((s) => s.focusedChunkId);
   const view = useTriageStore((s) => s.view);
@@ -54,23 +50,30 @@ export function TriageTimeline() {
   const updateChunk = useTriageStore((s) => s.updateChunk);
   const currentTime = useTriageStore((s) => s.playback.currentTime);
 
-  // Track wrapper width so zoom math has real pixels to work with.
+  // Track wrapper width AND height so the waveform breathes vertically
+  // when the user gives the timeline column more room.
   useEffect(() => {
     const el = wrapperRef.current;
     if (!el) return;
     const ro = new ResizeObserver((entries) => {
       for (const entry of entries) {
-        setWidth(Math.max(200, entry.contentRect.width));
+        setSize({
+          width: Math.max(200, entry.contentRect.width),
+          height: Math.max(180, entry.contentRect.height),
+        });
       }
     });
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
 
-  // Time-to-pixel mapping. zoom=1 fits the full duration; zoom=2 shows
-  // half; etc.
+  const waveformHeight = Math.max(
+    80,
+    size.height - TIME_RULER_HEIGHT - BAR_RULER_HEIGHT - CHUNK_LANE_HEIGHT,
+  );
+
   const visibleDuration = audioDuration > 0 ? audioDuration / view.zoom : 60;
-  const pxPerSec = width / visibleDuration;
+  const pxPerSec = size.width / visibleDuration;
   const viewStartS = Math.min(
     Math.max(0, view.scrollX),
     Math.max(0, audioDuration - visibleDuration),
@@ -84,7 +87,6 @@ export function TriageTimeline() {
     return viewStartS + xPx / pxPerSec;
   }
 
-  // ─── Wheel: zoom or pan ───────────────────────────────────────────────
   function onWheel(e: React.WheelEvent) {
     e.preventDefault();
     if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
@@ -98,14 +100,13 @@ export function TriageTimeline() {
     const factor = Math.exp(-e.deltaY * 0.002);
     const nextZoom = Math.max(1, Math.min(500, view.zoom * factor));
     const nextVisible = audioDuration / nextZoom;
-    const nextPxPerSec = width / nextVisible;
+    const nextPxPerSec = size.width / nextVisible;
     const nextScroll = cursorTimeBefore - cursorX / nextPxPerSec;
     setZoom(nextZoom);
     setScrollX(Math.max(0, Math.min(audioDuration - nextVisible, nextScroll)));
   }
 
-  // ─── Touch: pinch-zoom + 1-finger pan ─────────────────────────────────
-  // Track active pointers so we can detect pinch.
+  // Touch: pinch-zoom + 1-finger pan.
   const pointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
   const pinchStartRef = useRef<
     | {
@@ -157,7 +158,7 @@ export function TriageTimeline() {
         Math.min(500, pinchStartRef.current.zoom * factor),
       );
       const nextVisible = audioDuration / nextZoom;
-      const nextPxPerSec = width / nextVisible;
+      const nextPxPerSec = size.width / nextVisible;
       const nextScroll =
         pinchStartRef.current.midTime - pinchStartRef.current.midX / nextPxPerSec;
       setZoom(nextZoom);
@@ -180,10 +181,7 @@ export function TriageTimeline() {
     if (pointersRef.current.size === 0) panStartRef.current = null;
   }
 
-  // ─── Click: seek or focus chunk ───────────────────────────────────────
   function onCanvasClick(e: React.MouseEvent) {
-    // Drag-trim sets a flag; ignore the synthetic click that fires
-    // immediately afterwards.
     if (suppressClickRef.current) {
       suppressClickRef.current = false;
       return;
@@ -192,7 +190,7 @@ export function TriageTimeline() {
     const xPx = e.clientX - rect.left;
     const yPx = e.clientY - rect.top;
     const t = xToTime(xPx);
-    const chunkLaneTop = BAR_RULER_HEIGHT + WAVEFORM_HEIGHT;
+    const chunkLaneTop = TIME_RULER_HEIGHT + BAR_RULER_HEIGHT + waveformHeight;
     if (yPx >= chunkLaneTop) {
       const hit = chunks.find(
         (c) => t * 1000 >= c.startMs && t * 1000 <= c.endMs,
@@ -205,14 +203,16 @@ export function TriageTimeline() {
     seek(t);
   }
 
-  // ─── Trim drag state ──────────────────────────────────────────────────
-  // Per-chunk left/right edge drag. Snaps to nearest bar when the
-  // chunk has BPM, otherwise free.
+  // ─── Trim drag ────────────────────────────────────────────────────────
+  // Per-chunk left/right edge drag. Uses the editor's snap helper so
+  // the modes (off / 1 / 1/2 / 1/4 / 1/8 / 1/16) feel identical to the
+  // editor's timeline.
   const dragRef = useRef<
     | {
         chunkId: string;
         edge: "left" | "right";
-        snapMsPerBar: number; // 0 = no snap
+        bpm: number;
+        anchorS: number;
         startMs: number;
         endMs: number;
       }
@@ -227,11 +227,12 @@ export function TriageTimeline() {
   ) {
     e.preventDefault();
     e.stopPropagation();
-    const bpm = effectiveChunkBpm(chunk, sessionBpm);
+    const bpm = effectiveChunkBpm(chunk, jobBpm?.value ?? null);
     dragRef.current = {
       chunkId: chunk.id,
       edge,
-      snapMsPerBar: bpm > 0 ? (60_000 / bpm) * chunk.beatsPerBar : 0,
+      bpm,
+      anchorS: chunkBeatPhaseS(chunk),
       startMs: chunk.startMs,
       endMs: chunk.endMs,
     };
@@ -244,35 +245,37 @@ export function TriageTimeline() {
       if (!wrapper) return;
       const rect = wrapper.getBoundingClientRect();
       const xPx = ev.clientX - rect.left;
-      let timeMs = xToTime(xPx) * 1000;
-      // Snap to bar if the chunk has BPM and the user isn't holding Alt.
-      if (dragRef.current.snapMsPerBar > 0 && !ev.altKey) {
-        const anchor =
-          dragRef.current.edge === "left"
-            ? dragRef.current.endMs
-            : dragRef.current.startMs;
-        const bars = Math.round(
-          (timeMs - anchor) / dragRef.current.snapMsPerBar,
-        );
-        timeMs = anchor + bars * dragRef.current.snapMsPerBar;
-      }
+      const tS = xToTime(xPx);
+      // Alt = bypass snap for free positioning, otherwise honour the
+      // active snap mode anchored at the chunk's own audio-start.
+      const snapped = ev.altKey
+        ? tS
+        : snapTime(tS, snapMode, {
+            bpm: dragRef.current.bpm > 0 ? dragRef.current.bpm : null,
+            beatPhase: dragRef.current.anchorS,
+            beatsPerBar,
+          });
+      let timeMs = Math.round(snapped * 1000);
       const chunk = chunks.find((c) => c.id === dragRef.current!.chunkId);
       if (!chunk) return;
       if (dragRef.current.edge === "left") {
-        const next = Math.max(
-          0,
-          Math.min(chunk.endMs - 100, Math.round(timeMs)),
-        );
+        const next = Math.max(0, Math.min(chunk.endMs - 100, timeMs));
         if (next !== chunk.startMs) {
-          updateChunk(chunk.id, { startMs: next, trimMode: ev.altKey ? "free" : "bar" });
+          updateChunk(chunk.id, {
+            startMs: next,
+            trimMode: ev.altKey ? "free" : "bar",
+          });
         }
       } else {
         const next = Math.max(
           chunk.startMs + 100,
-          Math.min(audioDuration * 1000, Math.round(timeMs)),
+          Math.min(audioDuration * 1000, timeMs),
         );
         if (next !== chunk.endMs) {
-          updateChunk(chunk.id, { endMs: next, trimMode: ev.altKey ? "free" : "bar" });
+          updateChunk(chunk.id, {
+            endMs: next,
+            trimMode: ev.altKey ? "free" : "bar",
+          });
         }
       }
       suppressClickRef.current = true;
@@ -286,20 +289,26 @@ export function TriageTimeline() {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
-  }, [chunks, updateChunk, xToTime, audioDuration]);
+  }, [chunks, updateChunk, xToTime, audioDuration, snapMode, beatsPerBar]);
 
-  // ─── Layer 1: Bar-Ruler ───────────────────────────────────────────────
-  const ruler = useTimeRuler(viewStartS, viewEndS, width);
-  const barTicks = usePerChunkBarTicks(chunks, sessionBpm, viewStartS, viewEndS, pxPerSec);
+  const timeTicks = useTimeRuler(viewStartS, viewEndS, size.width);
+  const barTicks = usePerChunkBarTicks(
+    chunks,
+    jobBpm?.value ?? null,
+    beatsPerBar,
+    viewStartS,
+    viewEndS,
+    pxPerSec,
+  );
 
-  // ─── Layer 2: Waveform ────────────────────────────────────────────────
+  // Waveform canvas.
   const waveformCanvasRef = useRef<HTMLCanvasElement | null>(null);
   useEffect(() => {
     const canvas = waveformCanvasRef.current;
     if (!canvas || !envelope || envelope.length === 0) return;
     const dpr = window.devicePixelRatio || 1;
-    const cssW = width;
-    const cssH = WAVEFORM_HEIGHT;
+    const cssW = size.width;
+    const cssH = waveformHeight;
     canvas.width = Math.round(cssW * dpr);
     canvas.height = Math.round(cssH * dpr);
     canvas.style.width = `${cssW}px`;
@@ -308,7 +317,6 @@ export function TriageTimeline() {
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, cssW, cssH);
-
     ctx.fillStyle = "#FAF6EC";
     ctx.fillRect(0, 0, cssW, cssH);
 
@@ -335,7 +343,6 @@ export function TriageTimeline() {
       ctx.fillRect(xPx, cx - h, 1, h * 2);
     }
 
-    // Threshold guide lines.
     const thresholdY = cx - (thresholdLin / peakRef) * half;
     if (thresholdY > 0 && thresholdY < cssH) {
       ctx.strokeStyle = "rgba(255,87,34,0.5)";
@@ -353,16 +360,15 @@ export function TriageTimeline() {
       }
       ctx.setLineDash([]);
     }
-  }, [envelope, envelopeHz, width, viewStartS, viewEndS, silenceConfig, xToTime]);
+  }, [envelope, envelopeHz, size.width, waveformHeight, viewStartS, viewEndS, silenceConfig, xToTime]);
 
-  // ─── Layer 3: Chunk Lane (DOM-rendered) ───────────────────────────────
-  const totalHeight = BAR_RULER_HEIGHT + WAVEFORM_HEIGHT + CHUNK_LANE_HEIGHT;
+  const totalHeight =
+    TIME_RULER_HEIGHT + BAR_RULER_HEIGHT + waveformHeight + CHUNK_LANE_HEIGHT;
 
   return (
     <div
       ref={wrapperRef}
-      className="relative w-full bg-paper-hi border border-rule rounded-md overflow-hidden select-none touch-none"
-      style={{ height: totalHeight }}
+      className="relative w-full h-full bg-paper-hi border border-rule rounded-md overflow-hidden select-none touch-none"
       onWheel={onWheel}
       onClick={onCanvasClick}
       onPointerDown={onPointerDown}
@@ -370,13 +376,13 @@ export function TriageTimeline() {
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerUp}
     >
-      {/* Bar-ruler */}
+      {/* Time ruler — its own strip so MM:SS labels never collide with
+       *  the bar markers below. */}
       <div
         className="absolute left-0 top-0 right-0 bg-paper-deep border-b border-rule pointer-events-none"
-        style={{ height: BAR_RULER_HEIGHT }}
+        style={{ height: TIME_RULER_HEIGHT }}
       >
-        {/* Time-based ruler (always visible) */}
-        {ruler.map((tick, i) => (
+        {timeTicks.map((tick, i) => (
           <div
             key={`t-${i}`}
             className="absolute top-0 bottom-0 flex items-end pl-1"
@@ -394,7 +400,15 @@ export function TriageTimeline() {
             />
           </div>
         ))}
-        {/* Per-chunk BPM bar ticks (drawn over time ruler) */}
+      </div>
+
+      {/* Bar ruler — own strip below the time ruler. Per-chunk grid:
+       *  each chunk renders bars/beats anchored at its own onset, at
+       *  its own effective tempo. */}
+      <div
+        className="absolute left-0 right-0 bg-paper-hi border-b border-rule pointer-events-none"
+        style={{ top: TIME_RULER_HEIGHT, height: BAR_RULER_HEIGHT }}
+      >
         {barTicks.map((tick, i) => (
           <span
             key={`b-${i}`}
@@ -402,23 +416,24 @@ export function TriageTimeline() {
             style={{
               left: timeToX(tick.tS),
               width: 1,
-              height: tick.downbeat ? "70%" : "40%",
-              background: tick.downbeat ? "#FF5722" : "#FF572299",
+              height: tick.downbeat ? "85%" : "45%",
+              background: tick.downbeat ? "#FF5722" : "#FF5722AA",
             }}
           />
         ))}
       </div>
 
-      {/* Waveform */}
-      <div className="absolute left-0 right-0" style={{ top: BAR_RULER_HEIGHT }}>
+      <div
+        className="absolute left-0 right-0"
+        style={{ top: TIME_RULER_HEIGHT + BAR_RULER_HEIGHT }}
+      >
         <canvas ref={waveformCanvasRef} />
       </div>
 
-      {/* Chunk lane */}
       <div
         className="absolute left-0 right-0 border-t border-rule bg-paper-deep"
         style={{
-          top: BAR_RULER_HEIGHT + WAVEFORM_HEIGHT,
+          top: TIME_RULER_HEIGHT + BAR_RULER_HEIGHT + waveformHeight,
           height: CHUNK_LANE_HEIGHT,
         }}
       >
@@ -435,7 +450,6 @@ export function TriageTimeline() {
         ))}
       </div>
 
-      {/* Playhead */}
       {currentTime >= viewStartS && currentTime <= viewEndS && (
         <div
           className="absolute top-0 pointer-events-none"
@@ -518,7 +532,6 @@ function ChunkBlock({
               : "✕"}
         </span>
       )}
-      {/* Trim handles — only shown on chunks wide enough to hit. */}
       {showHandles && (
         <>
           <div
@@ -529,7 +542,7 @@ function ChunkBlock({
             }}
             onMouseDown={(e) => onTrimStart("left", e)}
             onClick={(e) => e.stopPropagation()}
-            title="Drag to trim start (Alt = free, no bar snap)"
+            title="Drag to trim start (Alt = free, no snap)"
           />
           <div
             className="absolute right-0 top-0 bottom-0 cursor-ew-resize"
@@ -539,7 +552,7 @@ function ChunkBlock({
             }}
             onMouseDown={(e) => onTrimStart("right", e)}
             onClick={(e) => e.stopPropagation()}
-            title="Drag to trim end (Alt = free, no bar snap)"
+            title="Drag to trim end (Alt = free, no snap)"
           />
         </>
       )}
@@ -547,7 +560,6 @@ function ChunkBlock({
   );
 }
 
-// ─── Bar-ruler tick generator ───────────────────────────────────────────
 interface RulerTick {
   t: number;
   label: string;
@@ -582,45 +594,65 @@ interface BarTick {
   downbeat: boolean;
 }
 
-/** Per-chunk bar/beat ticks. Skips chunks without BPM. Bails out when
- *  the bars would be too dense to read (< 4 px between ticks) — that
- *  visual noise is worse than nothing. */
+/** Per-chunk bar/beat ticks. Each chunk has its own anchor (audio-
+ *  start onset) and its own effective tempo (per-chunk detection,
+ *  octave-shifted; falls back to the song-global BPM). Chunks with
+ *  no BPM info anywhere are skipped. */
 function usePerChunkBarTicks(
   chunks: Chunk[],
-  sessionBpm: number | null,
+  jobBpm: number | null,
+  beatsPerBar: number,
   viewStartS: number,
   viewEndS: number,
   pxPerSec: number,
 ): BarTick[] {
   return useMemo(() => {
     const ticks: BarTick[] = [];
-    const minBeatPx = 3; // suppress beat ticks below this
-    const minBarPx = 8; // suppress entire bar grid below this
+    const minBeatPx = 3;
+    const minBarPx = 8;
     for (const chunk of chunks) {
-      const bpm = effectiveChunkBpm(chunk, sessionBpm);
+      const bpm = effectiveChunkBpm(chunk, jobBpm);
       if (bpm <= 0) continue;
       const sPerBeat = 60 / bpm;
-      const sPerBar = sPerBeat * chunk.beatsPerBar;
+      const sPerBar = sPerBeat * beatsPerBar;
       if (sPerBar * pxPerSec < minBarPx) continue;
       const startS = chunk.startMs / 1000;
       const endS = chunk.endMs / 1000;
       if (endS < viewStartS || startS > viewEndS) continue;
       const showBeats = sPerBeat * pxPerSec >= minBeatPx;
-      // Bars from chunk start.
+      const anchorS = chunkBeatPhaseS(chunk);
+      // Walk the grid from the anchor in both directions, but only
+      // emit ticks that fall inside this chunk's time range.
+      // Forward sweep.
       let beat = 0;
       for (
-        let t = startS;
+        let t = anchorS;
         t <= endS && t <= viewEndS;
-        t = startS + beat * sPerBeat, beat++
+        t = anchorS + ++beat * sPerBeat
       ) {
+        if (t < startS) continue;
         if (t < viewStartS) continue;
-        const isDownbeat = beat % chunk.beatsPerBar === 0;
+        const isDownbeat = beat % beatsPerBar === 0;
+        if (!showBeats && !isDownbeat) continue;
+        ticks.push({ tS: t, downbeat: isDownbeat });
+      }
+      // Backward sweep — anchor itself emits in the forward sweep
+      // (beat 0) so start at -1 here.
+      beat = -1;
+      for (
+        let t = anchorS + beat * sPerBeat;
+        t >= startS && t >= viewStartS;
+        t = anchorS + --beat * sPerBeat
+      ) {
+        if (t > endS) continue;
+        if (t > viewEndS) continue;
+        const isDownbeat = ((beat % beatsPerBar) + beatsPerBar) % beatsPerBar === 0;
         if (!showBeats && !isDownbeat) continue;
         ticks.push({ tS: t, downbeat: isDownbeat });
       }
     }
     return ticks;
-  }, [chunks, sessionBpm, viewStartS, viewEndS, pxPerSec]);
+  }, [chunks, jobBpm, beatsPerBar, viewStartS, viewEndS, pxPerSec]);
 }
 
 function niceStep(raw: number): number {

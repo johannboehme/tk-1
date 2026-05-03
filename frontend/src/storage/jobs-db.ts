@@ -191,14 +191,23 @@ export interface Chunk {
   /** Master-Audio-Zeit in ms. */
   startMs: number;
   endMs: number;
-  /** Vom Detection-Worker erkanntes BPM, falls verfügbar. */
+  /** Vom Detection-Worker pro Chunk erkanntes BPM, falls verfügbar.
+   *  Long-form-Sessions bestehen aus unabhängigen musikalischen
+   *  Fragmenten — daher detect pro Chunk und aggregiere zum
+   *  Song-globalen `job.bpm` (Mode der per-Chunk-Werte). */
   detectedBpm?: number;
   /** User-Override für Half/Double-Time. -1 → ÷2, 0 → unverändert,
    *  1 → ×2. Wird auf `detectedBpm` angewendet, ergibt `effectiveBpm`. */
   bpmOctaveShift: -1 | 0 | 1;
   /** Tatsächlich für Bar-Berechnung verwendetes BPM. Default = detectedBpm
-   *  * 2^bpmOctaveShift, oder Session-BPM falls vom User erzwungen. */
+   *  * 2^bpmOctaveShift; default = job.bpm wenn der User keinen
+   *  per-Chunk-Override gesetzt hat. */
   effectiveBpm: number;
+  /** Master-Audio-Zeit (ms) des ersten erkannten Onsets innerhalb
+   *  des Chunks. Damit ist der Chunk-eigene Bar-Grid anchored — Chunks
+   *  sind nicht zueinander aligned, jeder hat seinen eigenen Phase.
+   *  Default = startMs (kein Onset detected). */
+  audioStartMs?: number;
   /** Berechnete Bar-Anzahl (Dauer / Sekunden-pro-Bar). Optional — UI
    *  kann das auf der Fly berechnen falls nicht persistiert. */
   bars?: number;

@@ -1,23 +1,36 @@
 /**
  * Triage-Editor State.
  *
- * Lives separate from the Editor store because the concepts only loosely
- * overlap — Triage's "focused chunk" isn't an Editor "selected clip",
- * the chunk-list isn't a clip-list, and the per-chunk BPM isn't the
- * job-global BPM. We do mirror the Editor's playback shape (currentTime,
- * loop, isPlaying) and zoom shape (zoom, scrollX) so a future shared
- * audio-master hook can drive both.
+ * Tempo model: BPM is **song-global** (one number that all chunks
+ * share when assembled), but each chunk has its own `audioStartMs` —
+ * the master-audio time of its first onset, used to anchor that
+ * chunk's bar grid in the timeline. Long-form sessions are not
+ * recorded against a click; chunks start where the musician started
+ * playing, which is rarely on the same beat-phase across chunks.
+ *
+ * The job-global BPM is computed as the most-common per-chunk BPM
+ * during sync (see `pickGlobalBpm` in chunk-detect.ts) — whole-file
+ * detection is unreliable on long-form sessions because the audio
+ * contains independent musical fragments. The user can override the
+ * global BPM via BpmReadout, and per chunk via the inspector's
+ * octave-shift buttons (for the rare case the detector picked the
+ * wrong octave on one chunk).
  */
 import { create } from "zustand";
+import type { BpmValue } from "../../editor/components/BpmReadoutView";
+import type { SnapMode } from "../../editor/snap";
 import type { Chunk, SilenceConfig, VideoAsset } from "../../storage/jobs-db";
 
 export interface TriagePlayback {
   currentTime: number;
   isPlaying: boolean;
-  /** Loop region (master-audio time, seconds). When set, the playback
-   *  hook keeps the playhead between [start, end]. Triage uses this
-   *  for chunk-loop. */
+  /** Loop region (master-audio time, seconds). When set AND
+   *  `loopEnabled` is true, the playback hook keeps the playhead
+   *  between [start, end]. */
   loop: { start: number; end: number } | null;
+  /** When false, focusing a chunk no longer arms loop playback —
+   *  audio plays linearly through chunks. Default true. */
+  loopEnabled: boolean;
 }
 
 export interface TriageView {
@@ -31,30 +44,30 @@ export interface TriageState {
   // ─── Inputs / cached data ─────────────────────────────────────────────
   jobId: string | null;
   audioDuration: number;
-  /** Decoded master-audio PCM at PCM_SAMPLE_RATE — held for live
-   *  re-runs of silence detection on slider tweaks. Cleared when the
-   *  page unmounts. */
   pcm: Float32Array | null;
   pcmSampleRate: number;
   envelope: Float32Array | null;
   envelopeHz: number;
-  /** Per-cam metadata (filename, color, sync). Mirror of the job's
-   *  videos[] filtered to video assets. */
   cams: VideoAsset[];
 
   // ─── Triage-specific ─────────────────────────────────────────────────
   chunks: Chunk[];
   silenceConfig: SilenceConfig;
-  /** Session-wide BPM override (optional). When set, all chunks adopt
-   *  this BPM in their bar-grid math regardless of their detected
-   *  value. The user explicitly opts in — auto-detect remains the
-   *  default. */
-  sessionBpmOverride: number | null;
-  /** ID of the focused chunk for inspector + loop playback. Null = no
-   *  focus, transport plays linearly. */
+  /** Current song-global BPM (possibly user-overridden). Null = no
+   *  detection yet (analysis stage didn't produce a tempo). */
+  jobBpm: BpmValue | null;
+  /** Auto-detected BPM snapshot. Used as the reset target when the
+   *  user has overridden. Null if detection failed. */
+  detectedBpm: { value: number; confidence: number } | null;
+  /** Time-signature numerator (= beats per bar). Default 4. */
+  beatsPerBar: number;
+  /** Anacrusis / pickup (beats), modulo `beatsPerBar`. Default 0. */
+  barOffsetBeats: number;
+  /** Beat-0 anchor in seconds (= editor's audioStart). Default 0. */
+  beatPhaseS: number;
+  /** Active snap mode for trim-handle drag. Default "1" (whole bar). */
+  snapMode: SnapMode;
   focusedChunkId: string | null;
-  /** ID of the cam being previewed + nudged. Null = the lead cam (cam-1
-   *  by convention) is shown. */
   selectedCamId: string | null;
 
   // ─── Playback / view ──────────────────────────────────────────────────
@@ -68,7 +81,13 @@ export interface TriageState {
     cams: VideoAsset[];
     chunks: Chunk[];
     silenceConfig: SilenceConfig;
-    sessionBpmOverride: number | null;
+    jobBpm: BpmValue | null;
+    detectedBpm: { value: number; confidence: number } | null;
+    beatsPerBar: number;
+    barOffsetBeats: number;
+    beatPhaseS: number;
+    snapMode: SnapMode;
+    loopEnabled: boolean;
     pcm: Float32Array;
     pcmSampleRate: number;
     envelope: Float32Array;
@@ -78,13 +97,19 @@ export interface TriageState {
 
   setChunks(chunks: Chunk[]): void;
   updateChunk(id: string, patch: Partial<Chunk>): void;
-  /** Extend or shrink a chunk's bounds by a number of bars at the
-   *  chunk's own effective-BPM. Sign convention: positive `barsBack`
-   *  pushes startMs back (longer chunk on the left); positive
-   *  `barsFwd` pushes endMs forward. */
+  /** Extend or shrink a chunk by a number of bars at the song-global
+   *  BPM. Sign convention: positive `barsBack` pushes startMs back
+   *  (longer chunk on the left); positive `barsFwd` pushes endMs
+   *  forward. */
   extendChunkBars(id: string, barsBack: number, barsFwd: number): void;
   setSilenceConfig(config: SilenceConfig): void;
-  setSessionBpm(bpm: number | null): void;
+
+  // BPM / time-signature.
+  setJobBpm(bpm: BpmValue): void;
+  resetBpmToDetected(): void;
+  setBeatsPerBar(n: number): void;
+  setSnapMode(m: SnapMode): void;
+
   focusChunk(id: string | null): void;
   acceptFocused(autoAdvance?: boolean): void;
   rejectFocused(autoAdvance?: boolean): void;
@@ -92,16 +117,13 @@ export interface TriageState {
   focusRelative(delta: -1 | 1): void;
 
   setSelectedCamId(id: string | null): void;
-  /** Adjust the user-override sync offset for one cam by a delta in
-   *  ms. Mirrors the editor's `nudgeClipSyncOverride` action. */
   nudgeCamSyncOverride(camId: string, deltaMs: number): void;
 
   // Playback actions (mirror editor shape).
   setPlaying(p: boolean): void;
   seek(t: number): void;
   setLoop(loop: TriagePlayback["loop"]): void;
-  /** Transport advances currentTime — bumped from the audio-master
-   *  hook every RAF tick. */
+  setLoopEnabled(enabled: boolean): void;
   tickTime(t: number): void;
 
   // View actions.
@@ -113,6 +135,7 @@ const INITIAL_PLAYBACK: TriagePlayback = {
   currentTime: 0,
   isPlaying: false,
   loop: null,
+  loopEnabled: true,
 };
 
 const INITIAL_VIEW: TriageView = {
@@ -136,7 +159,12 @@ export const useTriageStore = create<TriageState>((set, get) => ({
 
   chunks: [],
   silenceConfig: DEFAULT_SILENCE_CONFIG_STORE,
-  sessionBpmOverride: null,
+  jobBpm: null,
+  detectedBpm: null,
+  beatsPerBar: 4,
+  barOffsetBeats: 0,
+  beatPhaseS: 0,
+  snapMode: "1",
   focusedChunkId: null,
   selectedCamId: null,
 
@@ -150,17 +178,19 @@ export const useTriageStore = create<TriageState>((set, get) => ({
       cams: args.cams,
       chunks: args.chunks,
       silenceConfig: args.silenceConfig,
-      sessionBpmOverride: args.sessionBpmOverride,
+      jobBpm: args.jobBpm,
+      detectedBpm: args.detectedBpm,
+      beatsPerBar: args.beatsPerBar,
+      barOffsetBeats: args.barOffsetBeats,
+      beatPhaseS: args.beatPhaseS,
+      snapMode: args.snapMode,
       pcm: args.pcm,
       pcmSampleRate: args.pcmSampleRate,
       envelope: args.envelope,
       envelopeHz: args.envelopeHz,
-      // Default to the first cam for preview. The user can switch
-      // via the SyncPatchPanel.
       selectedCamId: args.cams[0]?.id ?? null,
-      // Reset transient UI state.
       focusedChunkId: null,
-      playback: INITIAL_PLAYBACK,
+      playback: { ...INITIAL_PLAYBACK, loopEnabled: args.loopEnabled },
       view: INITIAL_VIEW,
     });
   },
@@ -173,7 +203,12 @@ export const useTriageStore = create<TriageState>((set, get) => ({
       envelope: null,
       cams: [],
       chunks: [],
-      sessionBpmOverride: null,
+      jobBpm: null,
+      detectedBpm: null,
+      beatsPerBar: 4,
+      barOffsetBeats: 0,
+      beatPhaseS: 0,
+      snapMode: "1",
       focusedChunkId: null,
       selectedCamId: null,
       playback: INITIAL_PLAYBACK,
@@ -199,16 +234,15 @@ export const useTriageStore = create<TriageState>((set, get) => ({
     const s = get();
     const chunk = s.chunks.find((c) => c.id === id);
     if (!chunk) return;
-    const bpm = effectiveChunkBpm(chunk, s.sessionBpmOverride);
+    const bpm = effectiveChunkBpm(chunk, s.jobBpm?.value ?? null);
     if (bpm <= 0) return;
-    const msPerBar = (60_000 / bpm) * chunk.beatsPerBar;
+    const msPerBar = (60_000 / bpm) * s.beatsPerBar;
     const nextStart = Math.max(0, Math.round(chunk.startMs - barsBack * msPerBar));
     const nextEnd = Math.max(
       nextStart + 100,
       Math.min(s.audioDuration * 1000, Math.round(chunk.endMs + barsFwd * msPerBar)),
     );
     s.updateChunk(id, { startMs: nextStart, endMs: nextEnd, trimMode: "bar" });
-    // If this chunk is the loop region, follow the new bounds.
     if (s.focusedChunkId === id) {
       set({
         playback: {
@@ -219,8 +253,29 @@ export const useTriageStore = create<TriageState>((set, get) => ({
     }
   },
 
-  setSessionBpm(bpm) {
-    set({ sessionBpmOverride: bpm });
+  setJobBpm(bpm) {
+    set({ jobBpm: bpm });
+  },
+
+  resetBpmToDetected() {
+    const s = get();
+    if (!s.detectedBpm) return;
+    set({
+      jobBpm: {
+        value: s.detectedBpm.value,
+        confidence: s.detectedBpm.confidence,
+        manualOverride: false,
+      },
+    });
+  },
+
+  setBeatsPerBar(n) {
+    if (!Number.isFinite(n) || n < 1) return;
+    set({ beatsPerBar: Math.round(n) });
+  },
+
+  setSnapMode(m) {
+    set({ snapMode: m });
   },
 
   focusChunk(id) {
@@ -235,9 +290,11 @@ export const useTriageStore = create<TriageState>((set, get) => ({
       focusedChunkId: id,
       playback: {
         ...s.playback,
-        loop: { start: chunk.startMs / 1000, end: chunk.endMs / 1000 },
-        // Snap playhead to chunk start when focusing — feels like
-        // "tap chunk to hear it".
+        // Loop arms only when the user wants it. Off → linear playback,
+        // playhead jumps to chunk start but doesn't bounce.
+        loop: s.playback.loopEnabled
+          ? { start: chunk.startMs / 1000, end: chunk.endMs / 1000 }
+          : null,
         currentTime: chunk.startMs / 1000,
       },
     });
@@ -303,6 +360,29 @@ export const useTriageStore = create<TriageState>((set, get) => ({
     set((s) => ({ playback: { ...s.playback, loop } }));
   },
 
+  setLoopEnabled(enabled) {
+    set((s) => {
+      // Turning loop off while a chunk is focused clears the active
+      // loop region so playback continues linearly. Turning it back on
+      // re-arms loop on the focused chunk if any.
+      if (!enabled) {
+        return { playback: { ...s.playback, loopEnabled: false, loop: null } };
+      }
+      const focused = s.focusedChunkId
+        ? s.chunks.find((c) => c.id === s.focusedChunkId)
+        : null;
+      return {
+        playback: {
+          ...s.playback,
+          loopEnabled: true,
+          loop: focused
+            ? { start: focused.startMs / 1000, end: focused.endMs / 1000 }
+            : null,
+        },
+      };
+    });
+  },
+
   tickTime(t) {
     set((s) => ({ playback: { ...s.playback, currentTime: t } }));
   },
@@ -318,16 +398,30 @@ export const useTriageStore = create<TriageState>((set, get) => ({
   },
 }));
 
-/** Resolve the BPM that should drive a chunk's bar grid: session
- *  override (if set) takes precedence; otherwise the chunk's own
- *  detected BPM × octave shift. Returns 0 when no BPM is available. */
+/** Resolve the BPM that drives a chunk's bar grid. Per-chunk values
+ *  win when set (octave-shift on a detected per-chunk BPM); otherwise
+ *  fall back to the song-global `jobBpm`. Returns 0 when no BPM is
+ *  available anywhere — callers should suppress bar rendering in that
+ *  case. */
 export function effectiveChunkBpm(
-  chunk: Chunk,
-  sessionBpmOverride: number | null,
+  chunk: { detectedBpm?: number; bpmOctaveShift: -1 | 0 | 1; effectiveBpm: number },
+  jobBpm: number | null,
 ): number {
-  if (sessionBpmOverride && sessionBpmOverride > 0) return sessionBpmOverride;
-  if (chunk.detectedBpm) {
+  // Octave-shift only applies on top of a per-chunk detected BPM. If
+  // the chunk had no detection, fall through to the job-global.
+  if (chunk.detectedBpm && chunk.detectedBpm > 0) {
     return chunk.detectedBpm * Math.pow(2, chunk.bpmOctaveShift);
   }
+  if (jobBpm && jobBpm > 0) return jobBpm;
   return chunk.effectiveBpm > 0 ? chunk.effectiveBpm : 0;
+}
+
+/** Resolve the master-audio time (seconds) that anchors a chunk's
+ *  bar grid. Defaults to the chunk's start when no onset was
+ *  detected. */
+export function chunkBeatPhaseS(chunk: {
+  startMs: number;
+  audioStartMs?: number;
+}): number {
+  return (chunk.audioStartMs ?? chunk.startMs) / 1000;
 }

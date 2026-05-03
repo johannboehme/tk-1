@@ -25,6 +25,8 @@ import { useTriageStore } from "../../local/triage/triage-store";
 export function TriageTransportBar() {
   const isPlaying = useTriageStore((s) => s.playback.isPlaying);
   const setPlaying = useTriageStore((s) => s.setPlaying);
+  const loopEnabled = useTriageStore((s) => s.playback.loopEnabled);
+  const setLoopEnabled = useTriageStore((s) => s.setLoopEnabled);
   const focusedChunkId = useTriageStore((s) => s.focusedChunkId);
   const focusRelative = useTriageStore((s) => s.focusRelative);
   const acceptFocused = useTriageStore((s) => s.acceptFocused);
@@ -67,6 +69,12 @@ export function TriageTransportBar() {
     description: "Drop focused chunk (auto-advance)",
     group: "Triage",
   });
+  useRegisterShortcut({
+    id: "triage.loop",
+    keys: ["L"],
+    description: "Toggle loop on focused chunk",
+    group: "Transport",
+  });
 
   useEffect(() => {
     function isTextInput(target: EventTarget | null): boolean {
@@ -96,11 +104,15 @@ export function TriageTransportBar() {
       } else if (e.code === "Backspace") {
         e.preventDefault();
         rejectFocused();
+      } else if (e.code === "KeyL") {
+        e.preventDefault();
+        const cur = useTriageStore.getState().playback.loopEnabled;
+        setLoopEnabled(!cur);
       }
     }
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [setPlaying, focusRelative, acceptFocused, rejectFocused]);
+  }, [setPlaying, focusRelative, acceptFocused, rejectFocused, setLoopEnabled]);
 
   return (
     <div className="flex items-center gap-2 sm:gap-3 px-2 sm:px-4 py-2 bg-paper-hi border-t border-rule">
@@ -146,6 +158,20 @@ export function TriageTransportBar() {
         iconRight={<SkipFwdIcon className="w-4 h-4" />}
       >
         <span className="hidden sm:inline">Next</span>
+      </ChunkyButton>
+
+      {/* Loop toggle — when on (default), focusing a chunk arms a loop
+       *  region around it; when off, the playhead just jumps to the
+       *  chunk start and continues linearly. */}
+      <ChunkyButton
+        variant={loopEnabled ? "primary" : "secondary"}
+        size="sm"
+        onClick={() => setLoopEnabled(!loopEnabled)}
+        title={loopEnabled ? "Loop on · L to disable" : "Loop off · L to enable"}
+        aria-label={loopEnabled ? "Disable loop" : "Enable loop"}
+        aria-pressed={loopEnabled}
+      >
+        ⟲ Loop
       </ChunkyButton>
 
       {/* Time readout (subscribed separately so the bar doesn't re-render

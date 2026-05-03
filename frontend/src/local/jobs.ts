@@ -36,7 +36,7 @@ import {
 } from "./asset-source";
 import { syncAudio } from "./sync";
 import { getOrComputeAnalysis } from "./render/audio-analysis";
-import { detectChunks } from "./triage/chunk-detect";
+import { detectChunks, pickGlobalBpm } from "./triage/chunk-detect";
 import {
   DEFAULT_SILENCE_CONFIG,
 } from "./triage/triage-orchestrator";
@@ -529,9 +529,11 @@ async function runSync(jobId: string, audioExt: string): Promise<void> {
   }
 
   // Long-form chunk detection — only for `mode: "longform"` jobs.
-  // Runs envelope + silence-segments + per-chunk BPM and persists
-  // the result so the Triage screen can open instantly without
-  // any "decoding…" wait. Direct-mode jobs skip this entirely.
+  // Runs envelope + silence-segments and persists the result so the
+  // Triage screen can open instantly without any "decoding…" wait.
+  // BPM is song-global and produced by the audio-analysis step above,
+  // so no per-chunk tempo work happens here. Direct-mode jobs skip
+  // this entirely.
   const jobForMode = await jobsDb.getJob(jobId);
   if (jobForMode?.mode === "longform") {
     try {
@@ -541,11 +543,33 @@ async function runSync(jobId: string, audioExt: string): Promise<void> {
         studioMonoPcm.sampleRate,
         DEFAULT_SILENCE_CONFIG,
       );
-      await jobsDb.updateJob(jobId, {
+      // Aggregate per-chunk BPMs into the song-global tempo. Whole-file
+      // BPM detection is unreliable on long-form session recordings —
+      // each chunk votes with its own duration as weight, the most-
+      // common BPM wins. The detected number lands in `job.bpm`
+      // (manualOverride: false) so the editor + triage UI both see it.
+      // If the audio-analysis step above already set a manual BPM the
+      // user shouldn't get overridden — only fill in when nothing's
+      // there yet or when the existing value is auto-detected.
+      const fresh = await jobsDb.getJob(jobId);
+      const existingBpm = fresh?.bpm;
+      const updates: Partial<LocalJob> = {
         chunks: detection.chunks,
         silenceConfig: DEFAULT_SILENCE_CONFIG,
         triageEnvelope: detection.envelope,
-      });
+      };
+      if (!existingBpm?.manualOverride) {
+        const globalBpm = pickGlobalBpm(detection.chunks);
+        if (globalBpm) {
+          updates.bpm = {
+            value: globalBpm.value,
+            confidence: globalBpm.confidence,
+            phase: existingBpm?.phase ?? 0,
+            manualOverride: false,
+          };
+        }
+      }
+      await jobsDb.updateJob(jobId, updates);
     } catch (err) {
       console.warn(`Chunk detection failed for ${jobId} (non-fatal):`, err);
     }
