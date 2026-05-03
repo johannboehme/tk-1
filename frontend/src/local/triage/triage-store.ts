@@ -67,6 +67,11 @@ export interface TriageState {
   beatPhaseS: number;
   /** Active snap mode for trim-handle drag. Default "1" (whole bar). */
   snapMode: SnapMode;
+  /** Minimum chunk length (in bars at the global tempo) for a chunk to
+   *  remain accepted. 0 = no filter. Set via the DetectionPanel
+   *  dropdown — short blips below the threshold get auto-rejected so
+   *  the arrangement isn't polluted with sample-test fragments. */
+  minChunkBars: number;
   focusedChunkId: string | null;
   selectedCamId: string | null;
 
@@ -87,6 +92,7 @@ export interface TriageState {
     barOffsetBeats: number;
     beatPhaseS: number;
     snapMode: SnapMode;
+    minChunkBars: number;
     loopEnabled: boolean;
     pcm: Float32Array;
     pcmSampleRate: number;
@@ -109,6 +115,10 @@ export interface TriageState {
   resetBpmToDetected(): void;
   setBeatsPerBar(n: number): void;
   setSnapMode(m: SnapMode): void;
+  /** Set the min-bars filter. When > 0, all chunks shorter than that
+   *  many bars at the song-global tempo are immediately marked
+   *  accepted=false. Subsequent re-detections re-apply the filter. */
+  setMinChunkBars(bars: number): void;
 
   focusChunk(id: string | null): void;
   acceptFocused(autoAdvance?: boolean): void;
@@ -165,6 +175,7 @@ export const useTriageStore = create<TriageState>((set, get) => ({
   barOffsetBeats: 0,
   beatPhaseS: 0,
   snapMode: "1",
+  minChunkBars: 0,
   focusedChunkId: null,
   selectedCamId: null,
 
@@ -184,6 +195,7 @@ export const useTriageStore = create<TriageState>((set, get) => ({
       barOffsetBeats: args.barOffsetBeats,
       beatPhaseS: args.beatPhaseS,
       snapMode: args.snapMode,
+      minChunkBars: args.minChunkBars,
       pcm: args.pcm,
       pcmSampleRate: args.pcmSampleRate,
       envelope: args.envelope,
@@ -209,6 +221,7 @@ export const useTriageStore = create<TriageState>((set, get) => ({
       barOffsetBeats: 0,
       beatPhaseS: 0,
       snapMode: "1",
+      minChunkBars: 0,
       focusedChunkId: null,
       selectedCamId: null,
       playback: INITIAL_PLAYBACK,
@@ -290,6 +303,14 @@ export const useTriageStore = create<TriageState>((set, get) => ({
 
   setSnapMode(m) {
     set({ snapMode: m });
+  },
+
+  setMinChunkBars(bars) {
+    const safe = Number.isFinite(bars) ? Math.max(0, bars) : 0;
+    set((s) => ({
+      minChunkBars: safe,
+      chunks: applyMinBarsFilter(s.chunks, safe, s.jobBpm?.value ?? null, s.beatsPerBar),
+    }));
   },
 
   focusChunk(id) {
@@ -434,4 +455,30 @@ export function chunkBeatPhaseS(chunk: {
   audioStartMs?: number;
 }): number {
   return (chunk.audioStartMs ?? chunk.startMs) / 1000;
+}
+
+/** Mark every chunk shorter than `minBars` (at the given BPM +
+ *  beats-per-bar) as accepted=false. Chunks already meeting the
+ *  threshold are left untouched — including ones the user manually
+ *  rejected for other reasons. When `minBars <= 0` this is a no-op
+ *  and the user's per-chunk decisions are preserved. */
+export function applyMinBarsFilter(
+  chunks: Chunk[],
+  minBars: number,
+  jobBpm: number | null,
+  beatsPerBar: number,
+): Chunk[] {
+  if (minBars <= 0 || !jobBpm || jobBpm <= 0 || beatsPerBar <= 0) return chunks;
+  const msPerBar = (60_000 / jobBpm) * beatsPerBar;
+  const thresholdMs = minBars * msPerBar;
+  let mutated = false;
+  const next = chunks.map((c) => {
+    const lengthMs = c.endMs - c.startMs;
+    if (lengthMs < thresholdMs && c.accepted) {
+      mutated = true;
+      return { ...c, accepted: false };
+    }
+    return c;
+  });
+  return mutated ? next : chunks;
 }

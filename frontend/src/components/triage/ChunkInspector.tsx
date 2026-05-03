@@ -107,14 +107,6 @@ function ChunkBody({ chunk, jobBpmValue, beatsPerBar, onExtend }: BodyProps) {
           label="Anchor"
           value={phaseDeltaMs > 1 ? `+${phaseDeltaMs.toFixed(0)}ms` : "at start"}
         />
-        <KV
-          label="Tempo"
-          value={
-            effBpm > 0
-              ? `${effBpm.toFixed(0)}${chunk.bpmOctaveShift !== 0 ? ` (${chunk.bpmOctaveShift > 0 ? "×" : "÷"}2)` : ""}`
-              : "—"
-          }
-        />
       </div>
 
       {/* Bar extend / shrink — 2×2 grid of trim arrows. */}

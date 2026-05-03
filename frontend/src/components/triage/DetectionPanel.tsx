@@ -15,8 +15,21 @@
 import { useCallback, useRef } from "react";
 import { detectChunksFromEnvelope } from "../../local/triage/chunk-detect";
 import { jobsDb } from "../../local/jobs";
-import { useTriageStore } from "../../local/triage/triage-store";
+import {
+  applyMinBarsFilter,
+  useTriageStore,
+} from "../../local/triage/triage-store";
 import type { SilenceConfig } from "../../storage/jobs-db";
+
+/** Bar-length threshold options for the min-bars filter. 0 = off. */
+const MIN_BARS_OPTIONS: ReadonlyArray<{ value: number; label: string }> = [
+  { value: 0, label: "off" },
+  { value: 1, label: "≥ 1 bar" },
+  { value: 2, label: "≥ 2 bars" },
+  { value: 4, label: "≥ 4 bars" },
+  { value: 8, label: "≥ 8 bars" },
+  { value: 16, label: "≥ 16 bars" },
+];
 
 const LCD_BG = `
   repeating-linear-gradient(0deg, rgba(255,255,255,0.04) 0 1px, transparent 1px 3px),
@@ -39,6 +52,8 @@ export function DetectionPanel() {
   const setSilenceConfig = useTriageStore((s) => s.setSilenceConfig);
   const setChunks = useTriageStore((s) => s.setChunks);
   const chunks = useTriageStore((s) => s.chunks);
+  const minChunkBars = useTriageStore((s) => s.minChunkBars);
+  const setMinChunkBars = useTriageStore((s) => s.setMinChunkBars);
   const acceptedCount = chunks.filter((c) => c.accepted).length;
   const acceptedDurationMs = chunks
     .filter((c) => c.accepted)
@@ -73,7 +88,15 @@ export function DetectionPanel() {
           }
           return c;
         });
-        setChunks(merged);
+        // Re-apply the active min-bars filter so newly-emitted short
+        // chunks don't leak in as accepted on slider tweaks.
+        const filtered = applyMinBarsFilter(
+          merged,
+          state.minChunkBars,
+          state.jobBpm?.value ?? null,
+          state.beatsPerBar,
+        );
+        setChunks(filtered);
       });
     },
     [setChunks],
@@ -108,7 +131,7 @@ export function DetectionPanel() {
   }
 
   return (
-    <div className="flex-1 grid grid-cols-1 sm:grid-cols-[1fr_auto] gap-3 sm:gap-4 items-center">
+    <div className="flex-1 grid grid-cols-1 sm:grid-cols-[1fr_auto_auto] gap-3 sm:gap-4 items-center">
       <div className="flex flex-col gap-1.5 min-w-0">
         <SliderRow
           label="Threshold"
@@ -129,12 +152,49 @@ export function DetectionPanel() {
           onChange={(v) => onChange({ minPauseMs: v })}
         />
       </div>
+      <MinBarsFilter
+        value={minChunkBars}
+        onChange={setMinChunkBars}
+      />
       <KeptCounter
         chunkCount={chunks.length}
         keptCount={acceptedCount}
         totalMs={acceptedDurationMs}
       />
     </div>
+  );
+}
+
+function MinBarsFilter({
+  value,
+  onChange,
+}: {
+  value: number;
+  onChange: (n: number) => void;
+}) {
+  return (
+    <label className="flex flex-col items-start gap-1 shrink-0">
+      <span className="font-display text-[8px] tracking-[0.18em] text-ink-3 uppercase">
+        Min bars
+      </span>
+      <select
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className={[
+          "h-[26px] rounded-[3px] border border-black/40",
+          "font-mono tabular text-[11px] text-ink",
+          "bg-paper-hi px-2 pr-6 cursor-pointer",
+          "focus:outline-none focus:border-cobalt",
+        ].join(" ")}
+        title="Auto-drop chunks shorter than this many bars"
+      >
+        {MIN_BARS_OPTIONS.map((o) => (
+          <option key={o.value} value={o.value}>
+            {o.label}
+          </option>
+        ))}
+      </select>
+    </label>
   );
 }
 

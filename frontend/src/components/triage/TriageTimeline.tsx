@@ -191,104 +191,144 @@ export function TriageTimeline() {
     if (pointersRef.current.size === 0) panStartRef.current = null;
   }
 
-  function onCanvasClick(e: React.MouseEvent) {
-    if (suppressClickRef.current) {
-      suppressClickRef.current = false;
-      return;
-    }
+  // ─── Pointer interaction ──────────────────────────────────────────────
+  // Unified drag state — playhead scrub OR per-chunk trim handle. The
+  // trim handles have their own onMouseDown with stopPropagation so
+  // they never bubble here; the wrapper's onMouseDown handles the
+  // remaining cases (playhead drag, chunk-lane focus).
+  type DragState =
+    | {
+        kind: "trim";
+        chunkId: string;
+        edge: "left" | "right";
+        anchorS: number;
+      }
+    | { kind: "playhead" };
+  const dragRef = useRef<DragState | null>(null);
+  const movedRef = useRef(false);
+
+  /** Pick the snap context for a given master-time. We anchor on
+   *  whichever chunk the cursor is currently INSIDE; if it's between
+   *  chunks, fall back to the focused chunk; if neither, no snap.
+   *  Always reads the latest jobBpm/snapMode/beatsPerBar via store. */
+  function buildSnapAtTime(tS: number): {
+    bpm: number;
+    anchorS: number;
+  } | null {
+    const tMs = tS * 1000;
+    const inside = chunks.find((c) => tMs >= c.startMs && tMs <= c.endMs);
+    const focused = chunks.find((c) => c.id === focusedChunkId);
+    const c = inside ?? focused ?? null;
+    if (!c) return null;
+    const bpm = effectiveChunkBpm(c, jobBpm?.value ?? null);
+    if (bpm <= 0) return null;
+    return { bpm, anchorS: chunkBeatPhaseS(c) };
+  }
+
+  function snapTimeS(tS: number, ev: { shiftKey: boolean }, ctx?: { bpm: number; anchorS: number } | null): number {
+    if (ev.shiftKey || snapMode === "off") return tS;
+    const snapCtx = ctx ?? buildSnapAtTime(tS);
+    if (!snapCtx) return tS;
+    return snapTime(tS, snapMode, {
+      bpm: snapCtx.bpm,
+      beatPhase: snapCtx.anchorS,
+      beatsPerBar,
+    });
+  }
+
+  function onWrapperMouseDown(e: React.MouseEvent) {
+    // Only primary button.
+    if (e.button !== 0) return;
+    const target = e.target as HTMLElement;
+    // Trim handles register their own onMouseDown with stopPropagation,
+    // so they never reach here. Defensive double-check via data attr.
+    if (target.dataset.trimHandle) return;
+
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     const xPx = e.clientX - rect.left;
     const yPx = e.clientY - rect.top;
-    const t = xToTime(xPx);
+    const tRaw = xToTime(xPx);
     const chunkLaneTop = TIME_RULER_HEIGHT + BAR_RULER_HEIGHT + waveformHeight;
+
+    // Click in the chunk lane on a chunk → focus it; that's the
+    // primary curation action there. We don't seek/scrub from the
+    // chunk lane to keep the focus interaction predictable.
     if (yPx >= chunkLaneTop) {
       const hit = chunks.find(
-        (c) => t * 1000 >= c.startMs && t * 1000 <= c.endMs,
+        (c) => tRaw * 1000 >= c.startMs && tRaw * 1000 <= c.endMs,
       );
       if (hit) {
         focusChunk(hit.id);
         return;
       }
+      // Fallthrough: empty area in chunk lane → playhead drag.
     }
-    seek(t);
-  }
 
-  // ─── Trim drag ────────────────────────────────────────────────────────
-  // Per-chunk left/right edge drag. Uses the editor's snap helper so
-  // the modes (off / 1 / 1/2 / 1/4 / 1/8 / 1/16) feel identical to the
-  // editor's timeline.
-  const dragRef = useRef<
-    | {
-        chunkId: string;
-        edge: "left" | "right";
-        bpm: number;
-        anchorS: number;
-        startMs: number;
-        endMs: number;
-      }
-    | null
-  >(null);
-  const suppressClickRef = useRef(false);
+    // Playhead scrub — seek immediately + start tracking.
+    movedRef.current = false;
+    dragRef.current = { kind: "playhead" };
+    seek(snapTimeS(tRaw, e));
+  }
 
   function startTrimDrag(
     e: React.MouseEvent,
     chunk: Chunk,
     edge: "left" | "right",
   ) {
+    if (e.button !== 0) return;
     e.preventDefault();
     e.stopPropagation();
-    const bpm = effectiveChunkBpm(chunk, jobBpm?.value ?? null);
+    movedRef.current = false;
     dragRef.current = {
+      kind: "trim",
       chunkId: chunk.id,
       edge,
-      bpm,
       anchorS: chunkBeatPhaseS(chunk),
-      startMs: chunk.startMs,
-      endMs: chunk.endMs,
     };
   }
 
   useEffect(() => {
     function onMove(ev: MouseEvent) {
-      if (!dragRef.current) return;
+      const drag = dragRef.current;
+      if (!drag) return;
       const wrapper = wrapperRef.current;
       if (!wrapper) return;
+      movedRef.current = true;
       const rect = wrapper.getBoundingClientRect();
       const xPx = ev.clientX - rect.left;
-      const tS = xToTime(xPx);
-      // Alt = bypass snap for free positioning, otherwise honour the
-      // active snap mode anchored at the chunk's own audio-start.
-      const snapped = ev.shiftKey
-        ? tS
-        : snapTime(tS, snapMode, {
-            bpm: dragRef.current.bpm > 0 ? dragRef.current.bpm : null,
-            beatPhase: dragRef.current.anchorS,
-            beatsPerBar,
-          });
-      let timeMs = Math.round(snapped * 1000);
-      const chunk = chunks.find((c) => c.id === dragRef.current!.chunkId);
+      const tRaw = xToTime(xPx);
+
+      if (drag.kind === "playhead") {
+        seek(snapTimeS(tRaw, ev));
+        return;
+      }
+
+      // Trim drag: snap anchored at the chunk's own audio-start, with
+      // the song-global BPM resolved fresh each move so changes mid-
+      // drag (rare) take effect immediately.
+      const chunk = chunks.find((c) => c.id === drag.chunkId);
       if (!chunk) return;
-      if (dragRef.current.edge === "left") {
+      const bpm = effectiveChunkBpm(chunk, jobBpm?.value ?? null);
+      const snapped =
+        ev.shiftKey || snapMode === "off" || bpm <= 0
+          ? tRaw
+          : snapTime(tRaw, snapMode, {
+              bpm,
+              beatPhase: drag.anchorS,
+              beatsPerBar,
+            });
+      const timeMs = Math.round(snapped * 1000);
+      const trimMode: "free" | "bar" = ev.shiftKey ? "free" : "bar";
+      if (drag.edge === "left") {
         const next = Math.max(0, Math.min(chunk.endMs - 100, timeMs));
-        if (next !== chunk.startMs) {
-          updateChunk(chunk.id, {
-            startMs: next,
-            trimMode: ev.shiftKey ? "free" : "bar",
-          });
-        }
+        if (next !== chunk.startMs) updateChunk(chunk.id, { startMs: next, trimMode });
       } else {
         const next = Math.max(
           chunk.startMs + 100,
           Math.min(audioDuration * 1000, timeMs),
         );
-        if (next !== chunk.endMs) {
-          updateChunk(chunk.id, {
-            endMs: next,
-            trimMode: ev.shiftKey ? "free" : "bar",
-          });
-        }
+        if (next !== chunk.endMs) updateChunk(chunk.id, { endMs: next, trimMode });
       }
-      suppressClickRef.current = true;
     }
     function onUp() {
       dragRef.current = null;
@@ -299,7 +339,19 @@ export function TriageTimeline() {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
-  }, [chunks, updateChunk, xToTime, audioDuration, snapMode, beatsPerBar]);
+    // buildSnapAtTime / snapTimeS close over the current store values
+    // so we re-install the listeners whenever any of those change.
+  }, [
+    chunks,
+    focusedChunkId,
+    updateChunk,
+    xToTime,
+    audioDuration,
+    snapMode,
+    beatsPerBar,
+    jobBpm,
+    seek,
+  ]);
 
   const timeTicks = useTimeRuler(viewStartS, viewEndS, size.width);
   const barTicks = usePerChunkBarTicks(
@@ -380,7 +432,7 @@ export function TriageTimeline() {
       ref={wrapperRef}
       className="relative w-full h-full bg-paper-hi border border-rule rounded-md overflow-hidden select-none touch-none"
       onWheel={onWheel}
-      onClick={onCanvasClick}
+      onMouseDown={onWrapperMouseDown}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
@@ -434,34 +486,41 @@ export function TriageTimeline() {
       >
         {barTicks.map((tick, i) => {
           const dim = tick.extension;
-          // Downbeats: thick, full-height. Beats: thin, half-height.
-          const isDownbeat = tick.downbeat;
-          const tickWidth = isDownbeat ? 2 : 1;
-          const tickHeight = isDownbeat ? "100%" : "45%";
-          const tickColor = isDownbeat
-            ? dim
-              ? "#FF572266"
-              : HOT_COLOR
-            : dim
-              ? "#FF572233"
-              : "#FF5722B0";
+          // Three tiers of marker, each with its own stroke + height
+          // so the eye reads the hierarchy at any zoom:
+          //   bar-major: 2px, full height, labeled with bar number
+          //   bar-minor: 1.5px, ~70% height, no label
+          //   beat:      1px, ~40% height, no label
+          let tickWidth = 1;
+          let tickHeight = "40%";
+          let tickColor = dim ? "#FF572233" : "#FF5722B0";
+          if (tick.kind === "bar-major") {
+            tickWidth = 2;
+            tickHeight = "100%";
+            tickColor = dim ? "#FF572266" : HOT_COLOR;
+          } else if (tick.kind === "bar-minor") {
+            tickWidth = 1.5;
+            tickHeight = "70%";
+            tickColor = dim ? "#FF572255" : "#FF5722CC";
+          }
+          const x = timeToX(tick.tS);
           return (
             <span key={`b-${i}`}>
               <span
                 className="absolute bottom-0"
                 style={{
-                  left: timeToX(tick.tS),
+                  left: x,
                   width: tickWidth,
                   height: tickHeight,
                   background: tickColor,
                   marginLeft: -tickWidth / 2,
                 }}
               />
-              {isDownbeat && (
+              {tick.kind === "bar-major" && (
                 <span
                   className="absolute font-display tracking-[0.05em] uppercase tabular leading-none select-none"
                   style={{
-                    left: timeToX(tick.tS) + 3,
+                    left: x + 3,
                     top: 3,
                     fontSize: 9,
                     color: dim ? "#FF572277" : "#1A1612",
@@ -588,23 +647,23 @@ function ChunkBlock({
       {showHandles && (
         <>
           <div
+            data-trim-handle="left"
             className="absolute left-0 top-0 bottom-0 cursor-ew-resize"
             style={{
               width: TRIM_HANDLE_PX,
               background: focused ? "#2F6FED" : "rgba(0,0,0,0.25)",
             }}
             onMouseDown={(e) => onTrimStart("left", e)}
-            onClick={(e) => e.stopPropagation()}
             title="Drag to trim start (Shift = bypass snap)"
           />
           <div
+            data-trim-handle="right"
             className="absolute right-0 top-0 bottom-0 cursor-ew-resize"
             style={{
               width: TRIM_HANDLE_PX,
               background: focused ? "#2F6FED" : "rgba(0,0,0,0.25)",
             }}
             onMouseDown={(e) => onTrimStart("right", e)}
-            onClick={(e) => e.stopPropagation()}
             title="Drag to trim end (Shift = bypass snap)"
           />
         </>
@@ -644,29 +703,51 @@ function useTimeRuler(viewStartS: number, viewEndS: number, widthPx: number): Ru
 
 interface BarTick {
   tS: number;
-  downbeat: boolean;
-  /** Bar number — 1 at the chunk's audio-start anchor, 2 at the next
-   *  downbeat, etc. Only meaningful for downbeats (beats inside a bar
-   *  share the same barIndex but we don't render it for them). */
+  /** Visual category — drives stroke + label rendering.
+   *  - "bar-major": labeled downbeat (e.g. bar 1, 5, 9 at stride 4)
+   *  - "bar-minor": unlabeled downbeat between major bars
+   *  - "beat":      sub-bar beat tick (high zoom only)
+   */
+  kind: "bar-major" | "bar-minor" | "beat";
+  /** Bar number — 1 at the chunk's audio-start anchor. Only rendered
+   *  for `bar-major` ticks. */
   barIndex: number;
   /** True when this tick lies outside the chunk's current bounds — a
-   *  potential snap target if the user trims outwards. Rendered
-   *  dimmer so the user sees where the next bar would land without
-   *  confusing it with the chunk's "real" content. */
+   *  potential snap target if the user trims outwards. */
   extension: boolean;
 }
 
-/** Per-chunk bar/beat ticks. Each chunk has its own anchor (audio-
- *  start onset) and uses the song-global BPM (or its own detected
- *  value as fallback). Chunks with no BPM info anywhere are skipped.
+/** Per-chunk bar/beat ticks with adaptive density.
+ *
+ *  Each chunk has its own anchor (audio-start onset) and uses the
+ *  song-global BPM (or its own detected value as fallback). The
+ *  marker scale adapts to the current zoom so the ruler stays
+ *  legible at every level:
+ *
+ *  - High zoom (`pxPerBeat ≥ 8`):    every bar labeled, every beat as a tick
+ *  - Mid zoom  (`pxPerBar ≥ 56`):    every bar labeled, no beats
+ *  - Low zoom: pick the smallest power-of-2 stride such that labeled
+ *    bars sit at least 56 px apart. Unlabeled bars in between render
+ *    as minor ticks while there's still room (≥ 6 px); below that the
+ *    minors collapse and only the labeled stride remains.
  *
  *  Visibility rules:
  *  - Non-focused chunks: ticks only within the chunk's current bounds.
- *  - Focused chunk: ticks render across the FULL visible view, so the
- *    user can see snap targets when trim-dragging the boundary
- *    outwards past the current chunk extent. The extra ticks carry
- *    `extension: true` and are drawn at lower contrast.
+ *  - Focused chunk: ticks render across the FULL visible view (with
+ *    `extension: true` flag) so the user sees snap targets while
+ *    trim-dragging outwards.
  */
+const TARGET_LABEL_PX = 56;
+const MIN_MINOR_BAR_PX = 6;
+const MIN_BEAT_PX = 8;
+
+function pickBarStride(pxPerBar: number): number {
+  if (pxPerBar >= TARGET_LABEL_PX) return 1;
+  if (pxPerBar <= 0) return 1;
+  const need = TARGET_LABEL_PX / pxPerBar;
+  return Math.pow(2, Math.ceil(Math.log2(need)));
+}
+
 function usePerChunkBarTicks(
   chunks: Chunk[],
   focusedChunkId: string | null,
@@ -678,53 +759,53 @@ function usePerChunkBarTicks(
 ): BarTick[] {
   return useMemo(() => {
     const ticks: BarTick[] = [];
-    const minBeatPx = 3;
-    const minBarPx = 8;
     for (const chunk of chunks) {
       const bpm = effectiveChunkBpm(chunk, jobBpm);
       if (bpm <= 0) continue;
       const sPerBeat = 60 / bpm;
       const sPerBar = sPerBeat * beatsPerBar;
-      if (sPerBar * pxPerSec < minBarPx) continue;
+      const pxPerBar = sPerBar * pxPerSec;
+      const pxPerBeat = sPerBeat * pxPerSec;
+      // Skip when even the labeled stride would draw sub-pixel —
+      // useless and would just smear into a band.
+      if (pxPerBar < 0.25) continue;
+
+      const stride = pickBarStride(pxPerBar);
+      const showMinorBars = stride > 1 && pxPerBar >= MIN_MINOR_BAR_PX;
+      const showBeats = stride === 1 && pxPerBeat >= MIN_BEAT_PX;
+
       const startS = chunk.startMs / 1000;
       const endS = chunk.endMs / 1000;
       const isFocused = chunk.id === focusedChunkId;
-      // Where this chunk's grid should render. Focused chunks paint
-      // their grid across the full view to expose snap targets while
-      // trimming; everyone else stays inside their bounds.
       const renderStart = isFocused ? viewStartS : Math.max(startS, viewStartS);
       const renderEnd = isFocused ? viewEndS : Math.min(endS, viewEndS);
       if (renderEnd < viewStartS || renderStart > viewEndS) continue;
-      const showBeats = sPerBeat * pxPerSec >= minBeatPx;
       const anchorS = chunkBeatPhaseS(chunk);
 
-      // Forward sweep from anchor (anchor = beat 0 = bar 1).
-      let beat = 0;
-      for (
-        let t = anchorS;
-        t <= renderEnd;
-        t = anchorS + ++beat * sPerBeat
-      ) {
-        if (t < renderStart) continue;
-        const isDownbeat = beat % beatsPerBar === 0;
-        if (!showBeats && !isDownbeat) continue;
+      // Iterate every beat in the visible span.
+      const firstBeatI = Math.ceil((renderStart - anchorS) / sPerBeat - 1e-9);
+      const lastBeatI = Math.floor((renderEnd - anchorS) / sPerBeat + 1e-9);
+      for (let i = firstBeatI; i <= lastBeatI; i++) {
+        const t = anchorS + i * sPerBeat;
+        if (t < renderStart - 1e-9 || t > renderEnd + 1e-9) continue;
+        const beatInBar = ((i % beatsPerBar) + beatsPerBar) % beatsPerBar;
+        const isDownbeat = beatInBar === 0;
+        const barIndex = Math.floor(i / beatsPerBar) + 1;
+        const isLabeled =
+          isDownbeat && (((barIndex - 1) % stride) + stride) % stride === 0;
+
+        let kind: BarTick["kind"];
+        if (isLabeled) kind = "bar-major";
+        else if (isDownbeat) {
+          if (!showMinorBars) continue;
+          kind = "bar-minor";
+        } else {
+          if (!showBeats) continue;
+          kind = "beat";
+        }
+
         const extension = isFocused && (t < startS || t > endS);
-        const barIndex = Math.floor(beat / beatsPerBar) + 1;
-        ticks.push({ tS: t, downbeat: isDownbeat, barIndex, extension });
-      }
-      // Backward sweep — start at beat -1 (anchor itself was emitted).
-      beat = -1;
-      for (
-        let t = anchorS + beat * sPerBeat;
-        t >= renderStart;
-        t = anchorS + --beat * sPerBeat
-      ) {
-        if (t > renderEnd) continue;
-        const isDownbeat = ((beat % beatsPerBar) + beatsPerBar) % beatsPerBar === 0;
-        if (!showBeats && !isDownbeat) continue;
-        const extension = isFocused && (t < startS || t > endS);
-        const barIndex = Math.floor(beat / beatsPerBar) + 1;
-        ticks.push({ tS: t, downbeat: isDownbeat, barIndex, extension });
+        ticks.push({ tS: t, kind, barIndex, extension });
       }
     }
     return ticks;

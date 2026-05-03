@@ -38,7 +38,7 @@ import {
 } from "../local/triage/triage-orchestrator";
 import { loadAssetFile } from "../local/asset-source";
 import { decodeAudioToMonoPcm } from "../local/codec";
-import { TRIAGE_ENVELOPE_HZ } from "../local/triage/chunk-detect";
+import { TRIAGE_ENVELOPE_HZ, pickGlobalBpm } from "../local/triage/chunk-detect";
 import { useTriageStore } from "../local/triage/triage-store";
 import { useTriagePersist } from "../local/triage/useTriagePersist";
 import { getCachedAnalysis } from "../local/render/audio-analysis";
@@ -133,11 +133,26 @@ export default function Triage() {
         ? { value: detectedTempo.bpm, confidence: detectedTempo.confidence }
         : null;
       const persistedBpm = job!.bpm;
-      const jobBpm = persistedBpm
+      // Triple fallback: persisted job.bpm → whole-file analysis cache
+      // → mode of per-chunk detected BPMs. Whole-file is unreliable on
+      // long-form sessions but better than nothing; the chunk-mode is
+      // the canonical long-form path but only works when at least
+      // some chunks were long enough for tempo detection.
+      let jobBpm: ReturnType<typeof toBpmValue> | null = persistedBpm
         ? toBpmValue(persistedBpm)
         : detectedBpm
           ? { value: detectedBpm.value, confidence: detectedBpm.confidence, manualOverride: false }
           : null;
+      if (!jobBpm && job!.chunks?.length) {
+        const fromChunks = pickGlobalBpm(job!.chunks);
+        if (fromChunks) {
+          jobBpm = {
+            value: fromChunks.value,
+            confidence: fromChunks.confidence,
+            manualOverride: false,
+          };
+        }
+      }
       return {
         jobBpm,
         detectedBpm,
@@ -163,6 +178,7 @@ export default function Triage() {
           barOffsetBeats: timing.barOffsetBeats,
           beatPhaseS: timing.beatPhaseS,
           snapMode: job!.ui?.snapMode ?? "1",
+          minChunkBars: 0,
           loopEnabled: true,
           pcm: new Float32Array(0),
           pcmSampleRate: 22050,
@@ -205,6 +221,7 @@ export default function Triage() {
           barOffsetBeats: timing.barOffsetBeats,
           beatPhaseS: timing.beatPhaseS,
           snapMode: job!.ui?.snapMode ?? "1",
+          minChunkBars: 0,
           loopEnabled: true,
           pcm: result.pcm,
           pcmSampleRate: result.sampleRate,
