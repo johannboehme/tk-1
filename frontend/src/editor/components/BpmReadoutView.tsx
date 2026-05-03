@@ -168,35 +168,59 @@ export function BpmReadoutView({
         </div>
         <div className="relative inline-flex items-center gap-2">
           {editing ? (
-            <input
-              ref={inputRef}
-              data-testid="bpm-input"
-              type="number"
-              min={MIN_BPM}
-              max={MAX_BPM}
-              value={draft}
-              onChange={(e) => setDraft(e.target.value)}
-              onBlur={commit}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") commit();
-                else if (e.key === "Escape") cancel();
-              }}
-              className={[
-                "font-mono tabular tracking-[0.05em]",
-                "text-lg px-2 rounded-[3px] w-[58px] text-right",
-                "border border-black/40 outline-none focus:border-hot",
-              ].join(" ")}
-              style={{
-                height: 28,
-                lineHeight: "26px",
-                paddingTop: 0,
-                paddingBottom: 0,
-                background: LCD_BG,
-                boxShadow: LCD_SHADOW,
-                color: bpmColor,
-                textShadow: bpmGlow,
-              }}
-            />
+            <>
+              <input
+                ref={inputRef}
+                data-testid="bpm-input"
+                type="number"
+                min={MIN_BPM}
+                max={MAX_BPM}
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onBlur={(e) => {
+                  // Don't blur-commit when focus is moving to the
+                  // ÷2/×2/reset keys inside the same plate. Those
+                  // handle the value themselves; a commit here would
+                  // race them.
+                  const next = e.relatedTarget as HTMLElement | null;
+                  if (next?.dataset.bpmEditCtl === "1") return;
+                  commit();
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") commit();
+                  else if (e.key === "Escape") cancel();
+                }}
+                className={[
+                  "font-mono tabular tracking-[0.05em]",
+                  "text-lg px-2 rounded-[3px] w-[58px] text-right",
+                  "border border-black/40 outline-none focus:border-hot",
+                ].join(" ")}
+                style={{
+                  height: 28,
+                  lineHeight: "26px",
+                  paddingTop: 0,
+                  paddingBottom: 0,
+                  background: LCD_BG,
+                  boxShadow: LCD_SHADOW,
+                  color: bpmColor,
+                  textShadow: bpmGlow,
+                }}
+              />
+              {/* Octave shift on the live draft — the same hardware
+               *  language as the cassette snap keys, but tiny, sitting
+               *  right next to the LCD so the user can fix a half/
+               *  double-time misdetection without typing. Setting the
+               *  draft (not committing) lets the user keep editing. */}
+              <OctaveKeys
+                onShift={(factor) => {
+                  const cur = parseFloat(draft);
+                  if (!Number.isFinite(cur)) return;
+                  const next = Math.max(MIN_BPM, Math.min(MAX_BPM, cur * factor));
+                  setDraft(String(Math.round(next)));
+                  inputRef.current?.focus();
+                }}
+              />
+            </>
           ) : (
             <button
               type="button"
@@ -227,6 +251,7 @@ export function BpmReadoutView({
             <button
               type="button"
               data-testid="bpm-reset"
+              data-bpm-edit-ctl="1"
               onMouseDown={(e) => {
                 e.preventDefault();
                 onReset();
@@ -359,6 +384,61 @@ function TimeSigGrid({
           </button>
         );
       })}
+    </div>
+  );
+}
+
+/** Tiny vertical pair of dark hardware keys that halve / double the BPM
+ *  draft. Shown only while editing — the cassette-deck visual language
+ *  applied at thumbnail size so they read as physical buttons sitting
+ *  next to the LCD. */
+function OctaveKeys({ onShift }: { onShift: (factor: number) => void }) {
+  const KEY_STYLE: React.CSSProperties = {
+    background:
+      "linear-gradient(180deg, #2A2520 0%, #1A1612 60%, #2A2520 100%)",
+    boxShadow: [
+      "inset 0 1px 0 rgba(255,255,255,0.10)",
+      "inset 0 -1px 0 rgba(0,0,0,0.6)",
+      "0 1px 0 rgba(0,0,0,0.45)",
+      "0 2px 3px rgba(0,0,0,0.3)",
+    ].join(", "),
+    color: "#FAF6EC",
+  };
+  const baseCls = [
+    "h-[13px] w-[24px] rounded-[2px] border border-black/40",
+    "font-display tracking-[0.05em] text-[8px] leading-none",
+    "flex items-center justify-center",
+    "active:translate-y-[1px] transition-transform duration-75",
+    "select-none",
+  ].join(" ");
+  return (
+    <div className="flex flex-col gap-0.5 self-center">
+      <button
+        type="button"
+        data-testid="bpm-x2"
+        data-bpm-edit-ctl="1"
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={() => onShift(2)}
+        className={baseCls}
+        style={KEY_STYLE}
+        aria-label="Double BPM"
+        title="Double BPM (×2)"
+      >
+        ×2
+      </button>
+      <button
+        type="button"
+        data-testid="bpm-half"
+        data-bpm-edit-ctl="1"
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={() => onShift(0.5)}
+        className={baseCls}
+        style={KEY_STYLE}
+        aria-label="Halve BPM"
+        title="Halve BPM (÷2)"
+      >
+        ÷2
+      </button>
     </div>
   );
 }

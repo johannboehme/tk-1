@@ -1,19 +1,19 @@
 /**
- * Selected-chunk inspector. Shows a compact LCD-strip with the chunk's
- * time-range, bar count + length, plus per-chunk BPM controls.
+ * Selected-chunk inspector.
  *
- * BPM widgets:
- *   - The brass-plate BpmReadoutView at the top displays the
- *     song-global tempo and time-signature (mode of per-chunk
- *     detections). Click to override for the whole song.
- *   - Below the plate, three half/×1/double buttons override THIS
- *     chunk's tempo only (octave shift on the per-chunk detection) —
- *     useful when the auto-detector landed on the wrong octave for one
- *     fragment. Bar count + length recompute live.
+ * Header carries BOTH the section title (with current chunk index) AND
+ * the song-global BpmReadoutView brass plate — so the user always sees
+ * + can override the global tempo right where they read the chunk's
+ * derived bar count. The brass plate is the canonical edit surface for
+ * BPM and time-signature; clicking the LCD opens an in-line editor with
+ * ÷2 / ×2 keys for fast octave correction.
+ *
+ * Body shows per-chunk fields (start/end/length/bars, anchor, effective
+ * tempo) plus a per-chunk octave override and the trim-by-bar buttons.
+ * Body scrolls if it overflows.
  *
  * No Keep/Drop buttons — the TransportBar is the sole accept/reject
- * surface (shortcut Enter/Backspace) so users don't end up with three
- * places that all toggle the same flag.
+ * surface (Enter/Backspace).
  */
 import { ChunkyButton } from "../../editor/components/ChunkyButton";
 import { BpmReadoutView } from "../../editor/components/BpmReadoutView";
@@ -42,22 +42,19 @@ export function ChunkInspector() {
   const focused = focusedId ? chunks.find((c) => c.id === focusedId) ?? null : null;
 
   return (
-    <section className="rounded-md border border-rule overflow-hidden bg-paper-hi shadow-panel">
-      <header className="bg-paper-panel border-b border-rule px-3 py-2 flex items-center justify-between">
-        <span className="font-display tracking-label uppercase text-[10px] text-ink-2">
-          Tempo + Selected
-        </span>
-        {focused && (
-          <span className="font-mono text-[10px] tabular text-ink-3">
-            {sortedIdx + 1} / {chunks.length}
+    <section className="rounded-md border border-rule overflow-hidden bg-paper-hi shadow-panel h-full flex flex-col min-h-0">
+      <header className="flex-none bg-paper-panel border-b border-rule px-3 py-2 flex items-center gap-3">
+        <div className="flex items-baseline gap-2 min-w-0">
+          <span className="font-display tracking-label uppercase text-[10px] text-ink-2">
+            Selected
           </span>
-        )}
-      </header>
-
-      {/* Song-global BPM + time-signature plate. Always visible — even
-       *  before a chunk is focused, the user might want to set the
-       *  tempo manually. */}
-      <div className="px-3 pt-3 pb-2 flex justify-center bg-paper-deep border-b border-rule">
+          {focused && (
+            <span className="font-mono text-[10px] tabular text-ink-3">
+              {sortedIdx + 1} / {chunks.length}
+            </span>
+          )}
+        </div>
+        <div className="flex-1" />
         <BpmReadoutView
           bpm={jobBpm}
           detectedBpm={detectedBpm}
@@ -66,10 +63,10 @@ export function ChunkInspector() {
           onResetBpm={resetBpm}
           onBeatsPerBar={setBeatsPerBar}
         />
-      </div>
+      </header>
 
       {!focused ? (
-        <div className="p-4 text-center font-mono text-[11px] tracking-label uppercase text-ink-3">
+        <div className="flex-1 grid place-items-center p-4 text-center font-mono text-[11px] tracking-label uppercase text-ink-3">
           ◇ no chunk selected
         </div>
       ) : (
@@ -104,44 +101,33 @@ function ChunkBody({ chunk, jobBpmValue, beatsPerBar, onUpdate, onExtend }: Body
   const usingChunkOctave = chunk.detectedBpm !== undefined && chunk.detectedBpm > 0;
 
   return (
-    <div className="p-3 space-y-3 text-sm">
-      <div className="grid grid-cols-2 gap-x-2 gap-y-1 text-[11px]">
+    <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-3 text-sm">
+      <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[11px]">
         <KV label="In" value={formatTime(chunk.startMs / 1000)} />
         <KV label="Out" value={formatTime(chunk.endMs / 1000)} />
         <KV label="Length" value={`${lengthS.toFixed(1)}s`} />
         <KV label="Bars" value={bars > 0 ? `≈ ${bars.toFixed(1)}` : "—"} />
         <KV
           label="Anchor"
-          value={
-            phaseDeltaMs > 1
-              ? `+${phaseDeltaMs.toFixed(0)}ms`
-              : "at start"
-          }
+          value={phaseDeltaMs > 1 ? `+${phaseDeltaMs.toFixed(0)}ms` : "at start"}
         />
         <KV
           label="Tempo"
           value={
             effBpm > 0
-              ? `${effBpm.toFixed(0)} BPM${chunk.bpmOctaveShift !== 0 ? ` (${chunk.bpmOctaveShift > 0 ? "×" : "÷"}2)` : ""}`
+              ? `${effBpm.toFixed(0)}${chunk.bpmOctaveShift !== 0 ? ` (${chunk.bpmOctaveShift > 0 ? "×" : "÷"}2)` : ""}`
               : "—"
           }
         />
       </div>
 
-      {/* Per-chunk octave-shift — useful when the per-chunk detector
-       *  picked the wrong octave on one chunk. Only meaningful when
-       *  the chunk has its own detection; otherwise it'd just be
-       *  multiplying the global BPM, which the user can do at the
-       *  brass plate up top. */}
-      <div className="border-t border-rule pt-2">
-        <div className="flex items-baseline justify-between mb-1">
-          <span className="font-display tracking-label uppercase text-[10px] text-ink-2">
-            Per-chunk octave
-          </span>
-          <span className="font-mono text-[10px] tabular text-ink-3">
-            {usingChunkOctave ? "from per-chunk detection" : "no chunk detection"}
-          </span>
-        </div>
+      {/* Per-chunk octave-shift — for the rare case where the
+       *  per-chunk detector picked the wrong octave on one fragment.
+       *  Only meaningful when the chunk has its own detection. */}
+      <div className="border-t border-rule pt-2 flex items-center gap-2">
+        <span className="font-display tracking-label uppercase text-[9px] text-ink-3 shrink-0">
+          OCT
+        </span>
         <div className="flex gap-1.5">
           <ChunkyButton
             variant={chunk.bpmOctaveShift === -1 ? "primary" : "secondary"}
@@ -176,15 +162,20 @@ function ChunkBody({ chunk, jobBpmValue, beatsPerBar, onUpdate, onExtend }: Body
             ×2
           </ChunkyButton>
         </div>
+        {!usingChunkOctave && (
+          <span className="font-mono text-[9px] tabular text-ink-3 ml-auto">
+            no per-chunk detection
+          </span>
+        )}
       </div>
 
-      {/* Bar extend / shrink. */}
+      {/* Bar extend / shrink — 2×2 grid of trim arrows. */}
       <div className="border-t border-rule pt-2">
         <div className="flex items-baseline justify-between mb-1">
-          <span className="font-display tracking-label uppercase text-[10px] text-ink-2">
-            Trim by bar
+          <span className="font-display tracking-label uppercase text-[9px] text-ink-3">
+            TRIM BY BAR
           </span>
-          <span className="font-mono text-[10px] tabular text-ink-3">
+          <span className="font-mono text-[9px] tabular text-ink-3">
             {canExtend ? "snap = bar" : "needs BPM"}
           </span>
         </div>

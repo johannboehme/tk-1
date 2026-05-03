@@ -2,14 +2,25 @@
  * Triage-Phase (Step 1 von 3 für Long-Form-Session-Jobs).
  *
  * Identifiziert Audio-Chunks im Master-Audio per Stille-Erkennung. BPM
- * + Time-Signature kommen aus der Master-Audio-Analyse und gelten
- * song-global — alle Chunks teilen sich denselben Bar-Grid, weil sie
- * downstream auf Bars geschnitten und zu einem Song zusammengefügt
- * werden.
+ * gilt song-global (Mode der per-Chunk-Detections; user-überschreibbar
+ * via brass-plate im Inspector-Header), aber jeder Chunk hat seinen
+ * eigenen `audioStartMs`-Anchor — Long-form Sessions sind nicht
+ * zueinander beat-aligned.
  *
- * Layout (Desktop): Top-Strip mit Cam + Inspector + Chunk-Liste,
- * darunter SnapModeButtons-Plate, dann Timeline volle Breite, ganz
- * unten der Transport. Mobile: vertikaler Stack.
+ * Layout (Desktop): vier-Regionen-Rack
+ *   1. PhaseStrip                    (existing, 48px)
+ *   2. ControlRow                    (h-80, three equal-height columns)
+ *      ├── Cam preview + SyncPatch
+ *      ├── Inspector (BPM-plate im header, KV/octave/trim im body)
+ *      └── ChunksList (compact)
+ *   3. DeckStrip                     (h-20, brushed-metal band)
+ *      ├── SnapModeButtons cassette plate (left)
+ *      └── Detection sliders + kept-LCD (right)
+ *   4. Timeline                      (flex-1, fills the rest)
+ *   5. TransportBar                  (existing)
+ *
+ * Mobile: vertical stack, timeline gets `min-h-[280px]` so it never
+ * disappears.
  */
 
 import { useEffect, useRef, useState } from "react";
@@ -121,8 +132,6 @@ export default function Triage() {
       barOffsetBeats: number;
       beatPhaseS: number;
     }> {
-      // Pull cached audio analysis for the auto-detected reference;
-      // job.bpm carries the current (possibly user-overridden) value.
       const analysis = await getCachedAnalysis(job!.id).catch(() => undefined);
       const detectedTempo = analysis?.tempo;
       const detectedBpm = detectedTempo
@@ -223,7 +232,7 @@ export default function Triage() {
   }, [job, detection.kind, initFromJob]);
 
   return (
-    <div className="flex-1 flex flex-col min-h-0 paper-bg">
+    <div className="h-full flex flex-col min-h-0 paper-bg overflow-hidden">
       <PhaseStrip
         phase="triage"
         jobTitle={job?.title ?? null}
@@ -239,51 +248,77 @@ export default function Triage() {
         <NotReady job={job} detection={detection} />
       ) : (
         <>
-          {/* Top tools row — Cam preview + Inspector + Chunks list,
-           *  arranged so the Cam preview gets the most width on
-           *  desktop. */}
-          <div className="flex-none px-3 pt-3 grid gap-3 grid-cols-1 lg:grid-cols-[minmax(360px,1.2fr)_minmax(320px,1fr)_minmax(220px,0.8fr)]">
+          {/* ─── ControlRow — three equal-height columns ─────────── */}
+          <section
+            className={[
+              "flex-none px-3 pt-3",
+              "grid grid-cols-1 gap-3",
+              "lg:grid-cols-[minmax(420px,1.5fr)_minmax(360px,1.1fr)_minmax(220px,0.6fr)]",
+              "lg:h-80",
+            ].join(" ")}
+          >
+            {/* Col 1 — Monitor (Cam + SyncPatch) */}
             <div className="flex flex-col gap-3 min-h-0">
-              <CamPreview />
+              <div className="flex-none">
+                <CamPreview />
+              </div>
               {job && (
-                <SyncPatchPanel
-                  job={job}
-                  selectedCamId={selectedCamId}
-                  onSelectCam={(id) => setSelectedCamId(id)}
-                  onNudgeCam={(id, deltaMs) => nudgeCamSync(id, deltaMs)}
-                  syncOverrides={Object.fromEntries(
-                    cams.map((c) => [c.id, c.syncOverrideMs ?? 0]),
-                  )}
-                />
+                <div className="flex-1 min-h-0 overflow-y-auto">
+                  <SyncPatchPanel
+                    job={job}
+                    selectedCamId={selectedCamId}
+                    onSelectCam={(id) => setSelectedCamId(id)}
+                    onNudgeCam={(id, deltaMs) => nudgeCamSync(id, deltaMs)}
+                    syncOverrides={Object.fromEntries(
+                      cams.map((c) => [c.id, c.syncOverrideMs ?? 0]),
+                    )}
+                  />
+                </div>
               )}
             </div>
-            <div className="flex flex-col gap-3 min-h-0">
-              <ChunkInspector />
-              <DetectionPanel />
-            </div>
-            <div className="min-h-0">
-              <ChunksList />
-            </div>
-          </div>
 
-          {/* Snap-mode plate — sits between the tools row and the
-           *  timeline so it visibly governs trim drags below. */}
-          <div className="flex-none px-3 pt-3 flex items-center justify-center">
-            <SnapModeButtonsView
-              snapMode={snapMode}
-              onSnapModeChange={setSnapMode}
-              hasBpm={hasBpm}
-            />
-          </div>
+            {/* Col 2 — Inspector (BPM in header, body fills) */}
+            <ChunkInspector />
 
-          {/* Full-width timeline. Sits directly above the transport
-           *  bar — that's where the action is, so it gets the breathing
-           *  room. */}
-          <div className="flex-1 min-h-0 px-3 py-3 flex flex-col">
-            <div className="flex-1 min-h-0">
+            {/* Col 3 — Compact chunks index */}
+            <ChunksList />
+          </section>
+
+          {/* ─── DeckStrip — snap plate + detection sliders ─────── */}
+          <section
+            className={[
+              "flex-none mt-3 px-3 py-3",
+              "grid grid-cols-1 lg:grid-cols-[auto_1fr] gap-3 lg:gap-4 items-center",
+              "border-y border-rule bg-paper-deep",
+            ].join(" ")}
+            style={{
+              boxShadow: [
+                "inset 0 1px 0 rgba(255,255,255,0.5)",
+                "inset 0 -1px 0 rgba(0,0,0,0.15)",
+              ].join(", "),
+            }}
+          >
+            <div className="flex justify-center lg:justify-start">
+              <SnapModeButtonsView
+                snapMode={snapMode}
+                onSnapModeChange={setSnapMode}
+                hasBpm={hasBpm}
+              />
+            </div>
+            <DetectionPanel />
+          </section>
+
+          {/* ─── Timeline — fills remaining space ───────────────── */}
+          <section className="flex-1 min-h-0 px-3 pt-3 pb-3 flex">
+            <div
+              className="flex-1 min-h-[280px] rounded-md overflow-hidden"
+              style={{
+                boxShadow: "inset 0 2px 4px rgba(0,0,0,0.08)",
+              }}
+            >
               <TriageTimeline />
             </div>
-          </div>
+          </section>
 
           <TriageTransportBar />
         </>

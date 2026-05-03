@@ -248,7 +248,7 @@ export function TriageTimeline() {
       const tS = xToTime(xPx);
       // Alt = bypass snap for free positioning, otherwise honour the
       // active snap mode anchored at the chunk's own audio-start.
-      const snapped = ev.altKey
+      const snapped = ev.shiftKey
         ? tS
         : snapTime(tS, snapMode, {
             bpm: dragRef.current.bpm > 0 ? dragRef.current.bpm : null,
@@ -263,7 +263,7 @@ export function TriageTimeline() {
         if (next !== chunk.startMs) {
           updateChunk(chunk.id, {
             startMs: next,
-            trimMode: ev.altKey ? "free" : "bar",
+            trimMode: ev.shiftKey ? "free" : "bar",
           });
         }
       } else {
@@ -274,7 +274,7 @@ export function TriageTimeline() {
         if (next !== chunk.endMs) {
           updateChunk(chunk.id, {
             endMs: next,
-            trimMode: ev.altKey ? "free" : "bar",
+            trimMode: ev.shiftKey ? "free" : "bar",
           });
         }
       }
@@ -542,7 +542,7 @@ function ChunkBlock({
             }}
             onMouseDown={(e) => onTrimStart("left", e)}
             onClick={(e) => e.stopPropagation()}
-            title="Drag to trim start (Alt = free, no snap)"
+            title="Drag to trim start (Shift = bypass snap)"
           />
           <div
             className="absolute right-0 top-0 bottom-0 cursor-ew-resize"
@@ -552,7 +552,7 @@ function ChunkBlock({
             }}
             onMouseDown={(e) => onTrimStart("right", e)}
             onClick={(e) => e.stopPropagation()}
-            title="Drag to trim end (Alt = free, no snap)"
+            title="Drag to trim end (Shift = bypass snap)"
           />
         </>
       )}

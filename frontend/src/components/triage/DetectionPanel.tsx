@@ -1,20 +1,38 @@
 /**
- * Threshold + min-pause sliders that drive the silence-detection
- * algorithm. Slider changes re-run silence detection on the cached
- * envelope (cheap, sub-ms) and write the new chunks back to the
- * Triage store + IDB.
+ * Threshold + min-pause sliders + kept-counter LCD, laid out as a
+ * horizontal "deck control strip" — meant to live next to the snap
+ * cassette plate, between the upper rack and the timeline. The
+ * counter doubles as a passive readout: as the user drags the
+ * threshold the kept count + summed duration update live.
  *
- * BPM lives on the brass plate inside ChunkInspector — global value,
- * with per-chunk octave-shift for outliers. This panel is purely about
- * "where do chunks begin and end".
+ * Slider changes re-run silence detection on the cached envelope
+ * (cheap, sub-ms) and write the new chunks back to the Triage store +
+ * IDB.
+ *
+ * BPM lives on the brass plate inside ChunkInspector — this panel
+ * is purely about "where do chunks begin and end".
  */
 import { useCallback, useRef } from "react";
-import {
-  detectChunksFromEnvelope,
-} from "../../local/triage/chunk-detect";
+import { detectChunksFromEnvelope } from "../../local/triage/chunk-detect";
 import { jobsDb } from "../../local/jobs";
 import { useTriageStore } from "../../local/triage/triage-store";
 import type { SilenceConfig } from "../../storage/jobs-db";
+
+const LCD_BG = `
+  repeating-linear-gradient(0deg, rgba(255,255,255,0.04) 0 1px, transparent 1px 3px),
+  repeating-linear-gradient(90deg, rgba(0,0,0,0.10) 0 1px, transparent 1px 3px),
+  radial-gradient(120% 80% at 50% 0%, rgba(255,255,255,0.06), rgba(0,0,0,0) 60%),
+  linear-gradient(180deg, #0E1311 0%, #0A0E0C 100%)
+`;
+const LCD_SHADOW = [
+  "inset 0 1px 0 rgba(255,255,255,0.05)",
+  "inset 0 -1px 0 rgba(0,0,0,0.5)",
+  "inset 0 0 18px rgba(0,0,0,0.55)",
+  "0 1px 0 rgba(255,255,255,0.5)",
+].join(", ");
+const LCD_GREEN = "#9DEFD0";
+const GLOW_GREEN =
+  "0 0 5px rgba(157,239,208,0.4), 0 0 1px rgba(157,239,208,0.8)";
 
 export function DetectionPanel() {
   const silenceConfig = useTriageStore((s) => s.silenceConfig);
@@ -39,9 +57,6 @@ export function DetectionPanel() {
         state.envelope,
         config,
       ).then((result) => {
-        // Preserve user decisions + previously-detected per-chunk BPM
-        // and audio-start across slider drags. New boundaries that
-        // don't match an existing chunk start default-accepted.
         const merged = result.chunks.map((c) => {
           const prev = state.chunks.find(
             (p) => p.startMs === c.startMs && p.endMs === c.endMs,
@@ -93,16 +108,8 @@ export function DetectionPanel() {
   }
 
   return (
-    <section className="rounded-md border border-rule overflow-hidden bg-paper-hi shadow-panel">
-      <header className="bg-paper-panel border-b border-rule px-3 py-2 flex items-center justify-between">
-        <span className="font-display tracking-label uppercase text-[10px] text-ink-2">
-          Detection
-        </span>
-        <span className="font-mono text-[10px] tabular text-ink-3">
-          {chunks.length} chunks
-        </span>
-      </header>
-      <div className="p-3 space-y-3">
+    <div className="flex-1 grid grid-cols-1 sm:grid-cols-[1fr_auto] gap-3 sm:gap-4 items-center">
+      <div className="flex flex-col gap-1.5 min-w-0">
         <SliderRow
           label="Threshold"
           value={silenceConfig.thresholdDb}
@@ -121,12 +128,13 @@ export function DetectionPanel() {
           unit="ms"
           onChange={(v) => onChange({ minPauseMs: v })}
         />
-        <div className="border-t border-rule pt-2 grid grid-cols-2 gap-2 text-[11px]">
-          <Stat label="Kept" value={`${acceptedCount} chunk${acceptedCount === 1 ? "" : "s"}`} />
-          <Stat label="Time" value={formatDuration(acceptedDurationMs)} />
-        </div>
       </div>
-    </section>
+      <KeptCounter
+        chunkCount={chunks.length}
+        keptCount={acceptedCount}
+        totalMs={acceptedDurationMs}
+      />
+    </div>
   );
 }
 
@@ -142,15 +150,10 @@ interface SliderRowProps {
 
 function SliderRow({ label, value, min, max, step, unit, onChange }: SliderRowProps) {
   return (
-    <label className="block">
-      <div className="flex items-baseline justify-between mb-1">
-        <span className="font-display tracking-label uppercase text-[10px] text-ink-2">
-          {label}
-        </span>
-        <span className="font-mono text-[11px] tabular text-ink">
-          {value} {unit}
-        </span>
-      </div>
+    <label className="grid grid-cols-[80px_1fr_64px] items-center gap-2 min-w-0">
+      <span className="font-display tracking-label uppercase text-[10px] text-ink-2">
+        {label}
+      </span>
       <input
         type="range"
         min={min}
@@ -158,19 +161,49 @@ function SliderRow({ label, value, min, max, step, unit, onChange }: SliderRowPr
         step={step}
         value={value}
         onChange={(e) => onChange(Number(e.target.value))}
-        className="w-full accent-hot"
+        className="w-full accent-hot h-1"
       />
+      <span className="font-mono text-[11px] tabular text-ink text-right">
+        {value} {unit}
+      </span>
     </label>
   );
 }
 
-function Stat({ label, value }: { label: string; value: string }) {
+/** Small LCD-style readout that mirrors the BpmReadout brass plate
+ *  language. Bonded visually to the deck strip so the user reads it as
+ *  a meter, not a label. */
+function KeptCounter({
+  chunkCount,
+  keptCount,
+  totalMs,
+}: {
+  chunkCount: number;
+  keptCount: number;
+  totalMs: number;
+}) {
   return (
-    <div>
-      <div className="font-display tracking-label uppercase text-[9px] text-ink-3">
-        {label}
+    <div className="flex flex-col items-end shrink-0">
+      <span className="font-display text-[8px] tracking-[0.18em] text-ink-3 uppercase mb-0.5">
+        Kept
+      </span>
+      <div
+        className="font-mono tabular px-2 rounded-[3px] inline-flex items-center gap-1.5"
+        style={{
+          height: 26,
+          background: LCD_BG,
+          boxShadow: LCD_SHADOW,
+          color: LCD_GREEN,
+          textShadow: GLOW_GREEN,
+          border: "1px solid rgba(0,0,0,0.5)",
+        }}
+      >
+        <span className="text-[12px]">{keptCount}</span>
+        <span className="text-[10px] opacity-60">/</span>
+        <span className="text-[10px]">{chunkCount}</span>
+        <span className="text-[10px] opacity-60">·</span>
+        <span className="text-[12px]">{formatDuration(totalMs)}</span>
       </div>
-      <div className="font-mono tabular text-ink">{value}</div>
     </div>
   );
 }
@@ -179,5 +212,5 @@ function formatDuration(ms: number): string {
   const totalSec = Math.round(ms / 1000);
   const m = Math.floor(totalSec / 60);
   const s = totalSec % 60;
-  return `${m}m ${s.toString().padStart(2, "0")}s`;
+  return `${m}m${s.toString().padStart(2, "0")}`;
 }
