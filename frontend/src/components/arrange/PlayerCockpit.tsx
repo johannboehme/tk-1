@@ -7,18 +7,25 @@
  *
  * Mobile collapses to a single row: tiny preview + slimmer LCD.
  */
+import { useMemo } from "react";
 import { useArrangeStore } from "../../local/arrange/arrange-store";
 import { CamPreviewArrange } from "./CamPreviewArrange";
 
-interface PlayerCockpitProps {
-  /** When true, render the slim mobile layout (preview becomes
-   *  square thumbnail, LCD compresses). */
-  compact?: boolean;
-}
-
-export function PlayerCockpit({ compact = false }: PlayerCockpitProps) {
+/** PlayerCockpit is fully responsive — no `compact` prop. The cam
+ *  preview shrinks via internal Tailwind breakpoints, and the LCD
+ *  drops the "NOW" field at narrow widths. */
+export function PlayerCockpit() {
   const arrangement = useArrangeStore((s) => s.arrangement);
-  const totalDurationMs = useArrangeStore((s) => s.totalDurationMs());
+  const chunks = useArrangeStore((s) => s.chunks);
+  // Compute totals here instead of subscribing to s.totalDurationMs() —
+  // method calls inside selectors return fresh values every render and
+  // wreck zustand's reference-equality short-circuit.
+  const totalDurationMs = useMemo(() => {
+    const lookup = new Map(chunks.map((c) => [c.id, c.endMs - c.startMs]));
+    let total = 0;
+    for (const item of arrangement) total += lookup.get(item.chunkId) ?? 0;
+    return total;
+  }, [arrangement, chunks]);
   const isPlaying = useArrangeStore((s) => s.playback.isPlaying);
   const currentItemId = useArrangeStore((s) => s.playback.currentItemId);
   const items = arrangement;
@@ -27,12 +34,9 @@ export function PlayerCockpit({ compact = false }: PlayerCockpitProps) {
     : 0;
 
   return (
-    <section
-      className={`flex items-stretch gap-2 sm:gap-3 ${compact ? "" : ""}`}
-    >
-      <CamPreviewArrange compact={compact} />
+    <section className="flex items-stretch gap-2 sm:gap-3">
+      <CamPreviewArrange />
       <Lcd
-        compact={compact}
         totalDurationMs={totalDurationMs}
         itemIdx={itemIdx}
         itemCount={items.length}
@@ -43,13 +47,11 @@ export function PlayerCockpit({ compact = false }: PlayerCockpitProps) {
 }
 
 function Lcd({
-  compact,
   totalDurationMs,
   itemIdx,
   itemCount,
   isPlaying,
 }: {
-  compact: boolean;
   totalDurationMs: number;
   itemIdx: number;
   itemCount: number;
@@ -75,21 +77,16 @@ function Lcd({
           mixBlendMode: "multiply",
         }}
       />
-      <div
-        className={`relative px-3 ${compact ? "py-2" : "py-3"} flex items-center justify-between gap-3`}
-      >
+      <div className="relative px-3 py-2 sm:py-3 flex items-center justify-between gap-3">
         <div className="flex items-baseline gap-3 sm:gap-5 min-w-0 flex-wrap">
           <LcdField
             label="TOTAL"
             value={formatMs(totalDurationMs)}
             big
           />
-          {!compact && (
-            <LcdField
-              label="NOW"
-              value={formatTime(currentTime)}
-            />
-          )}
+          <span className="hidden sm:inline-flex items-baseline">
+            <LcdField label="NOW" value={formatTime(currentTime)} />
+          </span>
           <LcdField
             label="ITEM"
             value={itemCount === 0 ? "—" : `${itemIdx.toString().padStart(2, "0")}/${itemCount.toString().padStart(2, "0")}`}

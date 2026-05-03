@@ -759,13 +759,20 @@ export default function Editor() {
         const tout = Math.max(tin, Math.min(j.trim.out, audioMax));
         useEditorStore.getState().setTrim({ in: tin, out: tout });
       } else if (arrangementSegments.length > 0) {
-        // Long-form first-load: derive trim from segment span so
-        // skip-to-end / zoom-to-fit operate on the user-arranged
-        // window rather than the entire master audio.
-        const firstIn = arrangementSegments[0].in;
-        const lastOut =
-          arrangementSegments[arrangementSegments.length - 1].out;
-        useEditorStore.getState().setTrim({ in: firstIn, out: lastOut });
+        // Long-form first-load: derive trim from the span across ALL
+        // segments so skip-to-end / zoom-to-fit cover every active
+        // region. Arrangement order can place a duplicated early
+        // chunk after later ones, so we MUST take min/max — not
+        // first.in / last.out — to get a sensible window.
+        let lo = Infinity;
+        let hi = -Infinity;
+        for (const seg of arrangementSegments) {
+          if (seg.in < lo) lo = seg.in;
+          if (seg.out > hi) hi = seg.out;
+        }
+        if (lo < hi) {
+          useEditorStore.getState().setTrim({ in: lo, out: hi });
+        }
       }
     })().catch((e) => {
       if (!cancelled) setErr(e instanceof Error ? e.message : "Could not load job");

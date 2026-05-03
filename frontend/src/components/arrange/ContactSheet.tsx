@@ -9,6 +9,7 @@
  * On mobile the Contact Sheet sits directly underneath the Film Strip
  * — the user's eye and finger don't have to travel.
  */
+import { useMemo } from "react";
 import { useArrangeStore } from "../../local/arrange/arrange-store";
 import { effectiveBarsForChunk } from "../../local/arrange/arrange-store";
 import { Polaroid } from "./Polaroid";
@@ -18,13 +19,22 @@ export function ContactSheet() {
   const chunks = useArrangeStore((s) => s.chunks);
   const cams = useArrangeStore((s) => s.cams);
   const selectedCamId = useArrangeStore((s) => s.selectedCamId);
+  const arrangement = useArrangeStore((s) => s.arrangement);
   const insertChunkAtCursor = useArrangeStore((s) => s.insertChunkAtCursor);
   const seek = useArrangeStore((s) => s.seek);
   const setPlaying = useArrangeStore((s) => s.setPlaying);
   const focusItem = useArrangeStore((s) => s.focusItem);
 
   const cam = cams.find((c) => c.id === selectedCamId) ?? cams[0] ?? null;
-  const usageCounts = useArrangeStore((s) => s.usageCounts());
+  // Derive usage from the arrangement reference — useMemo keeps the
+  // returned object stable, so subscribers don't re-render every tick.
+  const usageCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const item of arrangement) {
+      counts[item.chunkId] = (counts[item.chunkId] ?? 0) + 1;
+    }
+    return counts;
+  }, [arrangement]);
   const acceptedChunks = chunks
     .filter((c) => c.accepted)
     .sort((a, b) => a.startMs - b.startMs);

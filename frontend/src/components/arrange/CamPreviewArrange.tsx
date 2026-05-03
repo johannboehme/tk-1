@@ -10,11 +10,8 @@ import { useEffect, useState } from "react";
 import { resolveCamAssetUrl } from "../../local/jobs";
 import { useArrangeStore } from "../../local/arrange/arrange-store";
 
-interface Props {
-  compact?: boolean;
-}
-
-export function CamPreviewArrange({ compact = false }: Props) {
+/** Cam preview viewfinder. Sizes itself: 84×84 below sm, 240×135 above. */
+export function CamPreviewArrange() {
   const jobId = useArrangeStore((s) => s.jobId);
   const cams = useArrangeStore((s) => s.cams);
   const selectedCamId = useArrangeStore((s) => s.selectedCamId);
@@ -77,15 +74,9 @@ export function CamPreviewArrange({ compact = false }: Props) {
     }
   }, [isPlaying, videoEl]);
 
-  // Compact (mobile): a square 84×84 thumbnail viewfinder. Desktop:
-  // 16:9 ~240×135.
-  const dims = compact
-    ? { className: "w-[84px] h-[84px]", aspect: undefined }
-    : { className: "w-[240px] h-[135px]", aspect: undefined };
-
   return (
     <div
-      className={`relative shrink-0 rounded-md overflow-hidden border-2 border-rule shadow-emboss ${dims.className}`}
+      className="relative shrink-0 rounded-md overflow-hidden border-2 border-rule shadow-emboss w-[84px] h-[84px] sm:w-[240px] sm:h-[135px]"
       style={{
         background:
           "linear-gradient(180deg, #1A1816 0%, #0E0D0B 100%)",

@@ -1,0 +1,289 @@
+/**
+ * E2E visual + functional smoke test for the Arrange page.
+ *
+ * Launches a fresh Chromium per run, seeds a long-form job using the
+ * readme fixtures, walks Arrange + Editor, screenshots key moments,
+ * and asserts that arrangement → segments propagate into the editor.
+ */
+import { chromium } from "playwright";
+import { mkdir, rm } from "node:fs/promises";
+import path from "node:path";
+
+const BASE = "http://localhost:5173";
+const OUT = path.resolve("./e2e-screens");
+await rm(OUT, { recursive: true, force: true });
+await mkdir(OUT, { recursive: true });
+
+const log = (msg) =>
+  console.log(`[e2e] ${new Date().toISOString().slice(11, 19)} ${msg}`);
+
+const browser = await chromium.launch({ headless: true });
+const ctx = await browser.newContext({ viewport: { width: 1456, height: 900 } });
+ctx.on("weberror", (e) => console.error("[browser-error]", e.error().message));
+ctx.on("console", (msg) => {
+  const t = msg.text();
+  if (
+    msg.type() === "error" &&
+    !t.includes("React Router Future Flag") &&
+    !t.includes("React DevTools")
+  ) {
+    console.log(`[browser-${msg.type()}]`, t.slice(0, 240));
+  }
+});
+const page = await ctx.newPage();
+
+await page.goto(BASE, { waitUntil: "networkidle" });
+await page.waitForSelector('text="Drop the song."', { timeout: 10_000 });
+log("upload page visible");
+
+const jobId = await page.evaluate(async () => {
+  const m = await import("/src/local/jobs.ts");
+  async function asFile(url, name, type) {
+    const r = await fetch(url);
+    const blob = await r.blob();
+    return new File([blob], name, { type });
+  }
+  const audio = await asFile("/__readme_fixtures__/studio.mp3", "studio.mp3", "audio/mpeg");
+  const v1 = await asFile("/__readme_fixtures__/take-1.mp4", "take-1.mp4", "video/mp4");
+  const v2 = await asFile("/__readme_fixtures__/take-2.mp4", "take-2.mp4", "video/mp4");
+  return m.createJob(
+    [
+      { file: v1, handle: null },
+      { file: v2, handle: null },
+    ],
+    { file: audio, handle: null },
+    { title: "E2E long-form", mode: "longform" },
+  );
+});
+log(`job created: ${jobId}`);
+
+let synced = null;
+const t0 = Date.now();
+while (Date.now() - t0 < 120_000) {
+  const j = await page.evaluate(async (id) => {
+    const m = await import("/src/local/jobs.ts");
+    return (await m.jobsDb.getJob(id)) ?? null;
+  }, jobId);
+  if (j?.status === "synced") {
+    synced = j;
+    break;
+  }
+  if (j?.status === "failed") throw new Error(`sync failed: ${j.error}`);
+  await new Promise((r) => setTimeout(r, 500));
+}
+if (!synced) throw new Error("sync didn't finish in 120s");
+log(`synced: chunks=${synced.chunks?.length ?? 0}`);
+
+// Force-seed 6 chunks if detection produced fewer (studio.mp3 is short
+// and contains no silences for the detector to find).
+if (!synced.chunks || synced.chunks.length < 4) {
+  await page.evaluate(async (id) => {
+    const m = await import("/src/local/jobs.ts");
+    const j = await m.jobsDb.getJob(id);
+    const dur = j.durationS ?? 30;
+    // 5 chunks, EACH 2.5s, separated by 1s gaps. That gives a clearly
+    // visible "off-segment" shaded gap between each pair on the editor
+    // audio lane — proves the segment-shading wiring works.
+    const chunkLenMs = 2500;
+    const gapMs = 1000;
+    const chunks = [];
+    let cursor = 1500;
+    while (cursor + chunkLenMs <= dur * 1000 && chunks.length < 5) {
+      chunks.push({
+        id: `chunk-${cursor}-${cursor + chunkLenMs}`,
+        startMs: cursor,
+        endMs: cursor + chunkLenMs,
+        detectedBpm: 120,
+        bpmOctaveShift: 0,
+        effectiveBpm: 120,
+        beatsPerBar: 4,
+        accepted: true,
+        trimMode: "auto",
+      });
+      cursor += chunkLenMs + gapMs;
+    }
+    const arrangement = chunks.map((c, i) => ({
+      id: `arr-${c.id}-${Date.now()}-${i}`,
+      chunkId: c.id,
+    }));
+    await m.jobsDb.updateJob(id, { chunks, arrangement });
+  }, jobId);
+  log("seeded synthetic chunks (with gaps) + arrangement");
+  const post = await page.evaluate(async (id) => {
+    const m = await import("/src/local/jobs.ts");
+    const j = await m.jobsDb.getJob(id);
+    return {
+      durationS: j.durationS,
+      chunks: j.chunks?.length,
+      arr: j.arrangement?.length,
+      ranges: j.chunks?.map((c) => `${c.startMs / 1000}-${c.endMs / 1000}`),
+    };
+  }, jobId);
+  log(`post-seed: ${JSON.stringify(post)}`);
+}
+
+// Desktop arrange.
+await page.goto(`${BASE}/job/${jobId}/arrange`, { waitUntil: "networkidle" });
+await page.waitForSelector("text=/CONTACT SHEET/i", { timeout: 15_000 });
+await page.waitForTimeout(3_500); // let polaroids develop fully
+
+await page.screenshot({ path: path.join(OUT, "01-arrange-desktop.png") });
+log("01-arrange-desktop");
+
+// Take a tight crop of the filmstreifen so the visual can be assessed
+// at full resolution without the surrounding chrome.
+{
+  const strip = await page
+    .locator(".overflow-x-auto.overflow-y-hidden.bg-sunken")
+    .first();
+  const box = await strip.boundingBox();
+  if (box) {
+    await page.screenshot({
+      path: path.join(OUT, "01b-arrange-filmstrip.png"),
+      clip: { x: box.x, y: box.y, width: box.width, height: box.height },
+    });
+    log("01b-arrange-filmstrip (close-up)");
+  }
+}
+
+// Click +ADD on the first polaroid (insert duplicate at end).
+await page.locator('button[aria-label="Insert chunk into arrangement"]').first().click();
+await page.waitForTimeout(400);
+await page.screenshot({ path: path.join(OUT, "02-arrange-after-add.png") });
+log("02-arrange-after-add");
+
+// Click +ADD many more times to cause filmstrip overflow → mini-map.
+for (let i = 0; i < 8; i++) {
+  await page
+    .locator('button[aria-label="Insert chunk into arrangement"]')
+    .nth(i % 3)
+    .click();
+  await page.waitForTimeout(60);
+}
+await page.waitForTimeout(800);
+await page.screenshot({ path: path.join(OUT, "02b-arrange-overflow.png") });
+log("02b-arrange-overflow (mini-map should appear)");
+
+// Crop the strip + minimap region.
+{
+  const strip = await page
+    .locator(".overflow-x-auto.overflow-y-hidden.bg-sunken")
+    .first();
+  const box = await strip.boundingBox();
+  if (box) {
+    await page.screenshot({
+      path: path.join(OUT, "02c-arrange-overflow-strip.png"),
+      clip: { x: box.x, y: box.y, width: box.width, height: box.height + 40 },
+    });
+    log("02c-arrange-overflow-strip (close-up with minimap)");
+  }
+}
+
+// Click on the third frame to focus it.
+const frames = page.locator('main button[title^="#"]');
+const frameCount = await frames.count();
+if (frameCount >= 3) {
+  await frames.nth(2).click();
+  await page.waitForTimeout(400);
+}
+await page.screenshot({ path: path.join(OUT, "03-arrange-focused.png") });
+log(`03-arrange-focused (frames: ${frameCount})`);
+
+// Move insertion cursor to the leftmost position (click leading cursor).
+// All cursor buttons are aria-label="Set insertion point".
+const cursors = page.locator('button[aria-label="Set insertion point"]');
+await cursors.first().click();
+await page.waitForTimeout(200);
+await page.screenshot({ path: path.join(OUT, "04-arrange-cursor-leading.png") });
+log("04-arrange-cursor-leading");
+
+// Mobile layout.
+await page.setViewportSize({ width: 414, height: 900 });
+await page.waitForTimeout(800);
+await page.screenshot({ path: path.join(OUT, "05-arrange-mobile.png") });
+log("05-arrange-mobile");
+
+// Mobile minimap close-up (overflow guaranteed at this viewport).
+{
+  const strip = await page
+    .locator(".overflow-x-auto.overflow-y-hidden.bg-sunken")
+    .first();
+  const box = await strip.boundingBox();
+  if (box) {
+    await page.screenshot({
+      path: path.join(OUT, "05b-mobile-minimap.png"),
+      clip: { x: box.x, y: box.y, width: box.width, height: box.height + 30 },
+    });
+    log("05b-mobile-minimap");
+  }
+}
+
+// Mobile inspector visible — focus a frame to expand it.
+const mobileFrames = page.locator('main button[title^="#"]');
+if ((await mobileFrames.count()) > 0) {
+  await mobileFrames.first().click();
+  await page.waitForTimeout(400);
+}
+await page.screenshot({ path: path.join(OUT, "06-arrange-mobile-inspector.png") });
+log("06-arrange-mobile-inspector");
+
+// Continue → Editor.
+await page.setViewportSize({ width: 1456, height: 900 });
+await page.waitForTimeout(400);
+await page.click('button:has-text("Continue → Editor")');
+await page.waitForURL(`${BASE}/job/${jobId}/edit`, { timeout: 10_000 });
+await page.waitForTimeout(4_500);
+
+await page.screenshot({ path: path.join(OUT, "07-editor-after-arrange.png") });
+log("07-editor-after-arrange");
+
+// Zoom into the audio lane so the segment shading + splice marks are
+// visible. We crop a strip across the bottom of the editor.
+{
+  const audioLane = await page.locator("canvas").last();
+  const box = await audioLane.boundingBox();
+  if (box) {
+    await page.screenshot({
+      path: path.join(OUT, "07b-editor-audio-lane.png"),
+      clip: { x: box.x, y: box.y, width: box.width, height: box.height },
+    });
+    log("07b-editor-audio-lane (segment shading should show here)");
+  }
+}
+
+// Verify segment state in the editor store.
+const editorState = await page.evaluate(async () => {
+  const m = await import("/src/editor/store.ts");
+  const s = m.useEditorStore.getState();
+  return {
+    segments: s.arrangementSegments,
+    trim: s.trim,
+    fps: s.jobMeta?.fps,
+    duration: s.jobMeta?.duration,
+  };
+});
+log(
+  `editor: segments=${editorState.segments?.length ?? 0} trim=${editorState.trim?.in?.toFixed(2)}-${editorState.trim?.out?.toFixed(2)}`,
+);
+const segCount = editorState.segments?.length ?? 0;
+if (segCount === 0) {
+  throw new Error("editor did not receive arrangementSegments — Phase 7 wiring broken");
+}
+log(`✓ editor received ${segCount} arrangement segments`);
+
+// Drive the timeline to confirm playback works through the segment hops.
+// Just press space — Web Audio context can't be resumed in headless,
+// but the play/pause toggle should still update the store.
+await page.keyboard.press("Space");
+await page.waitForTimeout(300);
+await page.screenshot({ path: path.join(OUT, "08-editor-playing.png") });
+log("08-editor-playing");
+
+// Editor mobile.
+await page.setViewportSize({ width: 414, height: 900 });
+await page.waitForTimeout(600);
+await page.screenshot({ path: path.join(OUT, "09-editor-mobile.png") });
+log("09-editor-mobile");
+
+await browser.close();
+log("done");

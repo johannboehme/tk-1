@@ -152,9 +152,12 @@ export default function Arrange() {
 
       <ArrangeAudioMaster />
 
-      {/* Desktop layout */}
-      <main className="flex-1 min-h-0 hidden lg:grid lg:grid-cols-[1fr_300px] gap-3 px-3 py-3 overflow-hidden">
-        <section className="flex flex-col gap-3 min-h-0 overflow-y-auto">
+      {/* Single layout, responsive via Tailwind. Desktop (≥ lg) lays
+       *  the inspector into a 300px right rail; mobile stacks
+       *  everything vertically. Components mount ONCE so the
+       *  IntersectionObservers and Polaroid develops don't double up. */}
+      <main className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-[1fr_300px] gap-2 lg:gap-3 px-2 lg:px-3 py-2 lg:py-3 overflow-hidden">
+        <section className="flex flex-col gap-2 lg:gap-3 min-h-0 overflow-y-auto lg:order-1">
           <PlayerCockpit />
           <div>
             <FilmStrip />
@@ -162,20 +165,9 @@ export default function Arrange() {
           </div>
           <ContactSheet />
         </section>
-        <aside className="flex flex-col gap-3 min-h-0 overflow-y-auto">
+        <aside className="flex flex-col gap-2 lg:gap-3 min-h-0 overflow-y-auto lg:order-2">
           <ArrangeInspector />
         </aside>
-      </main>
-
-      {/* Mobile layout */}
-      <main className="flex-1 min-h-0 lg:hidden flex flex-col gap-2 px-2 py-2 overflow-y-auto">
-        <PlayerCockpit compact />
-        <div>
-          <FilmStrip />
-          <MiniMap />
-        </div>
-        <ContactSheet />
-        <ArrangeInspector />
       </main>
 
       <ArrangeTransport showCursorControls />
