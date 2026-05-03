@@ -36,6 +36,10 @@ import {
 } from "./asset-source";
 import { syncAudio } from "./sync";
 import { getOrComputeAnalysis } from "./render/audio-analysis";
+import { detectChunks } from "./triage/chunk-detect";
+import {
+  DEFAULT_SILENCE_CONFIG,
+} from "./triage/triage-orchestrator";
 import { quickRender } from "./render/quick";
 import {
   decodeStudioAudioInterleaved,
@@ -522,6 +526,29 @@ async function runSync(jobId: string, audioExt: string): Promise<void> {
     await getOrComputeAnalysis(jobId, studioMonoPcm.pcm, studioMonoPcm.sampleRate);
   } catch (err) {
     console.warn(`Audio analysis failed for ${jobId} (non-fatal):`, err);
+  }
+
+  // Long-form chunk detection — only for `mode: "longform"` jobs.
+  // Runs envelope + silence-segments + per-chunk BPM and persists
+  // the result so the Triage screen can open instantly without
+  // any "decoding…" wait. Direct-mode jobs skip this entirely.
+  const jobForMode = await jobsDb.getJob(jobId);
+  if (jobForMode?.mode === "longform") {
+    try {
+      await reportProgress(jobId, { pct: 97, stage: "detecting-chunks" });
+      const detection = await detectChunks(
+        studioMonoPcm.pcm,
+        studioMonoPcm.sampleRate,
+        DEFAULT_SILENCE_CONFIG,
+      );
+      await jobsDb.updateJob(jobId, {
+        chunks: detection.chunks,
+        silenceConfig: DEFAULT_SILENCE_CONFIG,
+        triageEnvelope: detection.envelope,
+      });
+    } catch (err) {
+      console.warn(`Chunk detection failed for ${jobId} (non-fatal):`, err);
+    }
   }
 
   const updated = await jobsDb.updateJob(jobId, {

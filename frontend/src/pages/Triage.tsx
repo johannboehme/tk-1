@@ -26,6 +26,9 @@ import {
   runChunkDetectionForJob,
   type TriageStageProgress,
 } from "../local/triage/triage-orchestrator";
+import { loadAssetFile } from "../local/asset-source";
+import { decodeAudioToMonoPcm } from "../local/codec";
+import { TRIAGE_ENVELOPE_HZ } from "../local/triage/chunk-detect";
 import { useTriageStore } from "../local/triage/triage-store";
 import { useTriagePersist } from "../local/triage/useTriagePersist";
 import { SyncPatchPanel } from "../components/sync/SyncPatchPanel";
@@ -79,14 +82,61 @@ export default function Triage() {
     };
   }, [reset]);
 
-  // Kick off detection (or load cached chunks) when the job is synced.
+  // Two paths into the Triage UI:
+  //
+  //   (A) Fast-path — sync already produced chunks + envelope (new
+  //       longform-mode jobs go through this). The page renders
+  //       instantly with the cached data; PCM is decoded in the
+  //       background only for live slider re-runs.
+  //
+  //   (B) Slow-path fallback — chunks/envelope are missing (older
+  //       longform jobs synced before detection moved into the sync
+  //       pipeline). Run detection inline like before.
   useEffect(() => {
     if (!job || job.status !== "synced") return;
     if (detectionStartedRef.current) return;
     if (detection.kind !== "idle") return;
     detectionStartedRef.current = true;
 
+    const hasCached =
+      Array.isArray(job.chunks) &&
+      job.chunks.length > 0 &&
+      job.triageEnvelope instanceof Float32Array;
+
     let cancelled = false;
+
+    if (hasCached) {
+      // (A) Fast path — use cached results immediately.
+      const videos = (job.videos ?? []).filter(isVideoAsset);
+      initFromJob({
+        jobId: job.id,
+        audioDuration: job.durationS ?? 0,
+        cams: videos,
+        chunks: job.chunks!,
+        silenceConfig: job.silenceConfig ?? DEFAULT_SILENCE_CONFIG,
+        sessionBpmOverride: job.sessionBpmOverride ?? null,
+        // PCM is `null` initially. Decoded below in background. Triage
+        // UI components handle the missing-PCM state gracefully (live
+        // re-detection waits until decode finishes).
+        pcm: new Float32Array(0),
+        pcmSampleRate: 22050,
+        envelope: job.triageEnvelope!,
+        envelopeHz: TRIAGE_ENVELOPE_HZ,
+      });
+      setDetection({ kind: "ready" });
+
+      // Background PCM decode so silence-slider re-runs work later.
+      void decodePcmInBackground(job).then((pcm) => {
+        if (cancelled || !pcm) return;
+        // Update store fields directly without resetting other state.
+        useTriageStore.setState({ pcm: pcm.pcm, pcmSampleRate: pcm.sampleRate });
+      });
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    // (B) Slow-path fallback — detection inline.
     setDetection({ kind: "running", stage: "decoding" });
     runChunkDetectionForJob(job.id, job.silenceConfig ?? DEFAULT_SILENCE_CONFIG, {
       onStage: (p) => {
@@ -96,9 +146,6 @@ export default function Triage() {
       .then((result) => {
         if (cancelled) return;
         const videos = (job.videos ?? []).filter(isVideoAsset);
-        // If the job already had stored chunks (returning to triage),
-        // prefer them over the freshly-detected — they carry user
-        // accept/reject decisions.
         const chunksToUse = job.chunks && job.chunks.length > 0 ? job.chunks : result.chunks;
         initFromJob({
           jobId: job.id,
@@ -186,6 +233,26 @@ export default function Triage() {
       )}
     </div>
   );
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────────
+
+/** Decode the master audio for live silence-slider re-runs. Runs in
+ *  the background after the page has already rendered with cached
+ *  chunks + envelope. Best-effort: a decode failure just means the
+ *  user can't tweak Threshold / Min-Pause until the page reloads. */
+async function decodePcmInBackground(
+  job: LocalJob,
+): Promise<{ pcm: Float32Array; sampleRate: number } | null> {
+  if (!job.audioSource) return null;
+  try {
+    const file = await loadAssetFile({ source: job.audioSource });
+    const decoded = await decodeAudioToMonoPcm(file, 22050);
+    return { pcm: decoded.pcm, sampleRate: decoded.sampleRate };
+  } catch (err) {
+    console.warn("Triage background PCM decode failed:", err);
+    return null;
+  }
 }
 
 // ─── Shared loading / error state UI ────────────────────────────────────

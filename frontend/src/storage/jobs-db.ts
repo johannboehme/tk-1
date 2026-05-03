@@ -352,6 +352,14 @@ export interface LocalJob {
   /** Geordnete Sequenz von Chunks (mit möglichen Duplikaten) für die
    *  Editor-Pre-Population. Wird in der Arrange-Phase gefüllt. */
   arrangement?: ArrangementItem[];
+
+  /** Cached RMS-envelope of the master audio at 10 Hz, computed during
+   *  sync. Lets Triage render the waveform overview without
+   *  re-decoding the multi-GB PCM up front. ~144 KB per hour of
+   *  audio — comfortable in IDB. Float32Array round-trips through
+   *  structured-clone natively. Optional / undefined for jobs synced
+   *  before this field existed (or direct-mode jobs). */
+  triageEnvelope?: Float32Array;
 }
 
 /** Storage shape for a single Punch-in FX. Mirrors `PunchFx` from the

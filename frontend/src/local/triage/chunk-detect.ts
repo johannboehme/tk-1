@@ -132,10 +132,18 @@ export async function detectChunksFromEnvelope(
     silenceConfig.minPauseMs,
   );
 
-  const chunks: Chunk[] = segments.map((seg) => {
+  // Per-chunk BPM is the slow part — analyzeAudio runs FFT + onset +
+  // autocorrelation on each chunk's PCM slice. For a long session
+  // with many chunks that easily blocks the main thread for tens of
+  // seconds. Yielding to the event loop between chunks lets the
+  // sync-progress UI keep updating + lets the user cancel without
+  // the tab freezing.
+  const chunks: Chunk[] = [];
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
     const detectedBpm = detectChunkBpm(pcm, sampleRate, seg.start_ms, seg.end_ms);
     const effectiveBpm = detectedBpm ?? 0;
-    return {
+    chunks.push({
       id: chunkId(seg.start_ms, seg.end_ms),
       startMs: seg.start_ms,
       endMs: seg.end_ms,
@@ -145,8 +153,14 @@ export async function detectChunksFromEnvelope(
       beatsPerBar: 4,
       accepted: true,
       trimMode: "auto",
-    };
-  });
+    });
+    // Yield every chunk so the event loop can paint a frame and
+    // process input. setTimeout(0) ≈ 4ms minimum delay, fine for
+    // long-form sessions where total chunk count is < 200.
+    if (i % 2 === 1 && i < segments.length - 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  }
 
   return { chunks, envelope, envelopeHz: TRIAGE_ENVELOPE_HZ };
 }

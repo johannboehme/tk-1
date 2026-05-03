@@ -42,15 +42,22 @@ export function DetectionPanel() {
         state.envelope,
         config,
       ).then((result) => {
-        // Preserve existing accept/reject decisions where the chunk
-        // boundaries match exactly. Any chunk whose start/end didn't
-        // line up with an existing one starts default-accepted.
+        // Preserve existing user decisions + previously-detected BPM
+        // (so background-decoded BPM doesn't get clobbered when the
+        // user drags a slider before PCM is ready). Boundaries that
+        // didn't match an existing chunk start default-accepted.
         const merged = result.chunks.map((c) => {
           const prev = state.chunks.find(
             (p) => p.startMs === c.startMs && p.endMs === c.endMs,
           );
           if (prev) {
-            return { ...c, accepted: prev.accepted, bpmOctaveShift: prev.bpmOctaveShift };
+            return {
+              ...c,
+              accepted: prev.accepted,
+              bpmOctaveShift: prev.bpmOctaveShift,
+              detectedBpm: c.detectedBpm ?? prev.detectedBpm,
+              effectiveBpm: c.detectedBpm ? c.effectiveBpm : prev.effectiveBpm,
+            };
           }
           return c;
         });
