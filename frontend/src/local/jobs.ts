@@ -354,7 +354,19 @@ async function runCamPrep(
       detail: `${cam.id} · ${cam.filename}`,
     });
 
-    const videoMonoPcm = await decodeAudioToMonoPcm(videoFile, 22050);
+    // Decode is the slowest piece of the per-cam band — for a 9 GB
+    // recording it eats ~10 s. Stream the streaming-decoder's
+    // bytes-read fraction into the global progress bar so the user
+    // sees continuous motion instead of a hard 0 → 0.4 jump.
+    const videoMonoPcm = await decodeAudioToMonoPcm(videoFile, 22050, {
+      onProgress: (frac) => {
+        void reportProgress(jobId, {
+          pct: opts.mapPct(frac * 0.4),
+          stage: `syncing-${cam.id}`,
+          detail: `${cam.id} · ${cam.filename}`,
+        });
+      },
+    });
     await reportProgress(jobId, {
       pct: opts.mapPct(0.4),
       stage: `syncing-${cam.id}`,
@@ -441,9 +453,18 @@ async function runSync(jobId: string, audioExt: string): Promise<void> {
   }
 
   // Decode the master studio audio once; every cam syncs against this.
+  // Master decode gets the 2..5 % slice of the global bar — small for
+  // typical few-MB songs but visible for hour-long master tracks.
   const audioFile = await loadJobAudio(job, audioExt);
-  await reportProgress(jobId, { pct: 5, stage: "decoding-studio-audio" });
-  const studioMonoPcm = await decodeAudioToMonoPcm(audioFile, 22050);
+  await reportProgress(jobId, { pct: 2, stage: "decoding-studio-audio" });
+  const studioMonoPcm = await decodeAudioToMonoPcm(audioFile, 22050, {
+    onProgress: (frac) => {
+      void reportProgress(jobId, {
+        pct: 2 + Math.floor(frac * 3),
+        stage: "decoding-studio-audio",
+      });
+    },
+  });
 
   const updatedVideos: VideoAsset[] = [];
   // Each cam gets an equal slice of the 5-95% progress band.

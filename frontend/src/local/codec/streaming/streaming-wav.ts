@@ -28,9 +28,15 @@ interface WavFmt {
   dataSize: number;
 }
 
+export interface StreamingWavOptions {
+  /** Reports progress as a fraction in [0, 1] of source bytes read. */
+  onProgress?: (frac: number) => void;
+}
+
 export async function decodeWavStreaming(
   source: Blob,
   targetSampleRate: number,
+  opts: StreamingWavOptions = {},
 ): Promise<DecodedAudio> {
   // Step 1: read enough of the head to find fmt + data chunk offsets.
   // 1 MiB is plenty for any sane WAV header (some have huge LIST/INFO
@@ -73,9 +79,13 @@ export async function decodeWavStreaming(
   // tail bytes to the next batch so each `decodeBatch` call sees only
   // whole frames.
   let carry: Uint8Array | null = null;
+  const sourceSize = source.size;
   for (;;) {
     const batch = await reader.next();
     if (batch === null) break;
+    if (opts.onProgress && sourceSize > 0) {
+      opts.onProgress(Math.min(0.95, (fmt.dataOffset + reader.position) / sourceSize));
+    }
     let view: Uint8Array = batch;
     if (carry) {
       const merged = new Uint8Array(carry.length + batch.length);
@@ -99,6 +109,7 @@ export async function decodeWavStreaming(
   }
 
   const pcm = resampler.finish();
+  opts.onProgress?.(1);
   return {
     pcm,
     sampleRate: targetSampleRate,

@@ -48,6 +48,12 @@ export interface CodecResolverOptions {
    *  `streaming` picks the appropriate streaming sub-decoder by
    *  container sniff regardless of file size. */
   forceBackend?: "webcodecs" | "ffmpeg-wasm" | "streaming";
+  /** Reports decode progress as a fraction in [0, 1]. The streaming
+   *  sub-decoders report after each read batch (smooth on big files);
+   *  the fast `decodeAudioData` and ffmpeg-wasm paths report 0 at the
+   *  start and 1 at the end (no sub-progress available from those
+   *  APIs). */
+  onProgress?: (frac: number) => void;
 }
 
 export async function decodeAudioToMonoPcm(
@@ -56,11 +62,17 @@ export async function decodeAudioToMonoPcm(
   opts: CodecResolverOptions = {},
 ): Promise<DecodedAudio> {
   if (opts.forceBackend === "ffmpeg-wasm") {
+    opts.onProgress?.(0);
     const ffDecode = await loadFfmpegAudioDecode();
-    return ffDecode(source, targetSampleRate);
+    const out = await ffDecode(source, targetSampleRate);
+    opts.onProgress?.(1);
+    return out;
   }
   if (opts.forceBackend === "webcodecs") {
-    return webcodecsDecodeAudio(source, targetSampleRate);
+    opts.onProgress?.(0);
+    const out = await webcodecsDecodeAudio(source, targetSampleRate);
+    opts.onProgress?.(1);
+    return out;
   }
   if (opts.forceBackend === "streaming") {
     if (!(source instanceof Blob)) {
@@ -68,20 +80,23 @@ export async function decodeAudioToMonoPcm(
         "forceBackend='streaming' requires a Blob/File source (not ArrayBuffer)",
       );
     }
-    return runStreamingDecode(source, targetSampleRate);
+    return runStreamingDecode(source, targetSampleRate, opts.onProgress);
   }
 
   // Auto-route by file size.
   const isBlob = source instanceof Blob;
   const tooBigForFastPath = isBlob && source.size >= STREAMING_THRESHOLD;
   if (tooBigForFastPath) {
-    return runStreamingDecode(source, targetSampleRate);
+    return runStreamingDecode(source, targetSampleRate, opts.onProgress);
   }
 
   // Small file: try WebCodecs / decodeAudioData first, fall back on failure.
+  opts.onProgress?.(0);
   let webcodecsErr: unknown;
   try {
-    return await webcodecsDecodeAudio(source, targetSampleRate);
+    const out = await webcodecsDecodeAudio(source, targetSampleRate);
+    opts.onProgress?.(1);
+    return out;
   } catch (err) {
     if (err instanceof Error && /webkit|webcodecs/i.test(err.name)) {
       // give up, no fallback path can do better than the native decoder
@@ -94,7 +109,9 @@ export async function decodeAudioToMonoPcm(
   // so we treat any failure as a signal to try the heavier backend.
   const ffDecode = await loadFfmpegAudioDecode();
   try {
-    return await ffDecode(source, targetSampleRate);
+    const out = await ffDecode(source, targetSampleRate);
+    opts.onProgress?.(1);
+    return out;
   } catch (ffErr) {
     // Both backends failed: chain the WebCodecs reason into the surfaced
     // error so the JobPage banner doesn't lose the diagnostic from the
@@ -111,19 +128,20 @@ export async function decodeAudioToMonoPcm(
 async function runStreamingDecode(
   source: Blob,
   targetSampleRate: number,
+  onProgress?: (frac: number) => void,
 ): Promise<DecodedAudio> {
   const fmt = await sniffContainer(source);
   if (fmt === "mp4") {
     const mod = await import("./streaming/streaming-mp4-audio");
-    return mod.decodeMp4AudioStreaming(source, targetSampleRate);
+    return mod.decodeMp4AudioStreaming(source, targetSampleRate, { onProgress });
   }
   if (fmt === "mp3") {
     const mod = await import("./streaming/streaming-mp3");
-    return mod.decodeMp3Streaming(source, targetSampleRate);
+    return mod.decodeMp3Streaming(source, targetSampleRate, { onProgress });
   }
   if (fmt === "wav") {
     const mod = await import("./streaming/streaming-wav");
-    return mod.decodeWavStreaming(source, targetSampleRate);
+    return mod.decodeWavStreaming(source, targetSampleRate, { onProgress });
   }
   throw new Error(
     `File is ${formatGiB(source.size)} and the container isn't streamable ` +

@@ -50,9 +50,18 @@ interface AudioTrackInfo {
   timescale: number;
 }
 
+export interface StreamingDecodeOptions {
+  /** Reports progress as a fraction in [0, 1] of source bytes
+   *  consumed. Called after each read batch is fed to the decoder.
+   *  May be called multiple times with the same value (idempotent on
+   *  the consumer's side). */
+  onProgress?: (frac: number) => void;
+}
+
 export async function decodeMp4AudioStreaming(
   source: Blob,
   targetSampleRate: number,
+  opts: StreamingDecodeOptions = {},
 ): Promise<DecodedAudio> {
   if (typeof AudioDecoder === "undefined") {
     throw new Error(
@@ -193,12 +202,19 @@ export async function decodeMp4AudioStreaming(
   const bodyEnd = moov && moovIsAfterHead ? moov.offset : source.size;
   const reader = chunkedReader(source.slice(bodyStart, bodyEnd));
   try {
+    const sourceSize = source.size;
     for (;;) {
       if (state.mp4boxError) throw state.mp4boxError;
       const batch = await reader.next();
       if (batch === null) break;
       const fileStart = bodyStart + (reader.position - batch.length);
       appendBytes(file, batch, fileStart);
+      // Cap the streaming read at 0.95 — the final 5% covers
+      // decoder.flush() + final resampler emit so the bar doesn't snap
+      // from 0.95 → done with no visible reason.
+      if (opts.onProgress && sourceSize > 0) {
+        opts.onProgress(Math.min(0.95, (bodyStart + reader.position) / sourceSize));
+      }
       // Apply backpressure between batches if the decoder is saturated.
       const dec = state.decoder;
       if (dec && dec.decodeQueueSize > DECODE_QUEUE_SOFT_CAP) {
@@ -237,6 +253,7 @@ export async function decodeMp4AudioStreaming(
   }
 
   const pcm = resampler.finish();
+  opts.onProgress?.(1);
   return {
     pcm,
     sampleRate: targetSampleRate,

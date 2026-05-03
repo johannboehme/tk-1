@@ -57,9 +57,16 @@ interface Mp3FrameHeader {
   samplesPerFrame: number;
 }
 
+export interface StreamingMp3Options {
+  /** Reports progress as a fraction in [0, 1] of source bytes read.
+   *  Called after each read batch. */
+  onProgress?: (frac: number) => void;
+}
+
 export async function decodeMp3Streaming(
   source: Blob,
   targetSampleRate: number,
+  opts: StreamingMp3Options = {},
 ): Promise<DecodedAudio> {
   if (typeof AudioDecoder === "undefined") {
     throw new Error(
@@ -70,6 +77,7 @@ export async function decodeMp3Streaming(
   const id3Skip = await detectId3v2TagSize(source);
   const dataBlob = id3Skip > 0 ? source.slice(id3Skip) : source;
   const reader = chunkedReader(dataBlob);
+  const sourceSize = source.size;
 
   const resampler = createMonoResampler({ targetSampleRate });
   let firstHeader: Mp3FrameHeader | null = null;
@@ -97,6 +105,9 @@ export async function decodeMp3Streaming(
     if (decoderErrors.length > 0) break;
     const batch = await reader.next();
     if (batch === null) break;
+    if (opts.onProgress && sourceSize > 0) {
+      opts.onProgress(Math.min(0.95, (id3Skip + reader.position) / sourceSize));
+    }
 
     let view: Uint8Array;
     if (carry) {
@@ -196,6 +207,7 @@ export async function decodeMp3Streaming(
   }
 
   const pcm = resampler.finish();
+  opts.onProgress?.(1);
   return {
     pcm,
     sampleRate: targetSampleRate,
