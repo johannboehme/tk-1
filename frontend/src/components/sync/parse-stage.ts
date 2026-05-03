@@ -9,6 +9,7 @@
  *   - "syncing-{camId}"                                    → that cam is syncing
  *   - "frames-{camId}"                                     → that cam is in frames
  *   - "analyzing-audio"                                    → master analyzing
+ *   - "detecting-chunks"                                   → master detecting (long-form only)
  *   - status === "synced"                                  → all done
  *   - status === "failed"                                  → mark active cam failed
  *
@@ -18,7 +19,13 @@
 
 import type { JobStatus } from "../../storage/jobs-db";
 
-export type MasterState = "pending" | "decoding" | "analyzing" | "done" | "failed";
+export type MasterState =
+  | "pending"
+  | "decoding"
+  | "analyzing"
+  | "detecting"
+  | "done"
+  | "failed";
 export type CamState = "pending" | "syncing" | "frames" | "done" | "failed";
 
 export interface CamProgressView {
@@ -111,6 +118,16 @@ export function buildSyncProgressView(input: BuildInput): SyncProgressView {
   if (stage === "analyzing-audio") {
     return {
       master: "analyzing",
+      cams: cams.map((c) => ({ id: c.id, state: "done", fraction: 0 })),
+      globalPct: pct,
+    };
+  }
+
+  // Long-form Triage: silence + per-chunk BPM run on the master audio
+  // after the per-cam stages. Cams are already done by then.
+  if (stage === "detecting-chunks") {
+    return {
+      master: "detecting",
       cams: cams.map((c) => ({ id: c.id, state: "done", fraction: 0 })),
       globalPct: pct,
     };

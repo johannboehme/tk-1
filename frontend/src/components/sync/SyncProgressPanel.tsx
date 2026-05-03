@@ -83,11 +83,13 @@ function ConsoleLabel({ state }: { state: MasterState }) {
       ? "Sync · halted"
       : state === "done"
         ? "Sync · finalising"
-        : state === "analyzing"
-          ? "Sync · analysing audio"
-          : state === "decoding"
-            ? "Sync · decoding master"
-            : "Sync · queued";
+        : state === "detecting"
+          ? "Sync · detecting chunks"
+          : state === "analyzing"
+            ? "Sync · analysing audio"
+            : state === "decoding"
+              ? "Sync · decoding master"
+              : "Sync · queued";
 
   return (
     <div className="flex items-center gap-2">
@@ -101,7 +103,8 @@ function ConsoleLabel({ state }: { state: MasterState }) {
 
 function RegistrationDot({ state }: { state: MasterState }) {
   const reduce = useReducedMotion();
-  const isActive = state === "decoding" || state === "analyzing";
+  const isActive =
+    state === "decoding" || state === "analyzing" || state === "detecting";
   const isFailed = state === "failed";
   const color = isFailed
     ? "#C0392B"
@@ -157,7 +160,8 @@ function MasterStrip({
   state: MasterState;
   audioFilename: string;
 }) {
-  const isActive = state === "decoding" || state === "analyzing";
+  const isActive =
+    state === "decoding" || state === "analyzing" || state === "detecting";
   return (
     <motion.div
       className="grid grid-cols-[auto_1fr_auto_auto] gap-x-3 px-3 py-3 items-center bg-paper-deep/60 border-b-2 border-rule"
@@ -195,6 +199,9 @@ function MasterActivity({ state }: { state: MasterState }) {
   }
   if (state === "analyzing") {
     return <BarsAnimator label="ANALYSE" />;
+  }
+  if (state === "detecting") {
+    return <BarsAnimator label="CHUNKS" />;
   }
   if (state === "done") {
     return (
@@ -557,11 +564,13 @@ function FooterHint({ master }: { master: MasterState }) {
       ? "All set — opening editor."
       : master === "failed"
         ? "Sync halted. See error below."
-        : master === "analyzing"
-          ? "Listening for tempo + downbeats…"
-          : master === "decoding"
-            ? "Decoding the master audio for matching."
-            : "Reading the song. Cams next.";
+        : master === "detecting"
+          ? "Marking chunks for the Triage step…"
+          : master === "analyzing"
+            ? "Listening for tempo + downbeats…"
+            : master === "decoding"
+              ? "Decoding the master audio for matching."
+              : "Reading the song. Cams next.";
   return (
     <span className="font-mono text-[11px] text-ink-3 italic">{text}</span>
   );
