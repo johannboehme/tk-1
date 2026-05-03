@@ -7,16 +7,25 @@
  * No inline Keep/Drop buttons — actions live on the TransportBar
  * (Enter/Backspace) so the user always knows where to go.
  */
-import { useTriageStore } from "../../local/triage/triage-store";
+import {
+  chunkPassesFilter,
+  useTriageStore,
+} from "../../local/triage/triage-store";
 import type { Chunk } from "../../storage/jobs-db";
 
 export function ChunksList() {
   const chunks = useTriageStore((s) => s.chunks);
   const focusedId = useTriageStore((s) => s.focusedChunkId);
   const focusChunk = useTriageStore((s) => s.focusChunk);
+  const minChunkBars = useTriageStore((s) => s.minChunkBars);
+  const jobBpmValue = useTriageStore((s) => s.jobBpm?.value ?? null);
+  const beatsPerBar = useTriageStore((s) => s.beatsPerBar);
 
   const sorted = [...chunks].sort((a, b) => a.startMs - b.startMs);
-  const keptCount = sorted.filter((c) => c.accepted).length;
+  const keptCount = sorted.filter(
+    (c) =>
+      c.accepted && chunkPassesFilter(c, minChunkBars, jobBpmValue, beatsPerBar),
+  ).length;
 
   if (sorted.length === 0) {
     return (
@@ -37,15 +46,25 @@ export function ChunksList() {
         </span>
       </header>
       <ul className="flex-1 min-h-0 overflow-y-auto">
-        {sorted.map((chunk, i) => (
-          <ChunkRow
-            key={chunk.id}
-            chunk={chunk}
-            index={i}
-            focused={chunk.id === focusedId}
-            onFocus={() => focusChunk(chunk.id)}
-          />
-        ))}
+        {sorted.map((chunk, i) => {
+          const passes = chunkPassesFilter(
+            chunk,
+            minChunkBars,
+            jobBpmValue,
+            beatsPerBar,
+          );
+          return (
+            <ChunkRow
+              key={chunk.id}
+              chunk={chunk}
+              index={i}
+              focused={chunk.id === focusedId}
+              effectivelyAccepted={chunk.accepted && passes}
+              filteredOut={chunk.accepted && !passes}
+              onFocus={() => focusChunk(chunk.id)}
+            />
+          );
+        })}
       </ul>
     </section>
   );
@@ -55,16 +74,23 @@ interface RowProps {
   chunk: Chunk;
   index: number;
   focused: boolean;
+  effectivelyAccepted: boolean;
+  filteredOut: boolean;
   onFocus: () => void;
 }
 
-function ChunkRow({ chunk, index, focused, onFocus }: RowProps) {
+function ChunkRow({
+  chunk,
+  index,
+  focused,
+  effectivelyAccepted,
+  filteredOut,
+  onFocus,
+}: RowProps) {
   const lengthS = (chunk.endMs - chunk.startMs) / 1000;
-  // Solid colors per state — no opacity tricks (memory: solid status,
-  // no alpha). Stripe carries the state, body stays neutral.
-  const stateStripe = chunk.accepted ? "#FF5722" : "#5D5546";
+  const stateStripe = effectivelyAccepted ? "#FF5722" : "#5D5546";
   const rowBg = focused
-    ? chunk.accepted
+    ? effectivelyAccepted
       ? "bg-hot/15"
       : "bg-paper-deep"
     : "bg-paper-hi hover:bg-paper-deep";
@@ -113,6 +139,15 @@ function ChunkRow({ chunk, index, focused, onFocus }: RowProps) {
               aria-label="Dropped"
             >
               DROP
+            </span>
+          )}
+          {filteredOut && (
+            <span
+              className="font-mono text-[8px] tracking-label uppercase text-paper-hi bg-ink-3 px-1 rounded"
+              aria-label="Filtered out by min-bars"
+              title="Below the active min-bars filter"
+            >
+              FILT
             </span>
           )}
         </div>

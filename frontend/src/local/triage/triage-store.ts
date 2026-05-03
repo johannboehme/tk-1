@@ -307,10 +307,7 @@ export const useTriageStore = create<TriageState>((set, get) => ({
 
   setMinChunkBars(bars) {
     const safe = Number.isFinite(bars) ? Math.max(0, bars) : 0;
-    set((s) => ({
-      minChunkBars: safe,
-      chunks: applyMinBarsFilter(s.chunks, safe, s.jobBpm?.value ?? null, s.beatsPerBar),
-    }));
+    set({ minChunkBars: safe });
   },
 
   focusChunk(id) {
@@ -351,12 +348,17 @@ export const useTriageStore = create<TriageState>((set, get) => ({
 
   focusRelative(delta) {
     const s = get();
-    // Prev/Next walk only through ACCEPTED chunks — dropped chunks
-    // shouldn't waste keypresses. If the currently focused chunk
-    // happens to be rejected (focused via click then dropped), find
-    // the nearest accepted chunk in the requested direction.
+    // Prev/Next walk only through EFFECTIVELY-accepted chunks — i.e.
+    // user-kept AND passing the active min-bars filter. Filter-hidden
+    // and user-dropped chunks both get skipped. If the focused chunk
+    // is itself excluded (focused via click then dropped, or below
+    // the filter threshold), find the nearest accepted chunk in the
+    // requested direction by master-time.
+    const jobBpmValue = s.jobBpm?.value ?? null;
     const accepted = [...s.chunks]
-      .filter((c) => c.accepted)
+      .filter((c) =>
+        isChunkEffectivelyAccepted(c, s.minChunkBars, jobBpmValue, s.beatsPerBar),
+      )
       .sort((a, b) => a.startMs - b.startMs);
     if (accepted.length === 0) return;
     const focused = s.focusedChunkId
@@ -482,28 +484,35 @@ export function chunkBeatPhaseS(chunk: {
   return (chunk.audioStartMs ?? chunk.startMs) / 1000;
 }
 
-/** Mark every chunk shorter than `minBars` (at the given BPM +
- *  beats-per-bar) as accepted=false. Chunks already meeting the
- *  threshold are left untouched — including ones the user manually
- *  rejected for other reasons. When `minBars <= 0` this is a no-op
- *  and the user's per-chunk decisions are preserved. */
-export function applyMinBarsFilter(
-  chunks: Chunk[],
+/** Pure predicate: does this chunk meet the active min-bars filter?
+ *  When the filter is off (or there's no BPM yet to size a bar), the
+ *  filter is a no-op and every chunk passes.
+ *
+ *  Filter is a VIEW-LAYER concern. It's read where chunks are
+ *  rendered or counted, never mutates `chunk.accepted` — that flag
+ *  belongs to the user's manual Keep/Drop decision and must survive
+ *  filter changes round-trip (off → 1 bar → off restores the
+ *  original state). */
+export function chunkPassesFilter(
+  chunk: { startMs: number; endMs: number },
   minBars: number,
   jobBpm: number | null,
   beatsPerBar: number,
-): Chunk[] {
-  if (minBars <= 0 || !jobBpm || jobBpm <= 0 || beatsPerBar <= 0) return chunks;
+): boolean {
+  if (minBars <= 0 || !jobBpm || jobBpm <= 0 || beatsPerBar <= 0) return true;
   const msPerBar = (60_000 / jobBpm) * beatsPerBar;
-  const thresholdMs = minBars * msPerBar;
-  let mutated = false;
-  const next = chunks.map((c) => {
-    const lengthMs = c.endMs - c.startMs;
-    if (lengthMs < thresholdMs && c.accepted) {
-      mutated = true;
-      return { ...c, accepted: false };
-    }
-    return c;
-  });
-  return mutated ? next : chunks;
+  return chunk.endMs - chunk.startMs >= minBars * msPerBar;
+}
+
+/** Convenience: a chunk is "effectively accepted" iff the user kept
+ *  it AND it passes the active min-bars filter. */
+export function isChunkEffectivelyAccepted(
+  chunk: Chunk,
+  minBars: number,
+  jobBpm: number | null,
+  beatsPerBar: number,
+): boolean {
+  return (
+    chunk.accepted && chunkPassesFilter(chunk, minBars, jobBpm, beatsPerBar)
+  );
 }

@@ -17,6 +17,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   chunkBeatPhaseS,
+  chunkPassesFilter,
   effectiveChunkBpm,
   useTriageStore,
 } from "../../local/triage/triage-store";
@@ -46,6 +47,7 @@ export function TriageTimeline() {
   const chunks = useTriageStore((s) => s.chunks);
   const jobBpm = useTriageStore((s) => s.jobBpm);
   const beatsPerBar = useTriageStore((s) => s.beatsPerBar);
+  const minChunkBars = useTriageStore((s) => s.minChunkBars);
   const snapMode = useTriageStore((s) => s.snapMode);
   const silenceConfig = useTriageStore((s) => s.silenceConfig);
   const focusedChunkId = useTriageStore((s) => s.focusedChunkId);
@@ -580,6 +582,14 @@ export function TriageTimeline() {
             visibleStart={viewStartS}
             visibleEnd={viewEndS}
             focused={chunk.id === focusedChunkId}
+            // Filter is a view concern — chunks below the threshold
+            // render as effectively-rejected without touching their
+            // .accepted flag, so toggling the filter back off restores
+            // the visual.
+            effectivelyAccepted={
+              chunk.accepted &&
+              chunkPassesFilter(chunk, minChunkBars, jobBpm?.value ?? null, beatsPerBar)
+            }
             onTrimStart={(edge, e) => startTrimDrag(e, chunk, edge)}
           />
         ))}
@@ -607,6 +617,10 @@ interface ChunkBlockProps {
   visibleStart: number;
   visibleEnd: number;
   focused: boolean;
+  /** chunk.accepted AND passes the active min-bars filter. Drives the
+   *  visual treatment (hot vs muted, strikethrough). The chunk's own
+   *  accepted flag stays the user's manual decision. */
+  effectivelyAccepted: boolean;
   onTrimStart: (edge: "left" | "right", e: React.MouseEvent) => void;
 }
 
@@ -616,6 +630,7 @@ function ChunkBlock({
   visibleStart,
   visibleEnd,
   focused,
+  effectivelyAccepted,
   onTrimStart,
 }: ChunkBlockProps) {
   const startS = chunk.startMs / 1000;
@@ -624,17 +639,11 @@ function ChunkBlock({
 
   const left = timeToX(startS);
   const right = timeToX(endS);
-  // Width tracks the actual chunk duration — no min-clamp, so very
-  // short chunks read as truly thin slivers when zoomed out instead
-  // of inflating to a misleading minimum.
   const widthPx = right - left;
 
-  const bg = chunk.accepted ? "#FF5722" : "#5D5546";
-  const fg = chunk.accepted ? "#FAF6EC" : "#A89F8B";
+  const bg = effectivelyAccepted ? "#FF5722" : "#5D5546";
+  const fg = effectivelyAccepted ? "#FAF6EC" : "#A89F8B";
 
-  // Only emit the in-block text when there's room for the full
-  // readout. No intermediate "●"/"✕" placeholder — the bg color +
-  // strikethrough already convey accept/reject state at any size.
   const showLabel = widthPx >= 120;
   const showHandles = widthPx >= TRIM_HANDLE_PX * 3;
 
@@ -652,9 +661,9 @@ function ChunkBlock({
       }}
       title={`${chunk.id}: ${formatTime(startS)} → ${formatTime(endS)}${
         chunk.detectedBpm ? ` · ${chunk.detectedBpm.toFixed(1)} BPM` : ""
-      }`}
+      }${chunk.accepted && !effectivelyAccepted ? " · filtered out" : ""}`}
     >
-      {!chunk.accepted && (
+      {!effectivelyAccepted && (
         <div
           aria-hidden
           className="absolute left-0 right-0 top-1/2 h-px"

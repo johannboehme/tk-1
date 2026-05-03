@@ -18,6 +18,10 @@ export interface SnapModeButtonsViewProps {
   hasBpm: boolean;
   /** When false, the MATCH key is disabled (no candidate positions). */
   matchAvailable?: boolean;
+  /** Subset of modes to render. Omit to show all. Use this to hide
+   *  modes that don't make sense for the surface — e.g. Triage has
+   *  no audio-match candidates so it leaves MATCH out entirely. */
+  modes?: ReadonlyArray<SnapMode>;
   /** Optional lock toggle — omit to hide the lock key + divider. */
   lock?: {
     locked: boolean;
@@ -137,8 +141,12 @@ export function SnapModeButtonsView({
   onSnapModeChange,
   hasBpm,
   matchAvailable = true,
+  modes,
   lock,
 }: SnapModeButtonsViewProps) {
+  const visibleButtons = modes
+    ? MODE_BUTTONS.filter((b) => modes.includes(b.mode))
+    : MODE_BUTTONS;
   return (
     <div
       className="flex items-center gap-1.5 self-center max-w-full overflow-x-auto no-native-scrollbar sm:inline-flex sm:overflow-visible sm:max-w-none"
@@ -146,7 +154,7 @@ export function SnapModeButtonsView({
       role="group"
       aria-label="Snap mode"
     >
-      {MODE_BUTTONS.map(({ mode, label, needsBpm }) => {
+      {visibleButtons.map(({ mode, label, needsBpm }) => {
         const active = snapMode === mode;
         const disabled =
           (needsBpm && !hasBpm) || (mode === "match" && !matchAvailable);

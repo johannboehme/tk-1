@@ -39,7 +39,10 @@ import {
 import { loadAssetFile } from "../local/asset-source";
 import { decodeAudioToMonoPcm } from "../local/codec";
 import { TRIAGE_ENVELOPE_HZ, pickGlobalBpm } from "../local/triage/chunk-detect";
-import { useTriageStore } from "../local/triage/triage-store";
+import {
+  isChunkEffectivelyAccepted,
+  useTriageStore,
+} from "../local/triage/triage-store";
 import { useTriagePersist } from "../local/triage/useTriagePersist";
 import { getCachedAnalysis } from "../local/render/audio-analysis";
 import { TriageTimeline } from "../components/triage/TriageTimeline";
@@ -75,8 +78,18 @@ export default function Triage() {
     const fresh = await jobsDb.getJob(state.jobId);
     const existing = fresh?.arrangement ?? [];
     const inArrangement = new Set(existing.map((a) => a.chunkId));
+    // Seed only chunks that are user-kept AND pass the active
+    // min-bars filter.
+    const jobBpmValue = state.jobBpm?.value ?? null;
     const acceptedSorted = [...state.chunks]
-      .filter((c) => c.accepted)
+      .filter((c) =>
+        isChunkEffectivelyAccepted(
+          c,
+          state.minChunkBars,
+          jobBpmValue,
+          state.beatsPerBar,
+        ),
+      )
       .sort((a, b) => a.startMs - b.startMs);
     const additions = acceptedSorted
       .filter((c) => !inArrangement.has(c.id))
@@ -303,6 +316,9 @@ export default function Triage() {
                 snapMode={snapMode}
                 onSnapModeChange={setSnapMode}
                 hasBpm={hasBpm}
+                // Triage has no per-clip audio-match candidates, so
+                // MATCH is meaningless here — drop it from the plate.
+                modes={["off", "1", "1/2", "1/4", "1/8", "1/16"]}
               />
             </div>
             <DetectionPanel />
