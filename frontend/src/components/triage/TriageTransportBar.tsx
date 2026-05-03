@@ -115,95 +115,103 @@ export function TriageTransportBar() {
   }, [setPlaying, focusRelative, acceptFocused, rejectFocused, setLoopEnabled]);
 
   return (
-    <div className="flex items-center gap-2 sm:gap-3 px-2 sm:px-4 py-2 bg-paper-hi border-t border-rule">
-      {/* Prev chunk */}
-      <ChunkyButton
-        variant="secondary"
-        size="sm"
-        onClick={() => focusRelative(-1)}
-        disabled={chunks.length === 0}
-        title="Previous chunk · Shift+←"
-        aria-label="Previous chunk"
-        iconLeft={<SkipBackIcon className="w-4 h-4" />}
-      >
-        <span className="hidden sm:inline">Prev</span>
-      </ChunkyButton>
-
-      {/* Play / pause */}
-      <ChunkyButton
-        variant="primary"
-        size="md"
-        onClick={() => setPlaying(!isPlaying)}
-        title={isPlaying ? "Pause · Space" : "Play · Space"}
-        aria-label={isPlaying ? "Pause" : "Play"}
-        iconLeft={
-          isPlaying ? (
-            <PauseIcon className="w-4 h-4" />
-          ) : (
-            <PlayIcon className="w-4 h-4" />
-          )
-        }
-      >
-        <span className="hidden sm:inline">{isPlaying ? "Pause" : "Play"}</span>
-      </ChunkyButton>
-
-      {/* Next chunk */}
-      <ChunkyButton
-        variant="secondary"
-        size="sm"
-        onClick={() => focusRelative(1)}
-        disabled={chunks.length === 0}
-        title="Next chunk · Shift+→"
-        aria-label="Next chunk"
-        iconRight={<SkipFwdIcon className="w-4 h-4" />}
-      >
-        <span className="hidden sm:inline">Next</span>
-      </ChunkyButton>
-
-      {/* Loop toggle — when on (default), focusing a chunk arms a loop
-       *  region around it; when off, the playhead just jumps to the
-       *  chunk start and continues linearly. */}
-      <ChunkyButton
-        variant={loopEnabled ? "primary" : "secondary"}
-        size="sm"
-        onClick={() => setLoopEnabled(!loopEnabled)}
-        title={loopEnabled ? "Loop on · L to disable" : "Loop off · L to enable"}
-        aria-label={loopEnabled ? "Disable loop" : "Enable loop"}
-        aria-pressed={loopEnabled}
-      >
-        ⟲ Loop
-      </ChunkyButton>
-
-      {/* Time readout (subscribed separately so the bar doesn't re-render
-       *  on every RAF tick). */}
+    <div
+      className={[
+        "grid items-center gap-2 px-3 py-2 bg-paper-hi border-t border-rule",
+        // Symmetric side-rails (10rem each) keep the centered cluster
+        // visually balanced AND reserve right-edge space for the
+        // floating Footer overlay (impressum / datenschutz) so Keep
+        // and Drop never sit underneath it.
+        "grid-cols-[10rem_1fr_10rem]",
+      ].join(" ")}
+    >
+      {/* Left rail — clock readout */}
       <TransportClock audioDuration={audioDuration} />
 
-      <div className="flex-1" />
+      {/* Centered transport cluster */}
+      <div className="flex justify-center items-center gap-2 sm:gap-3">
+        <ChunkyButton
+          variant="secondary"
+          size="sm"
+          onClick={() => focusRelative(-1)}
+          disabled={chunks.length === 0}
+          title="Previous chunk · Shift+←"
+          aria-label="Previous chunk"
+          iconLeft={<SkipBackIcon className="w-4 h-4" />}
+        >
+          <span className="hidden sm:inline">Prev</span>
+        </ChunkyButton>
 
-      {/* Accept / reject of focused chunk */}
-      <ChunkyButton
-        variant="secondary"
-        size="sm"
-        onClick={() => acceptFocused()}
-        disabled={!focusedChunkId}
-        title="Keep focused chunk · Enter"
-        aria-label="Keep focused chunk"
-      >
-        Keep
-      </ChunkyButton>
-      <ChunkyButton
-        variant="secondary"
-        size="sm"
-        onClick={() => rejectFocused()}
-        disabled={!focusedChunkId}
-        title="Drop focused chunk · Backspace"
-        aria-label="Drop focused chunk"
-      >
-        Drop
-      </ChunkyButton>
+        <ChunkyButton
+          variant="primary"
+          size="md"
+          onClick={() => setPlaying(!isPlaying)}
+          title={isPlaying ? "Pause · Space" : "Play · Space"}
+          aria-label={isPlaying ? "Pause" : "Play"}
+          iconLeft={
+            isPlaying ? (
+              <PauseIcon className="w-4 h-4" />
+            ) : (
+              <PlayIcon className="w-4 h-4" />
+            )
+          }
+        >
+          <span className="hidden sm:inline">{isPlaying ? "Pause" : "Play"}</span>
+        </ChunkyButton>
 
-      {/* Counter */}
-      <span className="font-mono text-[10px] tracking-label uppercase text-ink-3 tabular hidden md:inline-block">
+        <ChunkyButton
+          variant="secondary"
+          size="sm"
+          onClick={() => focusRelative(1)}
+          disabled={chunks.length === 0}
+          title="Next chunk · Shift+→"
+          aria-label="Next chunk"
+          iconRight={<SkipFwdIcon className="w-4 h-4" />}
+        >
+          <span className="hidden sm:inline">Next</span>
+        </ChunkyButton>
+
+        <span className="h-6 w-px bg-rule mx-1" aria-hidden />
+
+        <ChunkyButton
+          variant={loopEnabled ? "primary" : "secondary"}
+          size="sm"
+          onClick={() => setLoopEnabled(!loopEnabled)}
+          title={loopEnabled ? "Loop on · L to disable" : "Loop off · L to enable"}
+          aria-label={loopEnabled ? "Disable loop" : "Enable loop"}
+          aria-pressed={loopEnabled}
+        >
+          ⟲ Loop
+        </ChunkyButton>
+
+        <span className="h-6 w-px bg-rule mx-1" aria-hidden />
+
+        <ChunkyButton
+          variant="secondary"
+          size="sm"
+          onClick={() => acceptFocused()}
+          disabled={!focusedChunkId}
+          title="Keep focused chunk · Enter"
+          aria-label="Keep focused chunk"
+        >
+          Keep
+        </ChunkyButton>
+        <ChunkyButton
+          variant="secondary"
+          size="sm"
+          onClick={() => rejectFocused()}
+          disabled={!focusedChunkId}
+          title="Drop focused chunk · Backspace"
+          aria-label="Drop focused chunk"
+        >
+          Drop
+        </ChunkyButton>
+      </div>
+
+      {/* Right rail — kept counter (footer overlay floats over this
+       *  same area; the counter is unimportant enough to be partially
+       *  obscured if the user has nothing focused). */}
+      <span className="font-mono text-[10px] tracking-label uppercase text-ink-3 tabular text-right hidden md:inline-block">
         {acceptedCount} / {chunks.length} kept
       </span>
     </div>

@@ -398,21 +398,17 @@ export const useTriageStore = create<TriageState>((set, get) => ({
   },
 }));
 
-/** Resolve the BPM that drives a chunk's bar grid. Per-chunk values
- *  win when set (octave-shift on a detected per-chunk BPM); otherwise
- *  fall back to the song-global `jobBpm`. Returns 0 when no BPM is
- *  available anywhere — callers should suppress bar rendering in that
- *  case. */
+/** Resolve the BPM that drives a chunk's bar grid. Song-global `jobBpm`
+ *  wins; the per-chunk detected value is just a fallback for cases
+ *  where a global hasn't been determined yet (e.g. detection failed).
+ *  Returns 0 when no BPM is available anywhere — callers should
+ *  suppress bar rendering in that case. */
 export function effectiveChunkBpm(
-  chunk: { detectedBpm?: number; bpmOctaveShift: -1 | 0 | 1; effectiveBpm: number },
+  chunk: { detectedBpm?: number; effectiveBpm: number },
   jobBpm: number | null,
 ): number {
-  // Octave-shift only applies on top of a per-chunk detected BPM. If
-  // the chunk had no detection, fall through to the job-global.
-  if (chunk.detectedBpm && chunk.detectedBpm > 0) {
-    return chunk.detectedBpm * Math.pow(2, chunk.bpmOctaveShift);
-  }
   if (jobBpm && jobBpm > 0) return jobBpm;
+  if (chunk.detectedBpm && chunk.detectedBpm > 0) return chunk.detectedBpm;
   return chunk.effectiveBpm > 0 ? chunk.effectiveBpm : 0;
 }
 

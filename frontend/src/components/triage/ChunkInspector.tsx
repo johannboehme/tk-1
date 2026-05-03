@@ -33,7 +33,6 @@ export function ChunkInspector() {
   const setJobBpm = useTriageStore((s) => s.setJobBpm);
   const resetBpm = useTriageStore((s) => s.resetBpmToDetected);
   const setBeatsPerBar = useTriageStore((s) => s.setBeatsPerBar);
-  const updateChunk = useTriageStore((s) => s.updateChunk);
   const extendChunkBars = useTriageStore((s) => s.extendChunkBars);
   const sortedIdx =
     focusedId !== null
@@ -74,7 +73,6 @@ export function ChunkInspector() {
           chunk={focused}
           jobBpmValue={jobBpm?.value ?? null}
           beatsPerBar={beatsPerBar}
-          onUpdate={(patch) => updateChunk(focused.id, patch)}
           onExtend={(back, fwd) => extendChunkBars(focused.id, back, fwd)}
         />
       )}
@@ -86,11 +84,10 @@ interface BodyProps {
   chunk: Chunk;
   jobBpmValue: number | null;
   beatsPerBar: number;
-  onUpdate: (patch: Partial<Chunk>) => void;
   onExtend: (barsBack: number, barsFwd: number) => void;
 }
 
-function ChunkBody({ chunk, jobBpmValue, beatsPerBar, onUpdate, onExtend }: BodyProps) {
+function ChunkBody({ chunk, jobBpmValue, beatsPerBar, onExtend }: BodyProps) {
   const lengthMs = chunk.endMs - chunk.startMs;
   const lengthS = lengthMs / 1000;
   const effBpm = effectiveChunkBpm(chunk, jobBpmValue);
@@ -98,7 +95,6 @@ function ChunkBody({ chunk, jobBpmValue, beatsPerBar, onUpdate, onExtend }: Body
   const canExtend = effBpm > 0;
   const phaseS = chunkBeatPhaseS(chunk);
   const phaseDeltaMs = phaseS * 1000 - chunk.startMs;
-  const usingChunkOctave = chunk.detectedBpm !== undefined && chunk.detectedBpm > 0;
 
   return (
     <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-3 text-sm">
@@ -119,54 +115,6 @@ function ChunkBody({ chunk, jobBpmValue, beatsPerBar, onUpdate, onExtend }: Body
               : "—"
           }
         />
-      </div>
-
-      {/* Per-chunk octave-shift — for the rare case where the
-       *  per-chunk detector picked the wrong octave on one fragment.
-       *  Only meaningful when the chunk has its own detection. */}
-      <div className="border-t border-rule pt-2 flex items-center gap-2">
-        <span className="font-display tracking-label uppercase text-[9px] text-ink-3 shrink-0">
-          OCT
-        </span>
-        <div className="flex gap-1.5">
-          <ChunkyButton
-            variant={chunk.bpmOctaveShift === -1 ? "primary" : "secondary"}
-            size="xs"
-            disabled={!usingChunkOctave}
-            onClick={() =>
-              onUpdate({
-                bpmOctaveShift: chunk.bpmOctaveShift === -1 ? 0 : -1,
-              })
-            }
-          >
-            ÷2
-          </ChunkyButton>
-          <ChunkyButton
-            variant={chunk.bpmOctaveShift === 0 ? "primary" : "secondary"}
-            size="xs"
-            disabled={!usingChunkOctave}
-            onClick={() => onUpdate({ bpmOctaveShift: 0 })}
-          >
-            ×1
-          </ChunkyButton>
-          <ChunkyButton
-            variant={chunk.bpmOctaveShift === 1 ? "primary" : "secondary"}
-            size="xs"
-            disabled={!usingChunkOctave}
-            onClick={() =>
-              onUpdate({
-                bpmOctaveShift: chunk.bpmOctaveShift === 1 ? 0 : 1,
-              })
-            }
-          >
-            ×2
-          </ChunkyButton>
-        </div>
-        {!usingChunkOctave && (
-          <span className="font-mono text-[9px] tabular text-ink-3 ml-auto">
-            no per-chunk detection
-          </span>
-        )}
       </div>
 
       {/* Bar extend / shrink — 2×2 grid of trim arrows. */}
