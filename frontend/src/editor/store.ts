@@ -13,6 +13,7 @@ import {
   EditSpec,
   ExportSpec,
   MatchCandidate,
+  Segment,
   TextOverlay,
   ViewportTransform,
   VisualizerConfig,
@@ -311,6 +312,14 @@ interface EditorState {
    *  element AND baked into the rendered output by `edit.ts`. */
   audioVolume: number;
 
+  /** Long-form arrangement segments — when non-empty, replaces the
+   *  single-trim model: useAudioMaster walks these in order with a
+   *  gapless crossfade-hop at each segment boundary, and `buildEditSpec`
+   *  emits them verbatim into `EditSpec.segments` (the renderer already
+   *  supports multi-segment outputs). Empty array = legacy direct-mode
+   *  behaviour driven by `trim.in / trim.out`. */
+  arrangementSegments: Segment[];
+
   // actions
   reset(): void;
   loadJob(
@@ -321,8 +330,15 @@ interface EditorState {
       cuts?: Cut[];
       fx?: PunchFx[];
       audioVolume?: number;
+      /** Long-form arrangement segments (master-time {in, out}). When
+       *  passed, the editor walks them sequentially during playback +
+       *  emits them into EditSpec at render time. */
+      arrangementSegments?: Segment[];
     },
   ): void;
+  /** Replace the arrangement-segment list. Empty array reverts to
+   *  legacy single-trim behaviour. */
+  setArrangementSegments(segments: Segment[]): void;
 
   /** Append a single clip to clips[] without resetting any other editor
    *  state. Used by the Editor's "+ Media" flow when addVideoToJob /
@@ -804,6 +820,7 @@ export const useEditorStore = create<EditorState>()(
     fxDefaults: {},
     fxEnvelopes: {},
     audioVolume: 1.0,
+    arrangementSegments: [],
 
     reset() {
       set({
@@ -828,6 +845,7 @@ export const useEditorStore = create<EditorState>()(
         fxDefaults: {},
         fxEnvelopes: {},
         audioVolume: 1.0,
+        arrangementSegments: [],
       });
     },
 
@@ -887,6 +905,7 @@ export const useEditorStore = create<EditorState>()(
           typeof opts?.audioVolume === "number" && opts.audioVolume >= 0
             ? Math.min(4, opts.audioVolume)
             : 1.0,
+        arrangementSegments: opts?.arrangementSegments ?? [],
       });
     },
 
@@ -1686,14 +1705,26 @@ export const useEditorStore = create<EditorState>()(
 
     buildEditSpec() {
       const s = get();
+      // Long-form jobs: emit the arrangement-segment list verbatim so
+      // the renderer slices the master audio + video to match the
+      // user's chunk arrangement. Direct-mode jobs fall back to the
+      // single-trim region.
+      const segments =
+        s.arrangementSegments.length > 0
+          ? s.arrangementSegments
+          : [{ in: s.trim.in, out: s.trim.out }];
       return {
         version: 1,
-        segments: [{ in: s.trim.in, out: s.trim.out }],
+        segments,
         overlays: s.overlays,
         visualizer: s.visualizer,
         sync_override_ms: s.offset.userOverrideMs,
         export: s.exportSpec,
       };
+    },
+
+    setArrangementSegments(segments) {
+      set({ arrangementSegments: segments });
     },
 
     camRanges() {

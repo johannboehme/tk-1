@@ -31,6 +31,7 @@ import {
   type EditSpecLocal,
 } from "../local/jobs";
 import { isVideoAsset, type MediaAsset } from "../storage/jobs-db";
+import { arrangementToSegments } from "../local/arrange/chunks-to-segments";
 import { decodeAudioToMonoPcm } from "../local/codec";
 import { computeWaveformPeaks } from "../local/waveform-peaks";
 import { exportSpecToRenderOpts } from "../editor/exportPresets";
@@ -689,6 +690,15 @@ export default function Editor() {
                 }
               : null));
 
+      // Long-form jobs land here with a populated `arrangement[]` —
+      // translate it into a flat segment list so the editor's audio
+      // master walks the user's chunk sequence and `buildEditSpec`
+      // emits a multi-segment EditSpec the renderer slices natively.
+      const arrangementSegments =
+        j.mode === "longform" && Array.isArray(j.arrangement) && j.arrangement.length > 0
+          ? arrangementToSegments(j.arrangement, j.chunks ?? [])
+          : [];
+
       loadJob(
         {
           id: j.id,
@@ -717,6 +727,7 @@ export default function Editor() {
           cuts: j.cuts ?? [],
           fx: j.fx ?? [],
           audioVolume: j.audioVolume,
+          arrangementSegments,
         },
       );
 
@@ -747,6 +758,14 @@ export default function Editor() {
         const tin = Math.max(0, Math.min(j.trim.in, audioMax));
         const tout = Math.max(tin, Math.min(j.trim.out, audioMax));
         useEditorStore.getState().setTrim({ in: tin, out: tout });
+      } else if (arrangementSegments.length > 0) {
+        // Long-form first-load: derive trim from segment span so
+        // skip-to-end / zoom-to-fit operate on the user-arranged
+        // window rather than the entire master audio.
+        const firstIn = arrangementSegments[0].in;
+        const lastOut =
+          arrangementSegments[arrangementSegments.length - 1].out;
+        useEditorStore.getState().setTrim({ in: firstIn, out: lastOut });
       }
     })().catch((e) => {
       if (!cancelled) setErr(e instanceof Error ? e.message : "Could not load job");

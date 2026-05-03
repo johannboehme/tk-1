@@ -97,8 +97,13 @@ interface PingPongState {
   /** Which side is currently audible (gain ramped to 1). */
   active: "A" | "B";
   /** Crossfade scheduled but not yet fired. `fireAtCtxTime` is
-   *  `audioContext.currentTime` at which the gain ramps START. */
-  armed: { fireAtCtxTime: number; fromSide: "A" | "B" } | null;
+   *  `audioContext.currentTime` at which the gain ramps START.
+   *  `wrapTarget` overrides the post-fire seek destination for
+   *  arrangement-segment hops (where we land at the next segment's
+   *  `in` instead of the current loop's `start`). */
+  armed:
+    | { fireAtCtxTime: number; fromSide: "A" | "B"; wrapTarget?: number }
+    | null;
 }
 
 export function useAudioMaster(
@@ -386,8 +391,11 @@ export function useAudioMaster(
       ) {
         // Swap roles. The new idle = the former active, which is
         // still playing past the wrap point and must be paused +
-        // re-parked at the loop.start so it's ready for the NEXT wrap.
+        // re-parked at the wrap target (loop.start for normal loops,
+        // wrapTarget for arrangement-segment hops) so it's ready for
+        // the NEXT wrap.
         const wrapLoop = store.playback.loop;
+        const armedTarget = state.armed.wrapTarget;
         const formerActive = active;
         state.active = state.active === "A" ? "B" : "A";
         state.armed = null;
@@ -396,7 +404,16 @@ export function useAudioMaster(
         } catch {
           /* ignore */
         }
-        if (wrapLoop) {
+        if (armedTarget != null) {
+          try {
+            formerActive.currentTime = clampSeek(
+              armedTarget,
+              formerActive.duration,
+            );
+          } catch {
+            /* ignore */
+          }
+        } else if (wrapLoop) {
           try {
             formerActive.currentTime = clampSeek(
               wrapLoop.start,
@@ -410,6 +427,98 @@ export function useAudioMaster(
         if (store.playback.pendingWrapAt != null) {
           store.clearPendingWrap();
         }
+        rafRef.current = requestAnimationFrame(tick);
+        return;
+      }
+
+      // ─── Arrangement-segment walker ───────────────────────────────────
+      // When the editor was opened from a long-form Arrange handoff, the
+      // store carries a list of `arrangementSegments` (in master-time).
+      // Playback should walk them in order, gapless-hopping at each
+      // segment boundary instead of streaming straight through the
+      // master audio. Direct-mode jobs leave this empty and the legacy
+      // loop logic below runs as before.
+      const segs = store.arrangementSegments;
+      if (segs.length > 0) {
+        let curIdx = -1;
+        for (let i = 0; i < segs.length; i++) {
+          if (t >= segs[i].in - 1e-3 && t < segs[i].out) {
+            curIdx = i;
+            break;
+          }
+        }
+        if (curIdx === -1) {
+          // The playhead is in a "gap" between segments (or before the
+          // first one). Hard-seek to the next segment's start, or pause
+          // when we've fallen past the last segment.
+          let nextIdx = -1;
+          for (let i = 0; i < segs.length; i++) {
+            if (segs[i].in > t) {
+              nextIdx = i;
+              break;
+            }
+          }
+          if (nextIdx === -1) {
+            // Past the last segment — stop.
+            store.setPlaying(false);
+            rafRef.current = null;
+            return;
+          }
+          const target = segs[nextIdx].in;
+          try {
+            active.currentTime = clampSeek(target, active.duration);
+          } catch {
+            /* ignore */
+          }
+          store.setCurrentTime(target);
+          rafRef.current = requestAnimationFrame(tick);
+          return;
+        }
+        const curSeg = segs[curIdx];
+        const nextSeg = segs[curIdx + 1] ?? null;
+        if (state.armed === null) {
+          const distToEnd = curSeg.out - t;
+          if (distToEnd > 0 && distToEnd <= LEAD_TIME_S) {
+            const fireAtCtxTime = graph.ctx.currentTime + distToEnd;
+            if (nextSeg) {
+              try {
+                if (Math.abs(idle.currentTime - nextSeg.in) > 0.01) {
+                  idle.currentTime = clampSeek(nextSeg.in, idle.duration);
+                }
+              } catch {
+                /* ignore */
+              }
+              if (idle.paused) {
+                idle.play().catch(() => undefined);
+              }
+              const activeGain = state.active === "A" ? graph.gainA : graph.gainB;
+              const idleGain = state.active === "A" ? graph.gainB : graph.gainA;
+              activeGain.gain.cancelScheduledValues(graph.ctx.currentTime);
+              idleGain.gain.cancelScheduledValues(graph.ctx.currentTime);
+              activeGain.gain.setValueAtTime(1, fireAtCtxTime);
+              activeGain.gain.linearRampToValueAtTime(0, fireAtCtxTime + CROSSFADE_S);
+              idleGain.gain.setValueAtTime(0, fireAtCtxTime);
+              idleGain.gain.linearRampToValueAtTime(1, fireAtCtxTime + CROSSFADE_S);
+              state.armed = {
+                fireAtCtxTime,
+                fromSide: state.active,
+                wrapTarget: nextSeg.in,
+              };
+            } else {
+              // Last segment — no hop, just pause when we hit the end.
+              window.setTimeout(() => {
+                useEditorStore.getState().setPlaying(false);
+              }, Math.max(0, distToEnd * 1000));
+              // Fake-arm so we don't re-arm next tick.
+              state.armed = {
+                fireAtCtxTime,
+                fromSide: state.active,
+              };
+            }
+          }
+        }
+        // Skip the legacy loop arming below — segment-walk owns the
+        // crossfade scheduling for arrangement playback.
         rafRef.current = requestAnimationFrame(tick);
         return;
       }

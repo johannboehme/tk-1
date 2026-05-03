@@ -188,6 +188,7 @@ export function Timeline({
   // Store reads — narrow selectors to keep re-renders cheap.
   const jobMeta = useEditorStore((s) => s.jobMeta);
   const trim = useEditorStore((s) => s.trim);
+  const arrangementSegments = useEditorStore((s) => s.arrangementSegments);
   const setTrim = useEditorStore((s) => s.setTrim);
   const loop = useEditorStore((s) => s.playback.loop);
   const setLoop = useEditorStore((s) => s.setLoop);
@@ -543,6 +544,55 @@ export function Timeline({
     if (xOut < audioRightX)
       ctx.fillRect(xOut, audioBand.top, audioRightX - xOut, audioLaneHeight);
 
+    // Arrange handoff: dim every region NOT covered by an arrangement
+    // segment, so the user reads at-a-glance which slices of the master
+    // audio actually play. Segments overlap the trim shading naturally.
+    if (arrangementSegments.length > 0) {
+      // Build [trim.in, trim.out] minus the union of segment ranges,
+      // then fill those gaps. Sort + walk segments so overlapping or
+      // out-of-order segments still render correctly.
+      const sorted = [...arrangementSegments]
+        .map((s) => ({
+          inS: Math.max(trim.in, s.in),
+          outS: Math.min(trim.out, s.out),
+        }))
+        .filter((s) => s.outS > s.inS)
+        .sort((a, b) => a.inS - b.inS);
+      let cursor = trim.in;
+      ctx.fillStyle = "rgba(232,225,208,0.62)";
+      for (const seg of sorted) {
+        if (seg.inS > cursor) {
+          const gapX = tToX(cursor);
+          const gapEnd = tToX(seg.inS);
+          ctx.fillRect(gapX, audioBand.top, Math.max(1, gapEnd - gapX), audioLaneHeight);
+        }
+        cursor = Math.max(cursor, seg.outS);
+      }
+      if (cursor < trim.out) {
+        const tailX = tToX(cursor);
+        const tailEndX = tToX(trim.out);
+        ctx.fillRect(
+          tailX,
+          audioBand.top,
+          Math.max(1, tailEndX - tailX),
+          audioLaneHeight,
+        );
+      }
+      // Hot tick at every segment boundary (in + out) — like splice marks
+      // in a tape edit. Reads even when the audio waveform is busy.
+      ctx.fillStyle = "rgba(255,87,34,0.55)";
+      for (const seg of sorted) {
+        const sx = tToX(seg.inS);
+        const ex = tToX(seg.outS);
+        if (sx >= 0 && sx <= audioRightX) {
+          ctx.fillRect(sx, audioBand.top, 1, audioLaneHeight);
+        }
+        if (ex >= 0 && ex <= audioRightX) {
+          ctx.fillRect(ex, audioBand.top, 1, audioLaneHeight);
+        }
+      }
+    }
+
     // Loop band on audio lane.
     if (loop) {
       const xs = tToX(loop.start);
@@ -665,6 +715,7 @@ export function Timeline({
     audioDuration,
     trim.in,
     trim.out,
+    arrangementSegments,
     loop,
     currentTime,
     clips,
