@@ -7,7 +7,6 @@
  *   ffmpeg -i in -vf "fps=1/<step>,scale=-1:<H>,tile=<N>x1" -q:v 3 sheet.webp
  */
 
-import { fetchFile } from "@ffmpeg/util";
 import { getFfmpeg } from "../../codec/ffmpeg/ffmpeg-loader";
 import { planTileStrip } from "./strategy";
 import type { FrameStripResult } from "./types";
@@ -54,9 +53,13 @@ export async function extractFrameStripFfmpeg(
   const inputName = `frames-in-${Date.now()}.bin`;
   const outputName = `frames-out-${Date.now()}.webp`;
 
-  const data = source instanceof ArrayBuffer
-    ? new Uint8Array(source)
-    : await fetchFile(source);
+  // Avoid @ffmpeg/util's `fetchFile` — it routes through a legacy FileReader
+  // that rejects OPFS-backed Files on some Chromium builds. See sibling
+  // ffmpeg/audio-decode.ts for the longer note.
+  const data =
+    source instanceof ArrayBuffer
+      ? new Uint8Array(source)
+      : new Uint8Array(await source.arrayBuffer());
   await ffmpeg.writeFile(inputName, data);
 
   const filter =

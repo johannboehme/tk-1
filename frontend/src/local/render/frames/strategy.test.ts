@@ -10,15 +10,26 @@ describe("planTileStrip — adaptive sampling", () => {
     expect(plan.timestampsS[plan.timestampsS.length - 1]).toBeLessThan(30);
   });
 
-  it("uses 1s step for medium videos (≤600s)", () => {
+  it("uses 1s step for medium videos (≤600s) up to the maxTiles cap", () => {
+    // 120 / 1.0 = 120 raw tiles → capped to default maxTiles=100.
     const plan = planTileStrip({ durationS: 120, sourceWidth: 1920, sourceHeight: 1080 });
-    expect(plan.timestampsS.length).toBe(120);
+    expect(plan.timestampsS.length).toBe(100);
+
+    // Below the cap, we get the natural step.
+    const sub = planTileStrip({ durationS: 90, sourceWidth: 1920, sourceHeight: 1080 });
+    expect(sub.timestampsS.length).toBe(90);
   });
 
-  it("uses 2s step for long videos (>600s)", () => {
+  it("uses 5s step for long videos (10–30 min)", () => {
     const plan = planTileStrip({ durationS: 1200, sourceWidth: 1920, sourceHeight: 1080 });
-    // 1200 / 2 = 600 → would exceed maxTiles=200 default → cap kicks in.
-    expect(plan.timestampsS.length).toBeLessThanOrEqual(200);
+    // 1200 / 5 = 240 → would exceed maxTiles=100 default → cap kicks in.
+    expect(plan.timestampsS.length).toBeLessThanOrEqual(100);
+  });
+
+  it("uses 10s step for very long videos (>30 min)", () => {
+    const plan = planTileStrip({ durationS: 3600, sourceWidth: 1920, sourceHeight: 1080 });
+    // 3600 / 10 = 360 → cap kicks in.
+    expect(plan.timestampsS.length).toBeLessThanOrEqual(100);
   });
 
   it("caps tile count at maxTiles by widening the step", () => {
@@ -32,6 +43,15 @@ describe("planTileStrip — adaptive sampling", () => {
     // Last tile is somewhere within the source duration.
     expect(plan.timestampsS[plan.timestampsS.length - 1]).toBeLessThan(1200);
     expect(plan.timestampsS[plan.timestampsS.length - 1]).toBeGreaterThan(1100);
+  });
+
+  it("default cap is 100 tiles", () => {
+    const plan = planTileStrip({
+      durationS: 10_000,
+      sourceWidth: 1920,
+      sourceHeight: 1080,
+    });
+    expect(plan.timestampsS.length).toBe(100);
   });
 
   it("derives tile width from source aspect (landscape)", () => {

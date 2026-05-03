@@ -26,6 +26,13 @@ import {
 } from "../storage/jobs-db";
 import { camColorAt } from "../storage/migrations";
 import { opfs } from "../storage/opfs";
+import {
+  type AssetSource,
+  type PickedAsset,
+  loadAssetFile,
+  persistPickedAsset,
+  deleteAssetIfOwned,
+} from "./asset-source";
 import { syncAudio } from "./sync";
 import { getOrComputeAnalysis } from "./render/audio-analysis";
 import { quickRender } from "./render/quick";
@@ -60,6 +67,30 @@ const OUTPUT_NAME = "output.mp4";
 function audioPath(jobId: string, ext: string): string {
   return `jobs/${jobId}/${AUDIO_NAME}.${ext}`;
 }
+
+/** Resolve a job's master audio to a `File`. v3+ jobs carry an
+ *  explicit `audioSource` (handle or OPFS); legacy v2 jobs derive the
+ *  OPFS path from `audioFilename`'s extension. */
+async function loadJobAudio(job: LocalJob, audioExt: string): Promise<File> {
+  if (job.audioSource) {
+    return loadAssetFile({ source: job.audioSource });
+  }
+  return opfs.readFile(audioPath(job.id, audioExt));
+}
+
+/** Pull the `AssetSource` off a v3+ asset row, or synthesise an
+ *  `opfs`-kind source from the legacy `opfsPath` field for v2 rows. */
+function assetSource(asset: { source?: AssetSource; opfsPath: string }): AssetSource {
+  return asset.source ?? { kind: "opfs", path: asset.opfsPath };
+}
+
+/** Same for the master-audio side: prefer `job.audioSource`; fall back
+ *  to the OPFS path derived from `audioFilename`. */
+function jobAudioSource(job: LocalJob): AssetSource {
+  if (job.audioSource) return job.audioSource;
+  const ext = fileExtension(new File([], job.audioFilename), "wav");
+  return { kind: "opfs", path: audioPath(job.id, ext) };
+}
 function outputPath(jobId: string): string {
   return `jobs/${jobId}/${OUTPUT_NAME}`;
 }
@@ -93,32 +124,36 @@ function fileExtension(file: File, fallback: string): string {
 // flow (addVideoToJob / addImageToJob — one cam per call).
 // -----------------------------------------------------------------------------
 
-/** Persist a video file as cam-{index+1} in OPFS and return the
- *  VideoAsset record (without sync / dimensions / framesPath — those are
- *  filled by runCamPrep). */
+/** Persist a video pick (handle-backed or file-only) as cam-{index+1}
+ *  and return the VideoAsset record. For handle-backed picks no bytes
+ *  are copied — we keep the FileSystemFileHandle in the asset's
+ *  `source`. For file-only picks (legacy / unsupported browsers) the
+ *  bytes are written to OPFS and `source` points there. The
+ *  `opfsPath` field is always set to the canonical per-cam path so
+ *  derived paths (frames-strip etc.) stay deterministic. */
 async function persistVideoCam(
   jobId: string,
-  file: File,
+  picked: PickedAsset,
   index: number,
 ): Promise<VideoAsset> {
   const camId = `cam-${index + 1}`;
-  const ext = fileExtension(file, "mp4");
+  const ext = fileExtension(picked.file, "mp4");
   const opfsPath = camVideoPath(jobId, camId, ext);
-  await opfs.writeFile(opfsPath, file);
+  const source = await persistPickedAsset(picked, opfsPath);
   return {
     id: camId,
-    filename: file.name,
+    filename: picked.file.name,
     opfsPath,
+    source,
     color: camColorAt(index),
   };
 }
 
-/** Persist an image file as cam-{index+1} in OPFS, probe its dimensions,
- *  and return the ImageAsset record. Probing failure is non-fatal —
- *  width/height stay undefined and the lane uses a fallback aspect. */
+/** Persist an image pick — same dual-path logic as `persistVideoCam`,
+ *  plus a best-effort dimension probe. */
 async function persistImageCam(
   jobId: string,
-  file: File,
+  picked: PickedAsset,
   index: number,
   durationS: number,
 ): Promise<{
@@ -126,19 +161,20 @@ async function persistImageCam(
   id: string;
   filename: string;
   opfsPath: string;
+  source: AssetSource;
   color: string;
   durationS: number;
   width?: number;
   height?: number;
 }> {
   const camId = `cam-${index + 1}`;
-  const ext = fileExtension(file, "png");
+  const ext = fileExtension(picked.file, "png");
   const opfsPath = camVideoPath(jobId, camId, ext);
-  await opfs.writeFile(opfsPath, file);
+  const source = await persistPickedAsset(picked, opfsPath);
   let width: number | undefined;
   let height: number | undefined;
   try {
-    const bitmap = await createImageBitmap(file);
+    const bitmap = await createImageBitmap(picked.file);
     width = bitmap.width;
     height = bitmap.height;
     bitmap.close();
@@ -148,8 +184,9 @@ async function persistImageCam(
   return {
     kind: "image",
     id: camId,
-    filename: file.name,
+    filename: picked.file.name,
     opfsPath,
+    source,
     color: camColorAt(index),
     durationS,
     width,
@@ -163,20 +200,25 @@ interface CreateJobOptions {
 }
 
 /**
- * Persists the input files in OPFS, registers the job, and kicks off sync
- * asynchronously. Returns immediately with the new job id; subscribe to
- * `jobEvents` for status updates.
+ * Register a new job and kick off sync. Each pick is either:
+ *   - handle-backed (`{file, handle}`) — we keep the handle and read
+ *     bytes from the user's disk on demand (no copy)
+ *   - file-only (`{file}`) — we copy the bytes into OPFS as a fallback
+ *     for browsers without `showOpenFilePicker` (Safari, Firefox)
  *
- * `videoFiles` must contain at least one video; the first one becomes cam-1
- * (the lane that's mirrored into legacy top-level fields for backward
- * compat).
+ * Returns immediately with the new job id; subscribe to `jobEvents`
+ * for status updates.
+ *
+ * `videoPicks` must contain at least one video; the first one becomes
+ * cam-1 (the lane that's mirrored into legacy top-level fields for
+ * backward compat).
  */
 export async function createJob(
-  videoFiles: File[],
-  audioFile: File,
+  videoPicks: PickedAsset[],
+  audioPick: PickedAsset,
   options: CreateJobOptions = {},
 ): Promise<string> {
-  if (videoFiles.length === 0) {
+  if (videoPicks.length === 0) {
     throw new Error("At least one video is required");
   }
 
@@ -187,16 +229,16 @@ export async function createJob(
   await pruneIfQuotaTight().catch(() => undefined);
 
   const jobId = generateJobId();
-  const audioExt = fileExtension(audioFile, "wav");
-
-  await opfs.writeFile(audioPath(jobId, audioExt), audioFile);
+  const audioExt = fileExtension(audioPick.file, "wav");
+  const audioOpfsPath = audioPath(jobId, audioExt);
+  const audioSource = await persistPickedAsset(audioPick, audioOpfsPath);
 
   const videos: VideoAsset[] = [];
-  for (let i = 0; i < videoFiles.length; i++) {
-    videos.push(await persistVideoCam(jobId, videoFiles[i], i));
+  for (let i = 0; i < videoPicks.length; i++) {
+    videos.push(await persistVideoCam(jobId, videoPicks[i], i));
   }
 
-  const firstVideo = videoFiles[0];
+  const firstVideo = videoPicks[0].file;
 
   const job: LocalJob = {
     id: jobId,
@@ -204,12 +246,13 @@ export async function createJob(
     // Legacy V1 mirrors of cam-1 (kept for backward compat — older callers
     // may still read videoFilename / sync / dimensions at the top level).
     videoFilename: firstVideo.name,
-    audioFilename: audioFile.name,
+    audioFilename: audioPick.file.name,
+    audioSource,
     status: "queued",
     progress: { pct: 0, stage: "queued" },
     hasOutput: false,
     createdAt: Date.now(),
-    schemaVersion: 2,
+    schemaVersion: 3,
     videos,
     cuts: [],
   };
@@ -218,9 +261,16 @@ export async function createJob(
 
   // Kick off sync without awaiting — UI subscribes for results.
   void runSync(jobId, audioExt).catch(async (err) => {
+    // Preserve the stage the job was in when it threw — without this the
+    // banner just shows the raw decoder message and the user can't tell
+    // whether the master audio or a specific cam was the culprit.
+    const cur = await jobsDb.getJob(jobId);
+    const stage = cur?.progress?.stage;
+    const raw = err instanceof Error ? err.message : String(err);
+    const error = stage ? `[${stage}] ${raw}` : raw;
     const failed = await jobsDb.updateJob(jobId, {
       status: "failed",
-      error: err instanceof Error ? err.message : String(err),
+      error,
       progress: { pct: 100, stage: "failed" },
     });
     emitJobUpdate(failed);
@@ -290,7 +340,7 @@ async function runCamPrep(
     mapPct: (frac: number) => number;
   },
 ): Promise<VideoAsset> {
-  const videoFile = await opfs.readFile(cam.opfsPath);
+  const videoFile = await loadAssetFile(cam);
 
   // SYNC stage — only if matching is requested.
   let sync: SyncResult | undefined;
@@ -304,7 +354,19 @@ async function runCamPrep(
       detail: `${cam.id} · ${cam.filename}`,
     });
 
-    const videoMonoPcm = await decodeAudioToMonoPcm(videoFile, 22050);
+    // Decode is the slowest piece of the per-cam band — for a 9 GB
+    // recording it eats ~10 s. Stream the streaming-decoder's
+    // bytes-read fraction into the global progress bar so the user
+    // sees continuous motion instead of a hard 0 → 0.4 jump.
+    const videoMonoPcm = await decodeAudioToMonoPcm(videoFile, 22050, {
+      onProgress: (frac) => {
+        void reportProgress(jobId, {
+          pct: opts.mapPct(frac * 0.4),
+          stage: `syncing-${cam.id}`,
+          detail: `${cam.id} · ${cam.filename}`,
+        });
+      },
+    });
     await reportProgress(jobId, {
       pct: opts.mapPct(0.4),
       stage: `syncing-${cam.id}`,
@@ -391,9 +453,18 @@ async function runSync(jobId: string, audioExt: string): Promise<void> {
   }
 
   // Decode the master studio audio once; every cam syncs against this.
-  const audioFile = await opfs.readFile(audioPath(jobId, audioExt));
-  await reportProgress(jobId, { pct: 5, stage: "decoding-studio-audio" });
-  const studioMonoPcm = await decodeAudioToMonoPcm(audioFile, 22050);
+  // Master decode gets the 2..5 % slice of the global bar — small for
+  // typical few-MB songs but visible for hour-long master tracks.
+  const audioFile = await loadJobAudio(job, audioExt);
+  await reportProgress(jobId, { pct: 2, stage: "decoding-studio-audio" });
+  const studioMonoPcm = await decodeAudioToMonoPcm(audioFile, 22050, {
+    onProgress: (frac) => {
+      void reportProgress(jobId, {
+        pct: 2 + Math.floor(frac * 3),
+        stage: "decoding-studio-audio",
+      });
+    },
+  });
 
   const updatedVideos: VideoAsset[] = [];
   // Each cam gets an equal slice of the 5-95% progress band.
@@ -464,14 +535,14 @@ export interface AddVideoOptions {
  */
 export async function addVideoToJob(
   jobId: string,
-  file: File,
+  picked: PickedAsset,
   opts: AddVideoOptions = {},
 ): Promise<string> {
   const job = await jobsDb.getJob(jobId);
   if (!job) throw new Error(`Job ${jobId} not found`);
 
   const existing = job.videos ?? [];
-  const newCam = await persistVideoCam(jobId, file, existing.length);
+  const newCam = await persistVideoCam(jobId, picked, existing.length);
   const camId = newCam.id;
 
   // Probe dimensions BEFORE the first persist so the editor lane appears
@@ -479,7 +550,7 @@ export async function addVideoToJob(
   // a zero-width invisible sliver until runCamPrep finishes seconds later.
   try {
     const { demuxVideoTrack } = await import("./codec/webcodecs/demux");
-    const v = await demuxVideoTrack(file);
+    const v = await demuxVideoTrack(picked.file);
     if (v) {
       newCam.durationS = v.info.durationS;
       newCam.width = v.info.width;
@@ -505,7 +576,7 @@ export async function addVideoToJob(
           { name: job.audioFilename } as File,
           "wav",
         );
-        const audioFile = await opfs.readFile(audioPath(jobId, audioExt));
+        const audioFile = await loadJobAudio(job, audioExt);
         const decoded = await decodeAudioToMonoPcm(audioFile, 22050);
         studioPcm = decoded.pcm;
       }
@@ -566,7 +637,7 @@ const DEFAULT_IMAGE_DURATION_S = 5;
  */
 export async function addImageToJob(
   jobId: string,
-  file: File,
+  picked: PickedAsset,
   opts: AddImageOptions = {},
 ): Promise<string> {
   const job = await jobsDb.getJob(jobId);
@@ -576,7 +647,7 @@ export async function addImageToJob(
   const durationS = opts.durationS ?? DEFAULT_IMAGE_DURATION_S;
   const newAsset = await persistImageCam(
     jobId,
-    file,
+    picked,
     existing.length,
     durationS,
   );
@@ -606,11 +677,13 @@ export async function runQuickRender(
     await reportProgress(jobId, { pct: 5, stage: "render-prep" }, "rendering");
 
     // V1 limitation (same as runEditRender): renders cam-1 only.
-    const cam1Path = job.videos?.[0]?.opfsPath;
-    if (!cam1Path) throw new Error("No video found for this job.");
+    const cam1 = job.videos?.[0];
+    if (!cam1 || isImageAsset(cam1)) {
+      throw new Error("No video found for this job.");
+    }
     const audioExt = fileExtension(new File([], job.audioFilename), "wav");
-    const videoFile = await opfs.readFile(cam1Path);
-    const audioFile = await opfs.readFile(audioPath(jobId, audioExt));
+    const videoFile = await loadAssetFile(cam1);
+    const audioFile = await loadJobAudio(job, audioExt);
 
     await reportProgress(jobId, { pct: 15, stage: "encoding" });
     const totalOffsetMs = job.sync.offsetMs + (opts.offsetOverrideMs ?? 0);
@@ -722,7 +795,7 @@ export async function runEditRender(
     const videos = job.videos ?? [];
     if (videos.length === 0) throw new Error("No video found for this job.");
     const audioExt = fileExtension(new File([], job.audioFilename), "wav");
-    const audioFile = await opfs.readFile(audioPath(jobId, audioExt));
+    const audioFile = await loadJobAudio(job, audioExt);
 
     // Audio decode + energy curves run on the main thread because
     // AudioContext.decodeAudioData isn't available in workers. Both are
@@ -794,7 +867,7 @@ export async function runEditRender(
         const startOffsetS = ov?.startOffsetS ?? v.startOffsetS ?? 0;
         return {
           id: v.id,
-          opfsPath: v.opfsPath,
+          source: assetSource(v),
           masterStartS: startOffsetS,
           sourceDurationS: v.durationS,
           driftRatio: 1,
@@ -822,7 +895,7 @@ export async function runEditRender(
       );
       return {
         id: v.id,
-        opfsPath: v.opfsPath,
+        source: assetSource(v),
         masterStartS,
         sourceDurationS,
         driftRatio: v.sync?.driftRatio ?? 1,
@@ -1020,16 +1093,35 @@ export async function resolveJobAssetUrl(
     return opfs.objectUrl(path);
   }
   if (kind === "video") {
-    const path = job.videos?.[0]?.opfsPath;
-    if (!path) return null;
-    if (!(await opfs.exists(path))) return null;
-    return opfs.objectUrl(path);
+    const cam0 = job.videos?.[0];
+    if (!cam0) return null;
+    return objectUrlForAsset(cam0);
   }
   // audio
-  const ext = fileExtension(new File([], job.audioFilename), "wav");
-  const path = audioPath(jobId, ext);
-  if (!(await opfs.exists(path))) return null;
-  return opfs.objectUrl(path);
+  return objectUrlForAssetSource(jobAudioSource(job));
+}
+
+/** Build a `blob:` URL for an asset's bytes — works for both
+ *  OPFS-backed and handle-backed assets. Returns null when the
+ *  underlying file is missing (legacy OPFS path) or when permission
+ *  is denied (handle path). */
+async function objectUrlForAsset(
+  asset: { source?: AssetSource; opfsPath: string },
+): Promise<string | null> {
+  return objectUrlForAssetSource(assetSource(asset));
+}
+
+async function objectUrlForAssetSource(source: AssetSource): Promise<string | null> {
+  if (source.kind === "opfs") {
+    if (!(await opfs.exists(source.path))) return null;
+    return opfs.objectUrl(source.path);
+  }
+  try {
+    const file = await loadAssetFile({ source });
+    return URL.createObjectURL(file);
+  } catch {
+    return null;
+  }
 }
 
 /** Resolve the OPFS object URL for a specific cam's video or frames asset. */
@@ -1042,20 +1134,18 @@ export async function resolveCamAssetUrl(
   if (!job?.videos) return null;
   const cam = job.videos.find((v) => v.id === camId);
   if (!cam) return null;
-  // For "video" kind, return the asset's URL — works for both video and
-  // image cams (browsers serve any blob URL to <video src> or <img src>
-  // appropriately based on MIME). For "frames", only video assets have a
-  // thumbnail strip; image assets return null (the caller falls back to
-  // showing the image directly in the lane).
-  let path: string | undefined;
+  // For "video" kind, return the asset's URL — works for both video
+  // and image cams (browsers serve any blob URL to <video src> or
+  // <img src> appropriately based on MIME) AND for both OPFS-backed
+  // and FileSystemFileHandle-backed assets. For "frames", only video
+  // assets have a thumbnail strip; image assets return null.
   if (kind === "video") {
-    path = cam.opfsPath;
-  } else if (isVideoAsset(cam)) {
-    path = cam.framesPath;
+    return objectUrlForAsset(cam);
   }
-  if (!path) return null;
-  if (!(await opfs.exists(path))) return null;
-  return opfs.objectUrl(path);
+  // frames: always OPFS — we generated and own the strip
+  if (!isVideoAsset(cam) || !cam.framesPath) return null;
+  if (!(await opfs.exists(cam.framesPath))) return null;
+  return opfs.objectUrl(cam.framesPath);
 }
 
 export async function deleteJob(jobId: string): Promise<void> {
@@ -1082,11 +1172,21 @@ export async function removeCamFromJob(
   if (!cam) return;
 
   // Best-effort OPFS cleanup. Ignore not-found errors so a partially-
-  // prepped cam (frames still missing) deletes cleanly.
-  try {
-    await opfs.deletePath(cam.opfsPath);
-  } catch {
-    // ignore
+  // prepped cam (frames still missing) deletes cleanly. For
+  // handle-backed assets the bytes live on the user's disk — we only
+  // ever delete files we own (OPFS-backed copies + derived assets).
+  if (cam.source) {
+    try {
+      await deleteAssetIfOwned(cam.source);
+    } catch {
+      // ignore
+    }
+  } else {
+    try {
+      await opfs.deletePath(cam.opfsPath);
+    } catch {
+      // ignore
+    }
   }
   if (isVideoAsset(cam) && cam.framesPath) {
     try {

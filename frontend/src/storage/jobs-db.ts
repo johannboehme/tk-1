@@ -8,6 +8,7 @@
 
 import { openDB, type IDBPDatabase } from "idb";
 import { migrateV1ToV2 } from "./migrations";
+import type { AssetSource } from "../local/asset-source";
 
 export interface MatchCandidate {
   offsetMs: number;
@@ -40,9 +41,16 @@ export interface VideoAsset {
   id: string;
   /** Original-Dateiname vom User (für Anzeige in der UI). */
   filename: string;
-  /** OPFS-Pfad der Mediadatei. Explizit gespeichert, weil Migration und neue
-   * Uploads unterschiedliche Konventionen nutzen. */
+  /** OPFS-Pfad der Mediadatei. Required for legacy (v2) rows; on v3+
+   *  rows that hold a `FileSystemFileHandle` source it stays set as a
+   *  stable identifier (used for derived paths like `framesPath`) but
+   *  the bytes live on the user's disk, not in OPFS. Read sites should
+   *  prefer `loadAssetFile(asset)` over reading `opfsPath` directly. */
   opfsPath: string;
+  /** v3+: explicit asset source. When present, takes precedence over
+   *  `opfsPath` for byte access. Holds either an OPFS path or a native
+   *  `FileSystemFileHandle` (persisted via IDB structured clone). */
+  source?: AssetSource;
   /** Cam-Farbe für PROGRAM-Strip + Lane-Header (deterministisch beim Upload). */
   color: string;
   sync?: SyncResult;
@@ -89,6 +97,8 @@ export interface ImageAsset {
   id: string;
   filename: string;
   opfsPath: string;
+  /** v3+: explicit asset source. Mirrors VideoAsset.source — see there. */
+  source?: AssetSource;
   color: string;
   width?: number;
   height?: number;
@@ -156,6 +166,11 @@ export interface LocalJob {
    * der kanonische Pfad ist ab V2 `videos[i].filename`. */
   videoFilename: string;
   audioFilename: string;
+  /** v3+: explicit asset source for the master audio. When present,
+   *  takes precedence over deriving the OPFS path from `audioFilename`.
+   *  Either an OPFS path or a `FileSystemFileHandle` to the user's
+   *  original audio file. */
+  audioSource?: AssetSource;
 
   status: JobStatus;
   progress: JobProgress;
@@ -189,8 +204,10 @@ export interface LocalJob {
   // ---- V2 (Multi-Video) ----
 
   /** Persistierte Schema-Version. Fehlt bei Jobs, die vor der V2-Migration
-   * geschrieben wurden. */
-  schemaVersion?: 2;
+   * geschrieben wurden. v3 added `source` / `audioSource` for native
+   * `FileSystemFileHandle`-backed assets — old rows continue to work
+   * via the `opfsPath` fallback inside `loadAssetFile`. */
+  schemaVersion?: 2 | 3;
 
   /** Multi-Cam-Quellen. Bei V1-Jobs nach Migration genau ein Element.
    *  Heißt historisch "videos" — enthält ab dem Image-Clip-Schema eine

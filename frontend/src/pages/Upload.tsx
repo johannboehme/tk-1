@@ -1,19 +1,47 @@
-import { FormEvent, useState } from "react";
+import { FormEvent, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ChunkyButton } from "../editor/components/ChunkyButton";
 import { RuleStrip } from "../editor/components/RuleStrip";
 import { formatBytes } from "../components/ProgressBar";
 import { createJob } from "../local/jobs";
+import type { PickedAsset } from "../local/asset-source";
+import {
+  pickAudioFile,
+  pickVideoFiles,
+  supportsHandlePicker,
+} from "../local/file-picker";
+import {
+  getCapabilities,
+  LEGACY_BROWSER_MAX_FILE_BYTES,
+  supportsLargeMediaFiles,
+} from "../local/capabilities";
 
 export default function Upload() {
   const navigate = useNavigate();
-  const [audio, setAudio] = useState<File | null>(null);
-  const [videos, setVideos] = useState<File[]>([]);
+  const [audio, setAudio] = useState<PickedAsset | null>(null);
+  const [videos, setVideos] = useState<PickedAsset[]>([]);
   const [title, setTitle] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
+  // Snapshot once at mount: capabilities are static within a tab.
+  const caps = useMemo(getCapabilities, []);
+  const supportsBig = supportsLargeMediaFiles(caps);
+  const usesHandles = supportsHandlePicker();
+
   const ready = audio !== null && videos.length > 0 && !busy;
+
+  function rejectIfTooBigForBrowser(file: File, kind: "audio" | "video"): string | null {
+    if (supportsBig) return null;
+    if (file.size <= LEGACY_BROWSER_MAX_FILE_BYTES) return null;
+    return (
+      `${kind === "audio" ? "Audio" : "Video"} file "${file.name}" is ` +
+      `${formatGiB(file.size)} — your browser caps each file at ` +
+      `${formatGiB(LEGACY_BROWSER_MAX_FILE_BYTES)} because WebCodecs ` +
+      `decoders aren't available. Try Chrome / Edge / Brave for files ` +
+      `over 2 GB, or re-encode at a lower bitrate.`
+    );
+  }
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -29,10 +57,38 @@ export default function Upload() {
     }
   }
 
-  function addVideos(files: FileList | null) {
-    if (!files) return;
-    const next = Array.from(files);
-    setVideos((prev) => [...prev, ...next]);
+  async function pickAudioGuarded() {
+    try {
+      const picked = await pickAudioFile();
+      if (!picked) return; // user cancelled
+      const msg = rejectIfTooBigForBrowser(picked.file, "audio");
+      if (msg) {
+        setErr(msg);
+        return;
+      }
+      setErr(null);
+      setAudio(picked);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Could not open audio file");
+    }
+  }
+
+  async function pickVideosGuarded() {
+    try {
+      const picked = await pickVideoFiles({ multiple: true });
+      if (picked.length === 0) return; // user cancelled
+      for (const p of picked) {
+        const msg = rejectIfTooBigForBrowser(p.file, "video");
+        if (msg) {
+          setErr(msg);
+          return;
+        }
+      }
+      setErr(null);
+      setVideos((prev) => [...prev, ...picked]);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Could not open video files");
+    }
   }
 
   function removeVideo(idx: number) {
@@ -69,11 +125,25 @@ export default function Upload() {
         </aside>
       </header>
 
+      {!supportsBig && (
+        <div className="mb-6 border-l-2 border-cobalt pl-3 py-2 text-sm text-ink-2 font-mono">
+          Heads-up: this browser can only decode files up to{" "}
+          {formatGiB(LEGACY_BROWSER_MAX_FILE_BYTES)} each (no WebCodecs
+          AudioDecoder/VideoDecoder yet). Chrome, Edge or Brave handle
+          arbitrarily large files via streaming decode.
+        </div>
+      )}
+
       <form onSubmit={handleSubmit} className="flex flex-col gap-6">
         <div className="grid lg:grid-cols-[1fr_1.6fr] gap-3 items-stretch">
-          <AudioDropZone file={audio} onChange={setAudio} />
-          <VideoDropList files={videos} onAdd={addVideos} onRemove={removeVideo} />
+          <AudioDropZone picked={audio} onPick={pickAudioGuarded} />
+          <VideoDropList picks={videos} onAdd={pickVideosGuarded} onRemove={removeVideo} />
         </div>
+        {usesHandles && (
+          <p className="font-mono text-[10px] text-ink-3 tracking-label uppercase">
+            ●︎ Files stay where you keep them — no copy into browser storage
+          </p>
+        )}
 
         <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-4 px-1">
           <label htmlFor="job-title" className="label sm:w-32 sm:shrink-0 sm:pt-0">
@@ -113,18 +183,20 @@ export default function Upload() {
 }
 
 function AudioDropZone({
-  file,
-  onChange,
+  picked,
+  onPick,
 }: {
-  file: File | null;
-  onChange: (f: File | null) => void;
+  picked: PickedAsset | null;
+  onPick: () => void;
 }) {
-  const filled = file !== null;
+  const filled = picked !== null;
   return (
-    <label
-      htmlFor="picker-audio"
+    <button
+      type="button"
+      id="picker-audio"
+      onClick={onPick}
       className={[
-        "relative block rounded-lg cursor-pointer transition-colors group",
+        "relative block rounded-lg cursor-pointer transition-colors group text-left w-full",
         "border-2 border-dashed min-h-[220px]",
         filled ? "bg-hot/10 border-hot text-ink" : "bg-paper-hi border-rule hover:border-ink-2 hover:bg-paper-deep",
       ].join(" ")}
@@ -144,10 +216,10 @@ function AudioDropZone({
           {filled ? (
             <>
               <div className="font-mono text-base sm:text-lg text-ink truncate">
-                {file!.name}
+                {picked!.file.name}
               </div>
               <div className="mt-1 font-mono text-xs text-ink-2 tabular">
-                {formatBytes(file!.size)}
+                {formatBytes(picked!.file.size)}
               </div>
             </>
           ) : (
@@ -161,24 +233,17 @@ function AudioDropZone({
           )}
         </div>
       </div>
-      <input
-        id="picker-audio"
-        type="file"
-        accept="audio/*"
-        className="sr-only"
-        onChange={(e) => onChange(e.target.files?.[0] || null)}
-      />
-    </label>
+    </button>
   );
 }
 
 function VideoDropList({
-  files,
+  picks,
   onAdd,
   onRemove,
 }: {
-  files: File[];
-  onAdd: (list: FileList | null) => void;
+  picks: PickedAsset[];
+  onAdd: () => void;
   onRemove: (idx: number) => void;
 }) {
   return (
@@ -187,31 +252,31 @@ function VideoDropList({
         <span className="font-display tracking-label uppercase text-[11px] text-ink-2">
           02 · Video sources
         </span>
-        {files.length > 0 && (
+        {picks.length > 0 && (
           <span className="font-mono text-[10px] tracking-label uppercase text-hot">
-            ● {files.length} READY
+            ● {picks.length} READY
           </span>
         )}
       </div>
 
       <ul className="flex flex-col gap-2">
-        {files.map((f, i) => (
+        {picks.map((p, i) => (
           <li
-            key={`${f.name}-${i}`}
+            key={`${p.file.name}-${i}`}
             className="flex items-center gap-3 px-3 h-11 bg-paper-deep border border-rule rounded-md"
           >
             <span className="font-mono text-xs text-ink-3 tabular w-8">
               {String(i + 1).padStart(2, "0")}
             </span>
-            <span className="font-mono text-sm text-ink truncate flex-1">{f.name}</span>
+            <span className="font-mono text-sm text-ink truncate flex-1">{p.file.name}</span>
             <span className="font-mono text-xs text-ink-3 tabular hidden sm:inline">
-              {formatBytes(f.size)}
+              {formatBytes(p.file.size)}
             </span>
             <button
               type="button"
               onClick={() => onRemove(i)}
               className="font-mono text-[11px] text-ink-3 hover:text-danger uppercase tracking-label"
-              aria-label={`Remove ${f.name}`}
+              aria-label={`Remove ${p.file.name}`}
             >
               remove
             </button>
@@ -219,29 +284,23 @@ function VideoDropList({
         ))}
       </ul>
 
-      <label
-        htmlFor="picker-videos"
+      <button
+        type="button"
+        id="picker-videos"
+        onClick={onAdd}
         className={[
           "mt-auto flex items-center justify-center gap-3 h-12 rounded-md cursor-pointer transition-colors",
           "border border-dashed",
-          files.length === 0
+          picks.length === 0
             ? "border-rule text-ink-3 bg-transparent hover:border-ink-2 hover:text-ink-2"
             : "border-rule text-ink-2 hover:border-ink-2 hover:text-ink",
         ].join(" ")}
       >
         <span className="text-xl leading-none">+</span>
         <span className="font-mono text-xs tracking-label uppercase">
-          {files.length === 0 ? "Add videos (multi-select ok)" : "Add another"}
+          {picks.length === 0 ? "Add videos (multi-select ok)" : "Add another"}
         </span>
-      </label>
-      <input
-        id="picker-videos"
-        type="file"
-        accept="video/*"
-        multiple
-        className="sr-only"
-        onChange={(e) => onAdd(e.target.files)}
-      />
+      </button>
     </div>
   );
 }
@@ -251,8 +310,8 @@ function ReadinessStatus({
   videos,
   busy,
 }: {
-  audio: File | null;
-  videos: File[];
+  audio: PickedAsset | null;
+  videos: PickedAsset[];
   busy: boolean;
 }) {
   return (
@@ -266,6 +325,10 @@ function ReadinessStatus({
       </span>
     </div>
   );
+}
+
+function formatGiB(bytes: number): string {
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`;
 }
 
 function Dot({ ok, label }: { ok: boolean; label: string }) {

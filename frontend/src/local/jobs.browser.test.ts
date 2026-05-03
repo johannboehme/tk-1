@@ -62,6 +62,12 @@ async function fetchVideoFile(): Promise<File> {
   return new File([blob], "tone-3s.mp4", { type: "video/mp4" });
 }
 
+/** Wrap a File as a PickedAsset without a handle — exercises the
+ *  legacy / unsupported-browser code path that copies bytes to OPFS. */
+function pick(file: File): { file: File; handle: null } {
+  return { file, handle: null };
+}
+
 function waitForJobStatus(
   jobId: string,
   target: string,
@@ -77,7 +83,8 @@ function waitForJobStatus(
         resolve();
       } else if (detail.job.status === "failed") {
         jobEvents.removeEventListener("update", onUpdate);
-        reject(new Error("Job failed"));
+        const reason = (detail.job as { error?: string }).error ?? "(no reason)";
+        reject(new Error(`Job failed: ${reason}`));
       }
     };
     jobEvents.addEventListener("update", onUpdate);
@@ -103,7 +110,7 @@ describe("local jobs lifecycle", () => {
     const video = await fetchVideoFile();
     const audio = new File([makeWavBlob()], "studio.wav", { type: "audio/wav" });
 
-    const jobId = await createJob([video], audio, { title: "Test take" });
+    const jobId = await createJob([pick(video)], pick(audio), { title: "Test take" });
     expect(jobId).toMatch(/^[a-f0-9]{12}$/);
 
     // Files persisted in OPFS under the V2 cam-N naming convention.
@@ -114,7 +121,7 @@ describe("local jobs lifecycle", () => {
     await waitForJobStatus(jobId, "synced");
     const job = await jobsDb.getJob(jobId);
     expect(job!.status).toBe("synced");
-    expect(job!.schemaVersion).toBe(2);
+    expect(job!.schemaVersion).toBe(3);
     expect(job!.videos).toHaveLength(1);
     const cam0 = asVideo(job!.videos![0]);
     expect(cam0.id).toBe("cam-1");
@@ -139,7 +146,7 @@ describe("local jobs lifecycle", () => {
     const v2 = await fetchVideoFile();
     const audio = new File([makeWavBlob()], "studio.wav", { type: "audio/wav" });
 
-    const jobId = await createJob([v1, v2], audio, { title: "Two cams" });
+    const jobId = await createJob([pick(v1), pick(v2)], pick(audio), { title: "Two cams" });
 
     expect(await opfs.exists(`jobs/${jobId}/cam-1.mp4`)).toBe(true);
     expect(await opfs.exists(`jobs/${jobId}/cam-2.mp4`)).toBe(true);
@@ -164,7 +171,7 @@ describe("local jobs lifecycle", () => {
     const video = await fetchVideoFile();
     const audio = new File([makeWavBlob()], "studio.wav", { type: "audio/wav" });
 
-    const jobId = await createJob([video], audio);
+    const jobId = await createJob([pick(video)], pick(audio));
     await waitForJobStatus(jobId, "synced");
 
     await runQuickRender(jobId);
@@ -182,7 +189,7 @@ describe("local jobs lifecycle", () => {
   it("if runQuickRender throws, the job is marked failed in IDB and an event is emitted", async () => {
     const video = await fetchVideoFile();
     const audio = new File([makeWavBlob()], "studio.wav", { type: "audio/wav" });
-    const jobId = await createJob([video], audio);
+    const jobId = await createJob([pick(video)], pick(audio));
     await waitForJobStatus(jobId, "synced");
 
     // Sabotage by deleting the audio file from OPFS — render will throw
@@ -218,7 +225,7 @@ describe("local jobs lifecycle", () => {
   it("deleteJob removes both OPFS files and the IndexedDB row", async () => {
     const video = await fetchVideoFile();
     const audio = new File([makeWavBlob()], "studio.wav", { type: "audio/wav" });
-    const jobId = await createJob([video], audio);
+    const jobId = await createJob([pick(video)], pick(audio));
     await waitForJobStatus(jobId, "synced");
 
     await deleteJob(jobId);
@@ -276,11 +283,11 @@ describe("addVideoToJob", () => {
   it("appends a cam to videos[] immediately and runs sync in the background", async () => {
     const v1 = await fetchVideoFile();
     const audio = new File([makeWavBlob()], "studio.wav", { type: "audio/wav" });
-    const jobId = await createJob([v1], audio, { title: "B-roll test" });
+    const jobId = await createJob([pick(v1)], pick(audio), { title: "B-roll test" });
     await waitForJobStatus(jobId, "synced");
 
     const v2 = await fetchVideoFile();
-    const camId = await addVideoToJob(jobId, v2);
+    const camId = await addVideoToJob(jobId, pick(v2));
     expect(camId).toBe("cam-2");
 
     // Lane shows up immediately, sync still pending.
@@ -305,11 +312,11 @@ describe("addVideoToJob", () => {
   it("with skipSync, leaves sync undefined but still extracts thumbnails", async () => {
     const v1 = await fetchVideoFile();
     const audio = new File([makeWavBlob()], "studio.wav", { type: "audio/wav" });
-    const jobId = await createJob([v1], audio);
+    const jobId = await createJob([pick(v1)], pick(audio));
     await waitForJobStatus(jobId, "synced");
 
     const v2 = await fetchVideoFile();
-    const camId = await addVideoToJob(jobId, v2, { skipSync: true });
+    const camId = await addVideoToJob(jobId, pick(v2), { skipSync: true });
 
     // Wait for frames since that's the marker that prep finished.
     await waitForCamReady(jobId, camId, "framesPath");
@@ -324,14 +331,14 @@ describe("addVideoToJob", () => {
   it("multiple sequential adds produce cam-N, cam-N+1", async () => {
     const v1 = await fetchVideoFile();
     const audio = new File([makeWavBlob()], "studio.wav", { type: "audio/wav" });
-    const jobId = await createJob([v1], audio);
+    const jobId = await createJob([pick(v1)], pick(audio));
     await waitForJobStatus(jobId, "synced");
 
-    const a = await addVideoToJob(jobId, await fetchVideoFile(), { skipSync: true });
+    const a = await addVideoToJob(jobId, pick(await fetchVideoFile()), { skipSync: true });
     expect(a).toBe("cam-2");
     await waitForCamReady(jobId, a, "framesPath");
 
-    const b = await addVideoToJob(jobId, await fetchVideoFile(), { skipSync: true });
+    const b = await addVideoToJob(jobId, pick(await fetchVideoFile()), { skipSync: true });
     expect(b).toBe("cam-3");
     await waitForCamReady(jobId, b, "framesPath");
 
