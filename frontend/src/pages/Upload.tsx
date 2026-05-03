@@ -398,21 +398,22 @@ function ModeCard({
       onClick={onClick}
       disabled={disabled}
       className={[
-        "group relative block text-left rounded-lg cursor-pointer transition-colors",
-        "border-2 min-h-[180px] p-5 pt-4",
-        // Sibling family: dashed when not actionable, solid when ready.
+        "group relative block text-left rounded-lg min-h-[180px] p-5 pt-4 transition-all",
+        // Hardware-button affordance: bevel via shadow-emboss, depresses
+        // on click. NO dashed border — that reads as a drop-target, which
+        // these are not.
         disabled
-          ? "border-dashed border-rule bg-paper-hi text-ink-3 cursor-not-allowed"
-          : "border-dashed border-rule bg-paper-hi hover:border-solid hover:border-ink shadow-emboss active:shadow-pressed active:translate-y-[1px]",
+          ? "bg-paper-hi opacity-40 cursor-not-allowed"
+          : "bg-paper-hi shadow-emboss hover:bg-paper-deep active:shadow-pressed active:translate-y-[1px] cursor-pointer",
       ].join(" ")}
     >
       <div className="flex items-start justify-between mb-4">
         <span className="font-display tracking-label uppercase text-[11px] text-ink-2">
           {tag}
         </span>
-        {!disabled && (
+        {busy && (
           <span className="font-mono text-[10px] tracking-label uppercase text-hot">
-            {busy ? "● PREP" : "● PRESS"}
+            PREP
           </span>
         )}
       </div>
