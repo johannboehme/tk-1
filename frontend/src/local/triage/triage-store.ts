@@ -237,10 +237,24 @@ export const useTriageStore = create<TriageState>((set, get) => ({
     const bpm = effectiveChunkBpm(chunk, s.jobBpm?.value ?? null);
     if (bpm <= 0) return;
     const msPerBar = (60_000 / bpm) * s.beatsPerBar;
-    const nextStart = Math.max(0, Math.round(chunk.startMs - barsBack * msPerBar));
+    // Snap the current edges to the chunk's own bar grid (anchored at
+    // its audio-start onset) BEFORE stepping. Without this, repeatedly
+    // hitting "⟸ in" or "out ⟹" on a boundary that started off-grid
+    // would just translate the offset further along — the chunk would
+    // never line up to its bars. With it, every click lands on the
+    // grid; the first click also corrects any pre-existing drift.
+    const anchorMs = chunk.audioStartMs ?? chunk.startMs;
+    const startBarsFromAnchor = Math.round((chunk.startMs - anchorMs) / msPerBar);
+    const endBarsFromAnchor = Math.round((chunk.endMs - anchorMs) / msPerBar);
+    const nextStartBars = startBarsFromAnchor - barsBack;
+    const nextEndBars = endBarsFromAnchor + barsFwd;
+    const nextStart = Math.max(0, Math.round(anchorMs + nextStartBars * msPerBar));
     const nextEnd = Math.max(
       nextStart + 100,
-      Math.min(s.audioDuration * 1000, Math.round(chunk.endMs + barsFwd * msPerBar)),
+      Math.min(
+        s.audioDuration * 1000,
+        Math.round(anchorMs + nextEndBars * msPerBar),
+      ),
     );
     s.updateChunk(id, { startMs: nextStart, endMs: nextEnd, trimMode: "bar" });
     if (s.focusedChunkId === id) {

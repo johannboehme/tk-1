@@ -301,6 +301,7 @@ export function TriageTimeline() {
   const timeTicks = useTimeRuler(viewStartS, viewEndS, size.width);
   const barTicks = usePerChunkBarTicks(
     chunks,
+    focusedChunkId,
     jobBpm?.value ?? null,
     beatsPerBar,
     viewStartS,
@@ -416,18 +417,29 @@ export function TriageTimeline() {
         className="absolute left-0 right-0 bg-paper-hi border-b border-rule pointer-events-none"
         style={{ top: TIME_RULER_HEIGHT, height: BAR_RULER_HEIGHT }}
       >
-        {barTicks.map((tick, i) => (
-          <span
-            key={`b-${i}`}
-            className="absolute bottom-0"
-            style={{
-              left: timeToX(tick.tS),
-              width: 1,
-              height: tick.downbeat ? "85%" : "45%",
-              background: tick.downbeat ? "#FF5722" : "#FF5722AA",
-            }}
-          />
-        ))}
+        {barTicks.map((tick, i) => {
+          // Extension ticks (focused chunk's grid projected past its
+          // current bounds) render dimmer + slightly shorter so the
+          // user reads them as "potential snap targets" rather than
+          // "this is part of the chunk".
+          const dim = tick.extension;
+          const downbeatHeight = dim ? "60%" : "85%";
+          const beatHeight = dim ? "30%" : "45%";
+          const downbeatColor = dim ? "#FF572255" : "#FF5722";
+          const beatColor = dim ? "#FF572233" : "#FF5722AA";
+          return (
+            <span
+              key={`b-${i}`}
+              className="absolute bottom-0"
+              style={{
+                left: timeToX(tick.tS),
+                width: 1,
+                height: tick.downbeat ? downbeatHeight : beatHeight,
+                background: tick.downbeat ? downbeatColor : beatColor,
+              }}
+            />
+          );
+        })}
       </div>
 
       <div
@@ -599,14 +611,27 @@ function useTimeRuler(viewStartS: number, viewEndS: number, widthPx: number): Ru
 interface BarTick {
   tS: number;
   downbeat: boolean;
+  /** True when this tick lies outside the chunk's current bounds — a
+   *  potential snap target if the user trims outwards. Rendered
+   *  dimmer so the user sees where the next bar would land without
+   *  confusing it with the chunk's "real" content. */
+  extension: boolean;
 }
 
 /** Per-chunk bar/beat ticks. Each chunk has its own anchor (audio-
- *  start onset) and its own effective tempo (per-chunk detection,
- *  octave-shifted; falls back to the song-global BPM). Chunks with
- *  no BPM info anywhere are skipped. */
+ *  start onset) and uses the song-global BPM (or its own detected
+ *  value as fallback). Chunks with no BPM info anywhere are skipped.
+ *
+ *  Visibility rules:
+ *  - Non-focused chunks: ticks only within the chunk's current bounds.
+ *  - Focused chunk: ticks render across the FULL visible view, so the
+ *    user can see snap targets when trim-dragging the boundary
+ *    outwards past the current chunk extent. The extra ticks carry
+ *    `extension: true` and are drawn at lower contrast.
+ */
 function usePerChunkBarTicks(
   chunks: Chunk[],
+  focusedChunkId: string | null,
   jobBpm: number | null,
   beatsPerBar: number,
   viewStartS: number,
@@ -625,41 +650,45 @@ function usePerChunkBarTicks(
       if (sPerBar * pxPerSec < minBarPx) continue;
       const startS = chunk.startMs / 1000;
       const endS = chunk.endMs / 1000;
-      if (endS < viewStartS || startS > viewEndS) continue;
+      const isFocused = chunk.id === focusedChunkId;
+      // Where this chunk's grid should render. Focused chunks paint
+      // their grid across the full view to expose snap targets while
+      // trimming; everyone else stays inside their bounds.
+      const renderStart = isFocused ? viewStartS : Math.max(startS, viewStartS);
+      const renderEnd = isFocused ? viewEndS : Math.min(endS, viewEndS);
+      if (renderEnd < viewStartS || renderStart > viewEndS) continue;
       const showBeats = sPerBeat * pxPerSec >= minBeatPx;
       const anchorS = chunkBeatPhaseS(chunk);
-      // Walk the grid from the anchor in both directions, but only
-      // emit ticks that fall inside this chunk's time range.
-      // Forward sweep.
+
+      // Forward sweep from anchor.
       let beat = 0;
       for (
         let t = anchorS;
-        t <= endS && t <= viewEndS;
+        t <= renderEnd;
         t = anchorS + ++beat * sPerBeat
       ) {
-        if (t < startS) continue;
-        if (t < viewStartS) continue;
+        if (t < renderStart) continue;
         const isDownbeat = beat % beatsPerBar === 0;
         if (!showBeats && !isDownbeat) continue;
-        ticks.push({ tS: t, downbeat: isDownbeat });
+        const extension = isFocused && (t < startS || t > endS);
+        ticks.push({ tS: t, downbeat: isDownbeat, extension });
       }
-      // Backward sweep — anchor itself emits in the forward sweep
-      // (beat 0) so start at -1 here.
+      // Backward sweep — start at beat -1 (anchor itself was emitted).
       beat = -1;
       for (
         let t = anchorS + beat * sPerBeat;
-        t >= startS && t >= viewStartS;
+        t >= renderStart;
         t = anchorS + --beat * sPerBeat
       ) {
-        if (t > endS) continue;
-        if (t > viewEndS) continue;
+        if (t > renderEnd) continue;
         const isDownbeat = ((beat % beatsPerBar) + beatsPerBar) % beatsPerBar === 0;
         if (!showBeats && !isDownbeat) continue;
-        ticks.push({ tS: t, downbeat: isDownbeat });
+        const extension = isFocused && (t < startS || t > endS);
+        ticks.push({ tS: t, downbeat: isDownbeat, extension });
       }
     }
     return ticks;
-  }, [chunks, jobBpm, beatsPerBar, viewStartS, viewEndS, pxPerSec]);
+  }, [chunks, focusedChunkId, jobBpm, beatsPerBar, viewStartS, viewEndS, pxPerSec]);
 }
 
 function niceStep(raw: number): number {
