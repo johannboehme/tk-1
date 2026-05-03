@@ -57,6 +57,45 @@ describe("analyzeAudio — pure pipeline", () => {
     expect(a.tempo!.bpm).toBeLessThan(92);
   });
 
+  it("picks the half-time tempo when both 85 and 170 BPM autocorrelate", () => {
+    // Lo-fi hip-hop / swing pattern: a strong kick on every beat at
+    // 85 BPM, plus a softer hat on every off-beat (twice the rate =
+    // 170 BPM events). The autocorrelation surface has peaks at
+    // BOTH lags and the unprior'd picker used to land on 170/180
+    // because it sums the on-beat-AC into the doubled-tempo lag's
+    // vote. The Rayleigh prior at ~110 BPM pulls the answer back
+    // toward the perceptually-correct slower octave.
+    const seconds = 16;
+    const total = Math.round(SR * seconds);
+    const pcm = new Float32Array(total);
+    for (let i = 0; i < total; i++) pcm[i] = (Math.random() - 0.5) * 0.01;
+    const beatStride = Math.round((60 / 85) * SR);
+    const halfStride = Math.round((60 / 170) * SR);
+    const clickLen = Math.round(0.005 * SR);
+    // Strong kick on every beat (85 BPM).
+    for (let beat = 0; beat * beatStride + clickLen < total; beat++) {
+      const start = beat * beatStride;
+      for (let k = 0; k < clickLen; k++) {
+        const env = Math.exp((-k / clickLen) * 4);
+        pcm[start + k] += 0.9 * env * Math.sin((2 * Math.PI * 80 * k) / SR);
+      }
+    }
+    // Softer hat on every off-beat (= every position at 170 BPM that
+    // ISN'T already a kick).
+    for (let h = 0; h * halfStride + clickLen < total; h++) {
+      if (h % 2 === 0) continue; // skip kicks
+      const start = h * halfStride;
+      for (let k = 0; k < clickLen; k++) {
+        const env = Math.exp((-k / clickLen) * 4);
+        pcm[start + k] += 0.4 * env * Math.sin((2 * Math.PI * 6000 * k) / SR);
+      }
+    }
+    const a = analyzeAudio(pcm, SR);
+    expect(a.tempo).not.toBeNull();
+    expect(a.tempo!.bpm).toBeGreaterThan(80);
+    expect(a.tempo!.bpm).toBeLessThan(95);
+  });
+
   it("emits beats roughly every beat-period (count near duration*bpm/60)", () => {
     const pcm = buildClickTrack(120, 10);
     const a = analyzeAudio(pcm, SR);
