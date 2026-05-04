@@ -54,6 +54,12 @@ export interface ArrangeState {
   /** Cams available for preview. The user picks one to "watch" while
    *  the arrangement plays back. */
   cams: VideoAsset[];
+  /** Song-global BPM (mirrors `job.bpm.value`). Drives the bar-grid
+   *  math for frame widths. Null = no BPM detected/set; we fall back
+   *  to a duration-based heuristic for sizing. */
+  jobBpm: number | null;
+  /** Song-global beats-per-bar numerator. Default 4 (4/4 time). */
+  jobBeatsPerBar: number;
 
   // ─── UI state ─────────────────────────────────────────────────────────
   /** ArrangementItem.id of the focused frame (one click). Null = nothing
@@ -76,6 +82,8 @@ export interface ArrangeState {
     chunks: Chunk[];
     arrangement: ArrangementItem[];
     cams: VideoAsset[];
+    jobBpm: number | null;
+    jobBeatsPerBar: number;
   }): void;
   reset(): void;
 
@@ -142,6 +150,8 @@ export const useArrangeStore = create<ArrangeState>((set, get) => ({
   chunks: [],
   arrangement: [],
   cams: [],
+  jobBpm: null,
+  jobBeatsPerBar: 4,
 
   focusedItemId: null,
   insertionIndex: 0,
@@ -156,6 +166,8 @@ export const useArrangeStore = create<ArrangeState>((set, get) => ({
       chunks: args.chunks,
       arrangement: args.arrangement,
       cams: args.cams,
+      jobBpm: args.jobBpm,
+      jobBeatsPerBar: args.jobBeatsPerBar,
       focusedItemId: null,
       insertionIndex: args.arrangement.length,
       selectedCamId: args.cams[0]?.id ?? null,
@@ -171,6 +183,8 @@ export const useArrangeStore = create<ArrangeState>((set, get) => ({
       chunks: [],
       arrangement: [],
       cams: [],
+      jobBpm: null,
+      jobBeatsPerBar: 4,
       focusedItemId: null,
       insertionIndex: 0,
       selectedCamId: null,
@@ -353,26 +367,23 @@ export function frameWidthForBars(bars: number): number {
   return Math.max(FRAME_MIN_PX, Math.min(FRAME_MAX_PX, Math.round(w)));
 }
 
-/** Given a chunk and the session BPM-override (if any), compute an
- *  effective bar count for sizing. Falls back to a sensible default
- *  when BPM is unknown so frames don't all collapse to MIN. */
+/** Compute the effective bar count for a chunk under the new
+ *  song-global tempo model. BPM is `job.bpm.value`; per-chunk BPM is
+ *  storage-only legacy and intentionally NOT consulted here. Falls back
+ *  to a duration-based heuristic when no BPM is set so frames still
+ *  scale proportionally. */
 export function effectiveBarsForChunk(
   chunk: Chunk,
-  sessionBpmOverride?: number | null,
+  jobBpm: number | null,
+  jobBeatsPerBar: number = 4,
 ): number {
-  const bpm =
-    sessionBpmOverride && sessionBpmOverride > 0
-      ? sessionBpmOverride
-      : chunk.detectedBpm
-        ? chunk.detectedBpm * Math.pow(2, chunk.bpmOctaveShift)
-        : chunk.effectiveBpm;
-  if (!bpm || bpm <= 0) {
-    // No BPM info — derive a "loose bars" approximation from duration so
-    // longer chunks still look longer. 8 seconds ≈ 4 bars at 120 BPM.
-    const seconds = (chunk.endMs - chunk.startMs) / 1000;
+  const seconds = (chunk.endMs - chunk.startMs) / 1000;
+  if (!jobBpm || jobBpm <= 0) {
+    // No BPM yet — assume "1 bar ≈ 2 seconds" so longer chunks still
+    // size up. The user can fix the BPM in Triage / Editor and the
+    // strip re-renders.
     return Math.max(1, seconds / 2);
   }
-  const sPerBar = (60 / bpm) * (chunk.beatsPerBar || 4);
-  const seconds = (chunk.endMs - chunk.startMs) / 1000;
+  const sPerBar = (60 / jobBpm) * (jobBeatsPerBar || 4);
   return Math.max(0.25, seconds / sPerBar);
 }

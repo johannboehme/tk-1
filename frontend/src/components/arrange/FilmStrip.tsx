@@ -44,6 +44,8 @@ export function FilmStrip() {
   const removeItem = useArrangeStore((s) => s.removeItem);
   const setStripScrollPx = useArrangeStore((s) => s.setStripScrollPx);
   const setStripMetrics = useArrangeStore((s) => s.setStripMetrics);
+  const jobBpm = useArrangeStore((s) => s.jobBpm);
+  const jobBeatsPerBar = useArrangeStore((s) => s.jobBeatsPerBar);
 
   const scrollerRef = useRef<HTMLDivElement | null>(null);
 
@@ -186,7 +188,7 @@ export function FilmStrip() {
         {arrangement.map((item, i) => {
           const chunk = chunkById.get(item.chunkId);
           if (!chunk) return null;
-          const bars = effectiveBarsForChunk(chunk);
+          const bars = effectiveBarsForChunk(chunk, jobBpm, jobBeatsPerBar);
           const w = frameWidthForBars(bars);
           return (
             <div

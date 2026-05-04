@@ -24,6 +24,8 @@ export function ContactSheet() {
   const seek = useArrangeStore((s) => s.seek);
   const setPlaying = useArrangeStore((s) => s.setPlaying);
   const focusItem = useArrangeStore((s) => s.focusItem);
+  const jobBpm = useArrangeStore((s) => s.jobBpm);
+  const jobBeatsPerBar = useArrangeStore((s) => s.jobBeatsPerBar);
 
   const cam = cams.find((c) => c.id === selectedCamId) ?? cams[0] ?? null;
   // Derive usage from the arrangement reference — useMemo keeps the
@@ -73,7 +75,7 @@ export function ContactSheet() {
       >
         <div className="flex items-stretch gap-3 px-3 py-3 min-w-max">
           {acceptedChunks.map((chunk, i) => {
-            const bars = effectiveBarsForChunk(chunk);
+            const bars = effectiveBarsForChunk(chunk, jobBpm, jobBeatsPerBar);
             const usage = usageCounts[chunk.id] ?? 0;
             return (
               <Polaroid

@@ -28,6 +28,7 @@ export function PlayerCockpit() {
   }, [arrangement, chunks]);
   const isPlaying = useArrangeStore((s) => s.playback.isPlaying);
   const currentItemId = useArrangeStore((s) => s.playback.currentItemId);
+  const jobBpm = useArrangeStore((s) => s.jobBpm);
   const items = arrangement;
   const itemIdx = currentItemId
     ? items.findIndex((a) => a.id === currentItemId) + 1
@@ -41,6 +42,7 @@ export function PlayerCockpit() {
         itemIdx={itemIdx}
         itemCount={items.length}
         isPlaying={isPlaying}
+        jobBpm={jobBpm}
       />
     </section>
   );
@@ -51,11 +53,13 @@ function Lcd({
   itemIdx,
   itemCount,
   isPlaying,
+  jobBpm,
 }: {
   totalDurationMs: number;
   itemIdx: number;
   itemCount: number;
   isPlaying: boolean;
+  jobBpm: number | null;
 }) {
   const currentTime = useArrangeStore((s) => s.playback.currentTime);
   return (
@@ -91,6 +95,9 @@ function Lcd({
             label="ITEM"
             value={itemCount === 0 ? "—" : `${itemIdx.toString().padStart(2, "0")}/${itemCount.toString().padStart(2, "0")}`}
           />
+          <span className="hidden sm:inline-flex items-baseline">
+            <LcdField label="BPM" value={jobBpm ? jobBpm.toFixed(0) : "—"} />
+          </span>
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
           {isPlaying ? (

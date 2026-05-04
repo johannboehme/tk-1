@@ -730,6 +730,18 @@ export default function Editor() {
           arrangementSegments,
         },
       );
+      // E2E debug hook — exposes the latest segment count + trim so
+      // the playwright poll observes the same module instance the
+      // editor uses. Vite dev hands back distinct module instances
+      // for dynamic imports vs static, so we can't `import("...store")`
+      // from the test and read the same zustand instance. Cheap to
+      // leave in production — just two writes per loadJob.
+      const _w = window as unknown as {
+        __lastEditorSegments?: number;
+        __lastEditorTrim?: { in: number; out: number };
+      };
+      _w.__lastEditorSegments = useEditorStore.getState().arrangementSegments.length;
+      _w.__lastEditorTrim = useEditorStore.getState().trim;
 
       // Restore persisted UI state (snap-mode, lanesLocked) and trim. Must
       // happen AFTER loadJob, since loadJob resets ui to defaults.
@@ -774,6 +786,10 @@ export default function Editor() {
           useEditorStore.getState().setTrim({ in: lo, out: hi });
         }
       }
+      // Refresh the e2e debug hook now that trim has been resolved.
+      (
+        window as unknown as { __lastEditorTrim?: { in: number; out: number } }
+      ).__lastEditorTrim = useEditorStore.getState().trim;
     })().catch((e) => {
       if (!cancelled) setErr(e instanceof Error ? e.message : "Could not load job");
     });

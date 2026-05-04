@@ -20,12 +20,19 @@ const log = (msg) =>
 const browser = await chromium.launch({ headless: true });
 const ctx = await browser.newContext({ viewport: { width: 1456, height: 900 } });
 ctx.on("weberror", (e) => console.error("[browser-error]", e.error().message));
+ctx.on("pageerror", (err) => console.error("[page-error]", err.message));
 ctx.on("console", (msg) => {
   const t = msg.text();
+  const skip =
+    t.includes("React Router Future Flag") ||
+    t.includes("React DevTools") ||
+    t.includes("[vite]");
+  if (skip) return;
   if (
-    msg.type() === "error" &&
-    !t.includes("React Router Future Flag") &&
-    !t.includes("React DevTools")
+    msg.type() === "error" ||
+    msg.type() === "warning" ||
+    t.includes("[editor-load]") ||
+    t.includes("[arrange]")
   ) {
     console.log(`[browser-${msg.type()}]`, t.slice(0, 240));
   }
@@ -232,7 +239,22 @@ await page.setViewportSize({ width: 1456, height: 900 });
 await page.waitForTimeout(400);
 await page.click('button:has-text("Continue → Editor")');
 await page.waitForURL(`${BASE}/job/${jobId}/edit`, { timeout: 10_000 });
-await page.waitForTimeout(4_500);
+// Manual poll — playwright's waitForFunction with async returns is
+// flaky (Promises read as truthy regardless of resolved value).
+let settledSeg = 0;
+const editorT0 = Date.now();
+while (Date.now() - editorT0 < 15_000) {
+  // Read via window.__lastEditorState (set by the Editor.tsx debug
+   // logging hook) so we observe the SAME store instance the editor
+   // mounts; Vite dev-server can hand back distinct module instances
+   // for dynamic imports vs static ones.
+  settledSeg = await page.evaluate(() => {
+    return window.__lastEditorSegments ?? 0;
+  });
+  if (settledSeg > 0) break;
+  await new Promise((r) => setTimeout(r, 250));
+}
+log(`editor settled: ${settledSeg} segments`);
 
 await page.screenshot({ path: path.join(OUT, "07-editor-after-arrange.png") });
 log("07-editor-after-arrange");
@@ -251,25 +273,33 @@ log("07-editor-after-arrange");
   }
 }
 
-// Verify segment state in the editor store.
-const editorState = await page.evaluate(async () => {
-  const m = await import("/src/editor/store.ts");
-  const s = m.useEditorStore.getState();
+// Verify segment state in the editor store. We use the
+// window.__lastEditorSegments / __lastEditorTrim hooks the Editor
+// page sets — Vite dev hands back distinct module instances for
+// dynamic imports, so reading the store via a fresh import gets a
+// different (default) zustand instance.
+const editorState = await page.evaluate(async (id) => {
+  const jm = await import("/src/local/jobs.ts");
+  const j = await jm.jobsDb.getJob(id);
   return {
-    segments: s.arrangementSegments,
-    trim: s.trim,
-    fps: s.jobMeta?.fps,
-    duration: s.jobMeta?.duration,
+    segments: window.__lastEditorSegments ?? 0,
+    trim: window.__lastEditorTrim ?? null,
+    persistedJob: {
+      mode: j?.mode,
+      arrangement: j?.arrangement?.length,
+      chunks: j?.chunks?.length,
+      bpm: j?.bpm?.value,
+    },
   };
-});
+}, jobId);
+console.log("[e2e] persistedJob:", JSON.stringify(editorState.persistedJob));
 log(
-  `editor: segments=${editorState.segments?.length ?? 0} trim=${editorState.trim?.in?.toFixed(2)}-${editorState.trim?.out?.toFixed(2)}`,
+  `editor: segments=${editorState.segments} trim=${editorState.trim?.in?.toFixed(2)}-${editorState.trim?.out?.toFixed(2)}`,
 );
-const segCount = editorState.segments?.length ?? 0;
-if (segCount === 0) {
+if (editorState.segments === 0) {
   throw new Error("editor did not receive arrangementSegments — Phase 7 wiring broken");
 }
-log(`✓ editor received ${segCount} arrangement segments`);
+log(`✓ editor received ${editorState.segments} arrangement segments`);
 
 // Drive the timeline to confirm playback works through the segment hops.
 // Just press space — Web Audio context can't be resumed in headless,

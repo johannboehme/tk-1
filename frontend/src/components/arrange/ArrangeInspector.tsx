@@ -14,6 +14,8 @@ export function ArrangeInspector() {
   const shiftItem = useArrangeStore((s) => s.shiftItem);
   const duplicateItem = useArrangeStore((s) => s.duplicateItem);
   const removeItem = useArrangeStore((s) => s.removeItem);
+  const jobBpm = useArrangeStore((s) => s.jobBpm);
+  const jobBeatsPerBar = useArrangeStore((s) => s.jobBeatsPerBar);
 
   const focusedItem = focusedItemId
     ? arrangement.find((a) => a.id === focusedItemId) ?? null
@@ -44,10 +46,10 @@ export function ArrangeInspector() {
       ) : (
         <Body
           chunkId={focusedChunk.id}
-          bars={effectiveBarsForChunk(focusedChunk)}
+          bars={effectiveBarsForChunk(focusedChunk, jobBpm, jobBeatsPerBar)}
           startMs={focusedChunk.startMs}
           endMs={focusedChunk.endMs}
-          bpm={focusedChunk.detectedBpm}
+          bpm={jobBpm ?? undefined}
           onShiftLeft={() => shiftItem(focusedItem.id, -1)}
           onShiftRight={() => shiftItem(focusedItem.id, +1)}
           onDuplicate={() => duplicateItem(focusedItem.id)}

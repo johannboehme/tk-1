@@ -25,6 +25,8 @@ export function MiniMap() {
   const view = useArrangeStore((s) => s.view);
   const currentItemId = useArrangeStore((s) => s.playback.currentItemId);
   const setStripScrollPx = useArrangeStore((s) => s.setStripScrollPx);
+  const jobBpm = useArrangeStore((s) => s.jobBpm);
+  const jobBeatsPerBar = useArrangeStore((s) => s.jobBeatsPerBar);
 
   const cam = cams.find((c) => c.id === selectedCamId) ?? cams[0] ?? null;
   const camColor = cam?.color ?? "#FF5722";
@@ -43,7 +45,7 @@ export function MiniMap() {
   const widths = arrangement.map((item) => {
     const ck = chunkById.get(item.chunkId);
     if (!ck) return 0;
-    return frameWidthForBars(effectiveBarsForChunk(ck));
+    return frameWidthForBars(effectiveBarsForChunk(ck, jobBpm, jobBeatsPerBar));
   });
   const totalContent = widths.reduce((s, w) => s + w, 0) + arrangement.length * 8; // +cursors
 

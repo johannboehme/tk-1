@@ -82,6 +82,10 @@ export default function Arrange() {
         chunks: j.chunks ?? [],
         arrangement,
         cams,
+        // Song-global tempo (Triage writes this via pickGlobalBpm or
+        // user override). Drives the frame-width math.
+        jobBpm: j.bpm?.value ?? null,
+        jobBeatsPerBar: j.beatsPerBar ?? 4,
       });
     });
     return () => {
@@ -98,8 +102,14 @@ export default function Arrange() {
   }, [reset]);
 
   async function continueToEditor() {
-    // Just navigate — the editor reads `arrangement` via the
-    // chunksToEditSpec layer (Phase 7).
+    // Flush the in-memory arrangement to IDB before navigating away —
+    // useArrangePersist debounces writes 250 ms, so a fast click
+    // following a recent +ADD/reorder would otherwise navigate before
+    // the writeback fires and the editor would read a stale row.
+    const s = useArrangeStore.getState();
+    if (s.jobId) {
+      await jobsDb.updateJob(s.jobId, { arrangement: s.arrangement });
+    }
     navigate(jobRoutePath(id, "edit"));
   }
 

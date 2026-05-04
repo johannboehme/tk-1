@@ -55,6 +55,8 @@ describe("arrange-store · init", () => {
       chunks,
       arrangement,
       cams: [cam("cam-1")],
+      jobBpm: 120,
+      jobBeatsPerBar: 4,
     });
 
     const s = useArrangeStore.getState();
@@ -74,6 +76,8 @@ describe("arrange-store · insertion-cursor", () => {
       chunks: [chunk("c1", 0, 1000), chunk("c2", 2000, 3000), chunk("c3", 4000, 5000)],
       arrangement: [arr("a1", "c1"), arr("a2", "c2"), arr("a3", "c3")],
       cams: [],
+      jobBpm: 120,
+      jobBeatsPerBar: 4,
     });
   });
 
@@ -110,6 +114,8 @@ describe("arrange-store · insertChunk", () => {
       chunks: [chunk("c1", 0, 1000), chunk("c2", 2000, 3000)],
       arrangement: [arr("a1", "c1")],
       cams: [],
+      jobBpm: 120,
+      jobBeatsPerBar: 4,
     });
   });
 
@@ -154,6 +160,8 @@ describe("arrange-store · remove + reorder", () => {
       chunks: [chunk("c1", 0, 1000), chunk("c2", 2000, 3000), chunk("c3", 4000, 5000)],
       arrangement: [arr("a1", "c1"), arr("a2", "c2"), arr("a3", "c3")],
       cams: [],
+      jobBpm: 120,
+      jobBeatsPerBar: 4,
     });
   });
 
@@ -220,6 +228,8 @@ describe("arrange-store · totals", () => {
       chunks: [chunk("c1", 0, 1000), chunk("c2", 2000, 5000)],
       arrangement: [arr("a1", "c1"), arr("a2", "c2"), arr("a3", "c1")],
       cams: [],
+      jobBpm: 120,
+      jobBeatsPerBar: 4,
     });
     const s = useArrangeStore.getState();
     // c1 = 1000ms; c2 = 3000ms; total = 1000 + 3000 + 1000 = 5000
@@ -234,6 +244,8 @@ describe("arrange-store · totals", () => {
       chunks: [chunk("c1", 0, 1000), chunk("c2", 2000, 3000)],
       arrangement: [arr("a1", "c1"), arr("a2", "c1"), arr("a3", "c2")],
       cams: [],
+      jobBpm: 120,
+      jobBeatsPerBar: 4,
     });
     const counts = useArrangeStore.getState().usageCounts();
     expect(counts["c1"]).toBe(2);
