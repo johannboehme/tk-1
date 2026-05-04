@@ -118,6 +118,7 @@ export async function detectChunksFromEnvelope(
     const chunkAnalysis = pcm.length > 0
       ? analyzeChunk(pcm, sampleRate, seg.start_ms, seg.end_ms)
       : null;
+    const audioStartMs = chunkAnalysis?.audioStartMs ?? seg.start_ms;
     chunks.push({
       id: chunkId(seg.start_ms, seg.end_ms),
       startMs: seg.start_ms,
@@ -125,10 +126,18 @@ export async function detectChunksFromEnvelope(
       detectedBpm: chunkAnalysis?.bpm,
       bpmOctaveShift: 0,
       effectiveBpm: chunkAnalysis?.bpm ?? 0,
-      audioStartMs: chunkAnalysis?.audioStartMs ?? seg.start_ms,
+      audioStartMs,
       beatsPerBar: 4,
       accepted: true,
       trimMode: "auto",
+      // Snapshot the boundaries this chunk was born with — the Reset
+      // button restores them. Subsequent re-detections (slider changes)
+      // also overwrite these, since "what the detector says" is the
+      // user's reference frame; manual splits/joins/inserts seed their
+      // own snapshots.
+      originalStartMs: seg.start_ms,
+      originalEndMs: seg.end_ms,
+      originalAudioStartMs: audioStartMs,
     });
     // Yield to event loop every 2 chunks so long-form sessions don't
     // freeze the UI during initial detection.

@@ -108,6 +108,30 @@ export interface TriageState {
    *  (longer chunk on the left); positive `barsFwd` pushes endMs
    *  forward. */
   extendChunkBars(id: string, barsBack: number, barsFwd: number): void;
+  /** Manually slice a chunk in two at the given master-audio time
+   *  (ms). Both halves inherit the user's accept-flag and BPM
+   *  metadata; the right half's `audioStartMs` becomes the split
+   *  point so its bar grid re-anchors there. Returns the new ID of
+   *  the right half, or null if the cut would be degenerate
+   *  (≤50 ms from either edge or outside the chunk). The left half
+   *  keeps the original ID so persistent references survive. */
+  splitChunkAt(id: string, atMs: number): string | null;
+  /** Merge a focused chunk with its chronological neighbour. The
+   *  combined chunk wins audioStartMs from whichever half started
+   *  first (preserves musical phase) and inherits accept = a OR b
+   *  (kept-wins). The neighbour is removed; the focused chunk's ID
+   *  is preserved so refs/IDs stay stable. */
+  joinChunks(id: string, direction: "prev" | "next"): void;
+  /** Drop a fresh chunk into a silence gap at the current playhead.
+   *  Defaults to one bar (or 4s if no BPM yet); trims to the
+   *  remaining gap when the default would overlap a neighbour.
+   *  Returns the new chunk ID, or null if the playhead is inside
+   *  an existing chunk. */
+  insertChunkAtPlayhead(): string | null;
+  /** Restore the chunk to its detection snapshot (or, for manually
+   *  created chunks, to the values it was seeded with). No-op when
+   *  the chunk has no snapshot yet — legacy data, see schema. */
+  resetChunk(id: string): void;
   setSilenceConfig(config: SilenceConfig): void;
 
   // BPM / time-signature.
@@ -275,6 +299,145 @@ export const useTriageStore = create<TriageState>((set, get) => ({
         playback: {
           ...s.playback,
           loop: { start: nextStart / 1000, end: nextEnd / 1000 },
+        },
+      });
+    }
+  },
+
+  splitChunkAt(id, atMs) {
+    const s = get();
+    const chunk = s.chunks.find((c) => c.id === id);
+    if (!chunk) return null;
+    const minGap = 50;
+    if (atMs <= chunk.startMs + minGap || atMs >= chunk.endMs - minGap) {
+      return null;
+    }
+    const splitMs = Math.round(atMs);
+    const newId = `${chunk.id}-r-${Date.now().toString(36)}`;
+    // Each half snapshots its own current bounds as its origin — Reset
+    // pulls back to "right after the split", not to the pre-split chunk
+    // (which no longer exists). Predictable: split, edit one side, hit
+    // Reset, you get the post-split version back.
+    const left: Chunk = {
+      ...chunk,
+      endMs: splitMs,
+      trimMode: "free",
+      originalStartMs: chunk.startMs,
+      originalEndMs: splitMs,
+      originalAudioStartMs: chunk.audioStartMs ?? chunk.startMs,
+    };
+    const right: Chunk = {
+      ...chunk,
+      id: newId,
+      startMs: splitMs,
+      audioStartMs: splitMs,
+      trimMode: "free",
+      originalStartMs: splitMs,
+      originalEndMs: chunk.endMs,
+      originalAudioStartMs: splitMs,
+    };
+    const others = s.chunks.filter((c) => c.id !== id);
+    set({ chunks: [...others, left, right] });
+    if (s.focusedChunkId === id) {
+      const next = useTriageStore.getState();
+      next.focusChunk(newId);
+    }
+    return newId;
+  },
+
+  joinChunks(id, direction) {
+    const s = get();
+    const sorted = [...s.chunks].sort((a, b) => a.startMs - b.startMs);
+    const idx = sorted.findIndex((c) => c.id === id);
+    if (idx < 0) return;
+    const neighbourIdx = direction === "prev" ? idx - 1 : idx + 1;
+    if (neighbourIdx < 0 || neighbourIdx >= sorted.length) return;
+    const a = sorted[idx];
+    const b = sorted[neighbourIdx];
+    const earlier = a.startMs <= b.startMs ? a : b;
+    const later = earlier === a ? b : a;
+    const mergedStart = earlier.startMs;
+    const mergedEnd = later.endMs;
+    const mergedAudioStart = earlier.audioStartMs ?? earlier.startMs;
+    const merged: Chunk = {
+      ...a,
+      startMs: mergedStart,
+      endMs: mergedEnd,
+      audioStartMs: mergedAudioStart,
+      accepted: a.accepted || b.accepted,
+      detectedBpm: durationWeightedBpm(a, b),
+      trimMode: "free",
+      originalStartMs: mergedStart,
+      originalEndMs: mergedEnd,
+      originalAudioStartMs: mergedAudioStart,
+    };
+    const remaining = s.chunks.filter((c) => c.id !== a.id && c.id !== b.id);
+    set({ chunks: [...remaining, merged] });
+    const next = useTriageStore.getState();
+    next.focusChunk(merged.id);
+  },
+
+  insertChunkAtPlayhead() {
+    const s = get();
+    const atMs = Math.round(s.playback.currentTime * 1000);
+    // Reject when the playhead sits inside an existing chunk — this
+    // action is for filling silence gaps only. Use Split instead.
+    const inside = s.chunks.find(
+      (c) => atMs > c.startMs && atMs < c.endMs,
+    );
+    if (inside) return null;
+    const sorted = [...s.chunks].sort((a, b) => a.startMs - b.startMs);
+    const nextNeighbour = sorted.find((c) => c.startMs >= atMs);
+    const gapEnd = Math.min(
+      s.audioDuration * 1000,
+      nextNeighbour?.startMs ?? s.audioDuration * 1000,
+    );
+    if (gapEnd <= atMs + 100) return null;
+    const bpm = s.jobBpm?.value ?? 0;
+    const desiredMs = bpm > 0
+      ? Math.round((60_000 / bpm) * s.beatsPerBar)
+      : 4000;
+    const endMs = Math.min(gapEnd, atMs + desiredMs);
+    const newId = `manual-${Date.now().toString(36)}`;
+    const chunk: Chunk = {
+      id: newId,
+      startMs: atMs,
+      endMs,
+      audioStartMs: atMs,
+      bpmOctaveShift: 0,
+      effectiveBpm: bpm,
+      beatsPerBar: s.beatsPerBar,
+      accepted: true,
+      trimMode: "free",
+      originalStartMs: atMs,
+      originalEndMs: endMs,
+      originalAudioStartMs: atMs,
+    };
+    set({ chunks: [...s.chunks, chunk] });
+    const next = useTriageStore.getState();
+    next.focusChunk(newId);
+    return newId;
+  },
+
+  resetChunk(id) {
+    const s = get();
+    const chunk = s.chunks.find((c) => c.id === id);
+    if (!chunk) return;
+    if (chunk.originalStartMs == null || chunk.originalEndMs == null) return;
+    s.updateChunk(id, {
+      startMs: chunk.originalStartMs,
+      endMs: chunk.originalEndMs,
+      audioStartMs: chunk.originalAudioStartMs ?? chunk.originalStartMs,
+      trimMode: "auto",
+    });
+    if (s.focusedChunkId === id && s.playback.loopEnabled) {
+      set({
+        playback: {
+          ...s.playback,
+          loop: {
+            start: chunk.originalStartMs / 1000,
+            end: chunk.originalEndMs / 1000,
+          },
         },
       });
     }
@@ -459,6 +622,21 @@ export const useTriageStore = create<TriageState>((set, get) => ({
     set((s) => ({ view: { ...s.view, scrollX: Math.max(0, x) } }));
   },
 }));
+
+/** When two chunks merge, prefer keeping a meaningful detected tempo
+ *  rather than dropping it. Picks the longer chunk's BPM if both have
+ *  one; falls back to whichever side has a BPM at all. */
+function durationWeightedBpm(
+  a: { startMs: number; endMs: number; detectedBpm?: number },
+  b: { startMs: number; endMs: number; detectedBpm?: number },
+): number | undefined {
+  if (!a.detectedBpm && !b.detectedBpm) return undefined;
+  if (a.detectedBpm && !b.detectedBpm) return a.detectedBpm;
+  if (b.detectedBpm && !a.detectedBpm) return b.detectedBpm;
+  const aLen = a.endMs - a.startMs;
+  const bLen = b.endMs - b.startMs;
+  return aLen >= bLen ? a.detectedBpm : b.detectedBpm;
+}
 
 /** Resolve the BPM that drives a chunk's bar grid. Song-global `jobBpm`
  *  wins; the per-chunk detected value is just a fallback for cases

@@ -134,6 +134,34 @@ export const SyncIcon = (p: SVGProps<SVGSVGElement>) => (
     <path d="M20.49 15a9 9 0 0 1-14.85 3.36L1 14" />
   </svg>
 );
+/** Scissors: two pivoted blades + a centre fastener. Used for the
+ *  Split-at-playhead action in Triage. */
+export const ScissorsIcon = (p: SVGProps<SVGSVGElement>) => (
+  <svg {...baseProps} {...p}>
+    <circle cx="6" cy="6" r="3" />
+    <circle cx="6" cy="18" r="3" />
+    <line x1="20" y1="4" x2="8.12" y2="15.88" />
+    <line x1="14.47" y1="14.48" x2="20" y2="20" />
+    <line x1="8.12" y1="8.12" x2="12" y2="12" />
+  </svg>
+);
+/** Two arrows converging on a single point — Join-with-neighbour. The
+ *  two variants point at each other, matching the chronological
+ *  direction in the inspector buttons. */
+export const JoinPrevIcon = (p: SVGProps<SVGSVGElement>) => (
+  <svg {...baseProps} {...p}>
+    <line x1="3" y1="12" x2="13" y2="12" />
+    <polyline points="9 8 13 12 9 16" />
+    <line x1="17" y1="5" x2="17" y2="19" />
+  </svg>
+);
+export const JoinNextIcon = (p: SVGProps<SVGSVGElement>) => (
+  <svg {...baseProps} {...p}>
+    <line x1="7" y1="5" x2="7" y2="19" />
+    <line x1="11" y1="12" x2="21" y2="12" />
+    <polyline points="15 8 11 12 15 16" />
+  </svg>
+);
 /** Curved arrow forming a clockwise loop — for the rotation hardware
  *  cluster header. */
 export const RotateCwIcon = (p: SVGProps<SVGSVGElement>) => (

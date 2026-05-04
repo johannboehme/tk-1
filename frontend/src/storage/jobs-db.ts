@@ -264,6 +264,14 @@ export interface Chunk {
    *  ursprünglichen Detection. */
   trimStartMs?: number;
   trimEndMs?: number;
+  /** Snapshot der Detection-Boundaries (oder bei manuellen Chunks
+   *  ihrer initialen Werte). Treibt den "Reset"-Button im Inspector,
+   *  der den Chunk wieder auf seinen Ausgangszustand zurücksetzen
+   *  darf. Optional: legacy-Chunks ohne dieses Feld können nicht
+   *  zurückgesetzt werden — Reset-Button ist dann disabled. */
+  originalStartMs?: number;
+  originalEndMs?: number;
+  originalAudioStartMs?: number;
 }
 
 /**

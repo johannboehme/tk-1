@@ -35,7 +35,18 @@ const CHUNK_LANE_HEIGHT = 32;
 const MAX_WAVEFORM_HEIGHT = 110;
 const PLAYHEAD_COLOR = "#FF5722";
 const HOT_COLOR = "#FF5722";
-const TRIM_HANDLE_PX = 6;
+/** Visible width of a trim handle. Hit area is bigger via padding so
+ *  the handle stays grabbable even at this thin spec — see ChunkBlock. */
+const TRIM_HANDLE_PX = 2;
+/** A chunk can't realistically be narrower than this on screen — at
+ *  sub-3 px the rect rounds to a single line and disappears into the
+ *  baseline. We render those as a tight pill at their anchor so the
+ *  user keeps a click target without distorting the proportional
+ *  weight of nearby chunks. */
+const MIN_VISIBLE_CHUNK_PX = 3;
+/** Below this, trim handles aren't shown — there's no room to grab
+ *  them anyway, the user is expected to zoom in for surgical edits. */
+const HANDLES_MIN_PX = 12;
 
 export function TriageTimeline() {
   const wrapperRef = useRef<HTMLDivElement | null>(null);
@@ -380,11 +391,43 @@ export function TriageTimeline() {
     viewEndS,
     pxPerSec,
   );
-  // Waveform canvas.
+  // ─── Waveform ──────────────────────────────────────────────────────────
+  // Mip-pyramid: each level halves sample count + max-pools — guarantees
+  // ≤ 2 samples per pixel at any zoom. Without this the previous 1-px-bar
+  // peak-hold blocks up at low zoom and aliases at high zoom; with it we
+  // can draw a smooth filled path that breathes naturally.
+  const mipsRef = useRef<Float32Array[]>([]);
+  const peakRefValue = useRef(1);
+  useEffect(() => {
+    if (!envelope || envelope.length === 0) {
+      mipsRef.current = [];
+      peakRefValue.current = 1;
+      return;
+    }
+    const mips: Float32Array[] = [envelope];
+    let cur = envelope;
+    while (cur.length > 64) {
+      const next = new Float32Array(Math.ceil(cur.length / 2));
+      for (let i = 0; i < next.length; i++) {
+        const a = cur[i * 2] ?? 0;
+        const b = cur[i * 2 + 1] ?? 0;
+        next[i] = a > b ? a : b;
+      }
+      mips.push(next);
+      cur = next;
+    }
+    let peak = 0.01;
+    for (let i = 0; i < envelope.length; i++) {
+      if (envelope[i] > peak) peak = envelope[i];
+    }
+    mipsRef.current = mips;
+    peakRefValue.current = peak;
+  }, [envelope]);
+
   const waveformCanvasRef = useRef<HTMLCanvasElement | null>(null);
   useEffect(() => {
     const canvas = waveformCanvasRef.current;
-    if (!canvas || !envelope || envelope.length === 0) return;
+    if (!canvas) return;
     const dpr = window.devicePixelRatio || 1;
     const cssW = size.width;
     const cssH = waveformHeight;
@@ -396,50 +439,149 @@ export function TriageTimeline() {
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, cssW, cssH);
-    ctx.fillStyle = "#FAF6EC";
-    ctx.fillRect(0, 0, cssW, cssH);
+
+    const mips = mipsRef.current;
+    if (mips.length === 0) {
+      // No envelope yet — leave the recessed paper-hi panel empty.
+      return;
+    }
 
     const thresholdLin = Math.pow(10, silenceConfig.thresholdDb / 20);
-    const peakRef = Math.max(0.01, ...envelope);
-
-    const sPerEnv = 1 / envelopeHz;
+    const peakRef = Math.max(0.01, peakRefValue.current);
     const cx = cssH / 2;
     const half = cssH / 2 - 2;
+
+    // Pick the mip level so we read at most ~2 samples per pixel.
+    // level 0 native rate = envelopeHz Hz; each level halves it.
+    const samplesPerPxL0 = envelopeHz / pxPerSec;
+    let level = 0;
+    while (level + 1 < mips.length && samplesPerPxL0 / Math.pow(2, level) > 2) {
+      level++;
+    }
+    const mip = mips[level];
+    const mipHz = envelopeHz / Math.pow(2, level);
+    const sPerSample = 1 / mipHz;
+
+    // Bucket peak-hold per pixel + 1-D box-blur for sub-pixel smoothness.
+    const samples = new Float32Array(cssW);
     for (let xPx = 0; xPx < cssW; xPx++) {
       const t0 = xToTime(xPx);
       const t1 = xToTime(xPx + 1);
-      const e0 = Math.max(0, Math.floor(t0 / sPerEnv));
-      const e1 = Math.min(envelope.length, Math.ceil(t1 / sPerEnv));
-      if (e1 <= e0) continue;
-      let max = 0;
-      for (let i = e0; i < e1; i++) {
-        if (envelope[i] > max) max = envelope[i];
+      const i0 = Math.max(0, Math.floor(t0 / sPerSample));
+      const i1 = Math.min(mip.length, Math.ceil(t1 / sPerSample));
+      let m = 0;
+      if (i1 > i0) {
+        for (let i = i0; i < i1; i++) {
+          if (mip[i] > m) m = mip[i];
+        }
+      } else if (i0 < mip.length) {
+        // Sub-sample regime — interpolate between neighbours.
+        const sFloat = t0 / sPerSample;
+        const j = Math.floor(sFloat);
+        const frac = sFloat - j;
+        const a = mip[Math.max(0, Math.min(mip.length - 1, j))] ?? 0;
+        const b = mip[Math.max(0, Math.min(mip.length - 1, j + 1))] ?? 0;
+        m = a * (1 - frac) + b * frac;
       }
-      const norm = max / peakRef;
-      const h = Math.max(1, norm * half);
-      const aboveThreshold = max > thresholdLin;
-      ctx.fillStyle = aboveThreshold ? "#221E1A" : "#A89F8B";
-      ctx.fillRect(xPx, cx - h, 1, h * 2);
+      samples[xPx] = m / peakRef;
     }
 
-    const thresholdY = cx - (thresholdLin / peakRef) * half;
+    // 3-tap smoothing — visually folds peaks into curves without losing
+    // the silhouette of transients.
+    const smoothed = new Float32Array(cssW);
+    for (let x = 0; x < cssW; x++) {
+      const a = samples[Math.max(0, x - 1)];
+      const b = samples[x];
+      const c = samples[Math.min(cssW - 1, x + 1)];
+      smoothed[x] = (a + 2 * b + c) * 0.25;
+    }
+
+    const yTop = (v: number) => cx - v * half;
+    const yBot = (v: number) => cx + v * half;
+
+    // Subtle ground line — keeps the visual anchored even when the
+    // envelope is dead silent for long stretches.
+    ctx.strokeStyle = "rgba(154,143,128,0.30)";
+    ctx.lineWidth = 0.5;
+    ctx.beginPath();
+    ctx.moveTo(0, cx);
+    ctx.lineTo(cssW, cx);
+    ctx.stroke();
+
+    // Layer 1 — full envelope shape, vertical gradient: dark warm ink at
+    // the centre fading to paper at the edges. Tape-loop-deck vibe.
+    const baseGrad = ctx.createLinearGradient(0, 0, 0, cssH);
+    baseGrad.addColorStop(0, "rgba(34, 30, 26, 0)");
+    baseGrad.addColorStop(0.18, "rgba(34, 30, 26, 0.32)");
+    baseGrad.addColorStop(0.5, "rgba(34, 30, 26, 0.92)");
+    baseGrad.addColorStop(0.82, "rgba(34, 30, 26, 0.32)");
+    baseGrad.addColorStop(1, "rgba(34, 30, 26, 0)");
+    ctx.beginPath();
+    ctx.moveTo(0, yTop(smoothed[0]));
+    for (let x = 1; x < cssW; x++) ctx.lineTo(x, yTop(smoothed[x]));
+    for (let x = cssW - 1; x >= 0; x--) ctx.lineTo(x, yBot(smoothed[x]));
+    ctx.closePath();
+    ctx.fillStyle = baseGrad;
+    ctx.fill();
+
+    // Layer 2 — phosphor-amber tint over above-threshold spans.
+    // Communicates "this part will pass detection" without re-drawing
+    // the silhouette in a different colour everywhere.
+    const tintGrad = ctx.createLinearGradient(0, 0, 0, cssH);
+    tintGrad.addColorStop(0, "rgba(255, 87, 34, 0)");
+    tintGrad.addColorStop(0.5, "rgba(255, 87, 34, 0.28)");
+    tintGrad.addColorStop(1, "rgba(255, 87, 34, 0)");
+    ctx.fillStyle = tintGrad;
+    const thresholdNorm = thresholdLin / peakRef;
+    let spanStart = -1;
+    for (let x = 0; x <= cssW; x++) {
+      const above = x < cssW && smoothed[x] > thresholdNorm;
+      if (above && spanStart < 0) spanStart = x;
+      else if (!above && spanStart >= 0) {
+        const spanEnd = x;
+        ctx.beginPath();
+        ctx.moveTo(spanStart, yTop(smoothed[spanStart]));
+        for (let xx = spanStart + 1; xx < spanEnd; xx++) {
+          ctx.lineTo(xx, yTop(smoothed[xx]));
+        }
+        for (let xx = spanEnd - 1; xx >= spanStart; xx--) {
+          ctx.lineTo(xx, yBot(smoothed[xx]));
+        }
+        ctx.closePath();
+        ctx.fill();
+        spanStart = -1;
+      }
+    }
+
+    // Threshold guides — phosphor-amber hairline dashes, mirrored
+    // across the centre. Dashed gives "guideline" not "limit fence".
+    const thresholdY = cx - thresholdNorm * half;
     if (thresholdY > 0 && thresholdY < cssH) {
-      ctx.strokeStyle = "rgba(255,87,34,0.5)";
-      ctx.setLineDash([3, 3]);
+      ctx.strokeStyle = "rgba(255,138,79,0.55)";
+      ctx.lineWidth = 0.75;
+      ctx.setLineDash([4, 3]);
       ctx.beginPath();
       ctx.moveTo(0, thresholdY);
       ctx.lineTo(cssW, thresholdY);
-      ctx.stroke();
-      const thresholdYBottom = cx + (thresholdLin / peakRef) * half;
+      const thresholdYBottom = cx + thresholdNorm * half;
       if (thresholdYBottom < cssH) {
-        ctx.beginPath();
         ctx.moveTo(0, thresholdYBottom);
         ctx.lineTo(cssW, thresholdYBottom);
-        ctx.stroke();
       }
+      ctx.stroke();
       ctx.setLineDash([]);
     }
-  }, [envelope, envelopeHz, size.width, waveformHeight, viewStartS, viewEndS, silenceConfig, xToTime]);
+  }, [
+    envelope,
+    envelopeHz,
+    size.width,
+    waveformHeight,
+    viewStartS,
+    viewEndS,
+    silenceConfig,
+    xToTime,
+    pxPerSec,
+  ]);
 
   const totalHeight =
     TIME_RULER_HEIGHT + BAR_RULER_HEIGHT + waveformHeight + CHUNK_LANE_HEIGHT;
@@ -639,35 +781,84 @@ function ChunkBlock({
 
   const left = timeToX(startS);
   const right = timeToX(endS);
-  const widthPx = right - left;
+  const exactWidthPx = right - left;
+  const tooNarrow = exactWidthPx < MIN_VISIBLE_CHUNK_PX;
+  const widthPx = tooNarrow ? MIN_VISIBLE_CHUNK_PX : exactWidthPx;
+  // Centre the pill at the true block midpoint so its visual position
+  // still matches the chunk's master-time even after the min-width
+  // clamp. Without this, sub-3-px chunks would always stick to their
+  // start edge and read as offset.
+  const renderLeft = tooNarrow
+    ? (left + right) / 2 - MIN_VISIBLE_CHUNK_PX / 2
+    : left;
 
-  const bg = effectivelyAccepted ? "#FF5722" : "#5D5546";
+  const bg = effectivelyAccepted ? HOT_COLOR : "#5D5546";
   const fg = effectivelyAccepted ? "#FAF6EC" : "#A89F8B";
 
-  const showLabel = widthPx >= 120;
-  const showHandles = widthPx >= TRIM_HANDLE_PX * 3;
+  const showLabel = !tooNarrow && widthPx >= 120;
+  const showHandles = !tooNarrow && widthPx >= HANDLES_MIN_PX;
+  // Shrink the hit-area on small blocks so the two handles don't cover
+  // the whole block (otherwise the centre is unclickable and you can't
+  // focus). Capped at 8 px on big blocks for a comfortable grab.
+  const handleHitPx = Math.max(4, Math.min(8, widthPx / 3));
+
+  const tooltip = `${chunk.id}: ${formatTime(startS)} → ${formatTime(endS)}${
+    chunk.detectedBpm ? ` · ${chunk.detectedBpm.toFixed(1)} BPM` : ""
+  }${chunk.accepted && !effectivelyAccepted ? " · filtered out" : ""}`;
+
+  // Pill mode — block too narrow to host content. Render a compact
+  // rounded rectangle that's still visible at full zoom-out + reads
+  // as proportionally tiny next to the rest of the lane.
+  if (tooNarrow) {
+    return (
+      <div
+        className="absolute top-1 bottom-1 rounded-[2px]"
+        style={{
+          left: renderLeft,
+          width: widthPx,
+          background: bg,
+          outline: focused ? `1.5px solid ${HOT_COLOR}` : undefined,
+          outlineOffset: focused ? 1 : undefined,
+          boxShadow: focused
+            ? "0 0 4px rgba(255,87,34,0.65)"
+            : "inset 0 1px 0 rgba(255,255,255,0.18)",
+          zIndex: focused ? 2 : 1,
+        }}
+        title={tooltip}
+      />
+    );
+  }
 
   return (
     <div
       className="absolute top-0 bottom-0 flex items-center px-1 overflow-hidden"
       style={{
-        left,
+        left: renderLeft,
         width: widthPx,
         background: bg,
         color: fg,
-        outline: focused ? "2px solid #2F6FED" : undefined,
+        // Hot-orange ring + inner brass hairline = the 3-fach Tell
+        // shared with Arrange's Frame component. Keeps the whole
+        // selection language coherent across screens.
+        outline: focused ? `2px solid ${HOT_COLOR}` : undefined,
         outlineOffset: focused ? -2 : undefined,
+        boxShadow: focused
+          ? "inset 0 0 0 1px rgba(255,255,255,0.35), 0 0 6px rgba(255,87,34,0.45)"
+          : undefined,
         zIndex: focused ? 2 : 1,
       }}
-      title={`${chunk.id}: ${formatTime(startS)} → ${formatTime(endS)}${
-        chunk.detectedBpm ? ` · ${chunk.detectedBpm.toFixed(1)} BPM` : ""
-      }${chunk.accepted && !effectivelyAccepted ? " · filtered out" : ""}`}
+      title={tooltip}
     >
       {!effectivelyAccepted && (
+        // Soft diagonal hatch instead of the old hard 1-px white line —
+        // reads as "set aside" without screaming "deleted".
         <div
           aria-hidden
-          className="absolute left-0 right-0 top-1/2 h-px"
-          style={{ background: "#FAF6EC" }}
+          className="absolute inset-0 pointer-events-none"
+          style={{
+            backgroundImage:
+              "repeating-linear-gradient(135deg, rgba(250,246,236,0.18) 0 1.5px, transparent 1.5px 6px)",
+          }}
         />
       )}
       {showLabel && (
@@ -682,23 +873,41 @@ function ChunkBlock({
           <div
             data-trim-handle="left"
             className="absolute left-0 top-0 bottom-0 cursor-ew-resize"
-            style={{
-              width: TRIM_HANDLE_PX,
-              background: focused ? "#2F6FED" : "rgba(0,0,0,0.25)",
-            }}
+            style={{ width: handleHitPx }}
             onMouseDown={(e) => onTrimStart("left", e)}
             title="Drag to trim start (Shift = bypass snap)"
-          />
+          >
+            <div
+              data-trim-handle="left"
+              className="absolute left-0 top-0 bottom-0 pointer-events-none"
+              style={{
+                width: TRIM_HANDLE_PX,
+                background: focused ? HOT_COLOR : "rgba(15,12,9,0.55)",
+                boxShadow: focused
+                  ? "0 0 4px rgba(255,87,34,0.7)"
+                  : "1px 0 0 rgba(255,255,255,0.18)",
+              }}
+            />
+          </div>
           <div
             data-trim-handle="right"
             className="absolute right-0 top-0 bottom-0 cursor-ew-resize"
-            style={{
-              width: TRIM_HANDLE_PX,
-              background: focused ? "#2F6FED" : "rgba(0,0,0,0.25)",
-            }}
+            style={{ width: handleHitPx }}
             onMouseDown={(e) => onTrimStart("right", e)}
             title="Drag to trim end (Shift = bypass snap)"
-          />
+          >
+            <div
+              data-trim-handle="right"
+              className="absolute right-0 top-0 bottom-0 pointer-events-none"
+              style={{
+                width: TRIM_HANDLE_PX,
+                background: focused ? HOT_COLOR : "rgba(15,12,9,0.55)",
+                boxShadow: focused
+                  ? "0 0 4px rgba(255,87,34,0.7)"
+                  : "-1px 0 0 rgba(255,255,255,0.18)",
+              }}
+            />
+          </div>
         </>
       )}
     </div>

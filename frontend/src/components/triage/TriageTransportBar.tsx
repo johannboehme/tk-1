@@ -37,6 +37,10 @@ export function TriageTransportBar() {
   // Don't subscribe to currentTime — it changes 60×/s. Pull imperatively
   // when needed (only the clock readout cares) and render that as a
   // separate component so updates stay scoped.
+  const splitChunkAt = useTriageStore((s) => s.splitChunkAt);
+  const joinChunks = useTriageStore((s) => s.joinChunks);
+  const resetChunk = useTriageStore((s) => s.resetChunk);
+  const insertChunkAtPlayhead = useTriageStore((s) => s.insertChunkAtPlayhead);
   const acceptedCount = chunks.filter((c) => c.accepted).length;
 
   // ─── Shortcut registration + keydown handler ─────────────────────────
@@ -76,6 +80,36 @@ export function TriageTransportBar() {
     description: "Toggle loop on focused chunk",
     group: "Transport",
   });
+  useRegisterShortcut({
+    id: "triage.split",
+    keys: ["S"],
+    description: "Split focused chunk at the playhead",
+    group: "Triage · Edit",
+  });
+  useRegisterShortcut({
+    id: "triage.join-prev",
+    keys: ["J"],
+    description: "Merge focused chunk with previous",
+    group: "Triage · Edit",
+  });
+  useRegisterShortcut({
+    id: "triage.join-next",
+    keys: ["⇧J"],
+    description: "Merge focused chunk with next",
+    group: "Triage · Edit",
+  });
+  useRegisterShortcut({
+    id: "triage.new-chunk",
+    keys: ["N"],
+    description: "Insert a new chunk at the playhead (in silence)",
+    group: "Triage · Edit",
+  });
+  useRegisterShortcut({
+    id: "triage.reset-chunk",
+    keys: ["R"],
+    description: "Reset focused chunk to detection boundaries",
+    group: "Triage · Edit",
+  });
 
   useEffect(() => {
     function isTextInput(target: EventTarget | null): boolean {
@@ -109,11 +143,43 @@ export function TriageTransportBar() {
         e.preventDefault();
         const cur = useTriageStore.getState().playback.loopEnabled;
         setLoopEnabled(!cur);
+      } else if (e.code === "KeyS" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        const st = useTriageStore.getState();
+        if (st.focusedChunkId) {
+          splitChunkAt(
+            st.focusedChunkId,
+            Math.round(st.playback.currentTime * 1000),
+          );
+        }
+      } else if (e.code === "KeyJ" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        const st = useTriageStore.getState();
+        if (st.focusedChunkId) {
+          joinChunks(st.focusedChunkId, e.shiftKey ? "next" : "prev");
+        }
+      } else if (e.code === "KeyN" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        insertChunkAtPlayhead();
+      } else if (e.code === "KeyR" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        const st = useTriageStore.getState();
+        if (st.focusedChunkId) resetChunk(st.focusedChunkId);
       }
     }
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [setPlaying, focusRelative, acceptFocused, rejectFocused, setLoopEnabled]);
+  }, [
+    setPlaying,
+    focusRelative,
+    acceptFocused,
+    rejectFocused,
+    setLoopEnabled,
+    splitChunkAt,
+    joinChunks,
+    insertChunkAtPlayhead,
+    resetChunk,
+  ]);
 
   return (
     <div

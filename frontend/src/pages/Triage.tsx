@@ -492,7 +492,13 @@ function PhaseDots({ active }: { active: "triage" | "arrange" }) {
             {p.label}
           </span>
           {i < phases.length - 1 && (
-            <span className="text-ink-3 text-[10px]">━━▶</span>
+            <span
+              className="text-[10px]"
+              style={{ color: active === p.id ? "#FF8A4F" : "#9A8F80" }}
+              aria-hidden
+            >
+              ━━▶
+            </span>
           )}
         </span>
       ))}
