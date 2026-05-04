@@ -32,7 +32,8 @@ ctx.on("console", (msg) => {
     msg.type() === "error" ||
     msg.type() === "warning" ||
     t.includes("[editor-load]") ||
-    t.includes("[arrange]")
+    t.includes("[arrange]") ||
+    t.includes("[thumb")
   ) {
     console.log(`[browser-${msg.type()}]`, t.slice(0, 240));
   }
@@ -112,19 +113,20 @@ if (!synced.chunks || synced.chunks.length < 4) {
     const m = await import("/src/local/jobs.ts");
     const j = await m.jobsDb.getJob(id);
     const dur = j.durationS ?? 30;
-    // Compress 25 chunks into the available master-audio span. Mix
-    // long + short so the strip-vs-on-demand tier picker is exercised.
-    const N = 25;
-    const usable = dur - 0.5;
-    const base = (usable * 1000) / N;
+    // Two batches: (a) "tier-2 chunks" — long enough to overlap a
+    // strip tile (≥ 600 ms when tile spacing is 0.5 s); (b) "tier-3
+    // chunks" — narrow windows that fall BETWEEN tile timestamps
+    // (~ 0.05–0.15 s wide, positioned at offsets like 0.05, 0.55,
+    // 1.05, ...). Forces both code paths through the resolver.
     const chunks = [];
     let cursor = 250;
-    for (let i = 0; i < N; i++) {
-      const lenMs = Math.max(400, Math.round(base * (i % 3 === 0 ? 0.5 : 1.0)));
-      const endMs = Math.min(dur * 1000 - 50, cursor + lenMs);
+    // 8 normal chunks (tier 2)
+    for (let i = 0; i < 8; i++) {
+      const len = 600 + i * 80;
+      const endMs = Math.min(dur * 1000 - 50, cursor + len);
       if (endMs <= cursor + 100) break;
       chunks.push({
-        id: `chunk-${cursor}-${endMs}`,
+        id: `chunk-tier2-${i}`,
         startMs: cursor,
         endMs,
         detectedBpm: 120,
@@ -135,6 +137,24 @@ if (!synced.chunks || synced.chunks.length < 4) {
         trimMode: "auto",
       });
       cursor = endMs + 50;
+    }
+    // Inject 4 tiny windows that fall in tile-spacing gaps. For
+    // 0.5 s tile spacing the centres are at 0.25, 0.75, 1.25, ...
+    // — windows at 1.0–1.1, 2.0–2.1 etc. don't contain any centre.
+    for (const startS of [0.0, 1.0, 2.0, 3.0]) {
+      const startMs = Math.round(startS * 1000);
+      const endMs = startMs + 100; // 100ms window — guaranteed gap
+      chunks.push({
+        id: `chunk-tier3-${startS}`,
+        startMs,
+        endMs,
+        detectedBpm: 120,
+        bpmOctaveShift: 0,
+        effectiveBpm: 120,
+        beatsPerBar: 4,
+        accepted: true,
+        trimMode: "auto",
+      });
     }
     const arrangement = chunks.map((c, i) => ({
       id: `arr-${c.id}-${Date.now()}-${i}`,

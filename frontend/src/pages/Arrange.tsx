@@ -28,7 +28,10 @@ import { jobRoutePath } from "../local/jobs-routing";
 import { isVideoAsset } from "../storage/jobs-db";
 import { useArrangeStore } from "../local/arrange/arrange-store";
 import { useArrangePersist } from "../local/arrange/useArrangePersist";
-import { clearChunkThumbnails } from "../local/arrange/chunk-thumbnails";
+import {
+  clearChunkThumbnails,
+  prefetchChunkThumbnails,
+} from "../local/arrange/chunk-thumbnails";
 import { FilmStrip } from "../components/arrange/FilmStrip";
 import { ContactSheet } from "../components/arrange/ContactSheet";
 import { PlayerCockpit } from "../components/arrange/PlayerCockpit";
@@ -81,11 +84,17 @@ export default function Arrange() {
         chunks: j.chunks ?? [],
         arrangement,
         cams,
-        // Song-global tempo (Triage writes this via pickGlobalBpm or
-        // user override). Drives the frame-width math.
         jobBpm: j.bpm?.value ?? null,
         jobBeatsPerBar: j.beatsPerBar ?? 4,
       });
+      // Pre-warm the in-memory thumbnail URL cache from IDB so
+      // returning visitors don't see "developing" dots flicker on
+      // every Polaroid before the synchronous lookup hits. One
+      // bulk fetch per cam per page-mount.
+      const chunkIds = (j.chunks ?? []).map((c) => c.id);
+      for (const cam of cams) {
+        void prefetchChunkThumbnails(j.id, cam.id, chunkIds);
+      }
     });
     return () => {
       active = false;

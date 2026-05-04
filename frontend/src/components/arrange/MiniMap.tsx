@@ -24,6 +24,7 @@ export function MiniMap() {
   const selectedCamId = useArrangeStore((s) => s.selectedCamId);
   const view = useArrangeStore((s) => s.view);
   const currentItemId = useArrangeStore((s) => s.playback.currentItemId);
+  const focusedItemId = useArrangeStore((s) => s.focusedItemId);
   const setStripScrollPx = useArrangeStore((s) => s.setStripScrollPx);
   const jobBpm = useArrangeStore((s) => s.jobBpm);
   const jobBeatsPerBar = useArrangeStore((s) => s.jobBeatsPerBar);
@@ -121,7 +122,23 @@ export function MiniMap() {
         const w = widths[i] * scale;
         const left = runningX * scale;
         runningX += widths[i] + 8;
-        const isCurrent = item.id === currentItemId;
+        const isPlaying = item.id === currentItemId;
+        const isFocused = item.id === focusedItemId;
+        // Two highlight states share the lane: cobalt = focused (user
+        // selected this frame in the strip), hot = currently playing.
+        // Idle items render in the cam-color at half opacity.
+        let bg: string;
+        let opacity: number;
+        if (isPlaying) {
+          bg = "#FFB58A"; // hot tail
+          opacity = 1;
+        } else if (isFocused) {
+          bg = "#2F6FED"; // cobalt — matches the frame's focus ring
+          opacity = 1;
+        } else {
+          bg = camColor;
+          opacity = 0.6;
+        }
         return (
           <span
             key={item.id}
@@ -132,8 +149,8 @@ export function MiniMap() {
               width: Math.max(1, w),
               top: 3,
               bottom: 3,
-              background: isCurrent ? "#FFB58A" : camColor,
-              opacity: isCurrent ? 1 : 0.6,
+              background: bg,
+              opacity,
               borderRadius: 1,
             }}
           />

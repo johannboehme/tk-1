@@ -25,6 +25,7 @@
  */
 import { jobsDb, isVideoAsset } from "../../storage/jobs-db";
 import type { Chunk, VideoAsset } from "../../storage/jobs-db";
+import { loadAssetFile } from "../asset-source";
 import { resolveCamAssetUrl } from "../jobs";
 import { planTileStrip } from "../render/frames/strategy";
 
@@ -79,11 +80,15 @@ interface CamProbe {
   video: HTMLVideoElement;
   /** Object URL kept alive for the lifetime of the probe. */
   srcUrl: string;
-  /** True once `loadedmetadata` has fired and dims are stable. */
+  /** Resolved once the probe is fully usable: `<video>`'s
+   *  loadedmetadata event has fired AND the intrinsic rotation has
+   *  been resolved (either from the persisted asset field or the
+   *  lazy demux probe). Tier-2 slicers must await this before
+   *  reading `rotationDeg`. */
   ready: Promise<void>;
   /** Intrinsic rotation needed to display the source correctly,
-   *  derived from the dim-swap heuristic against `cam.width/height`.
-   *  0 = no rotation, 90/270 = portrait recordings, 180 rare. */
+   *  derived from `cam.intrinsicRotationDeg` (sync-time persistence)
+   *  or a lazy demux probe / dim-swap heuristic for legacy assets. */
   rotationDeg: 0 | 90 | 180 | 270;
   /** Serialises seek+grab calls so the decoder cursor isn't yanked
    *  mid-seek. */
@@ -118,7 +123,7 @@ async function getOrCreateProbe(
   video.preload = "auto";
   video.src = url;
 
-  const ready = new Promise<void>((resolve) => {
+  const metadataReady = new Promise<void>((resolve) => {
     function done() {
       cleanup();
       resolve();
@@ -133,41 +138,85 @@ async function getOrCreateProbe(
     setTimeout(done, 5_000); // never block forever
   });
 
-  // Probe rotation once metadata is available. Display dims that
-  // equal swapped stored dims = a 90° (or 270°) rotation; we can't
-  // distinguish 90 from 270 without the matrix, but 90 is the
-  // overwhelming majority for phone recordings held in portrait, so
-  // we pick that.
-  const rotationDegPromise = ready.then(() => {
-    const dispW = video.videoWidth;
-    const dispH = video.videoHeight;
-    const storedW = cam.width ?? 0;
-    const storedH = cam.height ?? 0;
-    if (
-      storedW > 0 &&
-      storedH > 0 &&
-      dispW > 0 &&
-      dispH > 0 &&
-      dispW === storedH &&
-      dispH === storedW
-    ) {
-      return 90 as const;
-    }
-    return 0 as const;
-  });
+  // Determine intrinsic rotation. Preference order:
+  //   1. `cam.intrinsicRotationDeg` — persisted at sync time from
+  //      the demuxer's matrix decode. Authoritative; distinguishes
+  //      90 from 270.
+  //   2. Lazy demux probe — for legacy jobs synced before the
+  //      field existed. Reads only the moov atom so this stays
+  //      cheap even on multi-GB sources, and persists the result
+  //      back to the asset so the next page-mount uses tier 1.
+  //   3. Dim-swap heuristic — last-resort fallback if the demux
+  //      throws (unsupported container, file missing). Can't
+  //      distinguish 90 from 270; defaults to 90 which fits the
+  //      common phone-portrait case.
+  const rotationDegPromise: Promise<0 | 90 | 180 | 270> =
+    cam.intrinsicRotationDeg !== undefined
+      ? Promise.resolve(cam.intrinsicRotationDeg)
+      : (async () => {
+          // Try the demux probe first. moov is at the head of most
+          // MP4 / MOV files, so this reads kilobytes, not gigabytes.
+          try {
+            const file = await loadAssetFile(cam);
+            const m = await import("../codec/webcodecs/demux");
+            const v = await m.demuxVideoTrack(file);
+            if (v) {
+              const r = v.info.rotationDeg;
+              // Persist back so future loads short-circuit. No await
+              // — UI doesn't need to wait for the IDB write.
+              void jobsDb
+                .updateJob(jobId, {
+                  videos: await (async () => {
+                    const job = await jobsDb.getJob(jobId);
+                    return (job?.videos ?? []).map((v2) =>
+                      isVideoAsset(v2) && v2.id === cam.id
+                        ? { ...v2, intrinsicRotationDeg: r }
+                        : v2,
+                    );
+                  })(),
+                })
+                .catch(() => undefined);
+              return r;
+            }
+          } catch {
+            /* fall through to heuristic */
+          }
+          // Heuristic: dim-swap implies a 90° (or 270°) rotation.
+          await metadataReady;
+          const dispW = video.videoWidth;
+          const dispH = video.videoHeight;
+          const storedW = cam.width ?? 0;
+          const storedH = cam.height ?? 0;
+          if (
+            storedW > 0 &&
+            storedH > 0 &&
+            dispW > 0 &&
+            dispH > 0 &&
+            dispW === storedH &&
+            dispH === storedW
+          ) {
+            return 90 as const;
+          }
+          return 0 as const;
+        })();
 
+  // probe.ready resolves only after BOTH metadata + rotation. That
+  // way tier-2 callers reading `probe.rotationDeg` after `await
+  // probe.ready` always see the real value, never the placeholder
+  // default.
+  const ready = Promise.all([metadataReady, rotationDegPromise]).then(() => {
+    /* discard tuple — callers only need the void resolution */
+  });
   const probe: CamProbe = {
     video,
     srcUrl: url,
     ready,
-    rotationDeg: 0,
+    rotationDeg: cam.intrinsicRotationDeg ?? 0,
     queue: Promise.resolve(),
     refCount: 1,
     syncOffsetMs: (cam.sync?.offsetMs ?? 0) + (cam.syncOverrideMs ?? 0),
   };
   probes.set(key, probe);
-  // Apply rotation as soon as known. Tier-2 callers `await` ready so
-  // they observe the resolved value.
   void rotationDegPromise.then((r) => {
     probe.rotationDeg = r;
   });
@@ -366,10 +415,15 @@ async function seekAndCapture(
   masterTimeS: number,
 ): Promise<Blob | null> {
   await probe.ready;
-  const sourceTimeS = masterTimeS - probe.syncOffsetMs / 1000;
   const v = probe.video;
   if (!Number.isFinite(v.duration) || v.duration <= 0) return null;
-  if (sourceTimeS < 0 || sourceTimeS > v.duration - 0.05) return null;
+  // Clamp the seek target into the cam's recorded range. Chunks whose
+  // master-time falls before the cam started (sourceTimeS < 0) or past
+  // its end (sourceTimeS > duration) get the boundary frame instead
+  // of nothing — better a slightly-off thumbnail than an "out of
+  // range" placeholder that the user has no way to act on.
+  const rawSource = masterTimeS - probe.syncOffsetMs / 1000;
+  const sourceTimeS = Math.max(0, Math.min(v.duration - 0.05, rawSource));
 
   await new Promise<void>((resolve) => {
     let timer: number | null = null;
@@ -507,6 +561,62 @@ export async function getChunkThumbnailUrl(
   recordAccess(ck, entry);
   evictIfFull();
   return url;
+}
+
+/**
+ * Synchronously look up an already-cached thumbnail URL. Returns the
+ * URL when the in-memory map has an entry, null otherwise. Use to
+ * decide whether to render the "developing" indicator or jump
+ * straight to showing the image.
+ */
+export function peekChunkThumbnailUrl(
+  jobId: string,
+  camId: string,
+  chunkId: string,
+): string | null {
+  const ck = cacheKey(jobId, camId, chunkId);
+  const memHit = urlCache.get(ck);
+  if (!memHit) return null;
+  recordAccess(ck, memHit);
+  return memHit.url;
+}
+
+/**
+ * Bulk-load every cached thumbnail for a job from IDB into the
+ * in-memory URL cache. Call this once per Arrange-page mount so the
+ * synchronous peek in `useChunkThumbnail` finds returning thumbs
+ * without a flash of "developing" dots.
+ *
+ * Skips chunks already in the in-memory cache; safe to call multiple
+ * times. Best-effort — IDB failures fall through.
+ */
+export async function prefetchChunkThumbnails(
+  jobId: string,
+  camId: string,
+  chunkIds: readonly string[],
+): Promise<number> {
+  let hits = 0;
+  await Promise.all(
+    chunkIds.map(async (chunkId) => {
+      const ck = cacheKey(jobId, camId, chunkId);
+      if (urlCache.has(ck)) {
+        hits += 1;
+        return;
+      }
+      try {
+        const blob = await jobsDb.getChunkThumbnail(jobId, camId, chunkId);
+        if (!blob) return;
+        const url = URL.createObjectURL(blob);
+        const entry: ThumbCacheEntry = { url, lastAccessedTick: 0 };
+        recordAccess(ck, entry);
+        evictIfFull();
+        hits += 1;
+      } catch {
+        /* per-chunk failure non-fatal */
+      }
+    }),
+  );
+  return hits;
 }
 
 /** Drop every in-memory blob-URL + tear down all probes. Called when

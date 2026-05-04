@@ -58,6 +58,15 @@ export interface VideoAsset {
   width?: number;
   height?: number;
   fps?: number;
+  /** Display rotation in degrees clockwise that needs to be applied to
+   *  the codec-level pixel buffer for correct on-screen orientation.
+   *  Decoded from the source MP4's `tkhd` matrix at sync time and
+   *  persisted so consumers (chunk-thumbnail extractor, future
+   *  renderers) don't have to re-demux just for the rotation flag.
+   *  Optional / undefined for legacy rows synced before this field
+   *  existed — those callers can fall back to a `<video>.videoWidth /
+   *  videoHeight` vs `width / height` swap-heuristic. */
+  intrinsicRotationDeg?: 0 | 90 | 180 | 270;
   /** OPFS-Pfad zur extrahierten Thumbnail-Strip-Datei (frames.webp). */
   framesPath?: string;
   // ---- Editor-state, persisted via auto-save ----

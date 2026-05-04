@@ -415,6 +415,7 @@ async function runCamPrep(
   let durationS: number | undefined;
   let width: number | undefined;
   let height: number | undefined;
+  let intrinsicRotationDeg: 0 | 90 | 180 | 270 | undefined;
   try {
     const { demuxVideoTrack } = await import("./codec/webcodecs/demux");
     const v = await demuxVideoTrack(videoFile);
@@ -422,6 +423,7 @@ async function runCamPrep(
       durationS = v.info.durationS;
       width = v.info.width;
       height = v.info.height;
+      intrinsicRotationDeg = v.info.rotationDeg;
     }
   } catch {
     // ignore — nice-to-have
@@ -457,6 +459,7 @@ async function runCamPrep(
     durationS,
     width,
     height,
+    intrinsicRotationDeg,
     framesPath,
   };
 }
