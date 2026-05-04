@@ -43,6 +43,30 @@ await page.goto(BASE, { waitUntil: "networkidle" });
 await page.waitForSelector('text="Drop the song."', { timeout: 10_000 });
 log("upload page visible");
 
+// Wipe the chunk-thumbnails IDB store between runs so we test FRESH
+// extraction (tiers 2 + 3), not whatever the previous run cached.
+await page.evaluate(async () => {
+  const dbName = "videoaudiosync";
+  await new Promise((resolve) => {
+    const req = indexedDB.open(dbName);
+    req.onsuccess = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains("chunk-thumbnails")) {
+        db.close();
+        resolve();
+        return;
+      }
+      const tx = db.transaction("chunk-thumbnails", "readwrite");
+      tx.objectStore("chunk-thumbnails").clear().onsuccess = () => {
+        db.close();
+        resolve();
+      };
+    };
+    req.onerror = () => resolve();
+    setTimeout(resolve, 3000);
+  });
+});
+
 const jobId = await page.evaluate(async () => {
   const m = await import("/src/local/jobs.ts");
   async function asFile(url, name, type) {
