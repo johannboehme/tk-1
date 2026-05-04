@@ -134,7 +134,7 @@ if (!synced.chunks || synced.chunks.length < 4) {
 
 // Desktop arrange.
 await page.goto(`${BASE}/job/${jobId}/arrange`, { waitUntil: "networkidle" });
-await page.waitForSelector("text=/CONTACT SHEET/i", { timeout: 15_000 });
+await page.waitForSelector("text=/CHUNKS ·/i", { timeout: 15_000 });
 await page.waitForTimeout(3_500); // let polaroids develop fully
 
 await page.screenshot({ path: path.join(OUT, "01-arrange-desktop.png") });

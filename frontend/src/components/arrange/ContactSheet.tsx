@@ -55,10 +55,7 @@ export function ContactSheet() {
     <section className="flex-1 min-h-0 rounded-md border border-rule bg-paper-hi shadow-panel overflow-hidden flex flex-col">
       <header className="flex-none bg-paper-panel border-b border-rule px-3 py-2 flex items-center gap-2">
         <span className="font-display tracking-label uppercase text-[10px] text-ink-2">
-          ◇ Contact sheet
-        </span>
-        <span className="font-mono text-[10px] tabular text-ink-3">
-          {acceptedChunks.length} chunks
+          ◇ Chunks · {acceptedChunks.length}
         </span>
         <span className="ml-auto font-mono text-[9px] tabular tracking-label uppercase text-ink-3 hidden sm:inline">
           + ADD inserts at cursor

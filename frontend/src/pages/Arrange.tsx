@@ -114,7 +114,7 @@ export default function Arrange() {
 
   if (error) {
     return (
-      <div className="flex-1 flex flex-col min-h-0 paper-bg">
+      <div className="h-screen flex flex-col min-h-0 paper-bg overflow-hidden">
         <PhaseStrip
           phase="arrange"
           jobTitle={null}
@@ -132,7 +132,7 @@ export default function Arrange() {
 
   if (!job) {
     return (
-      <div className="flex-1 flex flex-col min-h-0 paper-bg">
+      <div className="h-screen flex flex-col min-h-0 paper-bg overflow-hidden">
         <PhaseStrip
           phase="arrange"
           jobTitle={null}
@@ -149,7 +149,7 @@ export default function Arrange() {
   }
 
   return (
-    <div className="flex-1 flex flex-col min-h-0 paper-bg">
+    <div className="h-screen flex flex-col min-h-0 paper-bg overflow-hidden">
       <PhaseStrip
         phase="arrange"
         jobTitle={job.title}
