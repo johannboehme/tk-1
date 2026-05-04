@@ -410,7 +410,7 @@ export interface PunchFxRecord {
 }
 
 const DB_NAME = "videoaudiosync";
-const DB_VERSION = 4;
+const DB_VERSION = 5;
 const STORE = "jobs";
 const ANALYSIS_STORE = "audio-analysis";
 /** Per-chunk thumbnail JPEG bytes, keyed by `${jobId}::${camId}::${chunkId}`.
@@ -457,6 +457,16 @@ function db(): Promise<IDBPDatabase> {
             keyPath: "key",
           });
           s.createIndex("by-jobId", "jobId");
+        }
+
+        // V4 → V5: chunk-thumbnail extraction logic learned to apply
+        // intrinsic MP4 rotation. Old cached blobs were extracted
+        // without the rotation transform — wipe them so the next
+        // page-mount re-extracts via the corrected pipeline.
+        // Auto-heal — no user-facing migration UI needed.
+        if (oldVersion === 4 && database.objectStoreNames.contains(CHUNK_THUMBS_STORE)) {
+          const s = tx.objectStore(CHUNK_THUMBS_STORE);
+          await s.clear();
         }
       },
     });

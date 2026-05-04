@@ -398,7 +398,7 @@ await page.goto(`${BASE}/job/${jobId}/arrange`, { waitUntil: "networkidle" });
 await page.waitForTimeout(3_000);
 const cacheSize = await page.evaluate(async () => {
   return await new Promise((resolve) => {
-    const req = indexedDB.open("videoaudiosync", 4);
+    const req = indexedDB.open("videoaudiosync", 5);
     req.onsuccess = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains("chunk-thumbnails")) {

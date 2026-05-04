@@ -106,11 +106,14 @@ export function Polaroid({
         ) : (
           <PolaroidEmpty failed={thumb.failed} camColor={camColor} />
         )}
-        {/* Cam-color sticker top-right — like a tape-marker dot */}
+        {/* Cam-color sticker top-right — identifies which cam this
+         *  thumbnail is from (cam-1 is cobalt, cam-2 amber, etc).
+         *  Different vocabulary than the usage-count dots in the
+         *  label strip — the title makes that explicit on hover. */}
         <span
-          aria-hidden
           className="absolute right-1 top-1 h-2 w-2 rounded-full ring-1 ring-paper-hi/80"
           style={{ background: camColor }}
+          title={cam ? `Source: ${cam.id}` : "no cam"}
         />
       </div>
 
@@ -155,8 +158,11 @@ function PolaroidEmpty({
   return (
     <div className="absolute inset-0 grid place-items-center">
       {failed ? (
-        <span className="font-mono text-[9px] tracking-label uppercase text-paper-hi/70">
-          out of range
+        <span
+          className="font-mono text-[9px] tracking-label uppercase text-paper-hi/70"
+          title="Frame extraction failed — could be a codec quirk or a chunk outside the cam's recorded range. The chunk is still usable; only the preview is missing."
+        >
+          no preview
         </span>
       ) : (
         <DevelopingIndicator color={camColor} />
