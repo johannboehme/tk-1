@@ -58,7 +58,7 @@ export function ContactSheet() {
           ◇ Chunks · {acceptedChunks.length}
         </span>
         <span className="ml-auto font-mono text-[9px] tabular tracking-label uppercase text-ink-3 hidden sm:inline">
-          + ADD inserts at cursor
+          drag to strip · or hit + ADD
         </span>
       </header>
       <div

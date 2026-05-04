@@ -97,10 +97,213 @@ interface CamProbe {
   syncOffsetMs: number;
 }
 
-const probes = new Map<string, CamProbe>();
+// Map keyed by jobId::camId. Stores the in-flight Promise — concurrent
+// callers (e.g. 30 polaroids mounting at once) all await the SAME
+// probe creation instead of each kicking off a separate demux + IDB
+// roundtrip + <video> element. Without this dedup we'd leak 29 video
+// elements per cam on every mount.
+const probes = new Map<string, Promise<CamProbe | null>>();
 
 function probeKey(jobId: string, camId: string): string {
   return `${jobId}::${camId}`;
+}
+
+function thumbLog(...args: unknown[]) {
+  // Opt-in via `localStorage.__thumbDebug = '1'` — silent in prod by
+  // default. Use to diagnose rotation / tier / seek issues.
+  if (typeof localStorage === "undefined") return;
+  if (localStorage.getItem("__thumbDebug") !== "1") return;
+  // eslint-disable-next-line no-console
+  console.log("[thumb]", ...args);
+}
+
+async function buildProbe(
+  jobId: string,
+  cam: VideoAsset,
+): Promise<CamProbe | null> {
+  const url = await resolveCamAssetUrl(jobId, cam.id, "video");
+  if (!url) {
+    thumbLog("probe", cam.id, "no url");
+    return null;
+  }
+  const video = document.createElement("video");
+  video.muted = true;
+  video.playsInline = true;
+  video.preload = "auto";
+  video.src = url;
+
+  // 30 s metadata timeout. Big files (multi-GB phone recordings) can
+  // take tens of seconds to surface `loadedmetadata` on a cold
+  // OPFS-backed blob URL — 5 s was too aggressive and turned into a
+  // silent "v.duration === NaN" path that produced "no preview"
+  // placeholders later in tier 3.
+  const metadataReady = new Promise<void>((resolve) => {
+    let timer: number | null = null;
+    function done(reason: string) {
+      if (timer != null) clearTimeout(timer);
+      cleanup();
+      thumbLog(
+        "metadata",
+        cam.id,
+        reason,
+        "videoW=" + video.videoWidth,
+        "videoH=" + video.videoHeight,
+        "duration=" + video.duration,
+      );
+      resolve();
+    }
+    function cleanup() {
+      video.removeEventListener("loadedmetadata", () => done("event"));
+      video.removeEventListener("error", () => done("error"));
+    }
+    video.addEventListener("loadedmetadata", () => done("event"), {
+      once: true,
+    });
+    video.addEventListener("error", () => done("error"), { once: true });
+    if (video.readyState >= 1) done("already-ready");
+    timer = window.setTimeout(() => done("timeout-30s"), 30_000);
+  });
+
+  // Determine intrinsic rotation. Strategy:
+  //
+  //   1. Start with `cam.intrinsicRotationDeg` if persisted (from sync
+  //      time matrix decode). Use as the candidate.
+  //   2. If undefined, run lazy demux probe over the moov atom.
+  //   3. After metadata loads, run the dim-swap CROSS-CHECK against
+  //      the `<video>` element's display dims. Browsers honour the
+  //      container's display matrix when computing videoWidth/Height,
+  //      so it's the most reliable source of truth at runtime.
+  //      If dim-swap disagrees with the candidate (e.g. candidate=0
+  //      but the video is clearly portrait), override to 90 — a
+  //      previous matrix-decode bug at sync time mustn't survive into
+  //      tier-2 thumbnails forever.
+  //   4. If everything fails, fall back to 0.
+  //
+  // The cross-check fixes the case where intrinsicRotationDeg was
+  // persisted as 0 (e.g. mp4box exposed an unexpected matrix layout
+  // for a specific file) but the file is actually portrait — without
+  // it, tier 2 silently produces sideways thumbs while tier 3 (which
+  // honours browser auto-rotation) produces upright ones, giving
+  // mixed thumbnails for the same cam.
+  function detectDimSwap(): 0 | 90 | "unknown" {
+    const dispW = video.videoWidth;
+    const dispH = video.videoHeight;
+    const storedW = cam.width ?? 0;
+    const storedH = cam.height ?? 0;
+    if (storedW <= 0 || storedH <= 0 || dispW <= 0 || dispH <= 0) {
+      return "unknown";
+    }
+    if (dispW === storedH && dispH === storedW) return 90;
+    if (dispW === storedW && dispH === storedH) return 0;
+    return "unknown";
+  }
+
+  const rotationDegPromise: Promise<0 | 90 | 180 | 270> = (async () => {
+    let candidate: 0 | 90 | 180 | 270 | undefined = cam.intrinsicRotationDeg;
+    let source = "cam-field";
+
+    if (candidate === undefined) {
+      try {
+        const file = await loadAssetFile(cam);
+        const m = await import("../codec/webcodecs/demux");
+        const v = await m.demuxVideoTrack(file);
+        if (v) {
+          candidate = v.info.rotationDeg;
+          source = "lazy-demux";
+          void jobsDb
+            .updateJob(jobId, {
+              videos: await (async () => {
+                const job = await jobsDb.getJob(jobId);
+                return (job?.videos ?? []).map((v2) =>
+                  isVideoAsset(v2) && v2.id === cam.id
+                    ? { ...v2, intrinsicRotationDeg: candidate as 0 | 90 | 180 | 270 }
+                    : v2,
+                );
+              })(),
+            })
+            .catch(() => undefined);
+        } else {
+          thumbLog("rotation", cam.id, "lazy-demux-returned-null");
+        }
+      } catch (err) {
+        thumbLog("rotation", cam.id, "lazy-demux-throw", String(err));
+      }
+    }
+
+    // Cross-check against runtime display dims — the browser honours
+    // the container's display matrix here, so it's authoritative.
+    await metadataReady;
+    const dimSwap = detectDimSwap();
+    const candidateImpliesSwap = candidate === 90 || candidate === 270;
+
+    if (dimSwap === 90 && !candidateImpliesSwap) {
+      thumbLog(
+        "rotation",
+        cam.id,
+        "override-from-dim-swap",
+        `candidate=${candidate}(${source})`,
+        "→ 90",
+        `display=${video.videoWidth}x${video.videoHeight}`,
+        `stored=${cam.width}x${cam.height}`,
+      );
+      // The `<video>` element shows portrait but our candidate said
+      // landscape. Override to 90. We can't distinguish 90 from 270
+      // without the matrix, but 90 covers the common case (phone
+      // held in portrait).
+      return 90;
+    }
+    if (dimSwap === 0 && candidateImpliesSwap) {
+      thumbLog(
+        "rotation",
+        cam.id,
+        "override-no-swap",
+        `candidate=${candidate}(${source})`,
+        "→ 0",
+        `display=${video.videoWidth}x${video.videoHeight}`,
+        `stored=${cam.width}x${cam.height}`,
+      );
+      return 0;
+    }
+
+    if (candidate !== undefined) {
+      thumbLog(
+        "rotation",
+        cam.id,
+        source,
+        candidate,
+        `dim-swap=${dimSwap}`,
+      );
+      return candidate;
+    }
+    // Fall through: no demux candidate, dim-swap inconclusive.
+    if (dimSwap === 90) {
+      thumbLog("rotation", cam.id, "fallback-dim-swap", 90);
+      return 90;
+    }
+    thumbLog("rotation", cam.id, "fallback-zero", 0, `dim-swap=${dimSwap}`);
+    return 0;
+  })();
+
+  // Build the probe object up front so we have a stable reference. The
+  // `ready` promise is constructed via rotationDegPromise (NOT
+  // Promise.all) so we can SET probe.rotationDeg synchronously inside
+  // the same continuation that resolves ready — that way every awaiter
+  // observes the real value, no microtask-ordering hazard.
+  const probe: CamProbe = {
+    video,
+    srcUrl: url,
+    ready: undefined as unknown as Promise<void>,
+    rotationDeg: cam.intrinsicRotationDeg ?? 0,
+    queue: Promise.resolve(),
+    refCount: 0,
+    syncOffsetMs: (cam.sync?.offsetMs ?? 0) + (cam.syncOverrideMs ?? 0),
+  };
+  probe.ready = rotationDegPromise.then(async (r) => {
+    probe.rotationDeg = r;
+    await metadataReady;
+    thumbLog("probe-ready", cam.id, `rotation=${r}`);
+  });
+  return probe;
 }
 
 async function getOrCreateProbe(
@@ -108,135 +311,43 @@ async function getOrCreateProbe(
   cam: VideoAsset,
 ): Promise<CamProbe | null> {
   const key = probeKey(jobId, cam.id);
-  const existing = probes.get(key);
-  if (existing) {
-    existing.refCount += 1;
-    existing.syncOffsetMs =
-      (cam.sync?.offsetMs ?? 0) + (cam.syncOverrideMs ?? 0);
-    return existing;
+  let promise = probes.get(key);
+  if (!promise) {
+    promise = buildProbe(jobId, cam);
+    probes.set(key, promise);
   }
-  const url = await resolveCamAssetUrl(jobId, cam.id, "video");
-  if (!url) return null;
-  const video = document.createElement("video");
-  video.muted = true;
-  video.playsInline = true;
-  video.preload = "auto";
-  video.src = url;
-
-  const metadataReady = new Promise<void>((resolve) => {
-    function done() {
-      cleanup();
-      resolve();
-    }
-    function cleanup() {
-      video.removeEventListener("loadedmetadata", done);
-      video.removeEventListener("error", done);
-    }
-    video.addEventListener("loadedmetadata", done, { once: true });
-    video.addEventListener("error", done, { once: true });
-    if (video.readyState >= 1) done();
-    setTimeout(done, 5_000); // never block forever
-  });
-
-  // Determine intrinsic rotation. Preference order:
-  //   1. `cam.intrinsicRotationDeg` — persisted at sync time from
-  //      the demuxer's matrix decode. Authoritative; distinguishes
-  //      90 from 270.
-  //   2. Lazy demux probe — for legacy jobs synced before the
-  //      field existed. Reads only the moov atom so this stays
-  //      cheap even on multi-GB sources, and persists the result
-  //      back to the asset so the next page-mount uses tier 1.
-  //   3. Dim-swap heuristic — last-resort fallback if the demux
-  //      throws (unsupported container, file missing). Can't
-  //      distinguish 90 from 270; defaults to 90 which fits the
-  //      common phone-portrait case.
-  const rotationDegPromise: Promise<0 | 90 | 180 | 270> =
-    cam.intrinsicRotationDeg !== undefined
-      ? Promise.resolve(cam.intrinsicRotationDeg)
-      : (async () => {
-          // Try the demux probe first. moov is at the head of most
-          // MP4 / MOV files, so this reads kilobytes, not gigabytes.
-          try {
-            const file = await loadAssetFile(cam);
-            const m = await import("../codec/webcodecs/demux");
-            const v = await m.demuxVideoTrack(file);
-            if (v) {
-              const r = v.info.rotationDeg;
-              // Persist back so future loads short-circuit. No await
-              // — UI doesn't need to wait for the IDB write.
-              void jobsDb
-                .updateJob(jobId, {
-                  videos: await (async () => {
-                    const job = await jobsDb.getJob(jobId);
-                    return (job?.videos ?? []).map((v2) =>
-                      isVideoAsset(v2) && v2.id === cam.id
-                        ? { ...v2, intrinsicRotationDeg: r }
-                        : v2,
-                    );
-                  })(),
-                })
-                .catch(() => undefined);
-              return r;
-            }
-          } catch {
-            /* fall through to heuristic */
-          }
-          // Heuristic: dim-swap implies a 90° (or 270°) rotation.
-          await metadataReady;
-          const dispW = video.videoWidth;
-          const dispH = video.videoHeight;
-          const storedW = cam.width ?? 0;
-          const storedH = cam.height ?? 0;
-          if (
-            storedW > 0 &&
-            storedH > 0 &&
-            dispW > 0 &&
-            dispH > 0 &&
-            dispW === storedH &&
-            dispH === storedW
-          ) {
-            return 90 as const;
-          }
-          return 0 as const;
-        })();
-
-  // probe.ready resolves only after BOTH metadata + rotation. That
-  // way tier-2 callers reading `probe.rotationDeg` after `await
-  // probe.ready` always see the real value, never the placeholder
-  // default.
-  const ready = Promise.all([metadataReady, rotationDegPromise]).then(() => {
-    /* discard tuple — callers only need the void resolution */
-  });
-  const probe: CamProbe = {
-    video,
-    srcUrl: url,
-    ready,
-    rotationDeg: cam.intrinsicRotationDeg ?? 0,
-    queue: Promise.resolve(),
-    refCount: 1,
-    syncOffsetMs: (cam.sync?.offsetMs ?? 0) + (cam.syncOverrideMs ?? 0),
-  };
-  probes.set(key, probe);
-  void rotationDegPromise.then((r) => {
-    probe.rotationDeg = r;
-  });
+  const probe = await promise;
+  if (!probe) {
+    // Don't keep a null promise pinned — let a future caller retry.
+    if (probes.get(key) === promise) probes.delete(key);
+    return null;
+  }
+  probe.refCount += 1;
+  probe.syncOffsetMs =
+    (cam.sync?.offsetMs ?? 0) + (cam.syncOverrideMs ?? 0);
   return probe;
 }
 
 function releaseProbe(jobId: string, camId: string) {
   const key = probeKey(jobId, camId);
-  const p = probes.get(key);
-  if (!p) return;
-  p.refCount -= 1;
-  if (p.refCount > 0) return;
-  setTimeout(() => {
-    const p2 = probes.get(key);
-    if (!p2 || p2.refCount > 0) return;
-    URL.revokeObjectURL(p2.srcUrl);
-    p2.video.removeAttribute("src");
-    p2.video.load();
-    probes.delete(key);
-  }, 5_000);
+  const promise = probes.get(key);
+  if (!promise) return;
+  void promise.then((p) => {
+    if (!p) return;
+    p.refCount -= 1;
+    if (p.refCount > 0) return;
+    setTimeout(() => {
+      const promise2 = probes.get(key);
+      if (!promise2) return;
+      void promise2.then((p2) => {
+        if (!p2 || p2.refCount > 0) return;
+        URL.revokeObjectURL(p2.srcUrl);
+        p2.video.removeAttribute("src");
+        p2.video.load();
+        if (probes.get(key) === promise2) probes.delete(key);
+      });
+    }, 5_000);
+  });
 }
 
 // ─── Tier 2: strip slice ───────────────────────────────────────────────
@@ -280,13 +391,19 @@ async function loadCamStrip(
     URL.revokeObjectURL(url);
     return null;
   }
-  // Plan must mirror the extractor's tile cadence — derived from the
-  // same inputs (durationS + dims), defaults aligned with the
-  // extractor's defaults (tileHeight 80, maxTiles 100).
+  // Plan must mirror the extractor's tile cadence. New strips have
+  // rotation BAKED IN at extraction time (`framesOrientation:
+  // "display"`) — the planner there used the post-rotation aspect, so
+  // we replay that here too. Legacy strips (orientation undefined or
+  // "codec") used codec dims; consumers slice them with the manual
+  // rotation override below.
+  const swap =
+    cam.framesOrientation === "display" &&
+    (cam.intrinsicRotationDeg === 90 || cam.intrinsicRotationDeg === 270);
   const plan = planTileStrip({
     durationS: cam.durationS,
-    sourceWidth: cam.width,
-    sourceHeight: cam.height,
+    sourceWidth: swap ? cam.height : cam.width,
+    sourceHeight: swap ? cam.width : cam.height,
     tileHeight: 80,
     maxTiles: 100,
   });
@@ -413,10 +530,20 @@ async function sliceTileToBlob(
 async function seekAndCapture(
   probe: CamProbe,
   masterTimeS: number,
+  chunkIdForLog: string,
 ): Promise<Blob | null> {
   await probe.ready;
   const v = probe.video;
-  if (!Number.isFinite(v.duration) || v.duration <= 0) return null;
+  if (!Number.isFinite(v.duration) || v.duration <= 0) {
+    thumbLog(
+      "tier3-fail",
+      chunkIdForLog,
+      "no-duration",
+      "duration=" + v.duration,
+      "readyState=" + v.readyState,
+    );
+    return null;
+  }
   // Clamp the seek target into the cam's recorded range. Chunks whose
   // master-time falls before the cam started (sourceTimeS < 0) or past
   // its end (sourceTimeS > duration) get the boundary frame instead
@@ -425,25 +552,46 @@ async function seekAndCapture(
   const rawSource = masterTimeS - probe.syncOffsetMs / 1000;
   const sourceTimeS = Math.max(0, Math.min(v.duration - 0.05, rawSource));
 
+  let seekedFired = false;
   await new Promise<void>((resolve) => {
     let timer: number | null = null;
-    function done() {
+    function done(reason: string) {
       if (timer != null) clearTimeout(timer);
-      v.removeEventListener("seeked", done);
+      v.removeEventListener("seeked", onSeeked);
+      if (reason === "seeked") seekedFired = true;
       resolve();
     }
-    v.addEventListener("seeked", done);
+    function onSeeked() {
+      done("seeked");
+    }
+    v.addEventListener("seeked", onSeeked);
     try {
       v.currentTime = sourceTimeS;
-    } catch {
-      done();
+    } catch (err) {
+      thumbLog(
+        "tier3-fail",
+        chunkIdForLog,
+        "seek-throw",
+        String(err),
+      );
+      done("throw");
       return;
     }
     // Safety timeout — some codecs / files never fire `seeked` for
     // a target near EOF. 2 s is generous; we'd rather draw whatever
     // frame is current than hang.
-    timer = window.setTimeout(done, 2_000);
+    timer = window.setTimeout(() => done("timeout-2s"), 2_000);
   });
+
+  if (!seekedFired) {
+    thumbLog(
+      "tier3-warn",
+      chunkIdForLog,
+      "no-seeked-event",
+      "target=" + sourceTimeS.toFixed(3),
+      "current=" + v.currentTime.toFixed(3),
+    );
+  }
 
   // `<video>` width/height already honour the MP4 rotation matrix,
   // so we don't need to re-apply it here — drawImage(video) gets
@@ -456,16 +604,31 @@ async function seekAndCapture(
   canvas.width = w;
   canvas.height = h;
   const ctx = canvas.getContext("2d");
-  if (!ctx) return null;
+  if (!ctx) {
+    thumbLog("tier3-fail", chunkIdForLog, "no-2d-context");
+    return null;
+  }
   try {
     ctx.drawImage(v, 0, 0, w, h);
-  } catch {
+  } catch (err) {
+    thumbLog("tier3-fail", chunkIdForLog, "drawImage-throw", String(err));
     return null;
   }
 
-  return await new Promise<Blob | null>((resolve) => {
+  const blob = await new Promise<Blob | null>((resolve) => {
     canvas.toBlob((b) => resolve(b), "image/jpeg", 0.78);
   });
+  if (!blob) {
+    thumbLog("tier3-fail", chunkIdForLog, "toBlob-null");
+  } else {
+    thumbLog(
+      "tier3-ok",
+      chunkIdForLog,
+      `source=${sourceTimeS.toFixed(2)}`,
+      `dim=${w}x${h}`,
+    );
+  }
+  return blob;
 }
 
 function clampMidpointMasterS(chunk: Chunk): number {
@@ -517,6 +680,7 @@ export async function getChunkThumbnailUrl(
   }
 
   let blob: Blob | null = null;
+  let usedTier: "2" | "3" | "none" = "none";
 
   // Tier 2 — strip slice.
   try {
@@ -526,11 +690,46 @@ export async function getChunkThumbnailUrl(
         (req.cam.sync?.offsetMs ?? 0) + (req.cam.syncOverrideMs ?? 0);
       const tileIdx = findCoveringTileIdx(req.chunk, syncOffsetMs, bundle.plan);
       if (tileIdx !== null) {
-        blob = await sliceTileToBlob(bundle, tileIdx, probe.rotationDeg);
+        // Display-oriented strips have rotation baked in at extract
+        // time — slicing then needs zero rotation. Legacy codec
+        // strips need the cross-checked probe rotation.
+        const sliceRotation =
+          req.cam.framesOrientation === "display"
+            ? (0 as const)
+            : probe.rotationDeg;
+        blob = await sliceTileToBlob(bundle, tileIdx, sliceRotation);
+        if (blob) {
+          usedTier = "2";
+          thumbLog(
+            "tier2-ok",
+            req.chunk.id,
+            `cam=${req.cam.id}`,
+            `tileIdx=${tileIdx}`,
+            `orient=${req.cam.framesOrientation ?? "codec"}`,
+            `sliceRot=${sliceRotation}`,
+          );
+        } else {
+          thumbLog(
+            "tier2-fail",
+            req.chunk.id,
+            "slice-returned-null",
+            `tileIdx=${tileIdx}`,
+          );
+        }
+      } else {
+        thumbLog(
+          "tier2-skip",
+          req.chunk.id,
+          "no-covering-tile",
+          `chunkRange=${(req.chunk.startMs / 1000).toFixed(2)}-${(req.chunk.endMs / 1000).toFixed(2)}`,
+          `syncOff=${syncOffsetMs}`,
+        );
       }
+    } else if (!bundle) {
+      thumbLog("tier2-skip", req.chunk.id, "no-strip", `cam=${req.cam.id}`);
     }
-  } catch {
-    /* fall through to tier 3 */
+  } catch (err) {
+    thumbLog("tier2-throw", req.chunk.id, String(err));
   }
 
   // Tier 3 — on-demand seek (for chunks that fall between strip
@@ -538,14 +737,26 @@ export async function getChunkThumbnailUrl(
   if (!blob && probe) {
     const result = probe.queue
       .catch(() => null)
-      .then(() => seekAndCapture(probe, clampMidpointMasterS(req.chunk)));
+      .then(() =>
+        seekAndCapture(probe, clampMidpointMasterS(req.chunk), req.chunk.id),
+      );
     probe.queue = result.catch(() => null);
     try {
       blob = await result;
-    } catch {
+      if (blob) usedTier = "3";
+    } catch (err) {
+      thumbLog("tier3-throw", req.chunk.id, String(err));
       blob = null;
     }
   }
+
+  thumbLog(
+    "extract-done",
+    req.chunk.id,
+    `cam=${req.cam.id}`,
+    `tier=${usedTier}`,
+    `blob=${blob ? blob.size + "b" : "null"}`,
+  );
 
   if (probe) releaseProbe(req.jobId, req.cam.id);
 
@@ -627,10 +838,13 @@ export function clearChunkThumbnails(): void {
     URL.revokeObjectURL(entry.url);
   }
   urlCache.clear();
-  for (const [key, p] of probes) {
-    URL.revokeObjectURL(p.srcUrl);
-    p.video.removeAttribute("src");
-    p.video.load();
+  for (const [key, promise] of probes) {
+    void promise.then((p) => {
+      if (!p) return;
+      URL.revokeObjectURL(p.srcUrl);
+      p.video.removeAttribute("src");
+      p.video.load();
+    });
     probes.delete(key);
   }
   for (const [key, sp] of stripCache) {

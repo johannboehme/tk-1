@@ -15,6 +15,7 @@ import { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import type { Chunk, VideoAsset } from "../../storage/jobs-db";
 import { useChunkThumbnail } from "./useChunkThumbnail";
+import { useArrangeStore } from "../../local/arrange/arrange-store";
 
 interface PolaroidProps {
   jobId: string | null;
@@ -69,18 +70,85 @@ export function Polaroid({
   const lengthS = (chunk.endMs - chunk.startMs) / 1000;
   const camColor = cam?.color ?? "#FF5722";
 
+  // Drag-from-Polaroid → drop-on-Strip. We start the drag on
+  // pointerdown but only after the user has moved past a small
+  // threshold — that way a plain click still routes to the preview
+  // handler instead of being eaten by the drag gesture.
+  const beginChunkDrag = useArrangeStore((s) => s.beginChunkDrag);
+  const isDragSource = useArrangeStore(
+    (s) => s.drag?.chunkId === chunk.id,
+  );
+  const dragArmedRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+  } | null>(null);
+  // Tracks whether the most recent pointer-gesture moved past the drag
+  // threshold. We use this to swallow the click event that the
+  // browser fires after pointerup, so the preview-loop handler doesn't
+  // fire when the user actually meant to drag.
+  const draggedRef = useRef(false);
+  const DRAG_THRESHOLD_PX = 5;
+
+  function onPointerDownDragArm(e: React.PointerEvent) {
+    if (e.button !== 0 && e.pointerType !== "touch") return;
+    // Don't arm on the +ADD button — let it click normally.
+    const target = e.target as HTMLElement;
+    if (target.closest("[data-no-drag]")) return;
+    dragArmedRef.current = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+    };
+    draggedRef.current = false;
+  }
+  function onPointerMoveDragArm(e: React.PointerEvent) {
+    const armed = dragArmedRef.current;
+    if (!armed || armed.pointerId !== e.pointerId) return;
+    const dx = e.clientX - armed.startX;
+    const dy = e.clientY - armed.startY;
+    if (dx * dx + dy * dy < DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX) return;
+    dragArmedRef.current = null;
+    draggedRef.current = true;
+    beginChunkDrag({
+      chunkId: chunk.id,
+      thumbUrl: thumb.url,
+      camColor,
+      cursorX: e.clientX,
+      cursorY: e.clientY,
+    });
+  }
+  function onPointerUpDragArm() {
+    dragArmedRef.current = null;
+  }
+  function onClickGuarded() {
+    if (draggedRef.current) {
+      // The pointer-gesture became a drag — don't preview.
+      draggedRef.current = false;
+      return;
+    }
+    onPreview();
+  }
+
   return (
     <motion.div
       ref={wrapperRef}
       whileHover={{ y: -3, rotate: -0.5 }}
       transition={{ duration: 0.15 }}
-      className={`relative shrink-0 w-[124px] select-none rounded-md border border-rule/70 bg-paper-hi shadow-emboss ${active ? "ring-2 ring-cobalt ring-offset-1 ring-offset-paper" : ""}`}
+      className={`relative shrink-0 w-[124px] select-none rounded-md border border-rule/70 bg-paper-hi shadow-emboss ${active ? "ring-2 ring-cobalt ring-offset-1 ring-offset-paper" : ""} ${isDragSource ? "opacity-40" : ""}`}
       style={{
         // Polaroid stock = warm off-white with subtle paper texture
         background:
           "linear-gradient(180deg, #FBF7EE 0%, #F2EDE2 100%)",
+        // Touch action: prevent native scroll on the polaroid so a
+        // touch-drag can hand off to the chunk-drag controller.
+        touchAction: "none",
       }}
-      onClick={onPreview}
+      onClick={onClickGuarded}
+      onPointerDown={onPointerDownDragArm}
+      onPointerMove={onPointerMoveDragArm}
+      onPointerUp={onPointerUpDragArm}
+      onPointerCancel={onPointerUpDragArm}
       role="button"
       aria-label={`Chunk ${index + 1}, ${bars.toFixed(1)} bars`}
     >
@@ -106,15 +174,6 @@ export function Polaroid({
         ) : (
           <PolaroidEmpty failed={thumb.failed} camColor={camColor} />
         )}
-        {/* Cam-color sticker top-right — identifies which cam this
-         *  thumbnail is from (cam-1 is cobalt, cam-2 amber, etc).
-         *  Different vocabulary than the usage-count dots in the
-         *  label strip — the title makes that explicit on hover. */}
-        <span
-          className="absolute right-1 top-1 h-2 w-2 rounded-full ring-1 ring-paper-hi/80"
-          style={{ background: camColor }}
-          title={cam ? `Source: ${cam.id}` : "no cam"}
-        />
       </div>
 
       {/* Label strip — chunk meta + add affordance */}
@@ -131,10 +190,12 @@ export function Polaroid({
           <UsageDots count={usage} />
           <button
             type="button"
+            data-no-drag
             onClick={(e) => {
               e.stopPropagation();
               onAdd();
             }}
+            onPointerDown={(e) => e.stopPropagation()}
             className="inline-flex items-center justify-center rounded border border-hot/60 bg-hot text-paper-hi font-display font-semibold text-[9px] tracking-label uppercase shadow-emboss transition-colors hover:bg-hot-pressed"
             style={{ height: 20, paddingInline: 6 }}
             title="Insert into film strip at cursor"

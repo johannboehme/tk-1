@@ -46,6 +46,12 @@ export function FilmStrip() {
   const setStripMetrics = useArrangeStore((s) => s.setStripMetrics);
   const jobBpm = useArrangeStore((s) => s.jobBpm);
   const jobBeatsPerBar = useArrangeStore((s) => s.jobBeatsPerBar);
+  // Highlight the active drop target while the user is dragging a
+  // chunk from the Contact Sheet. Null when no drag is in flight or
+  // the pointer isn't over the strip.
+  const dropTargetIndex = useArrangeStore(
+    (s) => s.drag?.dropTargetIndex ?? null,
+  );
 
   const scrollerRef = useRef<HTMLDivElement | null>(null);
 
@@ -154,17 +160,23 @@ export function FilmStrip() {
   // ─── Empty state ──────────────────────────────────────────────────────
   if (arrangement.length === 0) {
     return (
-      <FilmStripShell scrollerRef={scrollerRef} contentRef={contentRef}>
+      <FilmStripShell
+        scrollerRef={scrollerRef}
+        contentRef={contentRef}
+        dropZoneEnd={0}
+      >
         <div className="flex w-full items-stretch">
           <InsertionCursor
+            index={0}
             active={insertionIndex === 0}
+            dropTarget={dropTargetIndex === 0}
             isTail
             height={FRAME_HEIGHT}
             onClick={() => setInsertionIndex(0)}
           />
           <div className="flex-1 flex items-center justify-center min-h-[96px] px-4">
             <span className="font-mono text-[11px] tracking-label uppercase text-paper-hi/60">
-              ◇ pool empty — add chunks from the contact sheet below
+              ◇ pool empty — drag a polaroid here, or hit + ADD
             </span>
           </div>
         </div>
@@ -173,7 +185,11 @@ export function FilmStrip() {
   }
 
   return (
-    <FilmStripShell scrollerRef={scrollerRef} contentRef={contentRef}>
+    <FilmStripShell
+      scrollerRef={scrollerRef}
+      contentRef={contentRef}
+      dropZoneEnd={arrangement.length}
+    >
       <div
         className="flex items-stretch"
         // Subtle horizontal grain to fake the film-stock texture
@@ -181,7 +197,9 @@ export function FilmStrip() {
       >
         {/* Leading cursor */}
         <InsertionCursor
+          index={0}
           active={insertionIndex === 0}
+          dropTarget={dropTargetIndex === 0}
           height={FRAME_HEIGHT}
           onClick={() => setInsertionIndex(0)}
         />
@@ -193,6 +211,7 @@ export function FilmStrip() {
           return (
             <div
               key={item.id}
+              data-strip-frame-index={i}
               className="flex items-stretch"
               onPointerDown={(e) => beginDrag(e, item.id)}
               style={{ touchAction: "pan-y" }}
@@ -216,7 +235,9 @@ export function FilmStrip() {
                 }}
               />
               <InsertionCursor
+                index={i + 1}
                 active={insertionIndex === i + 1}
+                dropTarget={dropTargetIndex === i + 1}
                 isTail={i === arrangement.length - 1}
                 height={FRAME_HEIGHT}
                 onClick={() => setInsertionIndex(i + 1)}
@@ -230,21 +251,31 @@ export function FilmStrip() {
 }
 
 /** Outer chrome: sprocket-hole rails + scroll container. The actual
- *  frames get composed into the middle band by the caller. */
+ *  frames get composed into the middle band by the caller.
+ *
+ *  `dropZoneEnd` is the index used as the fallback "drop at the end"
+ *  position when a chunk-drag lands inside the shell but not over a
+ *  specific frame or cursor (e.g. on the sprocket rails or empty
+ *  trailing space). The ChunkDragController hit-tests against the
+ *  `data-strip-drop-zone` attribute set here. */
 function FilmStripShell({
   scrollerRef,
   contentRef,
   children,
+  dropZoneEnd,
 }: {
   scrollerRef: React.MutableRefObject<HTMLDivElement | null>;
   contentRef: React.MutableRefObject<HTMLDivElement | null>;
   children: React.ReactNode;
+  dropZoneEnd: number;
 }) {
   return (
     <div
       ref={(el) => {
         scrollerRef.current = el;
       }}
+      data-strip-drop-zone="1"
+      data-strip-drop-zone-end={dropZoneEnd}
       className="relative w-full overflow-x-auto overflow-y-hidden bg-sunken rounded-md border border-rule shadow-emboss"
       style={{ height: STRIP_HEIGHT }}
     >
