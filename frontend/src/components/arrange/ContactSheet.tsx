@@ -52,8 +52,8 @@ export function ContactSheet() {
   }
 
   return (
-    <section className="rounded-md border border-rule bg-paper-hi shadow-panel overflow-hidden">
-      <header className="bg-paper-panel border-b border-rule px-3 py-2 flex items-center gap-2">
+    <section className="flex-1 min-h-0 rounded-md border border-rule bg-paper-hi shadow-panel overflow-hidden flex flex-col">
+      <header className="flex-none bg-paper-panel border-b border-rule px-3 py-2 flex items-center gap-2">
         <span className="font-display tracking-label uppercase text-[10px] text-ink-2">
           ◇ Contact sheet
         </span>
@@ -65,7 +65,7 @@ export function ContactSheet() {
         </span>
       </header>
       <div
-        className="overflow-x-auto overflow-y-hidden"
+        className="overflow-y-auto"
         style={{
           // Subtle paper-tone wash — the contact sheet is "mounted" on
           // a darker board, like a real darkroom contact print.
@@ -73,7 +73,10 @@ export function ContactSheet() {
             "linear-gradient(180deg, #E8E1D0 0%, #DDD4BE 100%)",
         }}
       >
-        <div className="flex items-stretch gap-3 px-3 py-3 min-w-max">
+        {/* Wrap-grid so the polaroids fill the available width and
+         *  height instead of forcing horizontal scroll. With ~124-px
+         *  cards the 1456-px desktop fits ~10 across, mobile 2-3. */}
+        <div className="flex flex-wrap items-stretch gap-3 px-3 py-3">
           {acceptedChunks.map((chunk, i) => {
             const bars = effectiveBarsForChunk(chunk, jobBpm, jobBeatsPerBar);
             const usage = usageCounts[chunk.id] ?? 0;
@@ -90,9 +93,6 @@ export function ContactSheet() {
                   insertChunkAtCursor(chunk.id);
                 }}
                 onPreview={() => {
-                  // Tap the body = focus + preview-loop:
-                  // jump the playhead to chunk start and start playing.
-                  // The audio hook will handle wrapping the loop region.
                   seek(chunk.startMs / 1000);
                   setPlaying(true);
                   focusItem(null);

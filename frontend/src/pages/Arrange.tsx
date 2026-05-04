@@ -32,7 +32,6 @@ import { clearChunkThumbnails } from "../local/arrange/chunk-thumbnails";
 import { FilmStrip } from "../components/arrange/FilmStrip";
 import { ContactSheet } from "../components/arrange/ContactSheet";
 import { PlayerCockpit } from "../components/arrange/PlayerCockpit";
-import { ArrangeInspector } from "../components/arrange/ArrangeInspector";
 import { ArrangeTransport } from "../components/arrange/ArrangeTransport";
 import { MiniMap } from "../components/arrange/MiniMap";
 import { ArrangeAudioMaster } from "../components/arrange/useArrangeAudio";
@@ -162,22 +161,18 @@ export default function Arrange() {
 
       <ArrangeAudioMaster />
 
-      {/* Single layout, responsive via Tailwind. Desktop (≥ lg) lays
-       *  the inspector into a 300px right rail; mobile stacks
-       *  everything vertically. Components mount ONCE so the
-       *  IntersectionObservers and Polaroid develops don't double up. */}
-      <main className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-[1fr_300px] gap-2 lg:gap-3 px-2 lg:px-3 py-2 lg:py-3 overflow-hidden">
-        <section className="flex flex-col gap-2 lg:gap-3 min-h-0 overflow-y-auto lg:order-1">
-          <PlayerCockpit />
-          <div>
-            <FilmStrip />
-            <MiniMap />
-          </div>
-          <ContactSheet />
-        </section>
-        <aside className="flex flex-col gap-2 lg:gap-3 min-h-0 overflow-y-auto lg:order-2">
-          <ArrangeInspector />
-        </aside>
+      {/* Full-width single-column layout. Inspector lives inside the
+       *  bottom transport bar instead of stealing horizontal real-
+       *  estate from the strip + contact sheet. ContactSheet is
+       *  flex-1 so it fills any vertical space the strip + cockpit
+       *  don't claim — wrap-grid inside, no wasted paper. */}
+      <main className="flex-1 min-h-0 flex flex-col gap-2 lg:gap-3 px-2 lg:px-3 py-2 lg:py-3 overflow-hidden">
+        <PlayerCockpit />
+        <div className="flex-none">
+          <FilmStrip />
+          <MiniMap />
+        </div>
+        <ContactSheet />
       </main>
 
       <ArrangeTransport showCursorControls />

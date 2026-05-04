@@ -401,9 +401,14 @@ export interface PunchFxRecord {
 }
 
 const DB_NAME = "videoaudiosync";
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 const STORE = "jobs";
 const ANALYSIS_STORE = "audio-analysis";
+/** Per-chunk thumbnail JPEG bytes, keyed by `${jobId}::${camId}::${chunkId}`.
+ *  Filled lazily by the Arrange page so reloads don't re-decode the
+ *  underlying video. Bounded soft-cap: callers can prune via
+ *  `pruneChunkThumbnailsForJob` when a job is deleted. */
+const CHUNK_THUMBS_STORE = "chunk-thumbnails";
 
 let dbPromise: Promise<IDBPDatabase> | null = null;
 
@@ -434,6 +439,15 @@ function db(): Promise<IDBPDatabase> {
         // Editor-Open eine frische Analyse.
         if (oldVersion < 3 && !database.objectStoreNames.contains(ANALYSIS_STORE)) {
           database.createObjectStore(ANALYSIS_STORE, { keyPath: "jobId" });
+        }
+
+        // V3 → V4: chunk-thumbnail cache so the Arrange page doesn't
+        // re-decode the same per-chunk thumbnails on every reload.
+        if (oldVersion < 4 && !database.objectStoreNames.contains(CHUNK_THUMBS_STORE)) {
+          const s = database.createObjectStore(CHUNK_THUMBS_STORE, {
+            keyPath: "key",
+          });
+          s.createIndex("by-jobId", "jobId");
         }
       },
     });
@@ -479,6 +493,7 @@ async function deleteJob(id: string): Promise<void> {
   if (d.objectStoreNames.contains(ANALYSIS_STORE)) {
     await d.delete(ANALYSIS_STORE, id);
   }
+  await deleteChunkThumbnailsForJob(id);
 }
 
 async function wipeAll(): Promise<void> {
@@ -486,6 +501,9 @@ async function wipeAll(): Promise<void> {
   await d.clear(STORE);
   if (d.objectStoreNames.contains(ANALYSIS_STORE)) {
     await d.clear(ANALYSIS_STORE);
+  }
+  if (d.objectStoreNames.contains(CHUNK_THUMBS_STORE)) {
+    await d.clear(CHUNK_THUMBS_STORE);
   }
 }
 
@@ -515,6 +533,63 @@ async function deleteAudioAnalysis(jobId: string): Promise<void> {
   }
 }
 
+interface ChunkThumbnailRecord {
+  /** `${jobId}::${camId}::${chunkId}` — primary key. */
+  key: string;
+  jobId: string;
+  /** image/jpeg bytes. */
+  blob: Blob;
+}
+
+function chunkThumbKey(jobId: string, camId: string, chunkId: string): string {
+  return `${jobId}::${camId}::${chunkId}`;
+}
+
+async function getChunkThumbnail(
+  jobId: string,
+  camId: string,
+  chunkId: string,
+): Promise<Blob | undefined> {
+  const d = await db();
+  if (!d.objectStoreNames.contains(CHUNK_THUMBS_STORE)) return undefined;
+  const rec = (await d.get(
+    CHUNK_THUMBS_STORE,
+    chunkThumbKey(jobId, camId, chunkId),
+  )) as ChunkThumbnailRecord | undefined;
+  return rec?.blob;
+}
+
+async function saveChunkThumbnail(
+  jobId: string,
+  camId: string,
+  chunkId: string,
+  blob: Blob,
+): Promise<void> {
+  const d = await db();
+  if (!d.objectStoreNames.contains(CHUNK_THUMBS_STORE)) return;
+  const rec: ChunkThumbnailRecord = {
+    key: chunkThumbKey(jobId, camId, chunkId),
+    jobId,
+    blob,
+  };
+  await d.put(CHUNK_THUMBS_STORE, rec);
+}
+
+/** Drop every cached thumbnail for a job (e.g. when the job itself is
+ *  deleted). Iterates the by-jobId index. */
+async function deleteChunkThumbnailsForJob(jobId: string): Promise<void> {
+  const d = await db();
+  if (!d.objectStoreNames.contains(CHUNK_THUMBS_STORE)) return;
+  const tx = d.transaction(CHUNK_THUMBS_STORE, "readwrite");
+  const idx = tx.store.index("by-jobId");
+  let cursor = await idx.openCursor(IDBKeyRange.only(jobId));
+  while (cursor) {
+    await cursor.delete();
+    cursor = await cursor.continue();
+  }
+  await tx.done;
+}
+
 export const jobsDb = {
   saveJob,
   getJob,
@@ -525,6 +600,9 @@ export const jobsDb = {
   getAudioAnalysis,
   saveAudioAnalysis,
   deleteAudioAnalysis,
+  getChunkThumbnail,
+  saveChunkThumbnail,
+  deleteChunkThumbnailsForJob,
 };
 
 export type JobsDb = typeof jobsDb;

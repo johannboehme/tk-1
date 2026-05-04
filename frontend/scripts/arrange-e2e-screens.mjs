@@ -88,18 +88,21 @@ if (!synced.chunks || synced.chunks.length < 4) {
     const m = await import("/src/local/jobs.ts");
     const j = await m.jobsDb.getJob(id);
     const dur = j.durationS ?? 30;
-    // 5 chunks, EACH 2.5s, separated by 1s gaps. That gives a clearly
-    // visible "off-segment" shaded gap between each pair on the editor
-    // audio lane — proves the segment-shading wiring works.
-    const chunkLenMs = 2500;
-    const gapMs = 1000;
+    // Compress 25 chunks into the available master-audio span. Mix
+    // long + short so the strip-vs-on-demand tier picker is exercised.
+    const N = 25;
+    const usable = dur - 0.5;
+    const base = (usable * 1000) / N;
     const chunks = [];
-    let cursor = 1500;
-    while (cursor + chunkLenMs <= dur * 1000 && chunks.length < 5) {
+    let cursor = 250;
+    for (let i = 0; i < N; i++) {
+      const lenMs = Math.max(400, Math.round(base * (i % 3 === 0 ? 0.5 : 1.0)));
+      const endMs = Math.min(dur * 1000 - 50, cursor + lenMs);
+      if (endMs <= cursor + 100) break;
       chunks.push({
-        id: `chunk-${cursor}-${cursor + chunkLenMs}`,
+        id: `chunk-${cursor}-${endMs}`,
         startMs: cursor,
-        endMs: cursor + chunkLenMs,
+        endMs,
         detectedBpm: 120,
         bpmOctaveShift: 0,
         effectiveBpm: 120,
@@ -107,7 +110,7 @@ if (!synced.chunks || synced.chunks.length < 4) {
         accepted: true,
         trimMode: "auto",
       });
-      cursor += chunkLenMs + gapMs;
+      cursor = endMs + 50;
     }
     const arrangement = chunks.map((c, i) => ({
       id: `arr-${c.id}-${Date.now()}-${i}`,
@@ -115,7 +118,7 @@ if (!synced.chunks || synced.chunks.length < 4) {
     }));
     await m.jobsDb.updateJob(id, { chunks, arrangement });
   }, jobId);
-  log("seeded synthetic chunks (with gaps) + arrangement");
+  log("seeded synthetic chunks (mixed lengths) + arrangement");
   const post = await page.evaluate(async (id) => {
     const m = await import("/src/local/jobs.ts");
     const j = await m.jobsDb.getJob(id);
@@ -195,6 +198,34 @@ if (frameCount >= 3) {
 }
 await page.screenshot({ path: path.join(OUT, "03-arrange-focused.png") });
 log(`03-arrange-focused (frames: ${frameCount})`);
+
+// Crop the bottom transport bar to assess the inline inspector layout.
+{
+  const bar = await page.locator(".bg-paper-hi.border-t.border-rule").last();
+  const box = await bar.boundingBox();
+  if (box) {
+    await page.screenshot({
+      path: path.join(OUT, "03b-transport-bar.png"),
+      clip: { x: box.x, y: box.y, width: box.width, height: box.height },
+    });
+    log("03b-transport-bar (inspector should be inline)");
+  }
+  // Diagnostic: which inspector buttons are present + visible?
+  const buttons = await page.evaluate(() =>
+    Array.from(document.querySelectorAll("button"))
+      .filter((b) => /Drop|Dup|×2|^◀$|^▶$/.test(b.textContent ?? ""))
+      .map((b) => {
+        const r = b.getBoundingClientRect();
+        return {
+          txt: b.textContent?.trim().slice(0, 12),
+          x: Math.round(r.x),
+          w: Math.round(r.width),
+          right: Math.round(r.right),
+        };
+      }),
+  );
+  console.log("[e2e] inspector buttons:", JSON.stringify(buttons));
+}
 
 // Move insertion cursor to the leftmost position (click leading cursor).
 // All cursor buttons are aria-label="Set insertion point".
@@ -314,6 +345,32 @@ await page.setViewportSize({ width: 414, height: 900 });
 await page.waitForTimeout(600);
 await page.screenshot({ path: path.join(OUT, "09-editor-mobile.png") });
 log("09-editor-mobile");
+
+// Quick verification of the IDB thumbnail cache: count how many
+// `chunk-thumbnails` rows landed in IDB after the user touched
+// every chunk on the page.
+await page.setViewportSize({ width: 1456, height: 900 });
+await page.goto(`${BASE}/job/${jobId}/arrange`, { waitUntil: "networkidle" });
+await page.waitForTimeout(3_000);
+const cacheSize = await page.evaluate(async () => {
+  return await new Promise((resolve) => {
+    const req = indexedDB.open("videoaudiosync", 4);
+    req.onsuccess = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains("chunk-thumbnails")) {
+        resolve({ ok: false, reason: "store missing" });
+        return;
+      }
+      const tx = db.transaction("chunk-thumbnails", "readonly");
+      const cnt = tx.objectStore("chunk-thumbnails").count();
+      cnt.onsuccess = () => resolve({ ok: true, count: cnt.result });
+      cnt.onerror = () => resolve({ ok: false, reason: "count error" });
+    };
+    req.onerror = () => resolve({ ok: false, reason: "open error" });
+    setTimeout(() => resolve({ ok: false, reason: "timeout" }), 5000);
+  });
+});
+console.log("[e2e] thumbnail cache:", JSON.stringify(cacheSize));
 
 await browser.close();
 log("done");
