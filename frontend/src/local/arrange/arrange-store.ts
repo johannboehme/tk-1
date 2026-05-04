@@ -15,6 +15,8 @@ import type {
   Chunk,
   VideoAsset,
 } from "../../storage/jobs-db";
+import type { AudioAnalysis } from "../render/audio-analysis/types";
+import type { ChunkMelData } from "./chunk-mel";
 
 export interface ArrangePlayback {
   /** Master-audio time (seconds). The arrangement playback walks
@@ -106,6 +108,16 @@ export interface ArrangeState {
    *  Null when not dragging. */
   drag: ArrangeDrag | null;
 
+  /** Master-audio analysis (band envelopes, onsets, RMS, beats). Null
+   *  while loading or absent. Drives auto-tags + color tag + stem
+   *  bars. Loaded once per job; survives the rest of the session in
+   *  IDB via `getOrComputeAnalysis`. */
+  analysis: AudioAnalysis | null;
+  /** Per-chunk mel-spectrogram data, keyed by chunk.id. Filled lazily
+   *  as the worker chews through the chunk pool — frames already
+   *  computed render immediately, frames in flight show a placeholder. */
+  melByChunkId: Record<string, ChunkMelData>;
+
   // ─── Actions ──────────────────────────────────────────────────────────
   initFromJob(args: {
     jobId: string;
@@ -142,10 +154,18 @@ export interface ArrangeState {
   seek(t: number): void;
   tickTime(t: number): void;
   setCurrentItemId(id: string | null): void;
+  /** Combined action: focus + set as current playback item + seek to
+   *  its chunk start. Use this for frame clicks, MiniMap clicks, etc.
+   *  — anywhere the user picks "this is what I want to play next". */
+  seekToItem(itemId: string): void;
 
   // View.
   setStripScrollPx(px: number): void;
   setStripMetrics(viewportWidthPx: number, contentWidthPx: number): void;
+
+  // Audio glance data.
+  setAnalysis(a: AudioAnalysis | null): void;
+  setChunkMel(chunkId: string, data: ChunkMelData): void;
 
   // Chunk-drag (Polaroid → FilmStrip).
   beginChunkDrag(args: {
@@ -209,6 +229,8 @@ export const useArrangeStore = create<ArrangeState>((set, get) => ({
   playback: INITIAL_PLAYBACK,
   view: INITIAL_VIEW,
   drag: null,
+  analysis: null,
+  melByChunkId: {},
 
   initFromJob(args) {
     set({
@@ -225,6 +247,8 @@ export const useArrangeStore = create<ArrangeState>((set, get) => ({
       playback: INITIAL_PLAYBACK,
       view: INITIAL_VIEW,
       drag: null,
+      // initFromJob preserves analysis + mel data across re-keying so
+      // hot reloads in dev don't re-trigger the full PCM decode.
     });
   },
 
@@ -243,7 +267,16 @@ export const useArrangeStore = create<ArrangeState>((set, get) => ({
       playback: INITIAL_PLAYBACK,
       view: INITIAL_VIEW,
       drag: null,
+      analysis: null,
+      melByChunkId: {},
     });
+  },
+
+  setAnalysis(a) {
+    set({ analysis: a });
+  },
+  setChunkMel(chunkId, data) {
+    set((s) => ({ melByChunkId: { ...s.melByChunkId, [chunkId]: data } }));
   },
 
   setInsertionIndex(idx) {
@@ -349,7 +382,42 @@ export const useArrangeStore = create<ArrangeState>((set, get) => ({
   },
 
   setPlaying(p) {
-    set((s) => ({ playback: { ...s.playback, isPlaying: p } }));
+    const s = get();
+    // Going false→true: pick which arrangement item to start from.
+    // Priority: the existing currentItemId (if it still resolves) →
+    // focusedItemId → arrangement[0]. Always snap currentTime to that
+    // item's chunk start. Audio master walks forward from there via
+    // crossfade-hops; identification of "which item plays right now"
+    // is done by ID, not by time-matching, so duplicates inside the
+    // arrangement (item ↔ chunk is many-to-one) work correctly.
+    if (p && !s.playback.isPlaying && s.arrangement.length > 0) {
+      const items = s.arrangement;
+      let targetId: string | null = s.playback.currentItemId;
+      if (targetId && !items.some((a) => a.id === targetId)) {
+        targetId = null;
+      }
+      if (!targetId) {
+        targetId =
+          s.focusedItemId && items.some((a) => a.id === s.focusedItemId)
+            ? s.focusedItemId
+            : items[0].id;
+      }
+      const item = items.find((a) => a.id === targetId)!;
+      const ck = s.chunks.find((c) => c.id === item.chunkId);
+      if (ck) {
+        set({
+          focusedItemId: targetId,
+          playback: {
+            ...s.playback,
+            isPlaying: true,
+            currentItemId: targetId,
+            currentTime: ck.startMs / 1000,
+          },
+        });
+        return;
+      }
+    }
+    set({ playback: { ...s.playback, isPlaying: p } });
   },
 
   seek(t) {
@@ -367,6 +435,22 @@ export const useArrangeStore = create<ArrangeState>((set, get) => ({
 
   setCurrentItemId(id) {
     set((s) => ({ playback: { ...s.playback, currentItemId: id } }));
+  },
+
+  seekToItem(itemId) {
+    const s = get();
+    const item = s.arrangement.find((a) => a.id === itemId);
+    if (!item) return;
+    const ck = s.chunks.find((c) => c.id === item.chunkId);
+    if (!ck) return;
+    set({
+      focusedItemId: itemId,
+      playback: {
+        ...s.playback,
+        currentItemId: itemId,
+        currentTime: ck.startMs / 1000,
+      },
+    });
   },
 
   setStripScrollPx(px) {

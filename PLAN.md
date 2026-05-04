@@ -146,7 +146,8 @@ interface Pill {
 | 2. Detection Backend | ✅ done | WASM silence_segments, per-chunk BPM + per-chunk audioStartMs, Mode-Aggregation, im Sync-Step |
 | 3. Triage UI | ✅ done | Vom User abgenommen — Layout, Snap, Adaptive Ruler, BPM-Widget, Min-Bars-Filter, Cam-Picker, Help-Overlay |
 | 4. Triage Polish | ✅ kollabiert in Phase 3 | Click-through, bar-snap, gapless audio, adaptive ruler — alles in Phase 3 reingefaltet |
-| 5. Arrange Phase | ✅ funktional, finale Abnahme offen | Filmstreifen + Polaroid Contact-Sheet + Drag-Drop, Strip-Rotation gebaken, Cam-Picker shared mit Triage. Bug 2 ("no preview") + Bug 1 (Rotation) sind gelöst; Bug 3 (Developing-Dots-Flicker) proaktiv gefixt, vom User noch zu verifizieren |
+| 5. Arrange Phase | ✅ done | Filmstreifen + Polaroid Contact-Sheet + Drag-Drop, Strip-Rotation gebaken, Cam-Picker shared mit Triage |
+| 5b. Arrange Polish + Cockpit-Glance | ✅ done | Bar-Cleanup (Icons + Cluster), Frame-Bezel skeuomorph, OP-1-Phosphor-Cockpit mit Mel-Spec + Auto-Tags + Stem-Bars, KEY-Detection (Krumhansl), Spectral Color-Tag, Click-to-seek im Spektrogramm, Walker-Audio-Loop (statt Time-Match → fixes Duplicate-Loop), Click-never-changes-playstate, Tier-2-Skip für portrait clips |
 | 6. Multi-Pill Editor Refactor | 🚧 nicht angefangen | Großer Brocken — explizit übersprungen, weil Arrange + Phase 7 Wiring auch ohne den Refactor funktionieren |
 | 7. Send to Editor + Segment Playback | ✅ Wiring done, ungeprüft | `arrangementSegments[]` im Editor-Store; `useAudioMaster` walked sie via Crossfade-Hop; Timeline dimmt off-segment Regionen. **Phase-7-Behavior nicht E2E vom User getestet.** |
 | 8. Polish | 🚧 nicht angefangen | Sensitivität, Performance, Documentation |
@@ -228,7 +229,7 @@ Page wrapper ist `h-screen overflow-hidden` damit ControlRow's flex-1 wirklich a
 
 ---
 
-### Phase 5 — Arrange Phase ✅ funktional
+### Phase 5 — Arrange Phase ✅
 
 **Designkonzept (vom User abgenickt)**: 35mm-**Filmstreifen** mit Sprocket-Holes als zentrale Komponente. Polaroid-Contact-Sheet als Source-Pool drunter. Player-Cockpit oben mit kleiner Cam-Vorschau + dunklem LCD (TOTAL · NOW · ITEM · BPM). Insertion-Cursor zwischen Frames als Add-Mechanik. Inspector inline in der Bottom-Transport-Bar. Mini-Map nur bei Strip-Overflow. Default-Arrangement = 1:1 chronologisch aus Triage-akzeptierten Chunks.
 
@@ -270,7 +271,7 @@ Page wrapper ist `h-screen overflow-hidden` damit ControlRow's flex-1 wirklich a
   - `pages/Editor.tsx` ruft `arrangementToSegments(j.arrangement, j.chunks)`, übergibt an loadJob; trim spannt min/max aller segments.
   - `window.__lastEditorSegments` als E2E-debug-hook (offen committed; rausziehen wenn finalisiert).
 
-- **IDB schema**: v3 → v4 (`chunk-thumbnails` store) → v5 (auto-clear chunk-thumbnails on migration).
+- **IDB schema**: v3 → v4 (`chunk-thumbnails` store) → v5 (auto-clear chunk-thumbnails on migration) → v6 (`chunk-mel-specs` store) → v7 (auto-clear chunk-thumbnails after slicer-quality fix).
 
 **Schreib-/Architektur-Entscheidungen**:
 - Inspector lebt in der Bottom-Transport-Bar (kein Side-Bar) — User wollte vertikalen Platz für Strip + Contact-Sheet.
@@ -278,6 +279,75 @@ Page wrapper ist `h-screen overflow-hidden` damit ControlRow's flex-1 wirklich a
 - `h-screen overflow-hidden` (Triage-Pattern) damit `flex-1` greift.
 
 ---
+
+### Phase 5b — Arrange Polish + Cockpit-Glance ✅
+
+User hat Phase 5 abgenommen, in dieser Sub-Session sind alle Polish-Punkte gelandet die in der ersten Plan-Datei (`das-ist-eine-session-expressive-hopper.md`) gelistet waren plus diverse Bugs/UX-Wishes die unterwegs auftauchten.
+
+**Bottom-Bar (`ArrangeTransport.tsx`)**:
+- CUR-Buttons + alte Inspector-`◀/▶` raus.
+- Inspector-Cluster: `[SHIFT◀] [Dup] [Drop] [SHIFT▶]` mit Hairline-Divider zwischen Move- und Edit-Paar.
+- Icons: `CopyIcon` + `TrashIcon`. Text-Labels weg.
+- ChunkyButton's `children` ist jetzt optional damit icon-only Buttons sauber durchgehen.
+- Tooltips zeigen die finalen Shortcuts.
+
+**Frame-Selection skeuomorph (`Frame.tsx`)**:
+- Cobalt-Outline weg. Stattdessen 3-fach Tell: hot-orange outer ring + brass-bezel inner hairline + soft phosphor halo.
+- Selection-Tooth: bevelter Trapez-Pip oben am Frame (statt flachem Chevron).
+- `animate-frame-pulse` keyframe pulsiert subtil wenn fokussiert-aber-nicht-spielend.
+- Playing-Cap auf 3px hoch + 4px inset → Selected+Playing co-existieren visuell.
+- `data-strip-frame-id={item.id}` für Auto-Scroll-Lookup.
+
+**Auto-Center + Auto-Follow (`FilmStrip.tsx`)**:
+- `useEffect` scrollt fokussiertes Item smooth in die Mitte des Strips.
+- Zweiter `useEffect` zieht focus dem `currentItemId` während Playback hinterher (kein currentItemId-dep, damit User-Picks nicht sofort zurückgesnapt werden).
+
+**Cockpit-LCD (`PlayerCockpit.tsx`)**:
+- OP-1 Phosphor-Look: wine-black sunken background, baked PHOSPHOR_LUT (256-entry RGB ramp: floor → mid copper → peak amber).
+- Linker Stat-Stack: TOTAL · ITEM · BPM · NOW · PLAY/READY (alle phosphor-glow).
+- Mel-Canvas (`putImageData` mit n_mels × n_frames, browser-bilinear scale = "phosphor bleed for free"). Click-to-seek auf das Spektrogramm — translates 0..1 fraction → master-time inside `showChunk`. Cursor `crosshair`, role="button". Setzt currentItemId mit, falls man in einen anderen Chunk klickt während Playback.
+- Echter Playhead: `playheadFraction = (currentTime*1000 - chunk.startMs) / span` — exakt synchron, nur sichtbar wenn `currentItemId === showItemId`.
+- Auto-Tags-Reihe: KEY · DENS · BRGT · PEAK in BezelStrip + BezelCells mit BezelDividern.
+- Stem-Bars (sm+ only, 180px wide BezelStrip): DRMS · BASS · MEL · FRMT als 4-row meter.
+- CamPreview: `sm:h-auto sm:self-stretch sm:min-h-[135px]` damit es höhenmäßig mit dem LCD mitwächst (kein Spalt drunter).
+
+**Audio-Pipeline (Phase C.1 + Walker-Refactor)**:
+- WASM `mel.rs`: STFT mit realfft (n_fft=2048, hop=sr/fps), Slaney-Style mel-filter-bank (default 64 mels), log-magnitude → u8 (0=floor, 255=peak). 6 unit-tests grün (sine concentrates, silence is zero, noise spreads, etc.).
+- WASM `chromaProfile()` als zusätzlicher Export — time-averaged 12-bin pitch-class profile pro Chunk. `class 0 = C`. L2-normalisiert.
+- `chunk-mel.ts` + `chunk-mel.worker.ts`: pro-chunk Pipeline. Worker computed mel + chroma im selben Pass, transferable buffers.
+- `chunk-mel.ts` exports: `chunkAutoTags(chunk, analysis, mel?)`, `keyFromChroma(chroma)` (Krumhansl-Schmuckler über die 12-bin Profile-Tables MAJ/MIN), `chunkSpectralColor(chunk, analysis)` (8-stop HSL ramp im Phosphor-Spirit, gedämpfte Pastels), `chunkStemHeuristic(chunk, analysis)` (4-band Energy + per-band onset-density → drums/bass/melody/formants).
+- `useChunkMelSpecs` Hook: lädt aus IDB, was fehlt computed der Worker sequenziell (CONCURRENCY=1) im Hintergrund. Master-PCM wird einmalig per `decodeAudioToMonoPcm(blob, 22050)` decoded. **Audio-Walker-Refactor** in `useArrangeAudio.tsx`: `currentItemId` ist authoritativer State (gesetzt von setPlaying / seekToItem / Crossfade-Hop), **NICHT mehr** via master-time matching. Fixes den Endless-Loop bei chunk-Duplikaten in der Arrangement.
+- `seekToItem(itemId)` action im Store: focus + currentItemId + seek auf chunk-start in einem move. Wird genutzt von Frame-Click, MiniMap-Click, PREV/NEXT, ←/→-Shortcuts.
+
+**Spectral Color-Tag (Phase D)**:
+- `Polaroid.tsx`: 3px stripe rechts am Image-Well, `mask-image` linear-gradient für sanftes top/bottom fade-out.
+- `Frame.tsx`: 6×6 Mini-Dot in der Bottom-Label-Band (zwischen `#NN` und `Nbr·bars`), 0.5px black rim für Lesbarkeit.
+
+**Shortcuts (final, in `ArrangeTransport.tsx`)**:
+- Space → play/pause
+- ←/→ → focus prev/next + seek (vorher: cursor nudge)
+- ⇧←/⇧→ → move focused frame (vorher: focus prev/next)
+- Backspace → drop focused
+- D → duplicate focused (vorher: ⌘D)
+
+**Click-Verhalten ist global state-erhaltend**: Frame-Click, MiniMap-Click, Polaroid-Click, Spectrogram-Click, PREV/NEXT — keiner setzt `setPlaying(true)`. Pause-State bleibt Pause-State, Play-State läuft an der neuen Position weiter. Einziger Trigger zum Start-of-Playback: Play-Button + Space.
+
+**MiniMap (`MiniMap.tsx`)**:
+- Click-on-Tick hit-tested gegen `data-strip-frame-id`-Cousin: pickt das richtige Item, ruft `seekToItem(id)`. Drag scrollt weiterhin den Strip. Falls in der Lücke geklickt: nur Scroll, keine Selektion.
+- Focused-Color hot-orange (vorher cobalt) — synchron zum neuen Frame-Bezel.
+
+**Thumbnail-Quality-Fix (`chunk-thumbnails.ts`)**:
+- Tier-2 Slice produziert jetzt JPEG in **nativer Tile-Resolution** (kein 1.4–4× Upscale-then-recompress mehr), JPEG-Quality 0.9.
+- `TIER2_MIN_TILE_WIDTH = 100` — wenn der Tile in Display-Orientierung schmaler als 100px ist (typisch portrait phone clips mit ~45px Tile-width), Tier-2 wird übersprungen → Tier-3 (full-res Video-Seek) liefert ein sauberes Thumbnail.
+- Tier-3 `THUMB_WIDTH = 256` (vorher 200).
+- IDB v6 → v7 mit auto-clear vom `chunk-thumbnails` Store, sonst sähe der User die alten blocky Versionen weiter.
+
+**Tailwind tokens** (`tailwind.config.js`): Neue keyframes `cockpit-scan`, `frame-pulse`. Animations `animate-cockpit-scan` (4s linear infinite, momentan ungenutzt nachdem der Mel-Playhead synchron läuft), `animate-frame-pulse` (1.6s ease-in-out infinite). `phosphor-text` utility class in `styles.css` (color #FF8A4F + dual text-shadow glow).
+
+**Storage-Schema-Änderungen**:
+- IDB v5 → v6: neuer `chunk-mel-specs` Store (key `${jobId}::${chunkId}`, value `{data, nMels, nFrames, durationS, chroma?}`). Migration ist additiv, kein clear.
+- IDB v6 → v7: clear `chunk-thumbnails` Store (slicer-quality fix invalidates all old).
+- `jobsDb.getChunkMelSpec`, `saveChunkMelSpec`, `deleteChunkMelSpecsForJob` als Public API.
 
 ### Phase 6 — Editor Multi-Pill-Refactor 🚧 not started
 
@@ -300,15 +370,20 @@ Sensitivität (snap-tick-feedback, nudge-haptic), performance (4h profile), sett
 ## Critical Files Reference
 
 **Read first** beim Wiedereinstieg:
-- `frontend/src/storage/jobs-db.ts` — Persistenz-Schema (Chunk, ArrangementItem, LocalJob, VideoAsset.framesOrientation, displayDimsOf)
+- `frontend/src/storage/jobs-db.ts` — Persistenz-Schema (Chunk, ArrangementItem, LocalJob, VideoAsset.framesOrientation, ChunkMelRecord, IDB v7)
 - `frontend/src/local/jobs-routing.ts` — `nextRouteForJob()`, `jobRoutePath()`
-- `frontend/src/local/triage/triage-store.ts` + `src/local/arrange/arrange-store.ts` — Store-Patterns
+- `frontend/src/local/triage/triage-store.ts` + `src/local/arrange/arrange-store.ts` — Store-Patterns (arrange-store hat jetzt analysis/melByChunkId/seekToItem)
 - `frontend/src/components/CamPickerDropdown.tsx` — shared cam-picker für Triage + Arrange
 - `frontend/src/components/triage/TriageTransportBar.tsx` — Transport-Pattern (centered grid, `useRegisterShortcut`)
-- `frontend/src/local/arrange/chunk-thumbnails.ts` — 3-tier thumbnail resolver, rotation-aware
+- `frontend/src/local/arrange/chunk-thumbnails.ts` — 3-tier thumbnail resolver, rotation-aware, Tier-2-Threshold
+- `frontend/src/local/arrange/chunk-mel.ts` — auto-tags / spectral-color / stems-heuristik / keyFromChroma helpers
+- `frontend/src/local/arrange/useChunkMelSpecs.ts` — Lazy-eager pipeline (PCM-decode + worker)
+- `frontend/src/components/arrange/PlayerCockpit.tsx` — OP-1 Phosphor LCD, click-to-seek im Spektrogramm
+- `frontend/src/components/arrange/useArrangeAudio.tsx` — Walker-based audio master (NICHT mehr time-match!)
 - `frontend/src/local/render/frames/{webcodecs,ffmpeg,index}.ts` — Strip-Extraktion mit `rotationDeg`
-- `frontend/src/editor/components/{BpmReadoutView,TransportClockView,SnapModeButtonsView,ChunkyButton,HardwarePopover,icons}.tsx` — design-tokens
+- `frontend/src/editor/components/{BpmReadoutView,TransportClockView,SnapModeButtonsView,ChunkyButton,HardwarePopover,icons}.tsx` — design-tokens (ChunkyButton.children jetzt optional)
 - `frontend/src/editor/shortcuts/useRegisterShortcut.ts` — Shortcut-Registry-Pattern
+- `frontend/wasm/sync-core/src/mel.rs` + `chroma.rs` + `lib.rs` — WASM exports `melSpectrogram`, `chromaProfile`
 
 Allgemein wichtig:
 - `frontend/src/editor/store.ts` — Editor-Zustand (für Phase 6+7)
@@ -357,17 +432,27 @@ Allgemein wichtig:
 
 ## Next Session — Quick Briefing
 
-**Stand**: Phase 5 funktional, alle gemeldeten Bugs gefixt. Drag-Drop Polaroid→Strip + History-Routing für longform-Jobs + Cam-Picker shared zwischen Triage/Arrange + Strip-Rotation gebaken sind in dieser Session dazugekommen.
+**Stand**: Phase 5 + 5b vom User abgenommen ("Perfekt. Danke für die Arbeit. Ist nen tolles Modul geworden."). Arrange-Screen ist optisch + funktional fertig: OP-1 Phosphor Cockpit, Mel-Spec mit click-to-seek, Auto-Tags (KEY/DENS/BRGT/PEAK), Stem-Bars, Spectral Color-Tag, skeuomorpher Frame-Bezel, Walker-basierte gapless playback (kein Duplicate-Loop mehr), MiniMap-Click→select, Click-never-changes-playstate als globale Regel.
 
-**Was zuerst**:
+**Was als nächstes anstehen könnte**:
 
-1. User fragen ob der **Developing-Dots-Flicker** (Bug 3) jetzt weg ist nach dem Prefetch-await-Fix. Wenn nicht: vermutlich React StrictMode invalidiert den Cache zwischen den Mounts — dann den prefetch in einen module-level Promise heben statt useEffect-scoped.
-2. User fragen ob **Phase 5 abgenommen** ist. Wenn ja: weiter mit Phase 6 oder Phase 8 polish. Wenn er Multi-Pill (Phase 6) NICHT will, kann das ganz raus aus dem Plan.
-3. **Phase 7 E2E vom User durchspielen lassen** — Continue→Editor mit echtem long-form-job, hört er die Segment-Boundaries? Knackt's an den Crossfade-Hops? `useAudioMaster.ts` ist der hot spot.
-4. **`window.__lastEditorSegments`** — falls Phase 7 abgenommen ist, das Test-Hook entfernen oder via env-flag gaten.
+1. **Phase 7 E2E vom User durchspielen lassen** — Continue→Editor mit echtem long-form-job. Hört er die Segment-Boundaries sauber? Knackt's an den Crossfade-Hops im Editor? `useAudioMaster.ts` (Editor) ist hot spot. Beachte: der **Arrange**-Audio-Master nutzt jetzt einen Walker (currentItemId als state), der **Editor**-AudioMaster nutzt vermutlich noch das alte Pattern — bei Phase 7 E2E darauf achten ob duplicate-segment-Loops dort wieder auftreten würden, dann Walker-Refactor dort wiederholen.
+2. **`window.__lastEditorSegments`** — falls Phase 7 abgenommen ist, das Test-Hook entfernen oder via env-flag gaten.
+3. **Phase 6 Multi-Pill-Refactor** klären: User wollte das mehrfach offen lassen — beim Start fragen ob das überhaupt noch gewünscht ist. Wenn nicht → Phase 6 raus aus dem Plan, direkt zu Phase 8 Polish springen.
+4. **KEY-Detection-Robustheit**: aktuell läuft sie über das gesamte chunk-PCM und schreibt manchmal nonsense bei reiner Drum-Loops (kein klarer harmonischer Inhalt). Wenn der User das stört: Threshold einführen — KEY zeigt nur dann eine Tonart wenn das chroma-Spitzen-Verhältnis (peak/mean) über z.B. 1.5 liegt, sonst "—". Helper liegt in `chunk-mel.ts:keyFromChroma`.
+5. **Stem-Bars-Kalibrierung**: heuristisch in `chunkStemHeuristic`, getuned gegen Bauchgefühl. Wenn der User auf seinen echten Sessions einen Bias spürt (z.B. "BASS zeigt immer 80%"), Schwellwerte dort drehen — Konstanten heißen `kickStrength`, `hatStrength`, `bassSus`, `formantBand` etc., alle clamped 0..1.
 
 **Workflow-Reminder**:
 - WASM `pkg/` ist gitignored → nach Pull `bun run wasm:build` aus `frontend/`.
-- Tests: `bun x vitest run --project=unit` für unit, `--project=browser` für browser-tests (Chromium).
+- Tests: `bun x vitest run --project=unit` für unit, `--project=browser` für browser-tests (Chromium). Mel-tests: `cd frontend/wasm/sync-core && cargo test mel`.
 - Worktree lebt in `.claude/worktrees/{name}/` — bash cwd resettet zwischen calls, mit absoluten Pfaden arbeiten oder `cd && cmd` chainen.
 - Diagnose-Logging: `localStorage.__thumbDebug = '1'` in der Console aktiviert die Tier-Resolver-Logs.
+- IDB-Schema steht jetzt bei v7. Beim Hinzufügen neuer Stores: nicht vergessen `deleteJob` und `wipeAll` zu erweitern.
+
+**Letzte UX-Konventionen (in dieser Session etabliert, beim Bauen weiterer Surfaces honorieren)**:
+- **Click ändert nie den Play-State.** Pause bleibt Pause, Play bleibt Play. Einziger Trigger: Play-Button + Space.
+- **`seekToItem(itemId)`** ist die kanonische Action für "User picked this item" — focus + currentItemId + seek in einem move. Frame-Click, MiniMap-Click, PREV/NEXT, ←/→ alle gehen darüber.
+- **Walker statt Time-Match** im Audio-Master: bei Duplikaten (gleiche chunkId mehrfach im arrangement) muss der walker explicit advance, sonst loop.
+- **Native Tile-Resolution** beim Strip-Slice. Kein Upscale-then-recompress. Bei zu kleinen Tiles (portrait phone clips < 100px display-width) → Tier-3 fallback.
+- **Hot-Orange #FF5722** ist die Selection-Farbe (vorher cobalt). Frame-Bezel + MiniMap-Tick + Cockpit-Glow alle aufeinander abgestimmt.
+- **Phosphor-Glow** für alles was "lit" sein soll: text-shadow `0 0 6px rgba(255,138,79,0.7), 0 0 12px rgba(255,87,34,0.3)`. Utility-Class `phosphor-text` in styles.css.

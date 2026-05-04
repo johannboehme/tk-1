@@ -77,7 +77,12 @@ export function CamPreviewArrange() {
 
   return (
     <div
-      className="relative shrink-0 rounded-md overflow-hidden border-2 border-rule shadow-emboss w-[84px] h-[84px] sm:w-[240px] sm:h-[135px]"
+      // Mobile: square thumb. Desktop: fixed width but height tracks
+      // the cockpit LCD next to it (via the section's items-stretch),
+      // so the cam stays flush with the LCD even when the LCD grows.
+      // object-cover on the video crops the 16:9 source to whatever
+      // aspect the box ends up at — minimal crop in practice.
+      className="relative shrink-0 rounded-md overflow-hidden border-2 border-rule shadow-emboss w-[84px] h-[84px] sm:w-[240px] sm:h-auto sm:self-stretch sm:min-h-[135px]"
       style={{
         background:
           "linear-gradient(180deg, #1A1816 0%, #0E0D0B 100%)",

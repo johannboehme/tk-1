@@ -28,6 +28,7 @@ import { jobRoutePath } from "../local/jobs-routing";
 import { isVideoAsset } from "../storage/jobs-db";
 import { useArrangeStore } from "../local/arrange/arrange-store";
 import { useArrangePersist } from "../local/arrange/useArrangePersist";
+import { useChunkMelSpecs } from "../local/arrange/useChunkMelSpecs";
 import {
   clearChunkThumbnails,
   prefetchChunkThumbnails,
@@ -52,6 +53,7 @@ export default function Arrange() {
 
   useArrangePersist();
   useChunkDragController();
+  useChunkMelSpecs();
 
   // Load the job and prime the arrange store. The IDB thumbnail
   // prefetch runs BEFORE we expose the job to the UI — that way the
@@ -196,7 +198,7 @@ export default function Arrange() {
         <ContactSheet />
       </main>
 
-      <ArrangeTransport showCursorControls />
+      <ArrangeTransport />
       <ChunkDragGhost />
     </div>
   );

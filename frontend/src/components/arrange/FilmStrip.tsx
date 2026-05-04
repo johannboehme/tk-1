@@ -22,6 +22,7 @@ import {
   frameWidthForBars,
   FRAME_MIN_PX,
 } from "../../local/arrange/arrange-store";
+import { chunkSpectralColor } from "../../local/arrange/chunk-mel";
 import type { Chunk } from "../../storage/jobs-db";
 import { Frame } from "./Frame";
 import { InsertionCursor } from "./InsertionCursor";
@@ -40,12 +41,14 @@ export function FilmStrip() {
   const currentItemId = useArrangeStore((s) => s.playback.currentItemId);
   const setInsertionIndex = useArrangeStore((s) => s.setInsertionIndex);
   const focusItem = useArrangeStore((s) => s.focusItem);
+  const seekToItem = useArrangeStore((s) => s.seekToItem);
   const reorderItem = useArrangeStore((s) => s.reorderItem);
   const removeItem = useArrangeStore((s) => s.removeItem);
   const setStripScrollPx = useArrangeStore((s) => s.setStripScrollPx);
   const setStripMetrics = useArrangeStore((s) => s.setStripMetrics);
   const jobBpm = useArrangeStore((s) => s.jobBpm);
   const jobBeatsPerBar = useArrangeStore((s) => s.jobBeatsPerBar);
+  const analysis = useArrangeStore((s) => s.analysis);
   // Highlight the active drop target while the user is dragging a
   // chunk from the Contact Sheet. Null when no drag is in flight or
   // the pointer isn't over the strip.
@@ -102,6 +105,44 @@ export function FilmStrip() {
       el.scrollLeft = stripScrollPx;
     }
   }, [stripScrollPx]);
+
+  // Auto-center on focus changes: when the focused item shifts (by
+  // SHIFT-buttons or PREV/NEXT or a click on an out-of-view polaroid),
+  // smoothly scroll the corresponding frame into the strip's center.
+  useEffect(() => {
+    if (!focusedItemId) return;
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    const target = scroller.querySelector<HTMLElement>(
+      `[data-strip-frame-id="${CSS.escape(focusedItemId)}"]`,
+    );
+    if (!target) return;
+    const sRect = scroller.getBoundingClientRect();
+    const tRect = target.getBoundingClientRect();
+    const offsetWithinScroller = tRect.left - sRect.left + scroller.scrollLeft;
+    const desired =
+      offsetWithinScroller - scroller.clientWidth / 2 + tRect.width / 2;
+    const max = scroller.scrollWidth - scroller.clientWidth;
+    const clamped = Math.max(0, Math.min(max, desired));
+    if (Math.abs(scroller.scrollLeft - clamped) > 1) {
+      scroller.scrollTo({ left: clamped, behavior: "smooth" });
+    }
+  }, [focusedItemId, arrangement]);
+
+  // Follow the playhead during playback — focus jumps to whichever
+  // chunk is currently playing, which in turn re-uses the auto-center
+  // effect above to keep the strip scrolled. Triggers only when the
+  // currentItemId changes, so a deliberate user-focus on a different
+  // frame still gets respected for the rest of that frame's playback.
+  useEffect(() => {
+    if (!currentItemId) return;
+    if (focusedItemId === currentItemId) return;
+    focusItem(currentItemId);
+    // We deliberately don't depend on focusedItemId here — that would
+    // re-fire every time the user picks a different frame and yank
+    // focus right back. This effect is a one-shot per-currentItemId.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentItemId, focusItem]);
 
   // ─── Reorder via drag ─────────────────────────────────────────────────
   const dragStateRef = useRef<{
@@ -212,6 +253,7 @@ export function FilmStrip() {
             <div
               key={item.id}
               data-strip-frame-index={i}
+              data-strip-frame-id={item.id}
               className="flex items-stretch"
               onPointerDown={(e) => beginDrag(e, item.id)}
               style={{ touchAction: "pan-y" }}
@@ -226,7 +268,14 @@ export function FilmStrip() {
                 height={FRAME_HEIGHT}
                 focused={item.id === focusedItemId}
                 isCurrentItem={item.id === currentItemId}
-                onFocus={() => focusItem(item.id)}
+                spectralColor={chunkSpectralColor(chunk, analysis)}
+                onFocus={() => {
+                  // Click on a frame = focus + seek + tag this as the
+                  // current playback item. Matches PREV/NEXT in the
+                  // transport bar; during playback the audio walker
+                  // continues from THIS item onwards.
+                  seekToItem(item.id);
+                }}
                 onContextMenu={(e) => {
                   e.preventDefault();
                   // Right-click = drop the item (matches the inspector
@@ -302,17 +351,19 @@ function FilmStripShell({
 }
 
 function SprocketRail({ height, side }: { height: number; side: "top" | "bottom" }) {
-  // Sprocket holes painted as a repeating background — dark rounded
-  // rects on a slightly lighter rail strip. The rail itself sticks
-  // to the scroller (position: sticky on the y axis) so it stays
-  // visible no matter how far the user scrolls horizontally.
-  // Dark gray rail with painted-on hole pattern.
+  // Sprocket holes painted as a repeating background. Pinned to top
+  // and bottom of the scroller via `position: absolute` so both rails
+  // are anchored at their edges regardless of how the document flow
+  // resolves around the absolutely-positioned frame band — `sticky`
+  // doesn't help here because there's no vertical scroll for it to
+  // anchor against, and the bottom rail would otherwise fall back to
+  // its natural flow position right under the top rail.
   const holeSize = 6;
   const holePitch = 22;
   return (
     <div
       aria-hidden
-      className="sticky inset-x-0 z-10 pointer-events-none"
+      className="absolute inset-x-0 z-10 pointer-events-none"
       style={{
         top: side === "top" ? 0 : "auto",
         bottom: side === "bottom" ? 0 : "auto",

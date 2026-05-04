@@ -1,12 +1,11 @@
 /**
  * Bottom transport bar for the Arrange page.
  *
- * Two zones inside one bar:
- *   - LEFT: transport controls (prev/play/next, cursor nav, counter)
- *   - RIGHT: focused-frame inspector (when a frame is focused) —
- *     SOURCE / BARS / LENGTH metadata + ◀ shift / shift ▶ /
- *     duplicate / drop buttons. Lives here instead of in a
- *     side-panel so the strip + contact sheet get the full width.
+ * LEFT: transport (prev / play / next).
+ * RIGHT (only when a frame is focused): metadata + a single mutation
+ * cluster — SHIFT◀ surrounds Dup/Drop on the left, SHIFT▶ on the right.
+ * The two SHIFT buttons reorder the selected item in the arrangement
+ * and re-center the strip on it.
  *
  * The right edge has a chunky padding so the floating Footer overlay
  * (Impressum · Datenschutz, fixed bottom-right) doesn't sit on top of
@@ -16,25 +15,21 @@ import { useEffect, useMemo } from "react";
 import { ChunkyButton } from "../../editor/components/ChunkyButton";
 import { useRegisterShortcut } from "../../editor/shortcuts/useRegisterShortcut";
 import {
+  CopyIcon,
   PauseIcon,
   PlayIcon,
   SkipBackIcon,
   SkipFwdIcon,
+  StepBackIcon,
+  StepFwdIcon,
+  TrashIcon,
 } from "../../editor/components/icons";
 import {
   effectiveBarsForChunk,
   useArrangeStore,
 } from "../../local/arrange/arrange-store";
 
-interface ArrangeTransportProps {
-  /** When true, show ◀cur cur▶ buttons (mobile-only). Hidden on
-   *  desktop because there the user clicks the cursor directly. */
-  showCursorControls?: boolean;
-}
-
-export function ArrangeTransport({
-  showCursorControls = false,
-}: ArrangeTransportProps) {
+export function ArrangeTransport() {
   const isPlaying = useArrangeStore((s) => s.playback.isPlaying);
   const setPlaying = useArrangeStore((s) => s.setPlaying);
   const arrangement = useArrangeStore((s) => s.arrangement);
@@ -43,8 +38,6 @@ export function ArrangeTransport({
   const removeItem = useArrangeStore((s) => s.removeItem);
   const shiftItem = useArrangeStore((s) => s.shiftItem);
   const duplicateItem = useArrangeStore((s) => s.duplicateItem);
-  const insertionIndex = useArrangeStore((s) => s.insertionIndex);
-  const nudgeCursor = useArrangeStore((s) => s.nudgeCursor);
   const chunkPool = useArrangeStore((s) => s.chunks);
   const jobBpm = useArrangeStore((s) => s.jobBpm);
   const jobBeatsPerBar = useArrangeStore((s) => s.jobBeatsPerBar);
@@ -65,8 +58,6 @@ export function ArrangeTransport({
     () => (focusedChunk ? effectiveBarsForChunk(focusedChunk, jobBpm, jobBeatsPerBar) : 0),
     [focusedChunk, jobBpm, jobBeatsPerBar],
   );
-  const seek = useArrangeStore((s) => s.seek);
-  const chunks = useArrangeStore((s) => s.chunks);
 
   // Shortcut registration so HelpOverlay surfaces them.
   useRegisterShortcut({
@@ -77,26 +68,26 @@ export function ArrangeTransport({
   });
   useRegisterShortcut({
     id: "arrange.prev-item",
-    keys: ["⇧←"],
+    keys: ["←"],
     description: "Focus previous frame",
     group: "Arrange",
   });
   useRegisterShortcut({
     id: "arrange.next-item",
-    keys: ["⇧→"],
+    keys: ["→"],
     description: "Focus next frame",
     group: "Arrange",
   });
   useRegisterShortcut({
-    id: "arrange.cursor-prev",
-    keys: ["←"],
-    description: "Move insertion cursor left",
+    id: "arrange.shift-left",
+    keys: ["⇧←"],
+    description: "Move focused frame left",
     group: "Arrange",
   });
   useRegisterShortcut({
-    id: "arrange.cursor-next",
-    keys: ["→"],
-    description: "Move insertion cursor right",
+    id: "arrange.shift-right",
+    keys: ["⇧→"],
+    description: "Move focused frame right",
     group: "Arrange",
   });
   useRegisterShortcut({
@@ -107,7 +98,7 @@ export function ArrangeTransport({
   });
   useRegisterShortcut({
     id: "arrange.duplicate",
-    keys: ["⌘D"],
+    keys: ["D"],
     description: "Duplicate focused frame",
     group: "Arrange",
   });
@@ -124,54 +115,49 @@ export function ArrangeTransport({
         t.isContentEditable
       );
     }
+    function focusAndSeek(delta: -1 | 1) {
+      focusRelative(delta);
+      const next = useArrangeStore.getState().focusedItemId;
+      if (next) useArrangeStore.getState().seekToItem(next);
+    }
+
     function handler(e: KeyboardEvent) {
       if (isTextInput(e.target)) return;
       if (e.code === "Space") {
         e.preventDefault();
         setPlaying(!useArrangeStore.getState().playback.isPlaying);
       } else if (e.shiftKey && e.code === "ArrowLeft") {
+        // Move focused frame one position to the left.
         e.preventDefault();
-        focusRelative(-1);
-        const next = useArrangeStore.getState().focusedItemId;
-        if (next) {
-          const item = useArrangeStore
-            .getState()
-            .arrangement.find((a) => a.id === next);
-          const ck = item
-            ? useArrangeStore
-                .getState()
-                .chunks.find((c) => c.id === item.chunkId)
-            : null;
-          if (ck) seek(ck.startMs / 1000);
-        }
+        const id = useArrangeStore.getState().focusedItemId;
+        if (id) shiftItem(id, -1);
       } else if (e.shiftKey && e.code === "ArrowRight") {
         e.preventDefault();
-        focusRelative(1);
-        const next = useArrangeStore.getState().focusedItemId;
-        if (next) {
-          const item = useArrangeStore
-            .getState()
-            .arrangement.find((a) => a.id === next);
-          const ck = item
-            ? useArrangeStore
-                .getState()
-                .chunks.find((c) => c.id === item.chunkId)
-            : null;
-          if (ck) seek(ck.startMs / 1000);
-        }
+        const id = useArrangeStore.getState().focusedItemId;
+        if (id) shiftItem(id, +1);
       } else if (e.code === "ArrowLeft") {
+        // Bare left = walk focus to the previous frame and seek.
         e.preventDefault();
-        nudgeCursor(-1);
+        focusAndSeek(-1);
       } else if (e.code === "ArrowRight") {
         e.preventDefault();
-        nudgeCursor(+1);
+        focusAndSeek(+1);
       } else if (e.code === "Backspace") {
         const id = useArrangeStore.getState().focusedItemId;
         if (id) {
           e.preventDefault();
           removeItem(id);
         }
-      } else if ((e.metaKey || e.ctrlKey) && (e.code === "KeyD" || e.key === "d")) {
+      } else if (
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        (e.code === "KeyD" || e.key === "d" || e.key === "D")
+      ) {
+        // Plain "D" — no modifiers. Stays out of the way of browser
+        // shortcuts (Cmd+D = bookmark) and doesn't fight the user when
+        // they're just typing a letter (focus would be in a text input
+        // and isTextInput() filters above already).
         const id = useArrangeStore.getState().focusedItemId;
         if (id) {
           e.preventDefault();
@@ -181,25 +167,18 @@ export function ArrangeTransport({
     }
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [setPlaying, focusRelative, nudgeCursor, removeItem, duplicateItem, seek]);
+  }, [setPlaying, focusRelative, shiftItem, removeItem, duplicateItem]);
 
+  const seekToItem = useArrangeStore((s) => s.seekToItem);
   const onPrevItem = () => {
     focusRelative(-1);
     const next = useArrangeStore.getState().focusedItemId;
-    if (next) {
-      const item = arrangement.find((a) => a.id === next);
-      const ck = item ? chunks.find((c) => c.id === item.chunkId) : null;
-      if (ck) seek(ck.startMs / 1000);
-    }
+    if (next) seekToItem(next);
   };
   const onNextItem = () => {
     focusRelative(1);
     const next = useArrangeStore.getState().focusedItemId;
-    if (next) {
-      const item = arrangement.find((a) => a.id === next);
-      const ck = item ? chunks.find((c) => c.id === item.chunkId) : null;
-      if (ck) seek(ck.startMs / 1000);
-    }
+    if (next) seekToItem(next);
   };
 
   // Footer overlay (Impressum · Datenschutz, fixed bottom-right) eats
@@ -247,42 +226,15 @@ export function ArrangeTransport({
         <span className="hidden sm:inline">Next</span>
       </ChunkyButton>
 
-      {showCursorControls && (
-        <>
-          <span className="w-px h-6 bg-rule mx-1" aria-hidden />
-          <ChunkyButton
-            variant="ghost"
-            size="sm"
-            onClick={() => nudgeCursor(-1)}
-            disabled={arrangement.length === 0 || insertionIndex === 0}
-            title="Cursor left · ←"
-            aria-label="Move insertion cursor left"
-          >
-            ◀ cur
-          </ChunkyButton>
-          <ChunkyButton
-            variant="ghost"
-            size="sm"
-            onClick={() => nudgeCursor(+1)}
-            disabled={
-              arrangement.length === 0 ||
-              insertionIndex === arrangement.length
-            }
-            title="Cursor right · →"
-            aria-label="Move insertion cursor right"
-          >
-            cur ▶
-          </ChunkyButton>
-        </>
-      )}
-
-      {/* Inspector — only when a frame is focused. Sits LEFT-of-spacer
-       *  so the floating Impressum/Datenschutz overlay (fixed bottom-
-       *  right) doesn't cover any actionable buttons. */}
+      {/* Inspector — only when a frame is focused. Four standard
+       *  ChunkyButtons in one row with hairline dividers between
+       *  the move-pair (SHIFT◀ / SHIFT▶) and the edit-pair (Dup / Drop)
+       *  so the function-grouping reads at a glance without needing
+       *  a separate plate. Tooltips carry the shortcut hints. */}
       {focusedItem && focusedChunk && (
-        <div className="flex items-stretch gap-2 min-w-0">
+        <div className="flex items-stretch gap-1.5 min-w-0">
           <span className="w-px h-9 bg-rule mx-1" aria-hidden />
-          <div className="flex flex-col justify-center font-mono text-[10px] tabular text-ink-2 leading-tight min-w-0">
+          <div className="flex flex-col justify-center font-mono text-[10px] tabular text-ink-2 leading-tight min-w-0 mr-1">
             <span className="font-display tracking-label uppercase text-[9px] text-ink-3">
               FRAME {focusedIdx + 1}/{arrangement.length}
             </span>
@@ -296,38 +248,38 @@ export function ArrangeTransport({
             size="sm"
             onClick={() => shiftItem(focusedItem.id, -1)}
             disabled={focusedIdx <= 0}
-            title="Shift left · Shift+←"
-            aria-label="Shift frame left"
-          >
-            ◀
-          </ChunkyButton>
+            title="Move frame left · Shift+←"
+            aria-label="Move frame left"
+            iconLeft={<StepBackIcon className="w-4 h-4" />}
+          />
           <ChunkyButton
             variant="secondary"
             size="sm"
             onClick={() => shiftItem(focusedItem.id, +1)}
-            disabled={focusedIdx === arrangement.length - 1 || focusedIdx === -1}
-            title="Shift right · Shift+→"
-            aria-label="Shift frame right"
-          >
-            ▶
-          </ChunkyButton>
+            disabled={
+              focusedIdx === arrangement.length - 1 || focusedIdx === -1
+            }
+            title="Move frame right · Shift+→"
+            aria-label="Move frame right"
+            iconLeft={<StepFwdIcon className="w-4 h-4" />}
+          />
+          <span className="w-px h-7 bg-rule mx-0.5 self-center" aria-hidden />
           <ChunkyButton
             variant="secondary"
             size="sm"
             onClick={() => duplicateItem(focusedItem.id)}
-            title="Duplicate frame · Cmd/Ctrl+D"
-          >
-            <span className="hidden sm:inline">Dup</span>
-            <span className="inline sm:hidden">×2</span>
-          </ChunkyButton>
+            title="Duplicate frame · D"
+            aria-label="Duplicate frame"
+            iconLeft={<CopyIcon className="w-4 h-4" />}
+          />
           <ChunkyButton
             variant="secondary"
             size="sm"
             onClick={() => removeItem(focusedItem.id)}
             title="Drop frame · Backspace"
-          >
-            Drop
-          </ChunkyButton>
+            aria-label="Drop frame"
+            iconLeft={<TrashIcon className="w-4 h-4" />}
+          />
         </div>
       )}
 

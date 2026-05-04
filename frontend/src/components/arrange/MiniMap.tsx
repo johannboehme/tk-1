@@ -26,6 +26,7 @@ export function MiniMap() {
   const currentItemId = useArrangeStore((s) => s.playback.currentItemId);
   const focusedItemId = useArrangeStore((s) => s.focusedItemId);
   const setStripScrollPx = useArrangeStore((s) => s.setStripScrollPx);
+  const seekToItem = useArrangeStore((s) => s.seekToItem);
   const jobBpm = useArrangeStore((s) => s.jobBpm);
   const jobBeatsPerBar = useArrangeStore((s) => s.jobBeatsPerBar);
 
@@ -79,6 +80,25 @@ export function MiniMap() {
     );
   }
 
+  /** Walk the per-frame layout to figure out which arrangement item
+   *  sits under `clientX`. Returns null if the click landed in the
+   *  inter-frame gap or outside the strip's content. */
+  function pointerToItemIndex(clientX: number): number | null {
+    const el = wrapRef.current;
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    const x = clientX - rect.left;
+    let cursor = 4;
+    for (let i = 0; i < arrangement.length; i++) {
+      const w = widths[i];
+      const start = cursor * scale;
+      const end = (cursor + w) * scale;
+      if (x >= start && x <= end) return i;
+      cursor += w + 8;
+    }
+    return null;
+  }
+
   function onPointerDown(e: React.PointerEvent) {
     e.preventDefault();
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
@@ -87,6 +107,13 @@ export function MiniMap() {
       startScroll: view.stripScrollPx,
     };
     setStripScrollPx(pointerToScroll(e.clientX));
+    // Click on a tick = focus + seek + tag as current playback item.
+    // Drag afterwards still scrolls (via pointermove). Falls through
+    // cleanly when the click landed in a gap.
+    const idx = pointerToItemIndex(e.clientX);
+    if (idx !== null) {
+      seekToItem(arrangement[idx].id);
+    }
   }
   function onPointerMove(e: React.PointerEvent) {
     if (!draggingRef.current) return;
@@ -133,7 +160,7 @@ export function MiniMap() {
           bg = "#FFB58A"; // hot tail
           opacity = 1;
         } else if (isFocused) {
-          bg = "#2F6FED"; // cobalt — matches the frame's focus ring
+          bg = "#FF5722"; // hot — matches the strip's focus bezel
           opacity = 1;
         } else {
           bg = camColor;

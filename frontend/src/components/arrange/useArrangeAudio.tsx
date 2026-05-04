@@ -213,35 +213,41 @@ function Driver({
           tickTime(t);
         }
 
-        // Resolve current arrangement item — the one whose master-time
-        // range covers `t`.
+        // The walker is identified by `currentItemId` (authoritative
+        // store state) — NOT by master-time matching. That way a
+        // duplicate of the same chunk doesn't collapse to the same
+        // index and loop forever, and a deletion in front of the
+        // current item doesn't yank the playhead onto a stale chunk.
         const items = state.arrangement;
         const chunkById = new Map(state.chunks.map((c) => [c.id, c]));
-        let currentItemIdx = -1;
-        for (let i = 0; i < items.length; i++) {
-          const ck = chunkById.get(items[i].chunkId);
-          if (!ck) continue;
-          if (t * 1000 >= ck.startMs && t * 1000 <= ck.endMs) {
-            currentItemIdx = i;
-            break;
-          }
-        }
-        const curItemId =
-          currentItemIdx >= 0 ? items[currentItemIdx].id : null;
-        if (state.playback.currentItemId !== curItemId) {
-          setCurrentItemId(curItemId);
+        const trackedId = state.playback.currentItemId;
+        const currentItemIdx = trackedId
+          ? items.findIndex((a) => a.id === trackedId)
+          : -1;
+
+        // Walker lost the item it was tracking (deleted while playing,
+        // or arrangement reset to empty). Bail safely.
+        if (state.playback.isPlaying && currentItemIdx === -1) {
+          setPlaying(false);
         }
 
         // Arm crossfade-hop near current item's end.
         if (state.playback.isPlaying && cur.armed === null && currentItemIdx >= 0) {
-          const curChunk = chunkById.get(items[currentItemIdx].chunkId);
+          const curItem = items[currentItemIdx];
+          const curChunk = chunkById.get(curItem.chunkId);
           const nextItem = items[currentItemIdx + 1];
           const nextChunk = nextItem ? chunkById.get(nextItem.chunkId) : null;
           if (curChunk) {
             const remaining = curChunk.endMs / 1000 - t;
             if (remaining > 0 && remaining < LEAD_TIME_S) {
-              if (nextChunk) {
-                // Hop to the next chunk's start.
+              if (nextItem && nextChunk) {
+                // Hop to the next item's master-time slice. Same gapless
+                // ping-pong: idle element pre-plays the next chunk while
+                // the active element finishes the current one, then a
+                // gain crossfade swaps them. Crucially we record the
+                // NEXT ITEM ID — that's what advances `currentItemId`
+                // when the crossfade fires, not whatever happens to
+                // match `t * 1000` afterwards.
                 try {
                   idle.currentTime = clampSeek(
                     nextChunk.startMs / 1000,
@@ -256,7 +262,7 @@ function Driver({
                 cur.armed = {
                   fireAtCtxTime: fireCtxT,
                   fromSide: cur.active,
-                  nextItemId: nextItem?.id ?? null,
+                  nextItemId: nextItem.id,
                 };
               } else {
                 // Last item — stop at end (don't loop in arrange).
@@ -274,7 +280,7 @@ function Driver({
           }
         }
 
-        // Crossfade fired — swap roles.
+        // Crossfade fired — swap roles AND advance the walker.
         if (
           cur.armed &&
           g.ctx.currentTime >= cur.armed.fireAtCtxTime + CROSSFADE_S
@@ -282,6 +288,8 @@ function Driver({
           if (cur.armed.nextItemId !== null) {
             active.pause();
             cur.active = cur.active === "A" ? "B" : "A";
+            // Walker advance: explicit, not via time-match.
+            setCurrentItemId(cur.armed.nextItemId);
           }
           cur.armed = null;
         }

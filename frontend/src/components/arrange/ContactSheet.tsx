@@ -12,6 +12,7 @@
 import { useMemo } from "react";
 import { useArrangeStore } from "../../local/arrange/arrange-store";
 import { effectiveBarsForChunk } from "../../local/arrange/arrange-store";
+import { chunkSpectralColor } from "../../local/arrange/chunk-mel";
 import { Polaroid } from "./Polaroid";
 
 export function ContactSheet() {
@@ -24,8 +25,10 @@ export function ContactSheet() {
   const seek = useArrangeStore((s) => s.seek);
   const setPlaying = useArrangeStore((s) => s.setPlaying);
   const focusItem = useArrangeStore((s) => s.focusItem);
+  const seekToItem = useArrangeStore((s) => s.seekToItem);
   const jobBpm = useArrangeStore((s) => s.jobBpm);
   const jobBeatsPerBar = useArrangeStore((s) => s.jobBeatsPerBar);
+  const analysis = useArrangeStore((s) => s.analysis);
 
   const cam = cams.find((c) => c.id === selectedCamId) ?? cams[0] ?? null;
   // Derive usage from the arrangement reference — useMemo keeps the
@@ -77,6 +80,7 @@ export function ContactSheet() {
           {acceptedChunks.map((chunk, i) => {
             const bars = effectiveBarsForChunk(chunk, jobBpm, jobBeatsPerBar);
             const usage = usageCounts[chunk.id] ?? 0;
+            const spectralColor = chunkSpectralColor(chunk, analysis);
             return (
               <Polaroid
                 key={chunk.id}
@@ -86,13 +90,24 @@ export function ContactSheet() {
                 index={i}
                 bars={bars}
                 usage={usage}
+                spectralColor={spectralColor}
                 onAdd={() => {
                   insertChunkAtCursor(chunk.id);
                 }}
                 onPreview={() => {
-                  seek(chunk.startMs / 1000);
-                  setPlaying(true);
-                  focusItem(null);
+                  // Click never changes the play state — if playback
+                  // is paused, stay paused; if it's running, the seek
+                  // re-routes it. This rule is global: no UI surface
+                  // auto-starts playback on click.
+                  const inArrangement = arrangement.find(
+                    (a) => a.chunkId === chunk.id,
+                  );
+                  if (inArrangement) {
+                    seekToItem(inArrangement.id);
+                  } else {
+                    focusItem(null);
+                    seek(chunk.startMs / 1000);
+                  }
                 }}
               />
             );

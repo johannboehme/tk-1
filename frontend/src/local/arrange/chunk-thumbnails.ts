@@ -29,7 +29,18 @@ import { loadAssetFile } from "../asset-source";
 import { resolveCamAssetUrl } from "../jobs";
 import { planTileStrip } from "../render/frames/strategy";
 
-const THUMB_WIDTH = 200;
+/** Target output width for tier-3 (on-demand seek) thumbnails — drawn
+ *  from the full-res video, so we can pick a number that's plenty
+ *  large for the biggest frame in the strip. */
+const THUMB_WIDTH = 256;
+/** Tier-2 only kicks in when the strip tile is at least this wide.
+ *  Strips are extracted at `tileHeight: 80`, so portrait phone clips
+ *  end up with ~45 px wide tiles — upscaling those to even 124 px
+ *  (Polaroid width) produces visible blocking. Landscape clips have
+ *  ~142 px tiles which scale up cleanly. The threshold sits between
+ *  the two regimes so portrait falls through to tier 3 (full-res
+ *  video seek), landscape stays on the fast strip path. */
+const TIER2_MIN_TILE_WIDTH = 100;
 const MAX_URL_CACHE = 200;
 
 interface ThumbCacheEntry {
@@ -458,10 +469,11 @@ function findCoveringTileIdx(
 }
 
 /**
- * Slice one tile out of the strip into a JPEG, honouring the cam's
- * intrinsic rotation. The strip stores raw codec-level pixels (no
- * rotation), so portrait phone recordings need a 90° rotate at draw
- * time to come out upright.
+ * Slice one tile out of the strip into a JPEG at the tile's NATIVE
+ * resolution — no upscale at encode time. CSS scaling does the final
+ * fit at the consumer end, which keeps the JPEG round small while
+ * avoiding the blocky upscale-then-recompress double-hit we used to
+ * pay when the slice was stretched to a fixed THUMB_WIDTH first.
  */
 async function sliceTileToBlob(
   bundle: StripBundle,
@@ -471,12 +483,12 @@ async function sliceTileToBlob(
   const { image, plan } = bundle;
   const srcX = tileIdx * plan.tileWidth;
 
-  // Output canvas dims are post-rotation (display orientation).
+  // Output canvas dims = the tile's display dimensions. Width and
+  // height swap when we rotate 90°/270° (portrait clip stored sideways
+  // in the codec strip — display dims are tile.height × tile.width).
   const swap = rotationDeg === 90 || rotationDeg === 270;
-  const sourceAspect = plan.tileWidth / plan.tileHeight;
-  const displayAspect = swap ? plan.tileHeight / plan.tileWidth : sourceAspect;
-  const w = THUMB_WIDTH;
-  const h = Math.max(2, Math.round(w / displayAspect));
+  const w = swap ? plan.tileHeight : plan.tileWidth;
+  const h = swap ? plan.tileWidth : plan.tileHeight;
 
   const canvas = document.createElement("canvas");
   canvas.width = w;
@@ -498,30 +510,30 @@ async function sliceTileToBlob(
         h,
       );
     } else {
-      // Rotate around the canvas centre. After rotation we draw the
-      // source tile at the (pre-rotation) display dims (h × w when
-      // swap, w × h otherwise), centred at origin.
-      const drawW = swap ? h : w;
-      const drawH = swap ? w : h;
       ctx.translate(w / 2, h / 2);
       ctx.rotate((rotationDeg * Math.PI) / 180);
+      // Source is tileWidth × tileHeight. Drawn centred so the rotation
+      // around the canvas centre lines up with the tile centre.
       ctx.drawImage(
         image,
         srcX,
         0,
         plan.tileWidth,
         plan.tileHeight,
-        -drawW / 2,
-        -drawH / 2,
-        drawW,
-        drawH,
+        -plan.tileWidth / 2,
+        -plan.tileHeight / 2,
+        plan.tileWidth,
+        plan.tileHeight,
       );
     }
   } catch {
     return null;
   }
+  // Higher JPEG quality compensates for the lower pixel count — at the
+  // small native tile size, blocky compression is the bigger eyesore
+  // than file size.
   return await new Promise<Blob | null>((resolve) => {
-    canvas.toBlob((b) => resolve(b), "image/jpeg", 0.78);
+    canvas.toBlob((b) => resolve(b), "image/jpeg", 0.9);
   });
 }
 
@@ -686,44 +698,63 @@ export async function getChunkThumbnailUrl(
   try {
     const bundle = await getOrLoadStrip(req.jobId, req.cam);
     if (bundle && probe) {
-      const syncOffsetMs =
-        (req.cam.sync?.offsetMs ?? 0) + (req.cam.syncOverrideMs ?? 0);
-      const tileIdx = findCoveringTileIdx(req.chunk, syncOffsetMs, bundle.plan);
-      if (tileIdx !== null) {
-        // Display-oriented strips have rotation baked in at extract
-        // time — slicing then needs zero rotation. Legacy codec
-        // strips need the cross-checked probe rotation.
-        const sliceRotation =
-          req.cam.framesOrientation === "display"
-            ? (0 as const)
-            : probe.rotationDeg;
-        blob = await sliceTileToBlob(bundle, tileIdx, sliceRotation);
-        if (blob) {
-          usedTier = "2";
-          thumbLog(
-            "tier2-ok",
-            req.chunk.id,
-            `cam=${req.cam.id}`,
-            `tileIdx=${tileIdx}`,
-            `orient=${req.cam.framesOrientation ?? "codec"}`,
-            `sliceRot=${sliceRotation}`,
-          );
-        } else {
-          thumbLog(
-            "tier2-fail",
-            req.chunk.id,
-            "slice-returned-null",
-            `tileIdx=${tileIdx}`,
-          );
-        }
-      } else {
+      const sliceRotation =
+        req.cam.framesOrientation === "display"
+          ? (0 as const)
+          : probe.rotationDeg;
+      // Display width of a single tile after the slicer's rotation —
+      // for portrait clips stored in a codec-orientation strip, the
+      // tile width as the user sees it is `tileHeight`. We gate on
+      // that so a 45-px-wide portrait tile doesn't get sliced and
+      // delivered as a blocky thumb.
+      const swap = sliceRotation === 90 || sliceRotation === 270;
+      const tileDisplayW = swap ? bundle.plan.tileHeight : bundle.plan.tileWidth;
+      if (tileDisplayW < TIER2_MIN_TILE_WIDTH) {
         thumbLog(
           "tier2-skip",
           req.chunk.id,
-          "no-covering-tile",
-          `chunkRange=${(req.chunk.startMs / 1000).toFixed(2)}-${(req.chunk.endMs / 1000).toFixed(2)}`,
-          `syncOff=${syncOffsetMs}`,
+          "tile-too-small",
+          `displayW=${tileDisplayW}`,
+          `min=${TIER2_MIN_TILE_WIDTH}`,
         );
+      } else {
+        const syncOffsetMs =
+          (req.cam.sync?.offsetMs ?? 0) + (req.cam.syncOverrideMs ?? 0);
+        const tileIdx = findCoveringTileIdx(
+          req.chunk,
+          syncOffsetMs,
+          bundle.plan,
+        );
+        if (tileIdx !== null) {
+          blob = await sliceTileToBlob(bundle, tileIdx, sliceRotation);
+          if (blob) {
+            usedTier = "2";
+            thumbLog(
+              "tier2-ok",
+              req.chunk.id,
+              `cam=${req.cam.id}`,
+              `tileIdx=${tileIdx}`,
+              `orient=${req.cam.framesOrientation ?? "codec"}`,
+              `sliceRot=${sliceRotation}`,
+              `displayW=${tileDisplayW}`,
+            );
+          } else {
+            thumbLog(
+              "tier2-fail",
+              req.chunk.id,
+              "slice-returned-null",
+              `tileIdx=${tileIdx}`,
+            );
+          }
+        } else {
+          thumbLog(
+            "tier2-skip",
+            req.chunk.id,
+            "no-covering-tile",
+            `chunkRange=${(req.chunk.startMs / 1000).toFixed(2)}-${(req.chunk.endMs / 1000).toFixed(2)}`,
+            `syncOff=${syncOffsetMs}`,
+          );
+        }
       }
     } else if (!bundle) {
       thumbLog("tier2-skip", req.chunk.id, "no-strip", `cam=${req.cam.id}`);

@@ -24,6 +24,9 @@ interface FrameProps {
   height: number;
   focused: boolean;
   isCurrentItem: boolean;
+  /** Optional spectral fingerprint colour (hsl) for the mini-dot in
+   *  the label band. Falls back to neutral grey when unknown. */
+  spectralColor?: string;
   onFocus: () => void;
   onContextMenu?: (e: React.MouseEvent) => void;
 }
@@ -38,6 +41,7 @@ export function Frame({
   height,
   focused,
   isCurrentItem,
+  spectralColor,
   onFocus,
   onContextMenu,
 }: FrameProps) {
@@ -72,24 +76,54 @@ export function Frame({
   // long strip-region" feel without actually decoding more frames.
   const tileCount = width >= 170 ? 3 : width >= 130 ? 2 : 1;
 
+  // Skeuomorphic selection tell: layered box-shadow chain reads as a
+  // brass clamp gripping the cell — outer hot ring + inner brass
+  // hairline + soft phosphor halo. Pulses when selected-but-not-playing
+  // so selected+playing co-exist as distinct signals.
+  const focusedShadow = [
+    "0 0 0 2px #FF5722",
+    "0 0 0 3px rgba(255,222,195,0.5) inset",
+    "0 0 16px 2px rgba(255,87,34,0.45)",
+  ].join(", ");
+
   return (
     <button
       ref={wrapperRef}
       type="button"
       onClick={onFocus}
       onContextMenu={onContextMenu}
-      className="relative block shrink-0 select-none"
+      className={`relative block shrink-0 select-none ${
+        focused && !isCurrentItem ? "animate-frame-pulse" : ""
+      }`}
       style={{
         width,
         height,
         background:
           "linear-gradient(180deg, #1A1816 0%, #0F0E0C 50%, #1A1816 100%)",
-        outline: focused ? "2px solid #2F6FED" : undefined,
-        outlineOffset: focused ? -2 : undefined,
+        boxShadow: focused ? focusedShadow : undefined,
         zIndex: focused ? 5 : isCurrentItem ? 4 : 1,
       }}
       title={`#${index + 1} · chunk ${chunk.id} · ${bars.toFixed(1)} bars · ${lengthS.toFixed(2)}s`}
     >
+      {/* Selection tooth — a small bevelled trapezoid on the top edge.
+       *  Reads as a 3D pip clamping the frame, not a flat sticker. */}
+      {focused && (
+        <span
+          aria-hidden
+          className="absolute pointer-events-none"
+          style={{
+            top: -5,
+            left: "50%",
+            transform: "translateX(-50%)",
+            width: 12,
+            height: 6,
+            clipPath: "polygon(50% 100%, 0 0, 100% 0)",
+            background:
+              "linear-gradient(180deg, #FF6A2A 0%, #FF5722 60%, #C8401A 100%)",
+            filter: "drop-shadow(0 -2px 5px rgba(255,87,34,0.8))",
+          }}
+        />
+      )}
       {/* Image well — flush to the frame edges in horizontal direction
        *  (no gutter), small black bars top/bottom for the film aesthetic. */}
       <div
@@ -127,11 +161,14 @@ export function Frame({
         ))}
       </div>
 
-      {/* Bottom label band: chunk index + bar count. The cam-color
-       *  hairline separates the band from the image, making the cam
-       *  identity readable at a glance. */}
+      {/* Bottom label band: chunk index + spectral mini-dot + bar count.
+       *  The cam-color hairline separates the band from the image so the
+       *  cam identity stays scannable. The spectral dot is the third
+       *  datum — a 6px disc whose hue encodes the chunk's audio
+       *  fingerprint. Black rim + faint white halo keep it legible
+       *  whatever its colour. */}
       <div
-        className="absolute inset-x-0 bottom-0 px-1.5 flex items-center justify-between"
+        className="absolute inset-x-0 bottom-0 px-1.5 flex items-center justify-between gap-1.5"
         style={{
           height: 12,
           background: "rgba(0,0,0,0.55)",
@@ -141,18 +178,30 @@ export function Frame({
         <span className="font-display text-[8.5px] font-semibold tracking-label uppercase text-paper-hi/95 leading-none">
           #{(index + 1).toString().padStart(2, "0")}
         </span>
+        <span
+          aria-hidden
+          className="block w-[6px] h-[6px] rounded-full shrink-0"
+          style={{
+            background: spectralColor ?? "#666",
+            boxShadow:
+              "0 0 0 0.5px rgba(0,0,0,0.6), 0 0 4px rgba(255,255,255,0.06)",
+          }}
+        />
         <span className="font-mono text-[8.5px] tabular text-paper-hi/75 leading-none">
           {bars.toFixed(bars >= 10 ? 0 : 1)}br
         </span>
       </div>
 
       {/* When this frame is the one currently playing, glow its top
-       *  edge with the cam's color — that's the on-air tell. */}
+       *  edge with the cam's color — inset by 4px so it reads as a
+       *  separate tell from the focused tooth. */}
       {isCurrentItem && (
         <span
           aria-hidden
-          className="absolute inset-x-0 top-0 h-[2px]"
+          className="absolute top-0 h-[3px]"
           style={{
+            left: 4,
+            right: 4,
             background: camColor,
             boxShadow: `0 0 8px ${camColor}`,
           }}

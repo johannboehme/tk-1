@@ -93,6 +93,13 @@ export const TrashIcon = (p: SVGProps<SVGSVGElement>) => (
     <path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2" />
   </svg>
 );
+/** Two overlapping rounded squares — duplicate / copy. */
+export const CopyIcon = (p: SVGProps<SVGSVGElement>) => (
+  <svg {...baseProps} {...p}>
+    <rect x="9" y="9" width="11" height="11" rx="2" ry="2" />
+    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+  </svg>
+);
 export const DownloadIcon = (p: SVGProps<SVGSVGElement>) => (
   <svg {...baseProps} {...p}>
     <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />

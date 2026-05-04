@@ -444,7 +444,7 @@ export interface PunchFxRecord {
 }
 
 const DB_NAME = "videoaudiosync";
-const DB_VERSION = 5;
+const DB_VERSION = 7;
 const STORE = "jobs";
 const ANALYSIS_STORE = "audio-analysis";
 /** Per-chunk thumbnail JPEG bytes, keyed by `${jobId}::${camId}::${chunkId}`.
@@ -452,6 +452,11 @@ const ANALYSIS_STORE = "audio-analysis";
  *  underlying video. Bounded soft-cap: callers can prune via
  *  `pruneChunkThumbnailsForJob` when a job is deleted. */
 const CHUNK_THUMBS_STORE = "chunk-thumbnails";
+/** Per-chunk mel-spectrogram bytes (u8 grayscale), keyed by
+ *  `${jobId}::${chunkId}`. Computed once when the user first opens
+ *  Arrange for a job and cached so re-mounts don't re-decode the
+ *  master audio. */
+const CHUNK_MELS_STORE = "chunk-mel-specs";
 
 let dbPromise: Promise<IDBPDatabase> | null = null;
 
@@ -502,6 +507,26 @@ function db(): Promise<IDBPDatabase> {
           const s = tx.objectStore(CHUNK_THUMBS_STORE);
           await s.clear();
         }
+
+        // V5 → V6: per-chunk mel-spectrogram cache for the Arrange-page
+        // glance display. No data migration — fresh store, lazily
+        // filled on first Arrange mount per job.
+        if (oldVersion < 6 && !database.objectStoreNames.contains(CHUNK_MELS_STORE)) {
+          const s = database.createObjectStore(CHUNK_MELS_STORE, {
+            keyPath: "key",
+          });
+          s.createIndex("by-jobId", "jobId");
+        }
+
+        // V6 → V7: chunk-thumbnail extraction switched from "200 px wide
+        // upscaled JPEG" to "native tile resolution + tier-3 fallback
+        // for tiles too small to upscale". Old cached thumbs are blocky
+        // (especially for portrait clips) — wipe them so the next page
+        // mount re-extracts via the corrected pipeline.
+        if (oldVersion === 6 && database.objectStoreNames.contains(CHUNK_THUMBS_STORE)) {
+          const s = tx.objectStore(CHUNK_THUMBS_STORE);
+          await s.clear();
+        }
       },
     });
   }
@@ -547,6 +572,7 @@ async function deleteJob(id: string): Promise<void> {
     await d.delete(ANALYSIS_STORE, id);
   }
   await deleteChunkThumbnailsForJob(id);
+  await deleteChunkMelSpecsForJob(id);
 }
 
 async function wipeAll(): Promise<void> {
@@ -557,6 +583,9 @@ async function wipeAll(): Promise<void> {
   }
   if (d.objectStoreNames.contains(CHUNK_THUMBS_STORE)) {
     await d.clear(CHUNK_THUMBS_STORE);
+  }
+  if (d.objectStoreNames.contains(CHUNK_MELS_STORE)) {
+    await d.clear(CHUNK_MELS_STORE);
   }
 }
 
@@ -643,6 +672,75 @@ async function deleteChunkThumbnailsForJob(jobId: string): Promise<void> {
   await tx.done;
 }
 
+interface ChunkMelRecord {
+  /** `${jobId}::${chunkId}` */
+  key: string;
+  jobId: string;
+  /** Frame-major u8 mel-spec data, length = `nMels * nFrames`. */
+  data: Uint8Array;
+  nMels: number;
+  nFrames: number;
+  /** Original chunk duration in seconds — lets the renderer pick a
+   *  pixel width independent of the mel frame count. */
+  durationS: number;
+  /** 12-bin chroma profile. Optional for back-compat with v6 records
+   *  that were saved before key-detection landed. Class 0 = C. */
+  chroma?: Float32Array;
+}
+
+function chunkMelKey(jobId: string, chunkId: string): string {
+  return `${jobId}::${chunkId}`;
+}
+
+async function getChunkMelSpec(
+  jobId: string,
+  chunkId: string,
+): Promise<ChunkMelRecord | undefined> {
+  const d = await db();
+  if (!d.objectStoreNames.contains(CHUNK_MELS_STORE)) return undefined;
+  return (await d.get(CHUNK_MELS_STORE, chunkMelKey(jobId, chunkId))) as
+    | ChunkMelRecord
+    | undefined;
+}
+
+async function saveChunkMelSpec(
+  jobId: string,
+  chunkId: string,
+  data: Uint8Array,
+  nMels: number,
+  nFrames: number,
+  durationS: number,
+  chroma?: Float32Array,
+): Promise<void> {
+  const d = await db();
+  if (!d.objectStoreNames.contains(CHUNK_MELS_STORE)) return;
+  const rec: ChunkMelRecord = {
+    key: chunkMelKey(jobId, chunkId),
+    jobId,
+    data,
+    nMels,
+    nFrames,
+    durationS,
+    chroma,
+  };
+  await d.put(CHUNK_MELS_STORE, rec);
+}
+
+async function deleteChunkMelSpecsForJob(jobId: string): Promise<void> {
+  const d = await db();
+  if (!d.objectStoreNames.contains(CHUNK_MELS_STORE)) return;
+  const tx = d.transaction(CHUNK_MELS_STORE, "readwrite");
+  const idx = tx.store.index("by-jobId");
+  let cursor = await idx.openCursor(IDBKeyRange.only(jobId));
+  while (cursor) {
+    await cursor.delete();
+    cursor = await cursor.continue();
+  }
+  await tx.done;
+}
+
+export type { ChunkMelRecord };
+
 export const jobsDb = {
   saveJob,
   getJob,
@@ -656,6 +754,9 @@ export const jobsDb = {
   getChunkThumbnail,
   saveChunkThumbnail,
   deleteChunkThumbnailsForJob,
+  getChunkMelSpec,
+  saveChunkMelSpec,
+  deleteChunkMelSpecsForJob,
 };
 
 export type JobsDb = typeof jobsDb;

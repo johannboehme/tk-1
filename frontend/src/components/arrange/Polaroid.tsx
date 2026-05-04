@@ -25,6 +25,9 @@ interface PolaroidProps {
   index: number;
   bars: number;
   usage: number;
+  /** Optional spectral fingerprint colour (hsl). Drives the right-edge
+   *  stripe so users can spot similar-sounding chunks at a glance. */
+  spectralColor?: string;
   onAdd: () => void;
   onPreview: () => void;
   /** True when the chunk's mini player-loop is the active focus. */
@@ -38,6 +41,7 @@ export function Polaroid({
   index,
   bars,
   usage,
+  spectralColor,
   onAdd,
   onPreview,
   active = false,
@@ -173,6 +177,23 @@ export function Polaroid({
           />
         ) : (
           <PolaroidEmpty failed={thumb.failed} camColor={camColor} />
+        )}
+        {/* Spectral fingerprint stripe — 3px on the right edge of the
+         *  image well, fading at top + bottom so it doesn't slam into
+         *  the corners. Reads as part of the photograph rather than a
+         *  bolt-on label. */}
+        {spectralColor && (
+          <span
+            aria-hidden
+            className="absolute right-0 top-0 bottom-0 w-[3px] pointer-events-none"
+            style={{
+              background: spectralColor,
+              maskImage:
+                "linear-gradient(180deg, transparent 0, #000 6px, #000 calc(100% - 6px), transparent 100%)",
+              WebkitMaskImage:
+                "linear-gradient(180deg, transparent 0, #000 6px, #000 calc(100% - 6px), transparent 100%)",
+            }}
+          />
         )}
       </div>
 
