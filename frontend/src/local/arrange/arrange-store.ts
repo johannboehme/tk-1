@@ -40,6 +40,34 @@ export interface ArrangeView {
   stripContentWidthPx: number;
 }
 
+/**
+ * State for an in-flight drag of a chunk from the Contact Sheet onto
+ * the Film Strip. Lives in the store so the Polaroid (drag origin),
+ * the floating drag-ghost, the FilmStrip (drop target highlighting),
+ * and the global pointer-event controller can all stay in sync without
+ * prop-drilling refs.
+ *
+ * `dropTargetIndex`:
+ *   - non-null when the pointer is over a valid drop position on the
+ *     strip (between or at either end of the existing frames). The
+ *     FilmStrip highlights the corresponding InsertionCursor.
+ *   - null when the pointer is outside the strip's drop zone — the
+ *     ghost still follows the cursor but releasing here cancels.
+ */
+export interface ArrangeDrag {
+  chunkId: string;
+  /** Optional thumbnail URL for the floating ghost. Falls back to a
+   *  cam-color tile if missing. */
+  thumbUrl: string | null;
+  /** Cam-color hint for the empty-thumb fallback. */
+  camColor: string;
+  /** Live cursor position in viewport pixels — updated on every
+   *  pointermove. Used to position the ghost. */
+  cursorX: number;
+  cursorY: number;
+  dropTargetIndex: number | null;
+}
+
 export interface ArrangeState {
   // ─── Inputs ───────────────────────────────────────────────────────────
   jobId: string | null;
@@ -74,6 +102,9 @@ export interface ArrangeState {
 
   playback: ArrangePlayback;
   view: ArrangeView;
+  /** In-flight drag of a chunk from the Contact Sheet onto the Strip.
+   *  Null when not dragging. */
+  drag: ArrangeDrag | null;
 
   // ─── Actions ──────────────────────────────────────────────────────────
   initFromJob(args: {
@@ -115,6 +146,25 @@ export interface ArrangeState {
   // View.
   setStripScrollPx(px: number): void;
   setStripMetrics(viewportWidthPx: number, contentWidthPx: number): void;
+
+  // Chunk-drag (Polaroid → FilmStrip).
+  beginChunkDrag(args: {
+    chunkId: string;
+    thumbUrl: string | null;
+    camColor: string;
+    cursorX: number;
+    cursorY: number;
+  }): void;
+  updateChunkDrag(args: {
+    cursorX: number;
+    cursorY: number;
+    dropTargetIndex: number | null;
+  }): void;
+  /** Commit if `dropTargetIndex` is non-null and there's a drag in
+   *  flight; otherwise no-op. Always clears the drag state. Returns
+   *  true on a successful drop. */
+  commitChunkDrag(): boolean;
+  cancelChunkDrag(): void;
 
   // Derived helpers.
   totalDurationMs(): number;
@@ -158,6 +208,7 @@ export const useArrangeStore = create<ArrangeState>((set, get) => ({
   selectedCamId: null,
   playback: INITIAL_PLAYBACK,
   view: INITIAL_VIEW,
+  drag: null,
 
   initFromJob(args) {
     set({
@@ -173,6 +224,7 @@ export const useArrangeStore = create<ArrangeState>((set, get) => ({
       selectedCamId: args.cams[0]?.id ?? null,
       playback: INITIAL_PLAYBACK,
       view: INITIAL_VIEW,
+      drag: null,
     });
   },
 
@@ -190,6 +242,7 @@ export const useArrangeStore = create<ArrangeState>((set, get) => ({
       selectedCamId: null,
       playback: INITIAL_PLAYBACK,
       view: INITIAL_VIEW,
+      drag: null,
     });
   },
 
@@ -328,6 +381,60 @@ export const useArrangeStore = create<ArrangeState>((set, get) => ({
         stripContentWidthPx: contentWidthPx,
       },
     }));
+  },
+
+  beginChunkDrag(args) {
+    set({
+      drag: {
+        chunkId: args.chunkId,
+        thumbUrl: args.thumbUrl,
+        camColor: args.camColor,
+        cursorX: args.cursorX,
+        cursorY: args.cursorY,
+        dropTargetIndex: null,
+      },
+    });
+  },
+
+  updateChunkDrag(args) {
+    set((s) => {
+      if (!s.drag) return {};
+      return {
+        drag: {
+          ...s.drag,
+          cursorX: args.cursorX,
+          cursorY: args.cursorY,
+          dropTargetIndex: args.dropTargetIndex,
+        },
+      };
+    });
+  },
+
+  commitChunkDrag() {
+    const s = get();
+    if (!s.drag || s.drag.dropTargetIndex === null) {
+      set({ drag: null });
+      return false;
+    }
+    const { chunkId, dropTargetIndex } = s.drag;
+    if (!s.chunks.some((c) => c.id === chunkId)) {
+      set({ drag: null });
+      return false;
+    }
+    const idx = clampIdx(dropTargetIndex, s.arrangement.length);
+    const item: ArrangementItem = { id: freshArrId(chunkId), chunkId };
+    const next = [...s.arrangement];
+    next.splice(idx, 0, item);
+    set({
+      arrangement: next,
+      insertionIndex: idx + 1,
+      drag: null,
+    });
+    return true;
+  },
+
+  cancelChunkDrag() {
+    set({ drag: null });
   },
 
   totalDurationMs() {

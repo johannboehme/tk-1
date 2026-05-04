@@ -31,6 +31,10 @@ export interface ExtractFramesOptions {
   sourceHeight?: number;
   /** [0..1] progress callback. Coarse on the ffmpeg path. */
   onProgress?: (frac: number) => void;
+  /** Bake the source's display rotation into the strip so tiles come
+   *  out upright. Should be the value the demuxer extracts from the
+   *  container's display matrix (`info.rotationDeg`). Default 0. */
+  rotationDeg?: 0 | 90 | 180 | 270;
 }
 
 let ffmpegImpl: typeof import("./ffmpeg") | null = null;
@@ -52,7 +56,8 @@ export async function extractTimelineFrames(
       opts.sourceWidth === undefined ||
       opts.sourceHeight === undefined
     ) {
-      // Probe via demux as a convenience.
+      // Probe via demux as a convenience. If the caller didn't pass
+      // rotation, take it from the demux probe.
       const probed = await demuxVideoTrack(source);
       if (!probed) throw new Error("Frame extraction: source has no video track");
       return extractFrameStripFfmpeg(source, {
@@ -62,6 +67,7 @@ export async function extractTimelineFrames(
         tileHeight: opts.tileHeight,
         maxTiles: opts.maxTiles,
         onProgress: opts.onProgress,
+        rotationDeg: opts.rotationDeg ?? probed.info.rotationDeg,
       });
     }
     return extractFrameStripFfmpeg(source, {
@@ -71,6 +77,7 @@ export async function extractTimelineFrames(
       tileHeight: opts.tileHeight,
       maxTiles: opts.maxTiles,
       onProgress: opts.onProgress,
+      rotationDeg: opts.rotationDeg,
     });
   }
 
@@ -80,6 +87,7 @@ export async function extractTimelineFrames(
       maxTiles: opts.maxTiles,
       quality: opts.quality,
       onProgress: opts.onProgress,
+      rotationDeg: opts.rotationDeg,
     });
   }
 
@@ -93,6 +101,7 @@ export async function extractTimelineFrames(
       maxTiles: opts.maxTiles,
       quality: opts.quality,
       onProgress: opts.onProgress,
+      rotationDeg: opts.rotationDeg,
     });
   } catch (err) {
     primaryError = err;
@@ -116,5 +125,6 @@ export async function extractTimelineFrames(
     tileHeight: opts.tileHeight,
     maxTiles: opts.maxTiles,
     onProgress: opts.onProgress,
+    rotationDeg: opts.rotationDeg ?? probed.info.rotationDeg,
   });
 }

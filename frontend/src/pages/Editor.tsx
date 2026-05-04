@@ -30,7 +30,7 @@ import {
   type LocalJob,
   type EditSpecLocal,
 } from "../local/jobs";
-import { isVideoAsset, type MediaAsset } from "../storage/jobs-db";
+import { isVideoAsset, type MediaAsset, type VideoAsset } from "../storage/jobs-db";
 import { arrangementToSegments } from "../local/arrange/chunks-to-segments";
 import { decodeAudioToMonoPcm } from "../local/codec";
 import { computeWaveformPeaks } from "../local/waveform-peaks";
@@ -1049,8 +1049,27 @@ export default function Editor() {
               cams={Object.fromEntries(
                 Object.entries(assets.cams).map(([camId, ca]) => {
                   const cam = job.videos?.find((v) => v.id === camId);
-                  const aspect =
-                    cam?.width && cam?.height ? cam.width / cam.height : 16 / 9;
+                  // Tile aspect must match the strip's pixel layout.
+                  // Legacy strips (`framesOrientation === "codec"` or
+                  // undefined): tiles are codec-oriented, so use codec
+                  // dims. New strips ("display"): tiles are upright,
+                  // so swap codec dims when the cam carries a 90/270
+                  // intrinsic rotation.
+                  const usingDisplayStrip =
+                    isVideoAsset(cam ?? ({} as never)) &&
+                    (cam as VideoAsset).framesOrientation === "display";
+                  const dims = (() => {
+                    if (!cam || cam.width == null || cam.height == null) return null;
+                    if (!usingDisplayStrip) return { w: cam.width, h: cam.height };
+                    const swap =
+                      isVideoAsset(cam) &&
+                      (cam.intrinsicRotationDeg === 90 ||
+                        cam.intrinsicRotationDeg === 270);
+                    return swap
+                      ? { w: cam.height, h: cam.width }
+                      : { w: cam.width, h: cam.height };
+                  })();
+                  const aspect = dims ? dims.w / dims.h : 16 / 9;
                   // Image clips: pass the asset URL through so the lane
                   // renders the actual image as a preview instead of an
                   // empty pill.

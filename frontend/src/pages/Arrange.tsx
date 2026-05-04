@@ -38,6 +38,8 @@ import { PlayerCockpit } from "../components/arrange/PlayerCockpit";
 import { ArrangeTransport } from "../components/arrange/ArrangeTransport";
 import { MiniMap } from "../components/arrange/MiniMap";
 import { ArrangeAudioMaster } from "../components/arrange/useArrangeAudio";
+import { ChunkDragGhost } from "../components/arrange/ChunkDragGhost";
+import { useChunkDragController } from "../components/arrange/useChunkDragController";
 import { PhaseStrip } from "./Triage";
 
 export default function Arrange() {
@@ -49,6 +51,7 @@ export default function Arrange() {
   const reset = useArrangeStore((s) => s.reset);
 
   useArrangePersist();
+  useChunkDragController();
 
   // Load the job and prime the arrange store.
   useEffect(() => {
@@ -185,6 +188,7 @@ export default function Arrange() {
       </main>
 
       <ArrangeTransport showCursorControls />
+      <ChunkDragGhost />
     </div>
   );
 }

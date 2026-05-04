@@ -152,13 +152,21 @@ export default function JobPage() {
               {canRetry ? "Retry quick render" : "Quick render"}
             </ChunkyButton>
           )}
-          <ChunkyButton
-            variant={showQuickRender ? "secondary" : "primary"}
-            size="lg"
-            onClick={() => navigate(jobRoutePath(job.id, nextRouteForJob(job)))}
-          >
-            {nextRouteLabel(nextRouteForJob(job))}
-          </ChunkyButton>
+          {job.mode === "longform" ? (
+            <LongformStageButtons
+              job={job}
+              isPrimary={!showQuickRender}
+              onNavigate={(route) => navigate(jobRoutePath(job.id, route))}
+            />
+          ) : (
+            <ChunkyButton
+              variant={showQuickRender ? "secondary" : "primary"}
+              size="lg"
+              onClick={() => navigate(jobRoutePath(job.id, nextRouteForJob(job)))}
+            >
+              {nextRouteLabel(nextRouteForJob(job))}
+            </ChunkyButton>
+          )}
           {downloadUrl && (
             <a
               href={downloadUrl}
@@ -197,6 +205,61 @@ function nextRouteLabel(route: ReturnType<typeof nextRouteForJob>): string {
     default:
       return "Open editor";
   }
+}
+
+/**
+ * Long-form jobs walk Triage → Arrange → Editor. Once a job has
+ * graduated past a phase the user typically still wants to be able to
+ * jump back into it (re-curate chunks, tweak the arrangement) without
+ * losing the editor state. We surface all reachable phases as buttons,
+ * highlighting the most-recent one as primary so a single click on
+ * "open" still lands them where they were.
+ */
+function LongformStageButtons({
+  job,
+  isPrimary,
+  onNavigate,
+}: {
+  job: LocalJob;
+  isPrimary: boolean;
+  onNavigate: (route: "triage" | "arrange" | "edit") => void;
+}) {
+  const arrangementDefined = job.arrangement !== undefined;
+  const arrangementHasItems = (job.arrangement?.length ?? 0) > 0;
+  // The "default" stage = the furthest one the user can land in.
+  // Highlighting that one as primary keeps the muscle memory of the
+  // single Continue button while still exposing the others.
+  const defaultStage = nextRouteForJob(job);
+
+  type Stage = { route: "triage" | "arrange" | "edit"; label: string; reachable: boolean };
+  const stages: Stage[] = [
+    { route: "triage", label: "Triage", reachable: true },
+    { route: "arrange", label: "Arrange", reachable: arrangementDefined },
+    { route: "edit", label: "Editor", reachable: arrangementHasItems },
+  ];
+
+  return (
+    <>
+      {stages
+        .filter((s) => s.reachable)
+        .map((s) => (
+          <ChunkyButton
+            key={s.route}
+            variant={
+              s.route === defaultStage
+                ? isPrimary
+                  ? "primary"
+                  : "secondary"
+                : "ghost"
+            }
+            size="lg"
+            onClick={() => onNavigate(s.route)}
+          >
+            {s.label}
+          </ChunkyButton>
+        ))}
+    </>
+  );
 }
 
 function StatusBadge({ status }: { status: string }) {

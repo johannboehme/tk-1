@@ -432,13 +432,18 @@ async function runCamPrep(
   // Per-cam thumbnail strip. Always runs (B-roll lanes need thumbnails too).
   // Failure is non-blocking.
   let framesPath: string | undefined;
+  let framesOrientation: "codec" | "display" | undefined;
   await reportProgress(jobId, {
     pct: opts.mapPct(0.6),
     stage: `frames-${cam.id}`,
     detail: `${cam.id} · ${cam.filename}`,
   });
   try {
+    // Bake the source's display rotation into the strip so every
+    // downstream consumer sees upright tiles without re-applying the
+    // rotation themselves (was a per-consumer bug-magnet).
     const r = await extractTimelineFrames(videoFile, {
+      rotationDeg: intrinsicRotationDeg,
       onProgress: (frac) => {
         void reportProgress(jobId, {
           pct: opts.mapPct(0.6 + frac * 0.4),
@@ -448,6 +453,7 @@ async function runCamPrep(
       },
     });
     framesPath = camFramesPath(jobId, cam.id);
+    framesOrientation = "display";
     await opfs.writeFile(framesPath, r.blob);
   } catch (err) {
     console.warn(`Frame strip extraction failed for ${jobId}/${cam.id}:`, err);
@@ -461,6 +467,7 @@ async function runCamPrep(
     height,
     intrinsicRotationDeg,
     framesPath,
+    framesOrientation,
   };
 }
 

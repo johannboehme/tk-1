@@ -69,6 +69,18 @@ export interface VideoAsset {
   intrinsicRotationDeg?: 0 | 90 | 180 | 270;
   /** OPFS-Pfad zur extrahierten Thumbnail-Strip-Datei (frames.webp). */
   framesPath?: string;
+  /** What pixel orientation the strip at `framesPath` carries.
+   *
+   *  - `"display"` — strip tiles are already display-oriented (rotation
+   *    baked in at extraction time). Tier-2 thumbnail consumers can
+   *    blit them straight to canvas. NEW.
+   *  - `"codec"` (or undefined for legacy rows) — strip tiles store
+   *    raw codec frames (no rotation). Consumers must apply
+   *    `intrinsicRotationDeg` themselves at slice time.
+   *
+   *  This is per-cam because we may incrementally re-extract one cam's
+   *  strip without forcing a re-extract of the others. */
+  framesOrientation?: "codec" | "display";
   // ---- Editor-state, persisted via auto-save ----
   /** User-nudge (ms) on top of sync.offsetMs. */
   syncOverrideMs?: number;
@@ -137,6 +149,28 @@ export function isImageAsset(a: MediaAsset): a is ImageAsset {
 }
 export function isVideoAsset(a: MediaAsset): a is VideoAsset {
   return a.kind !== "image";
+}
+
+/**
+ * Display-oriented dimensions for a cam — codec dims swapped when the
+ * intrinsic rotation is 90/270 (portrait phone recordings).
+ *
+ * Use this for any consumer that operates on the actual on-screen
+ * frame: `<video>.videoWidth/Height` matches these values, the
+ * baked-in (framesOrientation: "display") strip's tile aspect matches
+ * these, and the edit compositor's output canvas should follow them.
+ *
+ * Returns null when the cam never had width/height probed (legacy
+ * rows synced before width/height were captured).
+ */
+export function displayDimsOf(
+  cam: VideoAsset,
+): { width: number; height: number } | null {
+  if (cam.width === undefined || cam.height === undefined) return null;
+  const swap = cam.intrinsicRotationDeg === 90 || cam.intrinsicRotationDeg === 270;
+  return swap
+    ? { width: cam.height, height: cam.width }
+    : { width: cam.width, height: cam.height };
 }
 
 /**
