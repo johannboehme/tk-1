@@ -21,6 +21,16 @@ import {
 } from "react";
 import { useEditorStore } from "../store";
 import { clipRangeS, isVideoClip, type Clip } from "../types";
+import {
+  arrToMaster,
+  masterToArr,
+  mastersToArrAll,
+  segmentArrStarts,
+  segmentIndexAtArr,
+  sliceByArrSegments,
+  totalArrDuration,
+  type ArrSlice,
+} from "../arrangement-time";
 import { LaneHeader, type CamStatus } from "./timeline/LaneHeader";
 import { AddMediaButton } from "./AddMediaButton";
 import { ProgramStrip } from "./timeline/ProgramStrip";
@@ -234,18 +244,47 @@ export function Timeline({
     for (const k in fxHolds) set.add(fxHolds[k].fxId);
     return set;
   }, [fxHolds]);
+
   const takePromoteTimerRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
 
   const duration = jobMeta?.duration || audioDuration || 0;
+  // Arrangement-mode flag: when the editor was opened from a long-form
+  // Arrange handoff, the timeline shows the song (= sum of segments) on
+  // a continuous arr-time X-axis instead of the raw master-audio. The
+  // audio walker still hops in master-time internally; this flag flips
+  // every UI surface that thinks in time-space.
+  const isArrMode = arrangementSegments.length > 0;
+  const arrTotal = useMemo(
+    () => (isArrMode ? totalArrDuration(arrangementSegments) : 0),
+    [isArrMode, arrangementSegments],
+  );
+
+  // master ↔ view (arrangement) conversions. In direct-mode they are
+  // identity. The Timeline keeps store/cuts/fx as master-time internally
+  // and only applies the bijection at the canvas boundary.
+  const masterToView = useCallback(
+    (masterT: number) =>
+      isArrMode ? masterToArr(masterT, arrangementSegments) : masterT,
+    [isArrMode, arrangementSegments],
+  );
+  const viewToMaster = useCallback(
+    (viewT: number) =>
+      isArrMode ? arrToMaster(viewT, arrangementSegments) : viewT,
+    [isArrMode, arrangementSegments],
+  );
+
   // The visible/scroll range covers the union of the master audio AND
   // every cam's master-timeline span (incl. their match-marker positions
-  // so candidate ticks at negative master-time stay reachable). During
-  // an active clip-move drag we *freeze* this range to the snapshot
-  // captured at drag-start (`frozenTimelineRangeRef`) — without that
-  // freeze, dragging right would extend the range, shrink pxPerSec, and
-  // the pill would asymptote to the canvas edge instead of following
-  // the pointer.
+  // so candidate ticks at negative master-time stay reachable). In
+  // arrangement-mode the range collapses to [0, total-arr-duration] —
+  // the song is the only thing the user can scrub. During an active
+  // clip-move drag (direct-mode only) we *freeze* this range to the
+  // snapshot captured at drag-start (`frozenTimelineRangeRef`) so the
+  // canvas doesn't rescale under the user's cursor.
   const liveTimelineRange = useMemo(() => {
+    if (isArrMode) {
+      return { startS: 0, endS: arrTotal, span: arrTotal };
+    }
     let lo = 0;
     let hi = duration;
     for (const c of clips) {
@@ -262,7 +301,7 @@ export function Timeline({
       }
     }
     return { startS: lo, endS: hi, span: hi - lo };
-  }, [clips, duration]);
+  }, [isArrMode, arrTotal, clips, duration]);
   const timelineRange = activeClipMoveDragId && frozenTimelineRangeRef.current
     ? frozenTimelineRangeRef.current
     : liveTimelineRange;
@@ -281,16 +320,21 @@ export function Timeline({
   // playback or via a programmatic seek), snap scrollX so the playhead
   // reappears at the start of the next "screen". Gated on the playhead
   // having moved this render — otherwise scrolling away while paused
-  // would snap straight back.
+  // would snap straight back. Comparison happens in *view* space so the
+  // arrangement-mode path doesn't re-paint to master-time gaps.
   const lastPlayheadRef = useRef(currentTime);
+  const currentTimeView = masterToView(currentTime);
   useEffect(() => {
     const moved = currentTime !== lastPlayheadRef.current;
     lastPlayheadRef.current = currentTime;
     if (!moved) return;
-    if (currentTime >= viewStart && currentTime <= viewEnd) return;
-    const next = Math.max(0, Math.min(maxScroll, currentTime - timelineStartS));
+    if (currentTimeView >= viewStart && currentTimeView <= viewEnd) return;
+    const next = Math.max(
+      0,
+      Math.min(maxScroll, currentTimeView - timelineStartS),
+    );
     if (Math.abs(next - clampedScroll) > 1e-6) setScrollX(next);
-  }, [currentTime, viewStart, viewEnd, timelineStartS, maxScroll, clampedScroll, setScrollX]);
+  }, [currentTime, currentTimeView, viewStart, viewEnd, timelineStartS, maxScroll, clampedScroll, setScrollX]);
 
   // ---- Layout offsets (canvas y-coordinates per lane) ----
   const videoBands = clips.map((_, i) => ({
@@ -395,14 +439,93 @@ export function Timeline({
   }, [clips, cams]);
 
   // ---- t↔x helpers ----
+  // `tToX` accepts master-time (the editor's canonical clock) and lands on
+  // a canvas pixel via the active view-space (= master in direct-mode,
+  // arrangement in arr-mode). `xToT` is the inverse and always returns
+  // master-time so callers (seek/setTrim/cut-add) stay in the canonical
+  // clock. `arrTToX` is a pure view-space mapping for things that are
+  // already in arr coords (segment splice marks, audio waveform slices).
   const tToX = useCallback(
-    (t: number) => ((t - viewStart) / visibleDur) * canvasWidth,
-    [viewStart, visibleDur, canvasWidth],
+    (masterT: number) =>
+      ((masterToView(masterT) - viewStart) / visibleDur) * canvasWidth,
+    [viewStart, visibleDur, canvasWidth, masterToView],
   );
   const xToT = useCallback(
-    (x: number) => viewStart + (x / canvasWidth) * visibleDur,
+    (x: number) =>
+      viewToMaster(viewStart + (x / canvasWidth) * visibleDur),
+    [viewStart, visibleDur, canvasWidth, viewToMaster],
+  );
+  const arrTToX = useCallback(
+    (viewT: number) => ((viewT - viewStart) / visibleDur) * canvasWidth,
     [viewStart, visibleDur, canvasWidth],
   );
+
+  // Compute the seek-hint that disambiguates duplicate chunks. In arr-mode
+  // a single canvas-x position is uniquely tied to one segment occurrence
+  // (because arr-time is unique), so we take that hint along to the seek
+  // call — without it the walker would scan for the first master-time
+  // match and snap the playhead back to a duplicated earlier occurrence.
+  const seekFromX = useCallback(
+    (x: number, masterT: number) => {
+      if (!isArrMode) {
+        seek(masterT);
+        return;
+      }
+      const arrT = viewStart + (x / canvasWidth) * visibleDur;
+      const idx = segmentIndexAtArr(arrT, arrangementSegments);
+      seek(masterT, idx >= 0 ? { segmentIdxHint: idx } : undefined);
+    },
+    [
+      isArrMode,
+      viewStart,
+      visibleDur,
+      canvasWidth,
+      arrangementSegments,
+      seek,
+    ],
+  );
+
+  // Arrangement-mode strip projections.
+  //
+  // Cuts/FX live in master-time inside the store so they remain anchored
+  // to the source media regardless of how the user reorders the
+  // arrangement. The ProgramStrip + FxStripLayer however render in the
+  // active view-space (= arr-time when segments are present) so we
+  // pre-project here: each occurrence of a chunk that contains a cut
+  // produces a corresponding splice tab on the strip; FX capsules that
+  // straddle a segment boundary split into per-segment slices so the
+  // tape edit reads as the arrangement does.
+  // (Direct-mode passes the originals through unchanged.)
+  const stripCuts = useMemo(() => {
+    if (!isArrMode) return cuts;
+    return cuts.flatMap((cut) =>
+      mastersToArrAll(cut.atTimeS, arrangementSegments).map((arrT) => ({
+        ...cut,
+        atTimeS: arrT,
+      })),
+    );
+  }, [cuts, isArrMode, arrangementSegments]);
+  const stripFx = useMemo(() => {
+    if (!isArrMode) return fx;
+    const out: typeof fx = [];
+    for (const f of fx) {
+      const slices = sliceByArrSegments(f.inS, f.outS, arrangementSegments);
+      if (slices.length === 0) continue;
+      for (let i = 0; i < slices.length; i++) {
+        out.push({
+          ...f,
+          inS: slices[i].arrStartS,
+          outS: slices[i].arrEndS,
+          // Multi-slice fx need unique React keys downstream; the live
+          // recording case is always single-slice so the original id
+          // stays in liveFxIds for the pulser path.
+          id: slices.length === 1 ? f.id : `${f.id}::${i}`,
+        });
+      }
+    }
+    return out;
+  }, [fx, isArrMode, arrangementSegments]);
+  const stripDuration = isArrMode ? arrTotal : duration;
 
   // ---- Active-cam status per lane (drives LED color) ----
   const camStatusByCamId = useMemo(() => {
@@ -452,31 +575,49 @@ export function Timeline({
     for (let i = 0; i < clips.length; i++) {
       const clip = clips[i];
       const band = videoBands[i];
+      const range = clipRangeS(clip);
+      // Project the clip's master range onto view-space. Direct-mode →
+      // a single passthrough slice. Arrangement-mode → one slice per
+      // intersected segment, so a cam contributing to chunks A and B
+      // renders as two pills back-to-back along the song timeline.
+      const masterSlices: ArrSlice[] = sliceByArrSegments(
+        range.startS,
+        range.endS,
+        isArrMode ? arrangementSegments : [],
+      );
+      const slices: ClipPillSlice[] = masterSlices.map((s) => ({
+        masterStartS: s.masterStartS,
+        masterEndS: s.masterEndS,
+        xStart: ((s.arrStartS - viewStart) / visibleDur) * canvasWidth,
+        xEnd: ((s.arrEndS - viewStart) / visibleDur) * canvasWidth,
+      }));
       drawVideoLane({
         ctx,
         clip,
         bandTop: band.top,
         bandH: videoLaneHeight,
         canvasWidth,
-        viewStart,
-        visibleDur,
+        slices,
         img: camImagesRef.current.get(clip.id) ?? null,
         aspect: cams[clip.id]?.aspect ?? 16 / 9,
         selected: clip.id === selectedClipId,
       });
       // Match-point markers: vertical ticks at each candidate's implied
-      // start position. Highlighted in MATCH mode; subtle otherwise so the
-      // user can see all alternatives the matcher considered.
-      drawMatchMarkers({
-        ctx,
-        clip,
-        bandTop: band.top,
-        bandH: videoLaneHeight,
-        viewStart,
-        visibleDur,
-        canvasWidth,
-        emphasized: snapMode === "match",
-      });
+      // start position. Hidden in arrangement-mode — sync is locked once
+      // the arrangement is committed; surfacing alternative offsets here
+      // would just be visual noise around an immutable choice.
+      if (!isArrMode) {
+        drawMatchMarkers({
+          ctx,
+          clip,
+          bandTop: band.top,
+          bandH: videoLaneHeight,
+          viewStart,
+          visibleDur,
+          canvasWidth,
+          emphasized: snapMode === "match",
+        });
+      }
       // Lane separator line below each video lane (subtle sepia rule).
       ctx.fillStyle = "#D8CFB8";
       ctx.fillRect(0, band.bottom - 1, canvasWidth, 1);
@@ -500,143 +641,145 @@ export function Timeline({
     ctx.fillStyle = "#DDD4BE"; // paper-panel
     ctx.fillRect(0, audioBand.top, audioRightX, audioLaneHeight);
 
-    // Audio waveform — same logic as before.
+    // Audio waveform.
+    //   Direct-mode: walk peaks linearly across [viewStart, viewEnd] in
+    //     master-time. Same as before.
+    //   Arrangement-mode: walk peaks per segment. The arr-time X axis is
+    //     piece-wise-linear over master-time, so a single linear walk
+    //     would smear discontinuous master regions onto each other. For
+    //     each segment we slice the peaks-range corresponding to its
+    //     master span and project onto the segment's arr window.
     if (peaks.length > 0 && audioDuration > 0) {
       const wfMid = audioBand.top + audioLaneHeight / 2;
       const peaksPerSec = peaks.length / audioDuration;
-      const startIdx = Math.max(0, Math.floor(viewStart * peaksPerSec));
-      const endIdx = Math.min(peaks.length, Math.ceil(viewEnd * peaksPerSec));
       ctx.fillStyle = "#5C544A";
-      let prevX = -1;
-      let colMin = 0;
-      let colMax = 0;
-      for (let i = startIdx; i < endIdx; i++) {
-        const t = i / peaksPerSec;
-        const x = Math.round(tToX(t));
-        const [mn, mx] = peaks[i];
-        if (x !== prevX) {
-          if (prevX >= 0) {
-            const yMax = wfMid - (Math.max(0, colMax) * audioLaneHeight) / 2;
-            const yMin = wfMid + (Math.max(0, -colMin) * audioLaneHeight) / 2;
-            ctx.fillRect(prevX, yMax, 1, Math.max(1, yMin - yMax));
+
+      const drawColumns = (
+        startIdx: number,
+        endIdx: number,
+        peakIdxToX: (i: number) => number,
+      ) => {
+        let prevX = -1;
+        let colMin = 0;
+        let colMax = 0;
+        for (let i = startIdx; i < endIdx; i++) {
+          const x = Math.round(peakIdxToX(i));
+          const [mn, mx] = peaks[i];
+          if (x !== prevX) {
+            if (prevX >= 0) {
+              const yMax = wfMid - (Math.max(0, colMax) * audioLaneHeight) / 2;
+              const yMin = wfMid + (Math.max(0, -colMin) * audioLaneHeight) / 2;
+              ctx.fillRect(prevX, yMax, 1, Math.max(1, yMin - yMax));
+            }
+            prevX = x;
+            colMin = mn;
+            colMax = mx;
+          } else {
+            if (mn < colMin) colMin = mn;
+            if (mx > colMax) colMax = mx;
           }
-          prevX = x;
-          colMin = mn;
-          colMax = mx;
-        } else {
-          if (mn < colMin) colMin = mn;
-          if (mx > colMax) colMax = mx;
         }
-      }
-      if (prevX >= 0) {
-        const yMax = wfMid - (Math.max(0, colMax) * audioLaneHeight) / 2;
-        const yMin = wfMid + (Math.max(0, -colMin) * audioLaneHeight) / 2;
-        ctx.fillRect(prevX, yMax, 1, Math.max(1, yMin - yMax));
+        if (prevX >= 0) {
+          const yMax = wfMid - (Math.max(0, colMax) * audioLaneHeight) / 2;
+          const yMin = wfMid + (Math.max(0, -colMin) * audioLaneHeight) / 2;
+          ctx.fillRect(prevX, yMax, 1, Math.max(1, yMin - yMax));
+        }
+      };
+
+      if (!isArrMode) {
+        const startIdx = Math.max(0, Math.floor(viewStart * peaksPerSec));
+        const endIdx = Math.min(peaks.length, Math.ceil(viewEnd * peaksPerSec));
+        drawColumns(startIdx, endIdx, (i) => tToX(i / peaksPerSec));
+      } else {
+        const arrStarts = segmentArrStarts(arrangementSegments);
+        for (let segIdx = 0; segIdx < arrangementSegments.length; segIdx++) {
+          const seg = arrangementSegments[segIdx];
+          const segArrIn = arrStarts[segIdx];
+          const segArrOut = segArrIn + Math.max(0, seg.out - seg.in);
+          // Skip segments entirely outside the visible arr window.
+          if (segArrOut < viewStart || segArrIn > viewEnd) continue;
+          const startIdx = Math.max(0, Math.floor(seg.in * peaksPerSec));
+          const endIdx = Math.min(peaks.length, Math.ceil(seg.out * peaksPerSec));
+          drawColumns(startIdx, endIdx, (i) => {
+            const masterT = i / peaksPerSec;
+            const arrT = segArrIn + (masterT - seg.in);
+            return arrTToX(arrT);
+          });
+        }
       }
     }
 
-    // Trim dim — shading on AUDIO lane only, since trim still refers to the
-    // master-audio render bounds.
-    const xIn = tToX(trim.in);
-    const xOut = tToX(trim.out);
-    ctx.fillStyle = "rgba(232,225,208,0.78)";
-    if (xIn > 0) ctx.fillRect(0, audioBand.top, xIn, audioLaneHeight);
-    if (xOut < audioRightX)
-      ctx.fillRect(xOut, audioBand.top, audioRightX - xOut, audioLaneHeight);
+    // Trim dim, loop band, audio-start marker, trim handles —
+    // direct-mode-only chrome. In arrangement-mode the playable region
+    // IS the visible region, so trim/loop are unused and the audio-start
+    // marker is a triage concern. Splice marks at every segment seam
+    // replace the dimming so the user sees where the audio walker hops.
+    if (!isArrMode) {
+      const xIn = tToX(trim.in);
+      const xOut = tToX(trim.out);
+      ctx.fillStyle = "rgba(232,225,208,0.78)";
+      if (xIn > 0) ctx.fillRect(0, audioBand.top, xIn, audioLaneHeight);
+      if (xOut < audioRightX)
+        ctx.fillRect(xOut, audioBand.top, audioRightX - xOut, audioLaneHeight);
 
-    // Arrange handoff: dim every region NOT covered by an arrangement
-    // segment, so the user reads at-a-glance which slices of the master
-    // audio actually play. Segments overlap the trim shading naturally.
-    if (arrangementSegments.length > 0) {
-      // Build [trim.in, trim.out] minus the union of segment ranges,
-      // then fill those gaps. Sort + walk segments so overlapping or
-      // out-of-order segments still render correctly.
-      const sorted = [...arrangementSegments]
-        .map((s) => ({
-          inS: Math.max(trim.in, s.in),
-          outS: Math.min(trim.out, s.out),
-        }))
-        .filter((s) => s.outS > s.inS)
-        .sort((a, b) => a.inS - b.inS);
-      let cursor = trim.in;
-      ctx.fillStyle = "rgba(232,225,208,0.62)";
-      for (const seg of sorted) {
-        if (seg.inS > cursor) {
-          const gapX = tToX(cursor);
-          const gapEnd = tToX(seg.inS);
-          ctx.fillRect(gapX, audioBand.top, Math.max(1, gapEnd - gapX), audioLaneHeight);
-        }
-        cursor = Math.max(cursor, seg.outS);
-      }
-      if (cursor < trim.out) {
-        const tailX = tToX(cursor);
-        const tailEndX = tToX(trim.out);
-        ctx.fillRect(
-          tailX,
-          audioBand.top,
-          Math.max(1, tailEndX - tailX),
-          audioLaneHeight,
+      if (loop) {
+        const xs = tToX(loop.start);
+        const xe = tToX(loop.end);
+        ctx.fillStyle = "rgba(255,87,34,0.18)";
+        ctx.fillRect(xs, audioBand.top, Math.max(1, xe - xs), audioLaneHeight);
+        ctx.strokeStyle = "rgba(255,87,34,0.6)";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(
+          xs + 0.5,
+          audioBand.top + 0.5,
+          Math.max(0, xe - xs - 1),
+          audioLaneHeight - 1,
         );
       }
-      // Hot tick at every segment boundary (in + out) — like splice marks
-      // in a tape edit. Reads even when the audio waveform is busy.
-      ctx.fillStyle = "rgba(255,87,34,0.55)";
-      for (const seg of sorted) {
-        const sx = tToX(seg.inS);
-        const ex = tToX(seg.outS);
-        if (sx >= 0 && sx <= audioRightX) {
-          ctx.fillRect(sx, audioBand.top, 1, audioLaneHeight);
-        }
-        if (ex >= 0 && ex <= audioRightX) {
-          ctx.fillRect(ex, audioBand.top, 1, audioLaneHeight);
+
+      drawHandle(ctx, xIn, audioBand.top, audioLaneHeight);
+      drawHandle(
+        ctx,
+        Math.min(xOut, audioRightX),
+        audioBand.top,
+        audioLaneHeight,
+      );
+
+      const rawAudioStartS = jobMeta?.audioStartS ?? 0;
+      const audioNudgeS = jobMeta?.audioStartNudgeS ?? 0;
+      if (rawAudioStartS > 0 || audioNudgeS !== 0) {
+        const xMark = tToX(rawAudioStartS + audioNudgeS);
+        if (xMark >= 0 && xMark <= audioRightX) {
+          ctx.fillStyle = "rgba(255,107,0,0.85)";
+          ctx.fillRect(Math.floor(xMark), audioBand.top, 1, audioLaneHeight);
+          ctx.beginPath();
+          ctx.moveTo(xMark, audioBand.top);
+          ctx.lineTo(xMark + 5, audioBand.top);
+          ctx.lineTo(xMark, audioBand.top + 5);
+          ctx.closePath();
+          ctx.fill();
         }
       }
-    }
-
-    // Loop band on audio lane.
-    if (loop) {
-      const xs = tToX(loop.start);
-      const xe = tToX(loop.end);
-      ctx.fillStyle = "rgba(255,87,34,0.18)";
-      ctx.fillRect(xs, audioBand.top, Math.max(1, xe - xs), audioLaneHeight);
-      ctx.strokeStyle = "rgba(255,87,34,0.6)";
-      ctx.lineWidth = 1;
-      ctx.strokeRect(
-        xs + 0.5,
-        audioBand.top + 0.5,
-        Math.max(0, xe - xs - 1),
-        audioLaneHeight - 1,
-      );
-    }
-
-    // Trim handles on the audio lane (top + bottom brackets). Clamped to
-    // the audio's effective right edge so the rightmost handle doesn't
-    // poke under the vertical fader.
-    drawHandle(ctx, xIn, audioBand.top, audioLaneHeight);
-    drawHandle(
-      ctx,
-      Math.min(xOut, audioRightX),
-      audioBand.top,
-      audioLaneHeight,
-    );
-
-    // Audio-start marker (corrected position). Shown when the analyzer
-    // detected a silent intro OR the user nudged the start manually.
-    const rawAudioStartS = jobMeta?.audioStartS ?? 0;
-    const audioNudgeS = jobMeta?.audioStartNudgeS ?? 0;
-    if (rawAudioStartS > 0 || audioNudgeS !== 0) {
-      const xMark = tToX(rawAudioStartS + audioNudgeS);
-      if (xMark >= 0 && xMark <= audioRightX) {
-        ctx.fillStyle = "rgba(255,107,0,0.85)";
-        ctx.fillRect(Math.floor(xMark), audioBand.top, 1, audioLaneHeight);
-        // Small triangle flag at the top so the marker reads even when
-        // the playhead overlaps it.
-        ctx.beginPath();
-        ctx.moveTo(xMark, audioBand.top);
-        ctx.lineTo(xMark + 5, audioBand.top);
-        ctx.lineTo(xMark, audioBand.top + 5);
-        ctx.closePath();
-        ctx.fill();
+    } else {
+      // Arrangement-mode splice marks — hot ticks across the audio band
+      // at every segment seam in arr-time. The user reads them as the
+      // points where the audio walker crossfades to the next chunk.
+      const arrStarts = segmentArrStarts(arrangementSegments);
+      ctx.fillStyle = "rgba(255,87,34,0.55)";
+      for (let i = 0; i < arrangementSegments.length; i++) {
+        const arrIn = arrStarts[i];
+        const segLen = Math.max(
+          0,
+          arrangementSegments[i].out - arrangementSegments[i].in,
+        );
+        const xIn = arrTToX(arrIn);
+        const xOut = arrTToX(arrIn + segLen);
+        if (xIn >= 0 && xIn <= audioRightX) {
+          ctx.fillRect(xIn, audioBand.top, 1, audioLaneHeight);
+        }
+        if (xOut >= 0 && xOut <= audioRightX) {
+          ctx.fillRect(xOut, audioBand.top, 1, audioLaneHeight);
+        }
       }
     }
 
@@ -716,6 +859,9 @@ export function Timeline({
     trim.in,
     trim.out,
     arrangementSegments,
+    isArrMode,
+    arrTotal,
+    arrTToX,
     loop,
     currentTime,
     clips,
@@ -744,10 +890,20 @@ export function Timeline({
       const band = videoBands[i];
       if (y < band.top || y >= band.bottom) continue;
       const range = clipRangeS(clips[i]);
-      const x1 = tToX(range.startS);
-      const x2 = tToX(range.endS);
-      if (x >= x1 && x <= x2) return { clip: clips[i], band };
-      return null; // hit the lane but missed the pill → no clip selected
+      // Walk the projected slices — direct-mode is one passthrough slice,
+      // arrangement-mode is one per intersected segment. The pointer hits
+      // the clip iff it lands inside any slice's pixel range.
+      const slices = sliceByArrSegments(
+        range.startS,
+        range.endS,
+        isArrMode ? arrangementSegments : [],
+      );
+      for (const s of slices) {
+        const x1 = ((s.arrStartS - viewStart) / visibleDur) * canvasWidth;
+        const x2 = ((s.arrEndS - viewStart) / visibleDur) * canvasWidth;
+        if (x >= x1 && x <= x2) return { clip: clips[i], band };
+      }
+      return null; // hit the lane but missed every slice → no clip selected
     }
     return null;
   }
@@ -790,12 +946,17 @@ export function Timeline({
 
   function classifyAudioHit(x: number): "trim-in" | "trim-out" | "playhead" | "loop" | null {
     const xp = tToX(currentTime);
-    const xIn = tToX(trim.in);
-    const xOut = tToX(trim.out);
-    if (Math.abs(x - xIn) <= HANDLE_HIT) return "trim-in";
-    if (Math.abs(x - xOut) <= HANDLE_HIT) return "trim-out";
+    // Trim + loop are direct-mode-only chrome; arrangement-mode hides
+    // both, so don't surface their hit zones to the cursor either —
+    // otherwise the user would grab an invisible handle.
+    if (!isArrMode) {
+      const xIn = tToX(trim.in);
+      const xOut = tToX(trim.out);
+      if (Math.abs(x - xIn) <= HANDLE_HIT) return "trim-in";
+      if (Math.abs(x - xOut) <= HANDLE_HIT) return "trim-out";
+    }
     if (Math.abs(x - xp) <= HANDLE_HIT) return "playhead";
-    if (loop) {
+    if (!isArrMode && loop) {
       const xs = tToX(loop.start);
       const xe = tToX(loop.end);
       if (x >= xs && x <= xe) return "loop";
@@ -906,7 +1067,7 @@ export function Timeline({
         // SyncTuner. Selection is decoupled from the seek/drag so the
         // user can still scrub freely while the panel switches mode.
         setSelectedClipId(MASTER_AUDIO_ID);
-        seek(snapped(tRaw, e));
+        seekFromX(x, snapped(tRaw, e));
         dragRef.current = { kind: "playhead" };
       } else if (k === "trim-in") {
         dragRef.current = { kind: "trim-in" };
@@ -928,7 +1089,12 @@ export function Timeline({
     //     drag (durationS); click on a clip pill = drag-move that clip;
     //     click on empty area = scrub the playhead. Selection always
     //     happens.
-    if (!lanesLocked) {
+    //   * Arrangement-mode: clip-move + edge-resize would mutate
+    //     master-time sync/trim, which fights the chunk anchors set in
+    //     triage. We restrict to "click = scrub + select cam" in arr-mode
+    //     regardless of `lanesLocked` — the LOCK affordance is a
+    //     direct-mode tool.
+    if (!lanesLocked && !isArrMode) {
       const edge = findClipResizeEdge(x, y);
       if (edge) {
         setSelectedClipId(edge.clip.id);
@@ -958,7 +1124,7 @@ export function Timeline({
     const hit = findClipAt(x, y);
     if (hit) {
       setSelectedClipId(hit.clip.id);
-      if (!lanesLocked) {
+      if (!lanesLocked && !isArrMode) {
         const r = clipRangeS(hit.clip);
         dragRef.current = {
           kind: "clip-move",
@@ -975,7 +1141,7 @@ export function Timeline({
         frozenTimelineRangeRef.current = liveTimelineRange;
         setActiveClipMoveDragId(hit.clip.id);
       } else {
-        seek(snapped(tRaw, e));
+        seekFromX(x, snapped(tRaw, e));
         dragRef.current = { kind: "playhead" };
       }
     } else {
@@ -986,7 +1152,7 @@ export function Timeline({
       // lane band.
       const lane = findLaneAt(y);
       setSelectedClipId(lane ? lane.clip.id : null);
-      seek(snapped(tRaw, e));
+      seekFromX(x, snapped(tRaw, e));
       dragRef.current = { kind: "playhead" };
     }
   };
@@ -1040,7 +1206,7 @@ export function Timeline({
     const tRaw = Math.max(0, Math.min(duration, xToT(x)));
     const drag = dragRef.current;
     if (drag.kind === "playhead") {
-      seek(snapped(tRaw, e));
+      seekFromX(x, snapped(tRaw, e));
     } else if (drag.kind === "image-resize-end") {
       // New right edge follows the pointer (snapped to the active grid),
       // durationS = new-right - startOffsetS.
@@ -1352,18 +1518,24 @@ export function Timeline({
       </div>
 
       <div className="rounded-md overflow-hidden border border-rule shadow-panel bg-paper-hi-deep">
-        {/* Bar/beat ruler row — bars + beats + subdivisions, click to seek. */}
-        <div className="flex border-b border-rule">
-          <BarsHeader width={HEADER_W} height={26} />
-          <div className="flex-1" style={{ width: canvasWidth }}>
-            <BeatRuler
-              contentWidthPx={canvasWidth}
-              viewStartS={viewStart}
-              viewEndS={viewEnd}
-              height={26}
-            />
+        {/* Bar/beat ruler row — direct-mode only.
+         *  In arrangement-mode each chunk has its own bar phase (per the
+         *  triage tempo model), so a single continuous ruler over arr-time
+         *  would lie. The ruler is dropped here; the audio waveform's
+         *  splice marks already give the user a positional anchor. */}
+        {!isArrMode && (
+          <div className="flex border-b border-rule">
+            <BarsHeader width={HEADER_W} height={26} />
+            <div className="flex-1" style={{ width: canvasWidth }}>
+              <BeatRuler
+                contentWidthPx={canvasWidth}
+                viewStartS={viewStart}
+                viewEndS={viewEnd}
+                height={26}
+              />
+            </div>
           </div>
-        </div>
+        )}
 
         {/* PROGRAM-Strip row — header cell hosts the "+ Add" entry so
          *  there's no separate strip pushing the timeline taller. The
@@ -1378,32 +1550,55 @@ export function Timeline({
           </div>
           <div className="flex-1 relative" style={{ width: canvasWidth }}>
             <ProgramStrip
-              cuts={cuts}
+              cuts={stripCuts}
               cams={camLookupsForStrip}
-              duration={duration}
+              duration={stripDuration}
               viewStartS={viewStart}
               viewEndS={viewEnd}
               width={canvasWidth}
-              onRemoveCut={removeCutAt}
+              onRemoveCut={(atTimeS, camId) => {
+                // Strip is in view-space — convert back to master before
+                // mutating the store. removeCutAt resolves the cut by
+                // (master-time, camId), so a single call removes ALL
+                // arr-occurrences of a duplicated chunk's cut at once,
+                // which matches the user's mental model.
+                const masterT = isArrMode ? viewToMaster(atTimeS) : atTimeS;
+                removeCutAt(masterT, camId);
+              }}
               onCutDrag={(fromAtTimeS, camId, rawNewT, ev) => {
                 // Apply the same snap rules as the rest of the timeline:
                 // SHIFT bypasses, MATCH falls through (no candidatePositions
                 // for cut-set), grid modes round to the nearest beat/bar.
-                const snappedT = ev.shiftKey
-                  ? rawNewT
-                  : useEditorStore.getState().snapMasterTime(rawNewT);
-                return useEditorStore
+                const masterFrom = isArrMode
+                  ? viewToMaster(fromAtTimeS)
+                  : fromAtTimeS;
+                const masterTarget = isArrMode
+                  ? viewToMaster(rawNewT)
+                  : rawNewT;
+                const snappedMaster = ev.shiftKey
+                  ? masterTarget
+                  : useEditorStore.getState().snapMasterTime(masterTarget);
+                const landed = useEditorStore
                   .getState()
-                  .moveCut(fromAtTimeS, camId, snappedT);
+                  .moveCut(masterFrom, camId, snappedMaster);
+                return isArrMode ? masterToView(landed) : landed;
               }}
               paintPreview={(() => {
                 if (!holdGesture || !holdGesture.painting) return null;
                 const clip = clips.find((c) => c.id === holdGesture.camId);
                 if (!clip) return null;
                 const idx = clips.findIndex((c) => c.id === clip.id);
+                // Convert master-time hold endpoints into the strip's
+                // active view-space.
+                const fromS = isArrMode
+                  ? masterToView(holdGesture.startS)
+                  : holdGesture.startS;
+                const toS = isArrMode
+                  ? masterToView(currentTime)
+                  : currentTime;
                 return {
-                  fromS: holdGesture.startS,
-                  toS: currentTime,
+                  fromS,
+                  toS,
                   color: clip.color,
                   camLabel: `CAM ${idx + 1}`,
                 };
@@ -1411,10 +1606,14 @@ export function Timeline({
               matchMarkers={(() => {
                 // Show match markers ONLY while the user is actively
                 // dragging a clip in MATCH mode — they're an interaction
-                // affordance, not a permanent overlay. We render the
-                // markers for that one clip (so candidates from other
-                // cams don't pollute the view).
-                if (snapMode !== "match" || !activeClipMoveDragId) {
+                // affordance, not a permanent overlay. Hidden entirely
+                // in arrangement-mode (sync is locked once the arrangement
+                // is committed).
+                if (
+                  isArrMode ||
+                  snapMode !== "match" ||
+                  !activeClipMoveDragId
+                ) {
                   return undefined;
                 }
                 const found = clips.find((cc) => cc.id === activeClipMoveDragId);
@@ -1439,7 +1638,7 @@ export function Timeline({
                   });
               })()}
               mode={programStripMode}
-              fx={fx}
+              fx={stripFx}
               liveFxIds={liveFxIds}
               onClearCuts={clearCuts}
               onClearFx={clearAllFx}
@@ -1662,14 +1861,30 @@ export function Timeline({
 
 // ---- helpers ----
 
+/** One sub-pill of a clip — the projection of the clip's master-time
+ *  range onto a single contiguous view-space window. In direct-mode there
+ *  is exactly one such slice per clip; in arrangement-mode there is one
+ *  per intersected segment so the lane reads as N bites of the source
+ *  laid back-to-back along the song timeline. */
+interface ClipPillSlice {
+  /** Pixel range to draw on the canvas. */
+  xStart: number;
+  xEnd: number;
+  /** Master-time range, used to sample thumbnails from the strip. */
+  masterStartS: number;
+  masterEndS: number;
+}
+
 interface DrawVideoLaneArgs {
   ctx: CanvasRenderingContext2D;
   clip: Clip;
   bandTop: number;
   bandH: number;
   canvasWidth: number;
-  viewStart: number;
-  visibleDur: number;
+  /** Pre-computed pixel + master-time slices. Direct-mode passes a single
+   *  slice covering the whole clipRange; arrangement-mode passes one per
+   *  segment intersection. */
+  slices: ClipPillSlice[];
   img: HTMLImageElement | null;
   aspect: number;
   selected: boolean;
@@ -1681,8 +1896,7 @@ function drawVideoLane({
   bandTop,
   bandH,
   canvasWidth,
-  viewStart,
-  visibleDur,
+  slices,
   img,
   aspect,
   selected,
@@ -1692,110 +1906,129 @@ function drawVideoLane({
   ctx.fillStyle = "#E8E1D0"; // paper-deep
   ctx.fillRect(0, bandTop, canvasWidth, bandH);
 
-  // Clip range on the master timeline.
+  // Clip range on the master timeline — used for thumb sampling so the
+  // strip-image-x mapping stays identical to the direct-mode pre-refactor
+  // baseline (frame-strip covers the visible source span linearly).
   const range = clipRangeS(clip);
-  const xStart = ((range.startS - viewStart) / visibleDur) * canvasWidth;
-  const xEnd = ((range.endS - viewStart) / visibleDur) * canvasWidth;
-  if (xEnd <= 0 || xStart >= canvasWidth) return;
-  const pillX = Math.max(0, xStart);
-  const pillW = Math.min(canvasWidth, xEnd) - pillX;
-  if (pillW <= 0) return;
+  const visibleSpanS = Math.max(1e-6, range.endS - range.startS);
 
-  // Thumbnails — only inside the clip's pill region. Image clips show a
-  // single object-fit:cover preview; video clips show the tiled
-  // frame-strip sampled along the clip's source-time.
-  if (img && img.width > 0 && img.height > 0) {
-    const inset = 4;
-    const drawTop = bandTop + inset;
-    const drawH = bandH - inset * 2;
-    ctx.save();
-    roundRectPath(ctx, pillX, bandTop + 2, pillW, bandH - 4, 6);
-    ctx.clip();
+  for (const slice of slices) {
+    if (slice.xEnd <= 0 || slice.xStart >= canvasWidth) continue;
+    const pillX = Math.max(0, slice.xStart);
+    const pillW = Math.min(canvasWidth, slice.xEnd) - pillX;
+    if (pillW <= 0) continue;
 
-    if (clip.kind === "image") {
-      // object-fit: cover — fill the pill, crop the image to fit
-      // the lane height. Repeat horizontally if the pill is wider
-      // than one display copy so a long-duration still doesn't end
-      // up with awkward empty regions.
-      const dispW = drawH * (img.width / img.height);
-      if (dispW > 0) {
-        for (let x = pillX; x < pillX + pillW; x += dispW) {
-          const w = Math.min(dispW, pillX + pillW - x);
+    // Thumbnails — only inside this slice's pill region. Image clips show
+    // a single object-fit:cover preview; video clips show the tiled
+    // frame-strip sampled along the slice's master-time range.
+    if (img && img.width > 0 && img.height > 0) {
+      const inset = 4;
+      const drawTop = bandTop + inset;
+      const drawH = bandH - inset * 2;
+      ctx.save();
+      roundRectPath(ctx, pillX, bandTop + 2, pillW, bandH - 4, 6);
+      ctx.clip();
+
+      if (clip.kind === "image") {
+        // object-fit: cover — fill the pill, crop the image to fit
+        // the lane height. Repeat horizontally if the pill is wider
+        // than one display copy so a long-duration still doesn't end
+        // up with awkward empty regions.
+        const dispW = drawH * (img.width / img.height);
+        if (dispW > 0) {
+          for (let x = pillX; x < pillX + pillW; x += dispW) {
+            const w = Math.min(dispW, pillX + pillW - x);
+            ctx.drawImage(
+              img,
+              0,
+              0,
+              (w / dispW) * img.width,
+              img.height,
+              x,
+              drawTop,
+              w,
+              drawH,
+            );
+          }
+        }
+      } else {
+        const sourceTileW = img.height * aspect;
+        const tilesShown = Math.max(2, Math.round(pillW / TARGET_TILE_W));
+        const tileWDest = pillW / tilesShown;
+        for (let i = 0; i < tilesShown; i++) {
+          const tFrac = (i + 0.5) / tilesShown; // sample mid-tile
+          const tInClip =
+            slice.masterStartS +
+            tFrac * (slice.masterEndS - slice.masterStartS);
+          const sourceFrac = (tInClip - range.startS) / visibleSpanS;
+          const sx = Math.max(
+            0,
+            Math.min(
+              img.width - sourceTileW,
+              sourceFrac * img.width - sourceTileW / 2,
+            ),
+          );
           ctx.drawImage(
             img,
+            sx,
             0,
-            0,
-            (w / dispW) * img.width,
+            sourceTileW,
             img.height,
-            x,
+            pillX + i * tileWDest,
             drawTop,
-            w,
+            tileWDest,
             drawH,
           );
         }
       }
-    } else {
-      const sourceTileW = img.height * aspect;
-      const tilesShown = Math.max(2, Math.round(pillW / TARGET_TILE_W));
-      const tileWDest = pillW / tilesShown;
-      for (let i = 0; i < tilesShown; i++) {
-        const tFrac = (i + 0.5) / tilesShown; // sample mid-tile
-        const tInClip = range.startS + tFrac * (range.endS - range.startS);
-        const sourceFrac = (tInClip - range.startS) / (range.endS - range.startS);
-        const sx = Math.max(0, Math.min(img.width - sourceTileW, sourceFrac * img.width - sourceTileW / 2));
-        ctx.drawImage(
-          img,
-          sx,
-          0,
-          sourceTileW,
-          img.height,
-          pillX + i * tileWDest,
-          drawTop,
-          tileWDest,
-          drawH,
-        );
-      }
+      ctx.restore();
+    }
+
+    // Pill border + cam-color tint overlay (subtle so thumbs stay visible).
+    ctx.save();
+    roundRectPath(
+      ctx,
+      pillX + 0.5,
+      bandTop + 2.5,
+      Math.max(0, pillW - 1),
+      bandH - 5,
+      6,
+    );
+    ctx.fillStyle = hexToRgba(clip.color, 0.1);
+    ctx.fill();
+    ctx.lineWidth = selected ? 2 : 1;
+    ctx.strokeStyle = selected ? clip.color : hexToRgba(clip.color, 0.6);
+    ctx.stroke();
+    if (selected) {
+      ctx.shadowColor = hexToRgba(clip.color, 0.5);
+      ctx.shadowBlur = 6;
+      ctx.stroke();
     }
     ctx.restore();
-  }
 
-  // Pill border + cam-color tint overlay (very subtle so thumbs stay visible).
-  ctx.save();
-  roundRectPath(ctx, pillX + 0.5, bandTop + 2.5, Math.max(0, pillW - 1), bandH - 5, 6);
-  ctx.fillStyle = hexToRgba(clip.color, 0.1);
-  ctx.fill();
-  ctx.lineWidth = selected ? 2 : 1;
-  ctx.strokeStyle = selected ? clip.color : hexToRgba(clip.color, 0.6);
-  ctx.stroke();
-  if (selected) {
-    // Inner glow.
-    ctx.shadowColor = hexToRgba(clip.color, 0.5);
-    ctx.shadowBlur = 6;
-    ctx.stroke();
-  }
-  ctx.restore();
+    // Top color stripe — strong cam-color tab so the lane is identifiable
+    // even when the pill is compressed.
+    ctx.fillStyle = clip.color;
+    ctx.fillRect(pillX, bandTop, pillW, 3);
 
-  // Top color stripe — strong cam-color tab so the lane is identifiable
-  // even when the pill is compressed.
-  ctx.fillStyle = clip.color;
-  ctx.fillRect(pillX, bandTop, pillW, 3);
-
-  // Resize grips on both edges — three short vertical bars tucked
-  // just inside the pill so the user sees the affordance without
-  // needing to hover for the cursor change. Image and video clips
-  // both resize (image: durationS / startOffsetS; video: trim in/out).
-  if (pillW > 18) {
-    ctx.save();
-    ctx.fillStyle = "rgba(26,24,22,0.55)";
-    const drawGrip = (cx: number) => {
-      const gy = bandTop + bandH * 0.5 - 6;
-      for (let i = 0; i < 3; i++) {
-        ctx.fillRect(cx + i * 2 - 2, gy, 1, 12);
-      }
-    };
-    if (xStart >= 0) drawGrip(Math.max(0, xStart) + 4);
-    if (xEnd <= canvasWidth) drawGrip(Math.min(canvasWidth - 1, xEnd) - 4);
-    ctx.restore();
+    // Resize grips on both edges. Image and video clips both resize in
+    // direct-mode (image: durationS / startOffsetS; video: trim in/out).
+    // Arrangement-mode hides them by passing `selected:false` only when
+    // appropriate — the grips themselves are cheap.
+    if (pillW > 18) {
+      ctx.save();
+      ctx.fillStyle = "rgba(26,24,22,0.55)";
+      const drawGrip = (cx: number) => {
+        const gy = bandTop + bandH * 0.5 - 6;
+        for (let i = 0; i < 3; i++) {
+          ctx.fillRect(cx + i * 2 - 2, gy, 1, 12);
+        }
+      };
+      if (slice.xStart >= 0) drawGrip(Math.max(0, slice.xStart) + 4);
+      if (slice.xEnd <= canvasWidth)
+        drawGrip(Math.min(canvasWidth - 1, slice.xEnd) - 4);
+      ctx.restore();
+    }
   }
 }
 

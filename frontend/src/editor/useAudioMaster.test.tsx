@@ -510,4 +510,65 @@ describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => 
       expect(ramped).toBe(false);
     });
   });
+
+  describe("arrangement-segment walker", () => {
+    it("hops to the NEXT segment in arrangement order, not the first master-time match", async () => {
+      // Arrangement: chunk-A → chunk-B → chunk-A again (same master range
+      // [10,15] used twice). Without the authoritative segment-index in
+      // the walker, the second hop's lookup would snap back to occurrence
+      // #0 and we'd loop forever.
+      const segs = [
+        { in: 10, out: 15 },
+        { in: 50, out: 55 },
+        { in: 10, out: 15 }, // duplicate of segment 0
+      ];
+      const { mA, mB } = await setup(60);
+      useEditorStore.getState().setArrangementSegments(segs);
+      // Park playhead inside segment 0 just before its end so the
+      // crossfade arms on the next tick.
+      useEditorStore.getState().seek(10, { segmentIdxHint: 0 });
+      await act(async () => {
+        await flushAll();
+      });
+      await act(async () => {
+        useEditorStore.getState().setPlaying(true);
+        await flushAll();
+      });
+      // Drive master-time near the end of segment 0 so the walker arms.
+      await act(async () => {
+        mA.setCurrentTime(14.97);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      // Idle (B) should be parked at next segment's in (= 50).
+      expect(mB.getCurrentTime()).toBeCloseTo(50, 1);
+    });
+
+    it("user-seek with segmentIdxHint binds the walker to the requested occurrence", async () => {
+      const segs = [
+        { in: 10, out: 15 },
+        { in: 10, out: 15 }, // duplicate
+      ];
+      const { mA, mB } = await setup(20);
+      useEditorStore.getState().setArrangementSegments(segs);
+      // Click on the duplicate occurrence (idx 1) at master 12.
+      useEditorStore.getState().seek(12, { segmentIdxHint: 1 });
+      await act(async () => {
+        await flushAll();
+      });
+      await act(async () => {
+        useEditorStore.getState().setPlaying(true);
+        await flushAll();
+      });
+      // Drive near the end of segment 1 (= last segment). Walker should
+      // schedule a pause-at-end (no further segment to hop into) — and
+      // crucially NOT arm a crossfade hop because there's no nextSeg.
+      await act(async () => {
+        mA.setCurrentTime(14.97);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      // Idle was never re-parked at master 10 again — the walker treats
+      // segment idx 1 as final.
+      expect(mB.playSpy).not.toHaveBeenCalled();
+    });
+  });
 });

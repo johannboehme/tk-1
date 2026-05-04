@@ -23,7 +23,6 @@ export function ContactSheet() {
   const arrangement = useArrangeStore((s) => s.arrangement);
   const insertChunkAtCursor = useArrangeStore((s) => s.insertChunkAtCursor);
   const seek = useArrangeStore((s) => s.seek);
-  const setPlaying = useArrangeStore((s) => s.setPlaying);
   const focusItem = useArrangeStore((s) => s.focusItem);
   const seekToItem = useArrangeStore((s) => s.seekToItem);
   const jobBpm = useArrangeStore((s) => s.jobBpm);

@@ -100,10 +100,28 @@ interface PingPongState {
    *  `audioContext.currentTime` at which the gain ramps START.
    *  `wrapTarget` overrides the post-fire seek destination for
    *  arrangement-segment hops (where we land at the next segment's
-   *  `in` instead of the current loop's `start`). */
+   *  `in` instead of the current loop's `start`). `nextSegmentIdx`
+   *  is the index we're hopping INTO — used by the walker so it
+   *  advances explicitly through duplicate segments instead of
+   *  re-deriving from master-time (which would lock into the FIRST
+   *  matching duplicate forever). */
   armed:
-    | { fireAtCtxTime: number; fromSide: "A" | "B"; wrapTarget?: number }
+    | {
+        fireAtCtxTime: number;
+        fromSide: "A" | "B";
+        wrapTarget?: number;
+        nextSegmentIdx?: number;
+      }
     | null;
+  /** The arrangement segment we're currently playing through. Tracked
+   *  as authoritative state — set by user-seek (re-derived from master
+   *  time), advanced on every crossfade-hop. Without this the walker
+   *  would re-scan segments[] on every tick and pick the FIRST match,
+   *  which loops forever when a chunk is duplicated in the arrangement
+   *  (segments[0].master == segments[2].master → after hopping to
+   *  index 2 the lookup snaps back to 0). null = direct-mode or pre-
+   *  first-tick. */
+  currentSegmentIdx: number | null;
 }
 
 export function useAudioMaster(
@@ -120,7 +138,11 @@ export function useAudioMaster(
   const loop = useEditorStore((s) => s.playback.loop);
 
   const graphRef = useRef<AudioGraph | null>(null);
-  const stateRef = useRef<PingPongState>({ active: "A", armed: null });
+  const stateRef = useRef<PingPongState>({
+    active: "A",
+    armed: null,
+    currentSegmentIdx: null,
+  });
   const rafRef = useRef<number | null>(null);
   /** Pending seek that arrived before the audio reported metadata.
    *  Replayed once `loadedmetadata` fires on the active element. */
@@ -220,7 +242,7 @@ export function useAudioMaster(
     const graph: AudioGraph = { ctx, srcA, srcB, gainA, gainB, master };
     graphCache.set(a, graph);
     graphRef.current = graph;
-    stateRef.current = { active: "A", armed: null };
+    stateRef.current = { active: "A", armed: null, currentSegmentIdx: null };
 
     if (isProbeEnabled()) {
       void attachLoopGlitchProbe(ctx, master).catch((err) => {
@@ -264,6 +286,31 @@ export function useAudioMaster(
     // Cancel any armed crossfade — user seek invalidates it (the loop
     // boundary may now be far away or behind us).
     cancelArmedCrossfade(graphRef.current, stateRef.current);
+    // Re-bind currentSegmentIdx — prefer the caller-supplied
+    // `seekSegmentIdxHint` (the only correct answer when the master-time
+    // appears in multiple segments) and fall back to a master-time scan
+    // when no hint is given. Without this, a click on a duplicate
+    // chunk's second occurrence would bounce the playhead back onto
+    // occurrence #1.
+    const stateNow = useEditorStore.getState();
+    const segs = stateNow.arrangementSegments;
+    const hint = stateNow.playback.seekSegmentIdxHint;
+    if (segs.length > 0) {
+      if (hint != null && hint >= 0 && hint < segs.length) {
+        stateRef.current.currentSegmentIdx = hint;
+      } else {
+        let idx = -1;
+        for (let i = 0; i < segs.length; i++) {
+          if (seekRequest >= segs[i].in && seekRequest < segs[i].out) {
+            idx = i;
+            break;
+          }
+        }
+        stateRef.current.currentSegmentIdx = idx === -1 ? null : idx;
+      }
+    } else {
+      stateRef.current.currentSegmentIdx = null;
+    }
     clear();
   }, [seekRequest, isReady, refsStable.a, refsStable.b]);
 
@@ -396,9 +443,18 @@ export function useAudioMaster(
         // the NEXT wrap.
         const wrapLoop = store.playback.loop;
         const armedTarget = state.armed.wrapTarget;
+        const armedNextSegmentIdx = state.armed.nextSegmentIdx;
         const formerActive = active;
         state.active = state.active === "A" ? "B" : "A";
         state.armed = null;
+        // Authoritative segment-walker advance: the listener is now
+        // hearing the segment whose `in` we crossfaded into. Stamp it
+        // into state so the next tick's segment lookup doesn't snap
+        // backward to a duplicate of an earlier chunk that happens to
+        // share the same master-time range.
+        if (armedNextSegmentIdx !== undefined) {
+          state.currentSegmentIdx = armedNextSegmentIdx;
+        }
         try {
           formerActive.pause();
         } catch {
@@ -438,14 +494,33 @@ export function useAudioMaster(
       // segment boundary instead of streaming straight through the
       // master audio. Direct-mode jobs leave this empty and the legacy
       // loop logic below runs as before.
+      //
+      // The walker uses an AUTHORITATIVE state.currentSegmentIdx instead
+      // of re-deriving from master-time on every tick — duplicate chunks
+      // (same master-time range used multiple times in the arrangement)
+      // share master-time bounds, so a "scan-for-first-match" lookup
+      // would lock the playback into the first occurrence forever. The
+      // index advances on each crossfade hop and re-binds on user-seek.
       const segs = store.arrangementSegments;
       if (segs.length > 0) {
-        let curIdx = -1;
-        for (let i = 0; i < segs.length; i++) {
-          if (t >= segs[i].in - 1e-3 && t < segs[i].out) {
-            curIdx = i;
-            break;
+        let curIdx = state.currentSegmentIdx ?? -1;
+        // Validate the cached index — if master-time has drifted out of
+        // its window (e.g. browser nudged currentTime past the end while
+        // we were waiting on a frame), fall back to a scan.
+        if (curIdx >= 0 && curIdx < segs.length) {
+          const seg = segs[curIdx];
+          if (t < seg.in - 1e-3 || t >= seg.out) curIdx = -1;
+        } else {
+          curIdx = -1;
+        }
+        if (curIdx === -1) {
+          for (let i = 0; i < segs.length; i++) {
+            if (t >= segs[i].in - 1e-3 && t < segs[i].out) {
+              curIdx = i;
+              break;
+            }
           }
+          if (curIdx !== -1) state.currentSegmentIdx = curIdx;
         }
         if (curIdx === -1) {
           // The playhead is in a "gap" between segments (or before the
@@ -461,6 +536,7 @@ export function useAudioMaster(
           if (nextIdx === -1) {
             // Past the last segment — stop.
             store.setPlaying(false);
+            state.currentSegmentIdx = null;
             rafRef.current = null;
             return;
           }
@@ -470,6 +546,7 @@ export function useAudioMaster(
           } catch {
             /* ignore */
           }
+          state.currentSegmentIdx = nextIdx;
           store.setCurrentTime(target);
           rafRef.current = requestAnimationFrame(tick);
           return;
@@ -503,6 +580,7 @@ export function useAudioMaster(
                 fireAtCtxTime,
                 fromSide: state.active,
                 wrapTarget: nextSeg.in,
+                nextSegmentIdx: curIdx + 1,
               };
             } else {
               // Last segment — no hop, just pause when we hit the end.

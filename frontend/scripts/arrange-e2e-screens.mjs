@@ -319,12 +319,12 @@ await page.waitForURL(`${BASE}/job/${jobId}/edit`, { timeout: 10_000 });
 let settledSeg = 0;
 const editorT0 = Date.now();
 while (Date.now() - editorT0 < 15_000) {
-  // Read via window.__lastEditorState (set by the Editor.tsx debug
-   // logging hook) so we observe the SAME store instance the editor
-   // mounts; Vite dev-server can hand back distinct module instances
-   // for dynamic imports vs static ones.
+  // Read via window.__editorTestHooks (set by the Editor mount path,
+  // dev-only) so we observe the SAME store instance the editor
+  // mounts; Vite dev-server can hand back distinct module instances
+  // for dynamic imports vs static ones.
   settledSeg = await page.evaluate(() => {
-    return window.__lastEditorSegments ?? 0;
+    return window.__editorTestHooks?.segments ?? 0;
   });
   if (settledSeg > 0) break;
   await new Promise((r) => setTimeout(r, 250));
@@ -349,16 +349,17 @@ log("07-editor-after-arrange");
 }
 
 // Verify segment state in the editor store. We use the
-// window.__lastEditorSegments / __lastEditorTrim hooks the Editor
-// page sets — Vite dev hands back distinct module instances for
-// dynamic imports, so reading the store via a fresh import gets a
-// different (default) zustand instance.
+// window.__editorTestHooks side-channel the Editor page sets in dev —
+// Vite dev hands back distinct module instances for dynamic imports,
+// so reading the store via a fresh import gets a different (default)
+// zustand instance.
 const editorState = await page.evaluate(async (id) => {
   const jm = await import("/src/local/jobs.ts");
   const j = await jm.jobsDb.getJob(id);
+  const hooks = window.__editorTestHooks ?? null;
   return {
-    segments: window.__lastEditorSegments ?? 0,
-    trim: window.__lastEditorTrim ?? null,
+    segments: hooks?.segments ?? 0,
+    trim: hooks?.trim ?? null,
     persistedJob: {
       mode: j?.mode,
       arrangement: j?.arrangement?.length,

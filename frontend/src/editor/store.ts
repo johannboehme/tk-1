@@ -103,6 +103,13 @@ export interface PlaybackSlice {
   // user-initiated seeks from the 60Hz tick that mirrors the audio
   // element's clock back into the store.
   seekRequest: number | null;
+  // Disambiguator for arrangement-mode seeks. When the same master-time
+  // appears in multiple segments (a chunk used twice in the song), the
+  // caller can tell the walker which occurrence it intended — without
+  // this, the walker would lock onto the first match and the playhead
+  // would visually rewind to an earlier occurrence's arr-position. null
+  // = no hint (walker scans).
+  seekSegmentIdxHint: number | null;
   // Deferred wrap point for OP-1 style loop-shift. When non-null the audio
   // master wraps to loop.start at this master-time instead of at loop.end —
   // letting the playhead keep playing in a now-out-of-loop zone until it
@@ -363,7 +370,16 @@ interface EditorState {
   setPlaying(playing: boolean): void;
   setLoop(loop: LoopRegion | null): void;
   setAbBypass(bypass: boolean): void;
-  seek(t: number): void;
+  seek(
+    t: number,
+    opts?: {
+      /** Arrangement-mode disambiguator: which segment this seek lands
+       *  in (when the master-time appears in multiple segments). The
+       *  audio walker uses this as the authoritative segment index
+       *  instead of scanning for the first master-time match. */
+      segmentIdxHint?: number;
+    },
+  ): void;
   clearSeekRequest(): void;
   /** Step the playhead by the active snap target:
    *  - off → ±1 frame
@@ -583,6 +599,7 @@ const initialPlayback: PlaybackSlice = {
   isPlaying: false,
   loop: null,
   seekRequest: null,
+  seekSegmentIdxHint: null,
   pendingWrapAt: null,
 };
 
@@ -1048,7 +1065,7 @@ export const useEditorStore = create<EditorState>()(
     setAbBypass(bypass) {
       set({ offset: { ...get().offset, abBypass: bypass } });
     },
-    seek(t) {
+    seek(t, opts) {
       const meta = get().jobMeta;
       const dur = meta?.duration ?? Infinity;
       const clamped = Math.max(0, Math.min(t, dur));
@@ -1060,11 +1077,25 @@ export const useEditorStore = create<EditorState>()(
           // A user-initiated seek overrides any deferred loop-shift wrap —
           // the user's intent is to be at `t`, not at the OP-1 wrap point.
           pendingWrapAt: null,
+          // Arrangement-mode disambiguator. Multiple segments may share
+          // the same master-time range (chunk duplicated in the song);
+          // the timeline knows which sub-pill the user clicked because
+          // arr-time is unique. Forwarding the segment index here lets
+          // the audio walker resume on the right occurrence instead of
+          // snapping to the first match. null/undefined = no hint, the
+          // walker scans normally.
+          seekSegmentIdxHint: opts?.segmentIdxHint ?? null,
         },
       });
     },
     clearSeekRequest() {
-      set({ playback: { ...get().playback, seekRequest: null } });
+      set({
+        playback: {
+          ...get().playback,
+          seekRequest: null,
+          seekSegmentIdxHint: null,
+        },
+      });
     },
     stepByActiveSnap(direction) {
       const s = get();

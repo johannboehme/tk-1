@@ -730,18 +730,21 @@ export default function Editor() {
           arrangementSegments,
         },
       );
-      // E2E debug hook — exposes the latest segment count + trim so
-      // the playwright poll observes the same module instance the
-      // editor uses. Vite dev hands back distinct module instances
-      // for dynamic imports vs static, so we can't `import("...store")`
-      // from the test and read the same zustand instance. Cheap to
-      // leave in production — just two writes per loadJob.
-      const _w = window as unknown as {
-        __lastEditorSegments?: number;
-        __lastEditorTrim?: { in: number; out: number };
-      };
-      _w.__lastEditorSegments = useEditorStore.getState().arrangementSegments.length;
-      _w.__lastEditorTrim = useEditorStore.getState().trim;
+      // E2E hook (dev only) — Playwright reads `arrangementSegments[]`
+      // length via `window.__editorTestHooks` so the screenshot script
+      // can verify the long-form handoff without re-importing the
+      // zustand module (Vite hands back distinct instances for
+      // dynamic vs. static imports). Stripped from production builds.
+      if (import.meta.env.DEV) {
+        (
+          window as unknown as {
+            __editorTestHooks?: { segments: number; trim: { in: number; out: number } };
+          }
+        ).__editorTestHooks = {
+          segments: useEditorStore.getState().arrangementSegments.length,
+          trim: useEditorStore.getState().trim,
+        };
+      }
 
       // Restore persisted UI state (snap-mode, lanesLocked) and trim. Must
       // happen AFTER loadJob, since loadJob resets ui to defaults.
@@ -786,10 +789,17 @@ export default function Editor() {
           useEditorStore.getState().setTrim({ in: lo, out: hi });
         }
       }
-      // Refresh the e2e debug hook now that trim has been resolved.
-      (
-        window as unknown as { __lastEditorTrim?: { in: number; out: number } }
-      ).__lastEditorTrim = useEditorStore.getState().trim;
+      // Long-form: park the playhead at the first segment's in-point so
+      // the user pressing Space starts on real material instead of
+      // tripping the audio walker's "in-gap → hard seek" branch (audible
+      // as a momentary scratchy attack at master-time 0). The hint binds
+      // the audio walker to segment 0 so duplicate-chunk arrangements
+      // start at the right occurrence.
+      if (arrangementSegments.length > 0) {
+        useEditorStore
+          .getState()
+          .seek(arrangementSegments[0].in, { segmentIdxHint: 0 });
+      }
     })().catch((e) => {
       if (!cancelled) setErr(e instanceof Error ? e.message : "Could not load job");
     });

@@ -148,9 +148,9 @@ interface Pill {
 | 4. Triage Polish | ✅ kollabiert in Phase 3 | Click-through, bar-snap, gapless audio, adaptive ruler — alles in Phase 3 reingefaltet |
 | 5. Arrange Phase | ✅ done | Filmstreifen + Polaroid Contact-Sheet + Drag-Drop, Strip-Rotation gebaken, Cam-Picker shared mit Triage |
 | 5b. Arrange Polish + Cockpit-Glance | ✅ done | Bar-Cleanup (Icons + Cluster), Frame-Bezel skeuomorph, OP-1-Phosphor-Cockpit mit Mel-Spec + Auto-Tags + Stem-Bars, KEY-Detection (Krumhansl), Spectral Color-Tag, Click-to-seek im Spektrogramm, Walker-Audio-Loop (statt Time-Match → fixes Duplicate-Loop), Click-never-changes-playstate, Tier-2-Skip für portrait clips |
-| 6. Multi-Pill Editor Refactor | 🚧 nicht angefangen | Großer Brocken — explizit übersprungen, weil Arrange + Phase 7 Wiring auch ohne den Refactor funktionieren |
-| 7. Send to Editor + Segment Playback | ✅ Wiring done, ungeprüft | `arrangementSegments[]` im Editor-Store; `useAudioMaster` walked sie via Crossfade-Hop; Timeline dimmt off-segment Regionen. **Phase-7-Behavior nicht E2E vom User getestet.** |
-| 8. Polish | 🚧 nicht angefangen | Sensitivität, Performance, Documentation |
+| 6. Editor Arrangement-Mode | ✅ done | Surgical refactor statt voller `lanes[].pills[]`-Umbau: Timeline-X-Achse wird arrangement-time wenn Segments vorhanden, Cuts/FX bleiben master-time intern (sample-genau, chunk-anchored), Conversion-Layer in den UI-Surfaces. Per-Cam-Pills automatisch via `sliceByArrSegments` aus `clipRangeS ∩ Segments`. Audio-walker mit authoritativem `currentSegmentIdx` (fixes Duplicate-Chunk-Endless-Loop). Loop disabled, BeatRuler hidden, Match-Marker hidden in arr-mode. |
+| 7. Send to Editor + Segment Playback | ✅ done | E2E-verifiziert: focused playback test zeigt master-time advances 0.86→2.32 in segment 0, dann gapless hop nach 5.21 in segment 1, kein Drift in Master-Gaps. Render-Pfad in `local/render/edit.ts` walked Segments verbatim, Cuts via `activeCamAt` + master-time bleiben korrekt anchored. |
+| 8. Polish | 🚧 offen für später | Sensitivity tweaks, optional bar-aware-snap pro Chunk in arr-mode, render-output sanity-check mit echtem Footage |
 
 ---
 
@@ -349,21 +349,41 @@ User hat Phase 5 abgenommen, in dieser Sub-Session sind alle Polish-Punkte gelan
 - IDB v6 → v7: clear `chunk-thumbnails` Store (slicer-quality fix invalidates all old).
 - `jobsDb.getChunkMelSpec`, `saveChunkMelSpec`, `deleteChunkMelSpecsForJob` als Public API.
 
-### Phase 6 — Editor Multi-Pill-Refactor 🚧 not started
+### Phase 6 — Editor Arrangement-Mode ✅
 
-Siehe Datenmodell oben. Großer Brocken — `clips[]` → `lanes[].pills[]`, Selection-Refactor, Cuts-Logik anpassen, PreviewRuntime + VideoElementPool refaktorieren, schema migration. Phase 7 Wiring funktioniert auch ohne, also bewusst rausgeschoben — beim Start mit dem User klären ob's noch gebraucht wird.
+Der ursprüngliche Plan (full `lanes[].pills[]`-Refactor mit Schema-Migration und cuts-by-pill-id) wurde durch eine **surgische Conversion-Layer-Architektur** ersetzt — gleiche User-Experience, deutlich kleinerer Diff, keine Schema-Migration:
+
+**Architektur-Entscheidung: arrangement-time als UI-Zeit, master-time als Source-of-Truth**
+
+- Cuts/FX bleiben master-time-anchored im Store. So bleiben sie sample-genau auf der Source-Media verankert; eine Reorder im Arrangement ändert die master-time-Cut-Position nicht (stattdessen ändert sich nur ihr arr-time-Auftreten — ein Cut auf einer doppelt-verwendeten Chunk feuert beide Male, was musikalisch das Richtige ist).
+- Timeline-X-Achse wechselt auf arrangement-time wenn `arrangementSegments.length > 0`. Master-Time-Gaps existieren in der View nicht mehr — der User sieht nur die wirklich spielenden Bereiche back-to-back.
+- **`frontend/src/editor/arrangement-time.ts`** ist die einzige Conversion-Layer: pure helpers `masterToArr`, `arrToMaster`, `totalArrDuration`, `mastersToArrAll` (Duplikat-aware), `sliceByArrSegments` (für Pill-Splits), `segmentIndexAtArr/AtMaster`. 19 unit tests.
+
+**Konkrete Touch-Points:**
+- `Timeline.tsx`: `tToX(masterT)` läuft über `masterToView` (= identity in direct-mode, masterToArr in arr-mode); `xToT(x)` returns master-time via `viewToMaster`. Pills werden via `sliceByArrSegments(clipRange.startS, clipRange.endS, segments)` in N Sub-Pills geslicet — jede Cam zeigt für jedes Segment in dem sie Material hat einen eigenen Pill mit Thumbnail-Sampling aus dem Sub-Range. Audio-Waveform wird in arr-mode per-Segment gezeichnet (master-peaks pro Segment auf den arr-Pixel-Bereich gemappt). Splice marks (hot-orange ticks) an jeder Segment-Boundary. ProgramStrip/FxStripLayer kriegen pre-projected `stripCuts` (mit `mastersToArrAll`) und `stripFx` (mit slice-Splits) damit sie im arr-time space rendern; Callbacks konvertieren zurück über `viewToMaster`. BeatRuler/Trim-Handles/Loop-Region/Audio-Start-Marker/Match-Marker hidden in arr-mode.
+- `TransportClock.tsx`: zeigt `masterToArr(currentTime, segments)` und `totalArrDuration(segments)`. User sieht Song-Zeit, nicht Master-Audio-Zeit.
+- `TransportBar.tsx`: Skip-to-In landet auf `min(seg.in)`, Skip-to-Out auf `max(seg.out) - 1/fps` (kurz vor Ende, sonst trippt's den past-last-segment-pause-Branch). Arrow-Steps in arr-mode = ±1 Frame in arr-time (master-Bar-Snap macht keinen Sinn — jeder Chunk hat eigene Bar-Phase per Triage). Loop-Toggle ist no-op in arr-mode + Notice.
+- `useAudioMaster.ts`: **authoritative `currentSegmentIdx`** im PingPongState. Vorher hat der Walker bei jedem Tick `for-segs-find-first-match` gemacht — bei Duplikaten (gleiche Chunk mehrfach im Arrangement → identische master-time-Range) hat das endlos auf die erste Occurrence gemappt → Endless-Loop. Jetzt: Crossfade-Arming setzt `armed.nextSegmentIdx`, beim Fire wird `currentSegmentIdx` advanced. User-Seek nimmt entweder `seekSegmentIdxHint` (von Timeline-Click via `segmentIndexAtArr`) oder fällt auf master-time-scan zurück.
+- `Editor.tsx`: bei longform-Jobs initial `seek(segments[0].in, { segmentIdxHint: 0 })` damit Space-from-Mount nicht den Hard-Seek-aus-Gap-Branch trippt.
+
+**Erkundetes Verhalten (E2E `scripts/editor-playback-e2e.mjs`):** master-time advances 0.86 → 2.32 in segment-0 [0.5, 2.5], dann gapless hop nach 5.21 in segment-1 [5, 7]. Zero drift in Master-Gaps. Pause-on-Space-press funktioniert. 16/16 useAudioMaster-Tests grün, inkl. der zwei neuen Walker-Tests (duplicate-arrangement + segmentIdxHint-binding).
 
 ---
 
-### Phase 7 — Send to Editor + Segment Playback ✅ wiring done, ungeprüft
+### Phase 7 — Send to Editor + Segment Playback ✅
 
-`arrangementToSegments()` baut die Segment-Liste aus dem Arrangement. Editor's `useAudioMaster` walked sie per gapless crossfade-hop. E2E-Test (`scripts/arrange-e2e-screens.mjs`) propagiert 21 segments durch — vom User noch nicht durchgespielt.
+`arrangementToSegments()` baut die Segment-Liste, Editor's `useAudioMaster` walked sie per gapless crossfade-hop, Render-Pfad in `local/render/edit.ts` consumiert `EditSpec.segments` verbatim und composed Cuts via `activeCamAt(cuts, tMaster, camRanges)`. Segments sind in playback-Reihenfolge concateniert; `outTimestampUs` ist segment-relative aber FX-Lookup nutzt `tMaster` (siehe Schlüssel-Entscheidung im PLAN). E2E plus focused playback-test bestätigen den End-to-End-Flow.
+
+`window.__editorTestHooks` (DEV-only via `import.meta.env.DEV`-Gate) ersetzt das alte `window.__lastEditorSegments / __lastEditorTrim` Paar — kein Production-Bloat, der E2E-Script (`scripts/arrange-e2e-screens.mjs`) liest weiter darüber.
 
 ---
 
-### Phase 8 — Polish 🚧 not started
+### Phase 8 — Polish (offen für später)
 
-Sensitivität (snap-tick-feedback, nudge-haptic), performance (4h profile), settings persistence, README docs.
+Mögliche Verfeinerungen:
+- Per-Chunk-aware bar-snap in arr-mode (jeder Chunk hat eigene `audioStartMs`-Phase; aktuell ist arrow-step im arr-mode pure frame-step).
+- Render-Output-Sanity mit echter long-form-Session — Visualisierungen / Overlays / FX in einem multi-segment-render verifizieren.
+- Memory-Profil 4h Sessions.
 
 ---
 
@@ -373,6 +393,10 @@ Sensitivität (snap-tick-feedback, nudge-haptic), performance (4h profile), sett
 - `frontend/src/storage/jobs-db.ts` — Persistenz-Schema (Chunk, ArrangementItem, LocalJob, VideoAsset.framesOrientation, ChunkMelRecord, IDB v7)
 - `frontend/src/local/jobs-routing.ts` — `nextRouteForJob()`, `jobRoutePath()`
 - `frontend/src/local/triage/triage-store.ts` + `src/local/arrange/arrange-store.ts` — Store-Patterns (arrange-store hat jetzt analysis/melByChunkId/seekToItem)
+- `frontend/src/editor/arrangement-time.ts` — **die einzige master↔arr Conversion-Layer**. Pure, 19 tests.
+- `frontend/src/editor/useAudioMaster.ts` — Walker mit `currentSegmentIdx`, `seekSegmentIdxHint`-Binding, segment-walk-Branch im RAF tick
+- `frontend/src/editor/components/Timeline.tsx` — `tToX/xToT/arrTToX/seekFromX`, `sliceByArrSegments` für per-cam-pills, splice marks, stripCuts/stripFx-Projektionen
+- `frontend/src/editor/components/TransportClock.tsx` + `TransportBar.tsx` — arr-mode-aware clock + skip-to-end/start
 - `frontend/src/components/CamPickerDropdown.tsx` — shared cam-picker für Triage + Arrange
 - `frontend/src/components/triage/TriageTransportBar.tsx` — Transport-Pattern (centered grid, `useRegisterShortcut`)
 - `frontend/src/local/arrange/chunk-thumbnails.ts` — 3-tier thumbnail resolver, rotation-aware, Tier-2-Threshold
@@ -381,6 +405,7 @@ Sensitivität (snap-tick-feedback, nudge-haptic), performance (4h profile), sett
 - `frontend/src/components/arrange/PlayerCockpit.tsx` — OP-1 Phosphor LCD, click-to-seek im Spektrogramm
 - `frontend/src/components/arrange/useArrangeAudio.tsx` — Walker-based audio master (NICHT mehr time-match!)
 - `frontend/src/local/render/frames/{webcodecs,ffmpeg,index}.ts` — Strip-Extraktion mit `rotationDeg`
+- `frontend/src/local/render/edit.ts` — multi-segment-render path (already segment-aware, `applySegments` + walk per segment with `tMaster` for cuts)
 - `frontend/src/editor/components/{BpmReadoutView,TransportClockView,SnapModeButtonsView,ChunkyButton,HardwarePopover,icons}.tsx` — design-tokens (ChunkyButton.children jetzt optional)
 - `frontend/src/editor/shortcuts/useRegisterShortcut.ts` — Shortcut-Registry-Pattern
 - `frontend/wasm/sync-core/src/mel.rs` + `chroma.rs` + `lib.rs` — WASM exports `melSpectrogram`, `chromaProfile`
@@ -405,11 +430,11 @@ Allgemein wichtig:
 
 ## Risiken / Open Items
 
-1. **Multi-Pill-Refactor (Phase 6) ist die invasivste Änderung** — könnte schmerzen. Mitigation: extensive existierende Tests vorab grün, dann inkrementelle Migration.
-2. **Drag-Reorder in Arranger könnte Crossfade-Punkte hörbar machen wenn BPMs nicht matchen** — eigentlich gelöst durch globalen BPM-Wert, aber: wenn User manuell BPM per Job setzt der nicht zu allen Chunks passt, gibt's Tempo-Sprünge zwischen Chunks. UI-Warnung könnte sinnvoll sein.
-3. **`audioStartMs` für kurze Chunks fehlt** (Onset-Detection skipped bei < 4s) — dort wird auf `startMs` zurückgegriffen, was die silence-Boundary ist (nicht ein musikalischer Downbeat). Bar-Grid ist dann minimal off. Akzeptiert für jetzt.
-4. **Sync-Nudging gibt's nur noch im Editor** — Triage hat keinen SyncPatch mehr. Wenn ein Cam falsch synct ist, muss der User nach „Continue → Arrange" weitergehen und im Editor nudgen. Vom User akzeptiert.
-5. **Legacy-jobs ohne `framesOrientation`** — laufen über den manuellen Rotations-Pfad in `chunk-thumbnails.ts`. Wenn Phase 6 / 7 sauber läuft, lohnt sich evtl. ein Migration-Tool das alte Strips re-extrahiert. Bisher kein Druck.
+1. **Drag-Reorder in Arranger könnte Crossfade-Punkte hörbar machen wenn BPMs nicht matchen** — eigentlich gelöst durch globalen BPM-Wert, aber: wenn User manuell BPM per Job setzt der nicht zu allen Chunks passt, gibt's Tempo-Sprünge zwischen Chunks. UI-Warnung könnte sinnvoll sein.
+2. **`audioStartMs` für kurze Chunks fehlt** (Onset-Detection skipped bei < 4s) — dort wird auf `startMs` zurückgegriffen, was die silence-Boundary ist (nicht ein musikalischer Downbeat). Bar-Grid ist dann minimal off. Akzeptiert für jetzt.
+3. **Sync-Nudging gibt's nur noch im Editor** — Triage hat keinen SyncPatch mehr. Wenn ein Cam falsch synct ist, muss der User nach „Continue → Arrange" weitergehen und im Editor nudgen. Vom User akzeptiert.
+4. **Legacy-jobs ohne `framesOrientation`** — laufen über den manuellen Rotations-Pfad in `chunk-thumbnails.ts`. Wenn ein Migration-Tool sinnvoll wird, Re-Extraktion aller Strips ist die natürliche Lösung. Bisher kein Druck.
+5. **In arr-mode `clip-move` und `video-trim/image-resize` Drags sind disabled.** Der User kann im arr-mode keine Cam-Sync-Nudges mehr machen. Akzeptiert: triage hat den Sync committet, neu-nudgen würde alle Pill-Slices verschieben und das Arrangement-Layout invalidieren. Wenn Phase-8-User das doch braucht, gibt es zwei Wege: temporäres Toggle „direct-mode" zum Tunen oder per-Cam-Editor-Subview.
 
 ---
 
@@ -432,15 +457,21 @@ Allgemein wichtig:
 
 ## Next Session — Quick Briefing
 
-**Stand**: Phase 5 + 5b vom User abgenommen ("Perfekt. Danke für die Arbeit. Ist nen tolles Modul geworden."). Arrange-Screen ist optisch + funktional fertig: OP-1 Phosphor Cockpit, Mel-Spec mit click-to-seek, Auto-Tags (KEY/DENS/BRGT/PEAK), Stem-Bars, Spectral Color-Tag, skeuomorpher Frame-Bezel, Walker-basierte gapless playback (kein Duplicate-Loop mehr), MiniMap-Click→select, Click-never-changes-playstate als globale Regel.
+**Stand**: Workflow ist Upload → Triage → Arrange → Editor → Render komplett funktional. Phase 6 (surgical arrangement-time refactor statt full lanes/pills-Refactor) und Phase 7 (segment-walker mit `currentSegmentIdx` + `seekSegmentIdxHint`) sind zugemacht. Headless-E2E `editor-playback-e2e.mjs` verifiziert: master-time advances → gapless hop zwischen segments → kein Drift in Master-Gaps → pause-on-Space halts. 840+ unit tests grün.
 
-**Was als nächstes anstehen könnte**:
+**Was der User bei einem User-Run einmal selber durchspielen sollte:**
 
-1. **Phase 7 E2E vom User durchspielen lassen** — Continue→Editor mit echtem long-form-job. Hört er die Segment-Boundaries sauber? Knackt's an den Crossfade-Hops im Editor? `useAudioMaster.ts` (Editor) ist hot spot. Beachte: der **Arrange**-Audio-Master nutzt jetzt einen Walker (currentItemId als state), der **Editor**-AudioMaster nutzt vermutlich noch das alte Pattern — bei Phase 7 E2E darauf achten ob duplicate-segment-Loops dort wieder auftreten würden, dann Walker-Refactor dort wiederholen.
-2. **`window.__lastEditorSegments`** — falls Phase 7 abgenommen ist, das Test-Hook entfernen oder via env-flag gaten.
-3. **Phase 6 Multi-Pill-Refactor** klären: User wollte das mehrfach offen lassen — beim Start fragen ob das überhaupt noch gewünscht ist. Wenn nicht → Phase 6 raus aus dem Plan, direkt zu Phase 8 Polish springen.
-4. **KEY-Detection-Robustheit**: aktuell läuft sie über das gesamte chunk-PCM und schreibt manchmal nonsense bei reiner Drum-Loops (kein klarer harmonischer Inhalt). Wenn der User das stört: Threshold einführen — KEY zeigt nur dann eine Tonart wenn das chroma-Spitzen-Verhältnis (peak/mean) über z.B. 1.5 liegt, sonst "—". Helper liegt in `chunk-mel.ts:keyFromChroma`.
-5. **Stem-Bars-Kalibrierung**: heuristisch in `chunkStemHeuristic`, getuned gegen Bauchgefühl. Wenn der User auf seinen echten Sessions einen Bias spürt (z.B. "BASS zeigt immer 80%"), Schwellwerte dort drehen — Konstanten heißen `kickStrength`, `hatStrength`, `bassSus`, `formantBand` etc., alle clamped 0..1.
+1. **Echter long-form 1h+ Session-Footage durch den ganzen Flow**. Speziell hören an:
+   - Crossfade-Hops zwischen Chunks bei Wiedergabe (8 ms ramp, 50 ms lead — sollte unhörbar sein, aber bei sehr leisem material an chunk-out könnte ein Klick zu hören sein).
+   - Time-Display + Skip-to-End/Start verhalten sich wie eine Song-Position-Anzeige.
+   - Cuts via 1/2/...-Hotkey landen wo erwartet im Song.
+   - Render am Ende: erzeugte MP4 hat Cuts an den richtigen song-Positionen, audio ist gapless.
+
+2. **Loop in arrangement-mode** ist no-op + "Loop is disabled while playing an arrangement"-Toast. Falls der User das will: arr-time-aware Loop-Region wäre erweiterbar (loop muss innerhalb eines Segments liegen, oder cross-segments das walker-Pattern nutzen).
+
+3. **KEY-Detection-Robustheit** (von Phase 5b nicht angefasst): aktuell läuft sie über das gesamte chunk-PCM und schreibt manchmal nonsense bei reiner Drum-Loops. Threshold im `chunk-mel.ts:keyFromChroma` einführbar wenn nötig.
+
+4. **Stem-Bars-Kalibrierung**: heuristisch in `chunkStemHeuristic`. Auf echten Sessions tunen wenn Bias spürbar.
 
 **Workflow-Reminder**:
 - WASM `pkg/` ist gitignored → nach Pull `bun run wasm:build` aus `frontend/`.
@@ -452,7 +483,9 @@ Allgemein wichtig:
 **Letzte UX-Konventionen (in dieser Session etabliert, beim Bauen weiterer Surfaces honorieren)**:
 - **Click ändert nie den Play-State.** Pause bleibt Pause, Play bleibt Play. Einziger Trigger: Play-Button + Space.
 - **`seekToItem(itemId)`** ist die kanonische Action für "User picked this item" — focus + currentItemId + seek in einem move. Frame-Click, MiniMap-Click, PREV/NEXT, ←/→ alle gehen darüber.
-- **Walker statt Time-Match** im Audio-Master: bei Duplikaten (gleiche chunkId mehrfach im arrangement) muss der walker explicit advance, sonst loop.
+- **Walker statt Time-Match** im Audio-Master: bei Duplikaten (gleiche chunkId mehrfach im arrangement) muss der walker explicit advance, sonst loop. Editor's `useAudioMaster` nutzt `currentSegmentIdx`-State exakt analog zum arrange-store-Pattern.
 - **Native Tile-Resolution** beim Strip-Slice. Kein Upscale-then-recompress. Bei zu kleinen Tiles (portrait phone clips < 100px display-width) → Tier-3 fallback.
 - **Hot-Orange #FF5722** ist die Selection-Farbe (vorher cobalt). Frame-Bezel + MiniMap-Tick + Cockpit-Glow alle aufeinander abgestimmt.
 - **Phosphor-Glow** für alles was "lit" sein soll: text-shadow `0 0 6px rgba(255,138,79,0.7), 0 0 12px rgba(255,87,34,0.3)`. Utility-Class `phosphor-text` in styles.css.
+- **Arrangement-time im UI, master-time im Store.** Cuts/FX an master-time festmachen (chunk-anchored, sample-genau, survives reorder). Display + Hit-Test im UI über Conversion-Layer (`arrangement-time.ts`). Funktioniert weil `masterToArr` bijektiv ist im Inneren eines Segments — der Playhead-State pendelt zwischen den Welten ohne Information zu verlieren.
+- **Per-cam-pills sind derived, nicht stored.** `sliceByArrSegments(clipRange, segments)` produziert die N Sub-Pills einer Cam zur Render-Zeit. Reorder einer Arrangement → Pills werden automatisch neu projiziert beim nächsten Render-Tick. Kein Schema-Migration, keine pill-IDs zu pflegen.
