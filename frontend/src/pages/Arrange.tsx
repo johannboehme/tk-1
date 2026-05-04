@@ -53,18 +53,34 @@ export default function Arrange() {
   useArrangePersist();
   useChunkDragController();
 
-  // Load the job and prime the arrange store.
+  // Load the job and prime the arrange store. The IDB thumbnail
+  // prefetch runs BEFORE we expose the job to the UI — that way the
+  // first paint of every Polaroid finds its URL via the synchronous
+  // peek and skips the "developing dots" pulse for returning visitors.
   useEffect(() => {
     if (!id) return;
     let active = true;
-    jobsDb.getJob(id).then((j) => {
+    (async () => {
+      const j = await jobsDb.getJob(id);
       if (!active) return;
       if (!j) {
         setError("Job not found");
         return;
       }
-      setJob(j);
       const cams = (j.videos ?? []).filter(isVideoAsset);
+      const chunkIds = (j.chunks ?? []).map((c) => c.id);
+      // Warm the in-memory cache from IDB. We block on this so the
+      // polaroids that mount with the page-render below already see
+      // their thumbnail in `peekChunkThumbnailUrl()` — eliminates the
+      // brief flash of dots that landed on every card last session.
+      await Promise.all(
+        cams.map((cam) =>
+          prefetchChunkThumbnails(j.id, cam.id, chunkIds).catch(
+            () => undefined,
+          ),
+        ),
+      );
+      if (!active) return;
       // If the user came here via "Continue → Arrange" but the
       // arrangement is empty for some reason (e.g. legacy long-form
       // job pre-handoff), seed it with all accepted chunks now so
@@ -81,6 +97,7 @@ export default function Arrange() {
         // Persist the seed so the next mount doesn't re-seed
         void jobsDb.updateJob(j.id, { arrangement });
       }
+      setJob(j);
       initFromJob({
         jobId: j.id,
         audioDuration: j.durationS ?? 0,
@@ -90,15 +107,7 @@ export default function Arrange() {
         jobBpm: j.bpm?.value ?? null,
         jobBeatsPerBar: j.beatsPerBar ?? 4,
       });
-      // Pre-warm the in-memory thumbnail URL cache from IDB so
-      // returning visitors don't see "developing" dots flicker on
-      // every Polaroid before the synchronous lookup hits. One
-      // bulk fetch per cam per page-mount.
-      const chunkIds = (j.chunks ?? []).map((c) => c.id);
-      for (const cam of cams) {
-        void prefetchChunkThumbnails(j.id, cam.id, chunkIds);
-      }
-    });
+    })();
     return () => {
       active = false;
     };
