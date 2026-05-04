@@ -140,10 +140,10 @@ interface Pill {
 | 2. Detection Backend | ✅ done | WASM silence_segments, per-chunk BPM + per-chunk audioStartMs, Mode-Aggregation, im Sync-Step |
 | 3. Triage UI | ✅ done | Vom User abgenommen — Layout, Snap, Adaptive Ruler, BPM-Widget, Min-Bars-Filter, Cam-Picker, Help-Overlay |
 | 4. Triage Polish | ✅ kollabiert in Phase 3 | Click-through, bar-snap, gapless audio, adaptive ruler — alles in Phase 3 reingefaltet |
-| 5. Arrange Phase | 🚧 not started | **NÄCHSTE SESSION** |
-| 6. Multi-Pill Editor Refactor | 🚧 not started | Großer Brocken |
-| 7. Send to Editor + Segment Playback | 🚧 not started | Verbindet Arrange ↔ Editor; braucht Phase 6 |
-| 8. Polish | 🚧 not started | Sensitivität, Performance, Documentation |
+| 5. Arrange Phase | ⚠️ in progress, **NICHT abgenommen** | UI gebaut (Filmstreifen + Polaroid Contact-Sheet + LCD-Cockpit), aber Thumbnail-Pipeline + Rotation noch buggy. **Siehe Status-Section unten BEVOR du irgendwas anfasst.** |
+| 6. Multi-Pill Editor Refactor | 🚧 nicht angefangen | Großer Brocken — explizit übersprungen, weil Arrange + Phase 7 Wiring auch ohne den Refactor funktionieren |
+| 7. Send to Editor + Segment Playback | ✅ Wiring done, ungeprüft | `arrangementSegments[]` im Editor-Store; `useAudioMaster` walked sie via Crossfade-Hop; Timeline dimmt off-segment Regionen. **Phase-7-Behavior nicht E2E vom User getestet.** |
+| 8. Polish | 🚧 nicht angefangen | Sensitivität, Performance, Documentation |
 
 ---
 
@@ -251,30 +251,47 @@ Page wrapper ist `h-screen overflow-hidden` damit ControlRow's flex-1 wirklich a
 
 ---
 
-### Phase 5 — Arrange Phase 🚧 NÄCHSTE SESSION
+### Phase 5 — Arrange Phase ⚠️ in progress, **NICHT vom User abgenommen**
 
-**Ziel**: User sortiert akzeptierte Chunks via Mini-Arranger.
+**Designkonzept (vom User in dieser Session abgenickt)**: 35mm-**Filmstreifen** mit Sprocket-Holes als zentrale Komponente. Polaroid-Contact-Sheet als Source-Pool drunter (heißt im Header schlicht „Chunks · N"). Player-Cockpit oben mit kleiner Cam-Vorschau + dunklem LCD (TOTAL · NOW · ITEM · BPM). Insertion-Cursor zwischen Frames als universelle Add-Mechanik (statt Drag&Drop-only). Inspector inline in der Bottom-Transport-Bar. Mini-Map nur bei Strip-Overflow. Default-Arrangement = 1:1 chronologisch aus Triage-akzeptierten Chunks; User kann direkt **Continue → Editor** klicken ohne irgendwas anzufassen.
 
-**Konzept-Skizze (vor Beginn vom User abnehmen lassen!)**:
-- ArrangementTimeline: horizontale Flow von Chunk-Cards, click-to-focus, Reorder via Drag, ×2 Duplicate, ✕ Remove
-- SourcePool: vertikale Liste der akzeptierten Chunks (= alle Triage-effektiv-akzeptierten), mit Add-Button + Usage-Count pro Chunk
-- ArrangeTransport: play/pause + Item-Jump (Shift+←/→ vermutlich, kollidiert mit Triage nicht da andere Page)
-- Keyboard-Shortcuts müssen DE-safe sein. User wollte explizit `J/K/A/D/Cmd+arrows` für später freihalten — vermutlich für den Editor.
+**Was umgesetzt ist**:
 
-**Reuse-Audit (vor UI-Design machen!)**:
-- `BpmReadoutView` für song-global BPM display (gleicher value wie Triage)
-- `TransportClockView` für die Transport-Bar
-- `SnapModeButtonsView` für Snap (falls überhaupt nötig — Arrange operiert auf Chunk-Granularität, nicht Sub-Bar; wahrscheinlich überflüssig)
-- `useShortcutRegistry` + `useRegisterShortcut` (in `App.tsx` via `<HelpOverlay />` global gemountet — Help-Button-Pattern aus Triage übernehmen)
-- PhaseStrip aus Triage.tsx (gleiche Komponente, `phase="arrange"` setzen)
-- CamPreview könnte sinnvoll sein (mit Cam-Picker), wenn User pro Item Cam-Wahl bestätigen will. Nicht mit-bauen wenn unklar.
+- `src/local/arrange/`:
+  - `arrange-store.ts` — zustand store mit `arrangement[]`, `chunks[]`, `cams[]`, `focusedItemId`, `insertionIndex`, `selectedCamId`, `playback`, `view`, `jobBpm`, `jobBeatsPerBar`. Actions für insertChunkAtCursor / removeItem / shiftItem / reorderItem / duplicateItem / focusItem / focusRelative / setSelectedCamId / setPlaying / seek / tickTime / setStripScrollPx / setStripMetrics. `frameWidthForBars(bars)` — sublineares sqrt-scaling 64–200 px. `effectiveBarsForChunk(chunk, jobBpm, jobBeatsPerBar)` — song-global BPM driven, NICHT per-chunk.
+  - `useArrangePersist.ts` — 250ms debounced IDB write für arrangement + cam syncOverrideMs.
+  - `chunks-to-segments.ts` — `arrangementToSegments(arrangement, chunks)` mappt nach `EditSpec.segments[]`. Tests grün.
+  - `chunk-thumbnails.ts` — **3-tier thumbnail resolver** (siehe Bug-Section unten).
 
-**Audio-Playback**: Erstmal Loop-Preview eines fokussierten Items (gleiches Pattern wie Triage's `useTriageAudio`, eigener `useArrangeAudio`-Hook). **Sequentielle Wiedergabe** der gesamten Arrangement ist Phase 7.
+- `src/components/arrange/`:
+  - `FilmStrip.tsx` — Hauptkomponente. Sprocket-Hole-Rails oben/unten, Frame-Reihe in der Mitte, length-proportional Frames, drag-on-frame-to-reorder, Insertion-Cursor zwischen jedem Frame, Right-click = remove.
+  - `Frame.tsx` — Einzelner Strip-Frame; Cam-Color-Stripe unten, focused = cobalt outline, current playing = top-LED. IntersectionObserver-gated thumbnail load via `useChunkThumbnail`.
+  - `ContactSheet.tsx` — Wrap-grid (kein horizontal-scroll), label "Chunks · N", scrollt intern. Composiert Polaroid pro chunk.
+  - `Polaroid.tsx` — Polaroid-card mit Develop-Animation (saturate/sepia → full color über 800ms), `+ ADD` button = insert at cursor. Tap body = focus + preview-loop.
+  - `InsertionCursor.tsx` — Glühende vertikale Linie zwischen Frames, click setzt insertionIndex.
+  - `MiniMap.tsx` — Overflow-only; cobalt highlight für focused, hot-orange für playing.
+  - `PlayerCockpit.tsx` — Cam-Sucher (links) + Dark-LCD (TOTAL/NOW/ITEM/BPM/REC).
+  - `CamPreviewArrange.tsx` — Hidden video, seekt zu master-time minus cam-syncOffset, cam-picker als ◀cam-X▶ am unteren Rand. Sm: square 84×84, sm+: 240×135.
+  - `ArrangeTransport.tsx` — Bottom bar; PREV/PLAY/NEXT + ◀cur/cur▶ + Inspector inline (FRAME N/M, bars, ◀ ▶ Dup Drop) + 210px footer-clearance rechts.
+  - `useArrangeAudio.tsx` — Sequenzielle gapless playback, dual-element ping-pong + 8ms WebAudio crossfade-hop am chunk-Ende zum next-chunk-start. Pattern aus `useTriageAudio` recycelt.
 
-**Files** (geplant):
-- `src/local/arrange/arrange-store.ts`, `useArrangePersist.ts`
-- `src/components/arrange/ArrangementTimeline.tsx`, `SourcePool.tsx`, `ArrangeTransport.tsx`, `useArrangeAudio.tsx`
-- `src/pages/Arrange.tsx` (existiert als Placeholder)
+- `src/pages/Arrange.tsx` — `h-screen overflow-hidden` wrapper (Triage-Pattern), full-width single-column layout. `prefetchChunkThumbnails()` lädt IDB-cached thumbs in memory beim Mount. `continueToEditor()` flusht arrangement synchron in IDB bevor er navigiert (sonst geht der Persist-Debounce verloren).
+
+- **Phase 7 wiring** parallel mit gemacht (kein eigener Editor-Refactor, einfach segment-walker eingebaut):
+  - `editor/store.ts` bekommt `arrangementSegments: Segment[]` field + `setArrangementSegments` action; `loadJob` opts erweitert; `buildEditSpec` emittiert die Segmente verbatim wenn non-empty (Renderer kann schon multi-segment).
+  - `editor/useAudioMaster.ts` segment-walker branch: gapless hop von segment N's `out` zu segment N+1's `in` via wrapTarget auf der existierenden Crossfade-Maschine. Last segment → pause statt loop.
+  - `editor/components/Timeline.tsx` dimmt off-segment Regionen auf der Audio-Lane + zeichnet hot splice marks an Boundaries.
+  - `pages/Editor.tsx` ruft `arrangementToSegments(j.arrangement, j.chunks)` und übergibt an loadJob; trim spannt min/max aller segments.
+  - Editor exposed `window.__lastEditorSegments` als E2E-debug-hook (Vite dev hands distinct module instances zurück für dynamic imports vs static).
+
+- **VideoAsset.intrinsicRotationDeg**: neues Feld, populated beim Sync von `info.rotationDeg` aus dem demuxer. Für Legacy-Assets ohne das Feld macht der thumbnail resolver einen lazy demux probe + persistiert zurück. Heuristik (dim-swap = 90°) als allerletzter Fallback.
+
+- **IDB schema**: v3 → v4 (`chunk-thumbnails` store) → v5 (auto-clear chunk-thumbnails on migration weil rotation-pipeline sich geändert hatte).
+
+**Schreib-/Architektur-Entscheidungen**:
+- Inspector lebt **nicht** in einer Side-Bar sondern in der Bottom-Transport-Bar — User wollte expliziten Recovery von horizontalem Platz für Strip + Contact-Sheet.
+- ContactSheet wraps statt horizontal-scroll → bei vielen chunks füllt das den verfügbaren vertikalen Platz, scrollt intern.
+- `h-screen overflow-hidden` auf der Page (Triage-Pattern) damit `flex-1` die ContactSheet auf Viewport-Höhe constraint.
 
 ---
 
@@ -351,62 +368,82 @@ Allgemein wichtig:
 
 ## Status & Notes for Next Session — START HERE
 
-**Letzter Stand: Phase 3 (Triage) ist vom User abgenommen und gemerged-ready.** Phase 5 (Arrange) ist die nächste Aufgabe.
+**Letzter Stand: Arrange-UI gebaut, von der Bedienung her grob nutzbar, aber DIE THUMBNAIL-PIPELINE IST BUGGY und wurde vom User explizit NICHT abgenommen.** Du fängst nicht bei null an, aber renne nicht direkt weiter mit dem Code — lies erst die offenen Bugs unten.
 
-### Was committed ist (auf diesem Branch, 31 Commits ahead of `main`)
+### Offene Bugs (vom User in der letzten Session live festgestellt)
 
-```
-8d8f02d feat(triage): help button in the phase strip
-11df037 fix(triage): min-bars filter accepts arbitrary integers, label "MIN"
-9647f45 fix(triage deck strip): kept counter and bars filter render as a matched pair
-89e126f feat(triage): min-bars filter is reversible + drops MATCH snap + brass-LCD design
-8ded5c4 feat(triage): prev/next chunk navigation skips dropped chunks
-6391ae6 fix(triage timeline): chunk markers render at true width, drop dot fallback
-633b5ea feat(triage timeline): clicking the waveform inside a chunk focuses it
-b49710c feat(triage timeline): add 1/8 + 1/16 sub-beat tick subdivisions
-3e244ea fix(triage timeline): bar ruler renders ONLY the focused chunk's grid
-55cb900 feat(triage): adaptive bar markers, playhead drag, snap+seek, min-bars filter
-feeb50c fix(triage timeline): drop the loud audio-start anchor markers
-8e14058 fix(triage timeline): bar ruler primary + per-chunk audio-start anchor markers
-08b8440 fix(triage): per-chunk snap math + extension bar markers during trim drag
-a2b5337 feat(triage): reuse editor TransportClock + Loop button to far right
-b04ba19 fix(triage): centered transport bar + drop redundant per-chunk octave block
-080f920 fix(triage): lock page to viewport so ChunksList actually scrolls
-0ea5e38 fix(triage): cam-overflow + slim timeline + cam-picker dropdown + chunk row from→to
-0f71bac feat(triage): rack-mount layout, BPM widget in inspector header, octave keys in BPM editor
-2d7f6b3 feat(triage): layout overhaul, snap toolbar, BpmReadout reuse, loop toggle
-694fbe4 docs: add PLAN.md with phase status + next-session notes
-3ecff51 fix(sync-panel): handle 'detecting-chunks' stage so master state doesn't drop
-b82b15d fix(triage): routing graduates to arrange only via explicit Continue
-5ab95ee fix(triage): detect chunks during sync, instant page open, no double-loading
-554d847 feat(triage): finish UI — bar-snap trim, sync-nudge, session BPM, gapless audio
-4ca5cd2 feat(triage): full UI v1 — timeline, transport, panels, list, cam preview
-32bc4b3 refactor(sync): extract SyncPatchPanel from JobPage to shared component
-a53b5d1 feat(triage): chunk-detection backend (WASM silence + per-chunk BPM)
-9aafd41 fix(jobpage): hide Quick render for long-form jobs, keep it for direct
-1fb545c fix(upload): mode cards read as buttons, not drop targets
-104d708 fix(triage): full-bleed layout, sync-first flow, simpler routing glyph
-72cb6a5 feat(triage): mode-aware upload + triage/arrange route scaffolding
-```
+1. **Polaroid-Thumbnails sind teilweise um 90° rotiert** (manche, nicht alle).
+   - **Test-Material**: `~/Downloads/test video.mp4` (rotation=+90 laut ffprobe).
+   - **Was die letzte Session vermutet hat (und was sich als WAHRSCHEINLICH FALSCH herausstellte)**:
+     - Theorie A: Stale IDB-Cache von vor dem Rotations-Fix. Schema-bump v4→v5 würde das self-healen.
+     - Theorie B: dim-swap-Heuristik kann 90° nicht von 270° unterscheiden, also halbe Treffer.
+   - **Was der User explizit gesagt hat**: „Das war kein IDB cache problem. Ich hab bei jedem versuch das Projekt komplett von 0 auf durchgeführt." Also frischer Job pro Versuch — kein stale cache.
+   - **Echte Frage die NICHT beantwortet wurde**: Wenn alle Frames im selben Strip stecken, warum kommen manche korrekt rotiert raus und andere nicht? Möglichkeiten die NOCH nicht ausgeschlossen wurden:
+     - Race condition zwischen `probe.rotationDeg`-Zuweisung und Tier-2-Slice-Aufrufen (mehrere Polaroids parallel mounten via IntersectionObserver — wenn die Promise-all-Sequenz nicht atomic ist, beobachten manche `rotationDeg=0`)
+     - Tier-2 vs Tier-3 Mix: Tier-3 zieht Frame durch `<video>` (browser auto-rotates), Tier-2 zieht aus Strip (kein auto-rotate). Falls die Rotation-Probe nur für tier-2-Slices angewendet wird aber tier-3 ALS OB schon rotiert ist, könnte ein Subset doppelt-rotiert oder gar nicht rotiert werden.
+     - Strip-Image hat wirklich uniformes Pixel-Layout aller Tiles — also kann's nicht "manche tiles rotated, manche nicht" am Quellbild liegen.
+   - **Was nicht zu tun ist**: NICHT nochmal auf die "stale cache"-Theorie zurückfallen. NICHT den User fragen "hast du IDB clear gemacht". Der hat fresh-from-scratch getestet.
+   - **Empfehlung**: Reproduce mit `~/Downloads/test video.mp4`, leg Logs in die Tier-Resolver, schau dir an WELCHE konkreten Polaroids gedreht sind (cam-id? chunk-zeit? tier?) und finde das Pattern bevor du irgendwas änderst.
+
+2. **„no preview" (vorher „out of range") auf vielen kurzen Snippets**.
+   - User hat gesagt die betroffenen Chunks sind NICHT outside cam range. Trotzdem failed Tier-3.
+   - Was ich versucht hab: clamp `sourceTimeS` zu `[0, duration-0.05]` damit chunks außerhalb der cam-range zumindest einen boundary frame kriegen. Hat möglicherweise nichts gebracht weil die Chunks gar nicht outside-range waren — der echte Failure-Modus war anders.
+   - Mögliche andere Ursachen die NICHT verifiziert wurden:
+     - `<video>.duration` ist NaN weil die `loadedmetadata`-5s-Timeout vor metadata feuert (relevant für sehr große Files? `test video.mp4` ist 9 GB)
+     - `seeked` event feuert nicht bei manchen Frames → 2s safety timeout läuft → drawImage zieht falschen Frame oder failt
+     - Race zwischen `clearChunkThumbnails` (StrictMode unmount) und in-flight extractions → probe.video.src removed → drawImage tainted
+   - **Empfehlung**: Diagnostic logs in `seekAndCapture` lassen + reproduzieren. Welche Chunks failen, was sagt `v.duration`, was passiert beim seek.
+
+3. **Drei Lade-Punkte (developing dots) erscheinen kurz auf jedem Polaroid beim Pageload, auch wenn IDB-cached.**
+   - Was ich versucht hab: Bulk-prefetch `prefetchChunkThumbnails(jobId, camId, chunkIds)` in Arrange.tsx + `peekChunkThumbnailUrl()` synchroner getter + `useChunkThumbnail` initialisiert state aus dem peek.
+   - User hat danach NICHT explizit bestätigt ob's behoben ist — möglich dass das tatsächlich gefixed ist, möglich dass nicht.
+   - **Empfehlung**: Verifizier visuell, ob der Flicker noch da ist. Wenn ja: schaue ob der prefetch wirklich VOR dem ersten Polaroid-Mount durch ist (möglich dass die Prefetch-Promise noch fliegt während die Polaroids schon mounten, weil sie via IntersectionObserver getriggert werden — könnte timing-sensitiv sein).
+
+4. **„Out of range" war ein irreführendes Label**. Jetzt heißt es „no preview" mit Tooltip. Der User hat das nicht explizit kommentiert, also vermutlich OK. Bug 2 darunter ist davon unabhängig — die Extraktion failed wirklich, das Label ist nur korrekter benannt.
+
+### Was funktional läuft
+
+- **Layout**: full-width filmstrip + wrap-grid contact-sheet + inline inspector in der bottom bar. User hat nicht weiter dran rumkritisiert.
+- **Mini-Map**: highlight für `focusedItemId` (cobalt) und `currentItemId` (hot orange) — vom User in dieser Session als "geht jetzt" implizit akzeptiert.
+- **Insertion-Cursor + reorder + duplicate + drop**: keine Beschwerden.
+- **Sequential gapless playback** in Arrange (`useArrangeAudio`): nicht vom User getestet kommuniziert.
+- **Phase 7 wiring** (arrangementSegments → editor → useAudioMaster segment-walker → timeline shading): funktioniert in E2E (`scripts/arrange-e2e-screens.mjs` läuft sauber durch, 21 segments propagieren). Vom User noch NICHT durchgespielt.
+- **Continue-Button-Flow**: arrangement wird vor Navigation synchron geflusht → editor öffnet mit korrekten segments.
+
+### Lessons aus dem Arrange-Bau (Memory für die nächste Session)
+
+- **Diagnostiziere bevor du fixst**. Ich habe 3+ Iterationen verbrannt mit Theorien (StrictMode race, stale IDB cache, dim-swap-Heuristik) ohne den Bug einmal sauber zu reproduzieren + zu instrumentieren. Der User hat mir am Ende explizit gesagt "du bist nicht mehr koherent" — weil ich Bullshit-Diagnosen geliefert habe. **Schreib Logs, lass den User reproduzieren, sammle Daten, DANN fix.** Theoretische Mechanismen wie "Race condition zwischen X und Y" sind keine Diagnose, das ist Spekulation.
+- **Wenn der User klar sagt "Bug X tritt auf", glaub ihm**. Ich hab dem User mehrfach gesagt "das wird der IDB cache sein, lösch ihn manuell" — der User hatte aber von Anfang an sauber from-scratch getestet. Ich habe nicht zugehört.
+- **Wenn du drei Bugs gleichzeitig fixt und keiner davon vom User verifiziert wurde, beweisen E2E-Tests gar nichts**. Die fixture-Videos im Repo sind landscape — die testen den Rotations-Pfad nicht. Die Test-Cams haben keinen sync-offset → testen nicht den out-of-range-Pfad realistisch.
+- **Phase 6 ist NICHT umgesetzt**. Ich hab das übersprungen weil "Phase 7 wiring funktioniert auch ohne Multi-Pill-Refactor". Das ist eine valide Architektur-Entscheidung wenn der User damit OK ist, aber lass den User explizit entscheiden bevor du die zukünftige Multi-Pill-Welt aufgibst.
+- **Editor exposes `window.__lastEditorSegments`** als Test-Hook. Das ist offen committed; entweder rausziehen wenn finalisiert oder dokumentiert lassen.
+
+### Was committed ist (auf diesem Branch)
+
+Tail nach `git log --oneline 8d8f02d..HEAD`:
+- `feat(arrange): Filmstreifen — Phase 5 + 7` (initialer Wurf)
+- `fix(arrange): single-mount layout, stable selectors, segment trim min/max`
+- `fix(arrange): adapt to song-global tempo model + Continue→Editor flush`
+- `feat(arrange): full-width layout + 3-tier thumbnail resolver + IDB cache`
+- `fix(arrange): pin page to viewport + scroll chunks panel internally`
+- `fix(arrange): apply intrinsic rotation in strip-slice + tier-3 cleanup`
+- `fix(arrange): persist+probe intrinsic rotation, clamp tier-3, sync-peek thumb cache`
+- `fix(arrange): self-heal stale thumbnail cache + honest empty-state label`
+
+Alle commits pushed auf `claude/goofy-blackwell-f2eb00`. PR-fähig sind die ersten ~3-4; die letzten Rotations-/Cache-Fixes sind verdächtig (siehe Bug 1) und sollten **vor dem Mergen revisited** werden.
 
 ### So fängst du in der neuen Session an
 
-1. **Lies diese PLAN.md durch** — alle Schlüssel-Entscheidungen, das Tempo-Modell, das Datenmodell, die Triage-Architektur, die Arrange-Konzept-Skizze, die Lessons.
-2. **Reuse-Audit** für Arrange (siehe Phase 5 oben). Welche Editor- + Triage-Komponenten kommen ungenutzt rüber? Welche brauchen einen `View`-Twin?
-3. **Layout-Konzept beim User abnehmen lassen BEVOR Code geschrieben wird** (Memory `feedback_design_iteration.md`). Frontend-Design Skill nutzen für die Konzept-Iteration.
-4. **Dann erst implementieren.** TDD wo sinnvoll (Memory `feedback_tdd.md`). Multi-step plans ohne Pause durchziehen, commit OK, push nur auf Ansage (Memory `feedback_autonomous_execution.md`).
-5. **Dev-Server starten am Session-Ende** + konkrete Test-Anleitung (Memory `feedback_dev_server_at_session_end.md`).
-
-### Wichtige Vorgaben für Arrange
-
-- **Keep/Drop-Aktionen sind wieder Triage** — Arrange-Items sind ja schon akzeptiert. In Arrange geht's nur um Reihenfolge + Duplikate + Remove (≠ Drop).
-- **Reorder-Pattern**: Drag oder Up/Down-Arrows. User wollte explizit `J/K/A/D/Cmd+arrows` für SPÄTER freihalten — also nicht für Arrange. Vorschlag: Drag + Shift+←/→ für item-jump-focus.
-- **`arrangement[]` ist das persistente State** — duplizierte Items haben dieselbe `chunkId`, eigene `id` (`arr-{chunkId}-{ts}-{i}`). User-Reorder schreibt zurück in `job.arrangement`.
-- **TE-Spirit**: brass + cassette + LCD vocabulary. Nicht neu erfinden, aus Editor + Triage zusammenstellen.
+1. **Lies diese ganze PLAN.md** — Tempo-Modell, Datenmodell, Triage-Architektur, Arrange-Architektur (Phase 5 oben), und vor allem die Bugs hier in dieser Section.
+2. **Frag den User welche Bugs Priorität haben**. Vermutlich: Rotation zuerst, dann no-preview, dann developing-dots-Flicker.
+3. **Reproduce vor Fix**. Lass den User dir konkret sagen welcher Polaroid welches Verhalten zeigt. Logs in den Tier-Resolver, ggf. ein in-page-debug-Overlay das pro Polaroid zeigt welcher Tier gegriffen hat.
+4. **NICHT die alten Theorien aus dieser Session blind weiterverfolgen** — die haben sich nicht bewährt.
+5. **Erst wenn die Thumbnail-Pipeline robust ist**, vom User Phase 5 abnehmen lassen, dann zu Phase 6/7 verfeinern oder nächstes Feature.
 
 ### Pre-existing Caveats
 
 - **WASM `pkg/` ist gitignored** — nach jedem Pull `bun run wasm:build` aus `frontend/`
 - **Tests**: `bun x vitest run --project=unit` für unit, `bun x vitest run --project=browser` für browser-tests (Chromium via Playwright)
-- **Worktree-Setup**: Dieser Branch lebt in `.claude/worktrees/quirky-dhawan-fb619b/`. PWD beim shell-cd beachten — manche Bash-Calls landen im Repo-Root statt frontend/
+- **Worktree-Setup**: Dieser Branch lebt in `.claude/worktrees/goofy-blackwell-f2eb00/`. PWD beim shell-cd beachten — manche Bash-Calls landen im Repo-Root statt frontend/
 - **TypeScript-WASM-Errors** beim Typecheck (`Cannot find module sync_core.js`) sind pre-existing wenn pkg/ noch nicht gebaut wurde — `bun run wasm:build` fixt das
+- **E2E-Skript** liegt in `frontend/scripts/arrange-e2e-screens.mjs`. Seedet einen long-form job aus den `__readme_fixtures__` (landscape!), exerciset Tier 2 + 3, screenshots in `frontend/e2e-screens/` (gitignored). NUTZT NICHT die echten Test-Videos aus `~/Downloads/`. Für Rotations-Reproduktion brauchst du die echten Test-Videos.
