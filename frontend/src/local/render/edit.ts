@@ -356,7 +356,15 @@ export async function editRender(input: EditRenderInput): Promise<EditRenderResu
       });
     },
     error: (e) => {
-      pendingError = e instanceof Error ? e : new Error(String(e));
+      // The native VideoDecoder error message is just "Decoding error".
+      // Wrap it with the codec + dims so the user has at least a
+      // breadcrumb when render fails partway through.
+      const orig = e instanceof Error ? e.message : String(e);
+      pendingError = new Error(
+        `Render decode failed (codec ${video.info.codec}, ` +
+          `${video.info.width}×${video.info.height}, ` +
+          `${framesEmitted} frames emitted): ${orig}`,
+      );
     },
   });
   decoder.configure({
@@ -817,17 +825,48 @@ export async function editRenderMulti(
             //   editor must change which frame the renderer fetches.
             //   Direct-mode: master-to-cam-source via the cam's anchor
             //   + drift, identical to the legacy path.
-            const sourceTimeS = activePill
+            const rawSourceTimeS = activePill
               ? activePill.sourceInS + (tArr - activePill.arrStartS)
               : null;
+            // Clamp to the cam's actual source-time range. A pill whose
+            // sourceIn/Out window points just past the end of the
+            // video (within rounding error) would otherwise hand the
+            // VideoDecoder a timestamp it can't satisfy, surfacing as
+            // a context-free "Decoding error". Clamp to one frame
+            // before the end so the decoder always lands on a valid
+            // sample.
+            const sourceMaxS = Math.max(
+              0,
+              cam.cam.sourceDurationS - 1 / fps,
+            );
+            const sourceTimeS =
+              rawSourceTimeS != null
+                ? Math.max(0, Math.min(sourceMaxS, rawSourceTimeS))
+                : null;
             const sourceTimeUs =
               sourceTimeS != null
-                ? Math.max(0, Math.round(sourceTimeS * 1_000_000))
+                ? Math.round(sourceTimeS * 1_000_000)
                 : camSourceTimeUs(tMaster, {
                     masterStartS: cam.cam.masterStartS,
                     driftRatio: cam.cam.driftRatio ?? 1,
                   });
-            const frame = await cam.stream.frameAtOrBefore(sourceTimeUs);
+            let frame: VideoFrame | null = null;
+            try {
+              frame = await cam.stream.frameAtOrBefore(sourceTimeUs);
+            } catch (err) {
+              // The native VideoDecoder error message is just
+              // "Decoding error" — useless for debugging. Re-throw
+              // with the cam id, source-time, and frame number so
+              // the user has a chance of understanding which input
+              // is bad.
+              const orig = err instanceof Error ? err.message : String(err);
+              throw new Error(
+                `Render decode failed on cam '${cam.cam.id}' at source-time ` +
+                  `${(sourceTimeUs / 1_000_000).toFixed(3)}s ` +
+                  `(arr ${tArr.toFixed(3)}s, master ${tMaster.toFixed(3)}s, ` +
+                  `frame ${framesEmitted}): ${orig}`,
+              );
+            }
             if (frame) {
               source = frame as unknown as CanvasImageSource;
               srcW = cam.info.width;
