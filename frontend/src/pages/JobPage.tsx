@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { useNavigate, useParams } from "react-router-dom";
 import { ChunkyButton } from "../editor/components/ChunkyButton";
@@ -14,6 +14,8 @@ import {
   type LocalJob,
 } from "../local/jobs";
 import { jobRoutePath, nextRouteForJob } from "../local/jobs-routing";
+import { useSyncOp } from "../local/ops-store";
+import { isVideoAsset } from "../storage/jobs-db";
 import { SyncPatchPanel } from "../components/sync/SyncPatchPanel";
 
 export default function JobPage() {
@@ -22,6 +24,17 @@ export default function JobPage() {
   const [job, setJob] = useState<LocalJob | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+  const syncOp = useSyncOp(id);
+
+  // Derived state — phase comes from data + ops, never a status enum.
+  const hasSyncData = useMemo(() => {
+    const cams = job?.videos ?? [];
+    if (cams.length === 0) return false;
+    return cams.every((c) => !isVideoAsset(c) || Boolean(c.sync));
+  }, [job?.videos]);
+  const isSyncing = Boolean(syncOp) && !syncOp?.error;
+  const syncFailed = Boolean(syncOp?.error);
+  const hasOutput = Boolean(job?.lastRender);
 
   useEffect(() => {
     if (!id) return;
@@ -43,7 +56,7 @@ export default function JobPage() {
 
   // Build a download URL when an output appears.
   useEffect(() => {
-    if (!job?.hasOutput) return;
+    if (!job?.lastRender) return;
     let url: string | null = null;
     let cancelled = false;
     resolveJobAssetUrl(job.id, "output").then((u) => {
@@ -59,7 +72,7 @@ export default function JobPage() {
       if (url) URL.revokeObjectURL(url);
       setDownloadUrl(null);
     };
-  }, [job?.hasOutput, job?.id]);
+  }, [job?.lastRender, job?.id]);
 
   async function onQuickRender() {
     if (!job) return;
@@ -89,12 +102,13 @@ export default function JobPage() {
     );
   }
 
-  const isDone = job.status === "rendered" || job.status === "synced";
-  const isFailed = job.status === "failed";
-  // A failed job that already has a sync result is recoverable: the
-  // sync data lets the user re-enter the editor or kick off another
-  // render attempt without redoing the upload + analysis.
-  const canRetry = isFailed && Boolean(job.sync);
+  // "Ready to use" = sync result is on the job. Either freshly
+  // produced (op finished, hasSyncData) or rehydrated from history.
+  const isDone = hasSyncData && !isSyncing;
+  // A failed sync op with `videos[].sync` already filled is recoverable
+  // — the sync data lets the user re-enter the editor or kick off
+  // another render attempt without redoing the upload + analysis.
+  const canRetry = syncFailed && hasSyncData;
   // Quick render is the "drop video + audio → aligned MP4" shortcut —
   // skips the editor entirely. Doesn't fit the long-form workflow
   // (chunks need to be triaged, arranged, then composed in the editor),
@@ -109,7 +123,9 @@ export default function JobPage() {
             JOB · {job.id.slice(0, 8)}
           </span>
           <RuleStrip count={32} className="text-rule flex-1 max-w-[200px]" />
-          <StatusBadge status={job.status} />
+          <StatusBadge
+            label={statusLabel({ isSyncing, syncFailed, hasSyncData, hasOutput })}
+          />
         </div>
         <h1 className="font-display font-semibold text-3xl sm:text-4xl text-ink truncate">
           {job.title || job.id}
@@ -119,7 +135,7 @@ export default function JobPage() {
 
       <section className="mb-6">
         <AnimatePresence mode="wait" initial={false}>
-          {(job.status === "queued" || job.status === "syncing") ? (
+          {isSyncing ? (
             <motion.div
               key="progress"
               initial={{ opacity: 0, y: 6 }}
@@ -142,7 +158,9 @@ export default function JobPage() {
         </AnimatePresence>
       </section>
 
-      {isFailed && job.error && <Banner kind="error" text={job.error} />}
+      {syncFailed && syncOp?.error && (
+        <Banner kind="error" text={syncOp.error} />
+      )}
       {err && <Banner kind="error" text={err} />}
 
       {(isDone || canRetry) && (
@@ -183,8 +201,8 @@ export default function JobPage() {
         </div>
       )}
 
-      {/* Sync also failed — only recovery is to delete and retry the upload. */}
-      {isFailed && !job.sync && (
+      {/* Sync failed without producing any data — only recovery is to delete and retry. */}
+      {syncFailed && !hasSyncData && (
         <div className="flex flex-wrap gap-3 border-t border-rule pt-5">
           <ChunkyButton variant="ghost" size="lg" onClick={onDelete}>
             Delete and start over
@@ -262,12 +280,25 @@ function LongformStageButtons({
   );
 }
 
-function StatusBadge({ status }: { status: string }) {
+function StatusBadge({ label }: { label: string }) {
   return (
     <span className="font-mono text-[10px] tracking-label uppercase text-ink-2 bg-paper-hi border border-rule rounded-full px-2 py-0.5">
-      {status}
+      {label}
     </span>
   );
+}
+
+function statusLabel(args: {
+  isSyncing: boolean;
+  syncFailed: boolean;
+  hasSyncData: boolean;
+  hasOutput: boolean;
+}): string {
+  if (args.isSyncing) return "syncing";
+  if (args.syncFailed) return "failed";
+  if (args.hasOutput) return "rendered";
+  if (args.hasSyncData) return "synced";
+  return "needs sync";
 }
 
 /**

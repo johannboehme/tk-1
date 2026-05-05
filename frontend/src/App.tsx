@@ -5,7 +5,6 @@ import {
   initCapabilities,
   meetsMinRequirements,
 } from "./local/capabilities";
-import { markInterruptedJobsOnLoad } from "./local/lifecycle";
 import { HelpOverlay } from "./editor/components/HelpOverlay";
 import { RecMark } from "./editor/components/RuleStrip";
 import { Footer } from "./components/Footer";
@@ -41,24 +40,19 @@ export default function App() {
   // Hold off rendering anything browser-API-dependent until we've confirmed
   // we're not running in jsdom-with-coercion (some unit tests stub
   // navigator etc.). For real browsers this is a one-tick check.
-  // We also clean up jobs left in `syncing`/`rendering` from a previous
-  // page session — they were necessarily interrupted (the work was driven
-  // by a now-dead tab) so surfacing that beats letting them hang in limbo.
-  // And we await the WebGPU adapter probe so the Render-Backend factory
+  // We also await the WebGPU adapter probe so the Render-Backend factory
   // gets a reliable `caps.webgpu` from the very first mount.
   const [ready, setReady] = useState(false);
   useEffect(() => {
     let cancelled = false;
-    Promise.all([
-      markInterruptedJobsOnLoad().catch(() => undefined),
-      initCapabilities()
-        .then((merged) => {
-          if (!cancelled) setCaps(merged);
-        })
-        .catch(() => undefined),
-    ]).finally(() => {
-      if (!cancelled) setReady(true);
-    });
+    initCapabilities()
+      .then((merged) => {
+        if (!cancelled) setCaps(merged);
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (!cancelled) setReady(true);
+      });
     return () => {
       cancelled = true;
     };

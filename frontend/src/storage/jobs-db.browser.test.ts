@@ -13,9 +13,6 @@ function makeJob(overrides: Partial<LocalJob> = {}): LocalJob {
     title: null,
     videoFilename: "video.mp4",
     audioFilename: "audio.wav",
-    status: "queued",
-    progress: { pct: 0, stage: "queued" },
-    hasOutput: false,
     createdAt: Date.now(),
     ...overrides,
   };
@@ -70,14 +67,14 @@ describe("jobs-db (real Chromium IndexedDB)", () => {
 
   describe("updateJob", () => {
     it("merges patch onto existing job and returns the updated job", async () => {
-      const job = makeJob({ status: "queued" });
+      const job = makeJob({ title: "before" });
       await jobsDb.saveJob(job);
 
       const updated = await jobsDb.updateJob(job.id, {
-        status: "synced",
+        title: "after",
         sync: { offsetMs: 250, driftRatio: 1.0001, confidence: 0.85 },
       });
-      expect(updated.status).toBe("synced");
+      expect(updated.title).toBe("after");
       expect(updated.sync).toEqual({
         offsetMs: 250,
         driftRatio: 1.0001,
@@ -89,7 +86,7 @@ describe("jobs-db (real Chromium IndexedDB)", () => {
 
     it("throws when updating a non-existent job (does not silently create)", async () => {
       await expect(
-        jobsDb.updateJob("ghost", { status: "synced" }),
+        jobsDb.updateJob("ghost", { title: "x" }),
       ).rejects.toThrow(/not found/i);
     });
   });

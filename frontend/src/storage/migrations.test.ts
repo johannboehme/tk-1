@@ -13,14 +13,11 @@ function v1Job(overrides: Partial<LocalJob> = {}): LocalJob {
     title: null,
     videoFilename: "video.mp4",
     audioFilename: "audio.wav",
-    status: "synced",
-    progress: { pct: 100, stage: "synced" },
     sync: { offsetMs: 250, driftRatio: 1.0001, confidence: 0.85 },
     durationS: 120,
     width: 1920,
     height: 1080,
     fps: 30,
-    hasOutput: false,
     createdAt: 1700000000000,
     ...overrides,
   };
@@ -102,9 +99,9 @@ describe("migrateV1ToV2", () => {
     expect(twice).toBe(once);
   });
 
-  it("handles a job without sync result (status: queued)", () => {
+  it("handles a job without sync result", () => {
     const migrated = migrateV1ToV2(
-      v1Job({ status: "queued", sync: undefined, durationS: undefined }),
+      v1Job({ sync: undefined, durationS: undefined }),
     );
     expect(asVideo(migrated.videos![0]).sync).toBeUndefined();
     expect(asVideo(migrated.videos![0]).durationS).toBeUndefined();

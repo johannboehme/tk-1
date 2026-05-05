@@ -2,8 +2,12 @@
  * IndexedDB-Wrapper für lokale Job-Metadaten.
  *
  * Mediadaten (Video, Audio, Render-Output) leben in OPFS (siehe ./opfs.ts).
- * Hier liegen nur strukturierte Daten: Status, Sync-Result, Edit-Spec,
- * Progress, Timing.
+ * Hier liegen nur strukturierte Daten: Sync-Result, Edit-Spec, Timing.
+ *
+ * Lifecycle-Bits (was läuft gerade — Sync, Render, Fehler) leben NICHT
+ * hier, sondern in `local/ops-store.ts`. Die Phase eines Projekts ergibt
+ * sich rein aus den persistierten Daten (videos[].sync, chunks,
+ * arrangement, pills, lastRender).
  */
 
 import { openDB, type IDBPDatabase } from "idb";
@@ -184,23 +188,6 @@ export interface Cut {
   camId: string;
 }
 
-export interface JobProgress {
-  pct: number;
-  stage: string;
-  detail?: string;
-  etaS?: number;
-  framesDone?: number;
-  framesTotal?: number;
-}
-
-export type JobStatus =
-  | "queued"
-  | "syncing"
-  | "synced"
-  | "rendering"
-  | "rendered"
-  | "failed";
-
 /**
  * Workflow-Pfad nach dem Upload.
  *  - "direct"   — fertiges Stück + Video(s) → direkt in den Editor.
@@ -315,10 +302,6 @@ export interface LocalJob {
    *  original audio file. */
   audioSource?: AssetSource;
 
-  status: JobStatus;
-  progress: JobProgress;
-  error?: string;
-
   /** V1-Feld: Sync-Result für das (eine) Video. Ab V2 lebt das pro Video in
    * `videos[i].sync`. Wird zur Backward-Compat hier gespiegelt. */
   sync?: SyncResult;
@@ -337,12 +320,15 @@ export interface LocalJob {
    * Coupling zu vermeiden. */
   editSpec?: unknown;
 
-  hasOutput: boolean;
-  outputBytes?: number;
+  /** Last successful render. Persistent "this job has produced an output
+   *  video" pointer. Cleared (overwritten) on each new successful render.
+   *  Output bytes live at `jobs/{id}/output.mp4` in OPFS. */
+  lastRender?: {
+    completedAt: number;
+    outputBytes: number;
+  };
 
   createdAt: number;
-  startedAt?: number;
-  finishedAt?: number;
 
   // ---- V2 (Multi-Video) ----
 
@@ -492,7 +478,7 @@ export interface PunchFxRecord {
 }
 
 const DB_NAME = "videoaudiosync";
-const DB_VERSION = 7;
+const DB_VERSION = 8;
 const STORE = "jobs";
 const ANALYSIS_STORE = "audio-analysis";
 /** Per-chunk thumbnail JPEG bytes, keyed by `${jobId}::${camId}::${chunkId}`.
@@ -574,6 +560,46 @@ function db(): Promise<IDBPDatabase> {
         if (oldVersion === 6 && database.objectStoreNames.contains(CHUNK_THUMBS_STORE)) {
           const s = tx.objectStore(CHUNK_THUMBS_STORE);
           await s.clear();
+        }
+
+        // V7 → V8: removed the persisted lifecycle fields (status,
+        // progress, error, hasOutput, outputBytes, startedAt, finishedAt)
+        // from LocalJob in favour of the in-memory ops-store. Strip the
+        // legacy fields off existing rows so a TypeScript-aware reader
+        // never sees them again, and synthesize `lastRender` for rows
+        // that previously had `hasOutput === true` so the user doesn't
+        // lose the "I have a finished video" indicator.
+        if (oldVersion < 8 && database.objectStoreNames.contains(STORE)) {
+          const store = tx.objectStore(STORE);
+          let cursor = await store.openCursor();
+          while (cursor) {
+            const row = cursor.value as Record<string, unknown>;
+            const hasOutput = row.hasOutput === true;
+            const outputBytes =
+              typeof row.outputBytes === "number"
+                ? row.outputBytes
+                : 0;
+            const finishedAt =
+              typeof row.finishedAt === "number"
+                ? row.finishedAt
+                : Date.now();
+            const cleaned: Record<string, unknown> = { ...row };
+            delete cleaned.status;
+            delete cleaned.progress;
+            delete cleaned.error;
+            delete cleaned.hasOutput;
+            delete cleaned.outputBytes;
+            delete cleaned.startedAt;
+            delete cleaned.finishedAt;
+            if (hasOutput && !cleaned.lastRender) {
+              cleaned.lastRender = {
+                completedAt: finishedAt,
+                outputBytes,
+              };
+            }
+            await cursor.update(cleaned);
+            cursor = await cursor.continue();
+          }
         }
       },
     });

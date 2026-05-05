@@ -31,6 +31,7 @@ import { SnapModeButtonsView } from "../editor/components/SnapModeButtonsView";
 import { jobsDb } from "../local/jobs";
 import type { LocalJob } from "../local/jobs";
 import { jobRoutePath } from "../local/jobs-routing";
+import { useSyncOp } from "../local/ops-store";
 import { isVideoAsset } from "../storage/jobs-db";
 import {
   DEFAULT_SILENCE_CONFIG,
@@ -71,7 +72,15 @@ export default function Triage() {
   const snapMode = useTriageStore((s) => s.snapMode);
   const setSnapMode = useTriageStore((s) => s.setSnapMode);
   const hasBpm = useTriageStore((s) => Boolean(s.jobBpm?.value));
+  const syncOp = useSyncOp(id);
   useTriagePersist();
+
+  // Detection can run as soon as the master video has a sync result
+  // (its envelope/PCM is decodable). Independent of any lifecycle bit;
+  // history-loaded projects with sync data and a `lastRender` come in
+  // here just fine.
+  const masterCam = job?.videos?.find(isVideoAsset);
+  const hasSyncData = Boolean(masterCam?.sync);
 
   async function continueToArrange() {
     const state = useTriageStore.getState();
@@ -135,7 +144,7 @@ export default function Triage() {
   }, [reset]);
 
   useEffect(() => {
-    if (!job || job.status !== "synced") return;
+    if (!job || !hasSyncData) return;
     if (detectionStartedRef.current) return;
     if (detection.kind !== "idle") return;
     detectionStartedRef.current = true;
@@ -297,7 +306,7 @@ export default function Triage() {
     return () => {
       cancelled = true;
     };
-  }, [job, detection.kind, initFromJob]);
+  }, [job, hasSyncData, detection.kind, initFromJob]);
 
   return (
     <div className="h-screen flex flex-col min-h-0 paper-bg overflow-hidden">
@@ -313,7 +322,11 @@ export default function Triage() {
       {detection.kind === "ready" && <TriageAudioMaster />}
 
       {detection.kind !== "ready" ? (
-        <NotReady job={job} detection={detection} />
+        <NotReady
+          hasSyncData={hasSyncData}
+          syncStage={syncOp?.stage}
+          detection={detection}
+        />
       ) : (
         <>
           {/* ─── ControlRow — three equal-height columns. Grows on
@@ -425,10 +438,12 @@ async function decodePcmInBackground(job: LocalJob): Promise<PcmDecodeOutcome> {
 }
 
 function NotReady({
-  job,
+  hasSyncData,
+  syncStage,
   detection,
 }: {
-  job: LocalJob | null;
+  hasSyncData: boolean;
+  syncStage?: string;
   detection: DetectionState;
 }) {
   const stageLabel =
@@ -436,8 +451,10 @@ function NotReady({
       ? `${detection.stage}…`
       : detection.kind === "error"
         ? "error"
-        : job?.status !== "synced"
-          ? `waiting · ${job?.status ?? "loading"}`
+        : !hasSyncData
+          ? syncStage
+            ? `waiting · ${syncStage}`
+            : "waiting · sync needed"
           : "ready to detect";
   return (
     <main className="flex-1 min-h-0 grid place-items-center px-4 py-6">
@@ -451,8 +468,10 @@ function NotReady({
           </p>
         ) : (
           <p className="text-ink-2 leading-relaxed text-sm">
-            {job?.status !== "synced"
-              ? "Waiting for sync to complete before chunk detection can run."
+            {!hasSyncData
+              ? syncStage
+                ? "Sync is still running. Detection will start as soon as it finishes."
+                : "This project has no sync result yet — open the job page and re-run sync."
               : "Decoding master audio + detecting chunks…"}
           </p>
         )}

@@ -1,55 +1,29 @@
 /**
  * Cross-cutting lifecycle helpers for the local-jobs runtime:
  *
- *   1. `markInterruptedJobsOnLoad` — runs once at module init. Any job left
- *      in `syncing`/`rendering` from a previous page session can only be
- *      interrupted (the work was driven by a now-dead tab); we surface
- *      that to the user instead of letting the job hang in limbo.
- *
- *   2. `installRenderUnloadGuard` / `removeRenderUnloadGuard` — manage a
+ *   1. `installRenderUnloadGuard` / `removeRenderUnloadGuard` — manage a
  *      `beforeunload` listener that warns the user if they try to leave
  *      while a render is running.
  *
- *   3. `requestPersistentStorage` — asks the browser to mark our OPFS
+ *   2. `requestPersistentStorage` — asks the browser to mark our OPFS
  *      bucket as "persistent" so it doesn't get evicted under storage
  *      pressure. Called once on first user write.
  *
- *   4. `pruneIfQuotaTight` — best-effort OPFS quota guard: if usage
+ *   3. `pruneIfQuotaTight` — best-effort OPFS quota guard: if usage
  *      exceeds the high-water mark, delete the oldest finished jobs until
  *      we're back under the low-water mark.
+ *
+ * No "mark interrupted" pass: lifecycle progress lives in the in-memory
+ * `useOpsStore` which is empty after a page reload. Persisted job rows
+ * carry only data (sync result, chunks, arrangement, lastRender). A row
+ * lacking `videos[].sync` is simply "needs sync"; the user can re-run.
  */
 
 import { jobsDb, type LocalJob } from "../storage/jobs-db";
 import { opfs } from "../storage/opfs";
-import { emitJobUpdate } from "./jobs-events";
 
 const HIGH_WATER = 0.8; // start pruning above 80% used
 const LOW_WATER = 0.6; // prune down to 60%
-
-/**
- * Mark `syncing` / `rendering` jobs as failed with an "Interrupted" error.
- * Idempotent — safe to call multiple times.
- */
-export async function markInterruptedJobsOnLoad(): Promise<number> {
-  const all = await jobsDb.listJobs();
-  let touched = 0;
-  for (const j of all) {
-    if (j.status === "syncing" || j.status === "rendering") {
-      const updated = await jobsDb.updateJob(j.id, {
-        status: "failed",
-        error: `Interrupted: page was closed during ${j.status}. Restart the operation to retry.`,
-        progress: { pct: 100, stage: "interrupted" },
-        finishedAt: Date.now(),
-      });
-      // Emit so any open page (e.g. a JobPage that was already mounted
-      // before this housekeeping ran) refreshes immediately instead of
-      // showing a stale "rendering 30 %" forever.
-      emitJobUpdate(updated);
-      touched++;
-    }
-  }
-  return touched;
-}
 
 const ACTIVE_RENDER_JOBS = new Set<string>();
 let unloadHandler: ((e: BeforeUnloadEvent) => void) | null = null;
@@ -97,10 +71,10 @@ export async function requestPersistentStorage(): Promise<boolean> {
 }
 
 /**
- * If the OPFS bucket is over `HIGH_WATER`, delete the oldest finished jobs
- * (status === "rendered" or "failed", excluding the `protectedJobIds` we
- * are about to use) until usage drops back to `LOW_WATER`. Returns the
- * number of jobs pruned.
+ * If the OPFS bucket is over `HIGH_WATER`, delete the oldest "completed"
+ * jobs — those that already produced an output (`lastRender` set) —
+ * until usage drops back to `LOW_WATER`. Returns the number of jobs
+ * pruned. Excludes the `protectedJobIds` the caller is about to use.
  *
  * Best-effort: `navigator.storage.estimate()` returns aggregate browser
  * data, not just OPFS, so we use a conservative trigger threshold.
@@ -120,14 +94,13 @@ export async function pruneIfQuotaTight(
   if (quota <= 0) return 0;
   if (usage / quota < HIGH_WATER) return 0;
 
-  // Prune candidates: finished or failed jobs, oldest first.
+  // Prune candidates: jobs with a finished render, oldest first. A job
+  // without `lastRender` could be in any phase the user still cares
+  // about (mid-triage, mid-arrange) — too risky to delete out from
+  // under them without an explicit signal.
   const all = await jobsDb.listJobs();
   const candidates = all
-    .filter(
-      (j: LocalJob) =>
-        !protectedSet.has(j.id) &&
-        (j.status === "rendered" || j.status === "failed"),
-    )
+    .filter((j: LocalJob) => !protectedSet.has(j.id) && Boolean(j.lastRender))
     .sort((a, b) => a.createdAt - b.createdAt);
 
   const targetBytes = quota * LOW_WATER;

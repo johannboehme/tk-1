@@ -11,6 +11,8 @@
 import { motion, useReducedMotion } from "framer-motion";
 import { useMemo } from "react";
 import type { LocalJob, MediaAsset } from "../../storage/jobs-db";
+import { isVideoAsset } from "../../storage/jobs-db";
+import { useSyncOp } from "../../local/ops-store";
 import {
   buildSyncProgressView,
   type CamProgressView,
@@ -21,15 +23,25 @@ import { RuleStrip } from "../../editor/components/RuleStrip";
 
 export function SyncProgressPanel({ job }: { job: LocalJob }) {
   const cams: MediaAsset[] = useMemo(() => job.videos ?? [], [job.videos]);
+  const op = useSyncOp(job.id);
+  // "Done" = no live op AND every video cam has its sync result on
+  // the job. Image cams skip sync entirely so they don't gate this.
+  const dataDone = useMemo(
+    () => cams.every((c) => !isVideoAsset(c) || Boolean(c.sync)),
+    [cams],
+  );
+  const stage = op?.stage ?? "queued";
+  const pct = op?.pct ?? 0;
   const view = useMemo(
     () =>
       buildSyncProgressView({
-        status: job.status,
-        stage: job.progress.stage,
-        pct: job.progress.pct,
+        stage,
+        pct,
         cams,
+        done: !op && dataDone,
+        error: op?.error,
       }),
-    [job.status, job.progress.stage, job.progress.pct, cams],
+    [stage, pct, cams, op, dataDone],
   );
 
   const camById = new Map(cams.map((c) => [c.id, c]));

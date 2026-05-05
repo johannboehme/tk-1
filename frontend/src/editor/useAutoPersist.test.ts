@@ -8,8 +8,6 @@ const baseJob: LocalJob = {
   title: null,
   videoFilename: "v.mp4",
   audioFilename: "a.wav",
-  status: "synced",
-  progress: { pct: 100, stage: "synced" },
   videos: [
     {
       id: "cam-1",
@@ -19,7 +17,6 @@ const baseJob: LocalJob = {
       sync: { offsetMs: 250, driftRatio: 1, confidence: 0.9 },
     } satisfies VideoAsset,
   ],
-  hasOutput: false,
   createdAt: 0,
 };
 

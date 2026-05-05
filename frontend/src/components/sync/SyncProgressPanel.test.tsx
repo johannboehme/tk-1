@@ -1,7 +1,8 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, beforeEach, describe, it, expect } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { SyncProgressPanel } from "./SyncProgressPanel";
 import type { LocalJob } from "../../storage/jobs-db";
+import { useOpsStore } from "../../local/ops-store";
 
 function makeJob(overrides: Partial<LocalJob> = {}): LocalJob {
   return {
@@ -9,9 +10,6 @@ function makeJob(overrides: Partial<LocalJob> = {}): LocalJob {
     title: "Test job",
     videoFilename: "shot1.mp4",
     audioFilename: "song.wav",
-    status: "syncing",
-    progress: { pct: 10, stage: "syncing-cam-1" },
-    hasOutput: false,
     createdAt: Date.now(),
     schemaVersion: 2,
     videos: [
@@ -23,8 +21,12 @@ function makeJob(overrides: Partial<LocalJob> = {}): LocalJob {
   };
 }
 
+beforeEach(() => useOpsStore.setState({ ops: {} }));
+afterEach(() => useOpsStore.setState({ ops: {} }));
+
 describe("SyncProgressPanel", () => {
   it("renders one strip per cam", () => {
+    useOpsStore.getState().startSyncOp("abc123", { pct: 10, stage: "syncing-cam-1" });
     render(<SyncProgressPanel job={makeJob()} />);
     expect(screen.getByText(/Cam 1/i)).toBeInTheDocument();
     expect(screen.getByText(/Cam 2/i)).toBeInTheDocument();
@@ -33,64 +35,61 @@ describe("SyncProgressPanel", () => {
   });
 
   it("shows the master audio filename", () => {
+    useOpsStore.getState().startSyncOp("abc123", { pct: 10, stage: "syncing-cam-1" });
     render(<SyncProgressPanel job={makeJob()} />);
     expect(screen.getByText("song.wav")).toBeInTheDocument();
   });
 
-  it("renders nothing dramatic for an empty videos array", () => {
-    const job = makeJob({ videos: [] });
-    const { container } = render(<SyncProgressPanel job={job} />);
+  it("renders without crashing for an empty videos array", () => {
+    const { container } = render(<SyncProgressPanel job={makeJob({ videos: [] })} />);
     expect(container.querySelector('[data-testid="sync-progress-panel"]')).toBeInTheDocument();
   });
 
   it("highlights the active cam by stage", () => {
-    const { rerender } = render(
-      <SyncProgressPanel
-        job={makeJob({ progress: { pct: 10, stage: "syncing-cam-1" } })}
-      />,
-    );
-    // cam-1 is active syncing — its status text should be a percentage, not "pending"
-    expect(screen.queryByText(/pending/i)).toBeInTheDocument(); // cam-2 pending
+    useOpsStore.getState().startSyncOp("abc123", { pct: 10, stage: "syncing-cam-1" });
+    const { rerender } = render(<SyncProgressPanel job={makeJob()} />);
+    // cam-2 is still pending while cam-1 syncs.
+    expect(screen.queryByText(/pending/i)).toBeInTheDocument();
     // Switching to cam-2 active
-    rerender(
-      <SyncProgressPanel
-        job={makeJob({ progress: { pct: 50, stage: "syncing-cam-2" } })}
-      />,
-    );
+    useOpsStore.getState().updateSyncOp("abc123", { pct: 50, stage: "syncing-cam-2" });
+    rerender(<SyncProgressPanel job={makeJob()} />);
     expect(screen.getAllByText(/done/i).length).toBeGreaterThanOrEqual(1); // cam-1 done
   });
 
   it("shows ANALYSE indicator during analyzing-audio stage", () => {
-    render(
-      <SyncProgressPanel
-        job={makeJob({ progress: { pct: 95, stage: "analyzing-audio" } })}
-      />,
-    );
+    useOpsStore.getState().startSyncOp("abc123", { pct: 95, stage: "analyzing-audio" });
+    render(<SyncProgressPanel job={makeJob()} />);
     expect(screen.getByText(/analyse/i)).toBeInTheDocument();
   });
 
-  it("renders without crashing for a fully-synced job", () => {
-    const { container } = render(
-      <SyncProgressPanel
-        job={makeJob({
-          status: "synced",
-          progress: { pct: 100, stage: "synced" },
-        })}
-      />,
-    );
+  it("renders done-state when sync data is on the job and op cleared", () => {
+    const job = makeJob({
+      videos: [
+        {
+          id: "cam-1",
+          filename: "shot1.mp4",
+          opfsPath: "x",
+          color: "#FF5722",
+          sync: { offsetMs: 0, driftRatio: 1, confidence: 1 },
+        },
+        {
+          id: "cam-2",
+          filename: "shot2.mp4",
+          opfsPath: "y",
+          color: "#1F4E8C",
+          sync: { offsetMs: 0, driftRatio: 1, confidence: 1 },
+        },
+      ],
+    });
+    const { container } = render(<SyncProgressPanel job={job} />);
     expect(container.querySelector('[data-testid="sync-progress-panel"]')).toBeInTheDocument();
     expect(screen.getAllByText(/done/i).length).toBeGreaterThanOrEqual(2);
   });
 
   it("renders failed-state without crashing", () => {
-    render(
-      <SyncProgressPanel
-        job={makeJob({
-          status: "failed",
-          progress: { pct: 50, stage: "syncing-cam-2" },
-        })}
-      />,
-    );
+    useOpsStore.getState().startSyncOp("abc123", { pct: 50, stage: "syncing-cam-2" });
+    useOpsStore.getState().failSyncOp("abc123", "decoder boom");
+    render(<SyncProgressPanel job={makeJob()} />);
     expect(screen.getByText(/halted/i)).toBeInTheDocument();
   });
 });

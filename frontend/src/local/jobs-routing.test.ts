@@ -8,9 +8,6 @@ function baseJob(overrides: Partial<LocalJob> = {}): LocalJob {
     title: null,
     videoFilename: "video.mp4",
     audioFilename: "audio.wav",
-    status: "synced",
-    progress: { pct: 100, stage: "synced" },
-    hasOutput: false,
     createdAt: 0,
     ...overrides,
   };

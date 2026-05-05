@@ -3,16 +3,21 @@
  *
  * Flow:
  *   1. `createJob(videoFiles, audioFile, title)` writes 1 master audio +
- *      1..N video files to OPFS, records a fresh `LocalJob` in IndexedDB
- *      (status=queued), and returns its id. Sync is launched immediately
- *      as a fire-and-forget task per video; UI should subscribe to job
- *      events to show progress.
+ *      1..N video files to OPFS, records a fresh `LocalJob` in IndexedDB,
+ *      and returns its id. Sync is launched immediately as a fire-and-
+ *      forget task per video; UI should subscribe to `useOpsStore` for
+ *      progress and to `jobEvents` for data-shape changes.
  *   2. `runQuickRender(jobId, opts)` produces an MP4 in OPFS using the
  *      sync result + user offset/drift overrides.
  *   3. `runEditRender(jobId, editSpec)` does the same for the full edit.
  *
- * Progress is dispatched on a global EventTarget so multiple components
- * can subscribe (JobPage, History) without coupling to the orchestrator.
+ * Two channels:
+ *   - In-memory `useOpsStore` carries transient progress (sync running,
+ *     render running, last error). Reset on tab reload — the source of
+ *     truth for "what's happening right now".
+ *   - `jobEvents` is a global EventTarget that dispatches whenever the
+ *     persisted job row changes (sync result lands, lastRender updates,
+ *     etc). Subscribers re-read from IDB.
  */
 
 import {
@@ -20,11 +25,11 @@ import {
   isVideoAsset,
   jobsDb,
   type JobMode,
-  type JobProgress,
   type LocalJob,
   type SyncResult,
   type VideoAsset,
 } from "../storage/jobs-db";
+import { useOpsStore } from "./ops-store";
 import { camColorAt } from "../storage/migrations";
 import { opfs } from "../storage/opfs";
 import {
@@ -256,9 +261,6 @@ export async function createJob(
     videoFilename: firstVideo.name,
     audioFilename: audioPick.file.name,
     audioSource,
-    status: "queued",
-    progress: { pct: 0, stage: "queued" },
-    hasOutput: false,
     createdAt: Date.now(),
     schemaVersion: 3,
     videos,
@@ -269,57 +271,39 @@ export async function createJob(
   emitJobUpdate(job);
 
   // Kick off sync without awaiting — UI subscribes for results.
-  void runSync(jobId, audioExt).catch(async (err) => {
-    // Preserve the stage the job was in when it threw — without this the
+  useOpsStore.getState().startSyncOp(jobId, { pct: 0, stage: "queued" });
+  void runSync(jobId, audioExt).catch((err) => {
+    // Preserve the stage the op was in when it threw — without this the
     // banner just shows the raw decoder message and the user can't tell
     // whether the master audio or a specific cam was the culprit.
-    const cur = await jobsDb.getJob(jobId);
-    const stage = cur?.progress?.stage;
+    const stage = useOpsStore.getState().ops[jobId]?.sync?.stage;
     const raw = err instanceof Error ? err.message : String(err);
     const error = stage ? `[${stage}] ${raw}` : raw;
-    const failed = await jobsDb.updateJob(jobId, {
-      status: "failed",
-      error,
-      progress: { pct: 100, stage: "failed" },
-    });
-    emitJobUpdate(failed);
+    useOpsStore.getState().failSyncOp(jobId, error);
   });
 
   return jobId;
 }
 
-async function reportProgress(
-  jobId: string,
-  partial: Partial<JobProgress>,
-  status?: LocalJob["status"],
-): Promise<void> {
-  const cur = await jobsDb.getJob(jobId);
-  if (!cur) return;
-  const next: JobProgress = { ...cur.progress, ...partial };
-  const updated = await jobsDb.updateJob(jobId, {
-    progress: next,
-    ...(status ? { status } : {}),
-  });
-  emitJobUpdate(updated);
+interface SyncProgressPatch {
+  pct?: number;
+  stage?: string;
+  detail?: string;
 }
 
-/**
- * Mark a job as failed and emit an update event. Best-effort — if the
- * row no longer exists (e.g. user deleted it during render), we swallow.
- */
-async function markFailed(jobId: string, error: unknown): Promise<void> {
-  const message = error instanceof Error ? error.message : String(error);
-  try {
-    const updated = await jobsDb.updateJob(jobId, {
-      status: "failed",
-      error: message,
-      progress: { pct: 100, stage: "failed" },
-      finishedAt: Date.now(),
-    });
-    emitJobUpdate(updated);
-  } catch {
-    // ignore — likely deleted
-  }
+function reportSyncProgress(jobId: string, patch: SyncProgressPatch): void {
+  useOpsStore.getState().updateSyncOp(jobId, patch);
+}
+
+interface RenderProgressPatch {
+  pct?: number;
+  stage?: string;
+  framesDone?: number;
+  framesTotal?: number;
+}
+
+function reportRenderProgress(jobId: string, patch: RenderProgressPatch): void {
+  useOpsStore.getState().updateRenderOp(jobId, patch);
 }
 
 /**
@@ -357,7 +341,7 @@ async function runCamPrep(
     if (!studioPcm) {
       throw new Error(`runCamPrep: studioPcm is required when skipSync is false`);
     }
-    await reportProgress(jobId, {
+    reportSyncProgress(jobId, {
       pct: opts.mapPct(0),
       stage: `syncing-${cam.id}`,
       detail: `${cam.id} · ${cam.filename}`,
@@ -369,14 +353,14 @@ async function runCamPrep(
     // sees continuous motion instead of a hard 0 → 0.4 jump.
     const videoMonoPcm = await decodeAudioToMonoPcm(videoFile, 22050, {
       onProgress: (frac) => {
-        void reportProgress(jobId, {
+        reportSyncProgress(jobId, {
           pct: opts.mapPct(frac * 0.4),
           stage: `syncing-${cam.id}`,
           detail: `${cam.id} · ${cam.filename}`,
         });
       },
     });
-    await reportProgress(jobId, {
+    reportSyncProgress(jobId, {
       pct: opts.mapPct(0.4),
       stage: `syncing-${cam.id}`,
       detail: `${cam.id} · ${cam.filename}`,
@@ -393,7 +377,7 @@ async function runCamPrep(
       },
       {
         onProgress: (stage, frac) => {
-          void reportProgress(jobId, {
+          reportSyncProgress(jobId, {
             pct: opts.mapPct(0.4 + frac * 0.15),
             stage: `syncing-${cam.id}`,
             detail: `${cam.id} · ${cam.filename} · ${stage}`,
@@ -433,7 +417,7 @@ async function runCamPrep(
   // Failure is non-blocking.
   let framesPath: string | undefined;
   let framesOrientation: "codec" | "display" | undefined;
-  await reportProgress(jobId, {
+  reportSyncProgress(jobId, {
     pct: opts.mapPct(0.6),
     stage: `frames-${cam.id}`,
     detail: `${cam.id} · ${cam.filename}`,
@@ -445,7 +429,7 @@ async function runCamPrep(
     const r = await extractTimelineFrames(videoFile, {
       rotationDeg: intrinsicRotationDeg,
       onProgress: (frac) => {
-        void reportProgress(jobId, {
+        reportSyncProgress(jobId, {
           pct: opts.mapPct(0.6 + frac * 0.4),
           stage: `frames-${cam.id}`,
           detail: `${cam.id} · ${cam.filename}`,
@@ -472,7 +456,7 @@ async function runCamPrep(
 }
 
 async function runSync(jobId: string, audioExt: string): Promise<void> {
-  await reportProgress(jobId, { pct: 2, stage: "loading" }, "syncing");
+  reportSyncProgress(jobId, { pct: 2, stage: "loading" });
 
   const job = await jobsDb.getJob(jobId);
   if (!job?.videos?.length) {
@@ -490,10 +474,10 @@ async function runSync(jobId: string, audioExt: string): Promise<void> {
   // Master decode gets the 2..5 % slice of the global bar — small for
   // typical few-MB songs but visible for hour-long master tracks.
   const audioFile = await loadJobAudio(job, audioExt);
-  await reportProgress(jobId, { pct: 2, stage: "decoding-studio-audio" });
+  reportSyncProgress(jobId, { pct: 2, stage: "decoding-studio-audio" });
   const studioMonoPcm = await decodeAudioToMonoPcm(audioFile, 22050, {
     onProgress: (frac) => {
-      void reportProgress(jobId, {
+      reportSyncProgress(jobId, {
         pct: 2 + Math.floor(frac * 3),
         stage: "decoding-studio-audio",
       });
@@ -524,9 +508,9 @@ async function runSync(jobId: string, audioExt: string): Promise<void> {
     width: lead.width,
     height: lead.height,
     hasFrames: !!lead.framesPath,
-    progress: { pct: 95, stage: "analyzing-audio" },
   });
   emitJobUpdate(synced);
+  reportSyncProgress(jobId, { pct: 95, stage: "analyzing-audio" });
 
   // Audio-Analyse-Phase: Spectral-Flux Onsets, Tempo, Beats. Cached per job
   // in IDB so the editor can read it without recomputing. Failure is
@@ -547,7 +531,7 @@ async function runSync(jobId: string, audioExt: string): Promise<void> {
   const jobForMode = await jobsDb.getJob(jobId);
   if (jobForMode?.mode === "longform") {
     try {
-      await reportProgress(jobId, { pct: 97, stage: "detecting-chunks" });
+      reportSyncProgress(jobId, { pct: 97, stage: "detecting-chunks" });
       const detection = await detectChunks(
         studioMonoPcm.pcm,
         studioMonoPcm.sampleRate,
@@ -579,18 +563,17 @@ async function runSync(jobId: string, audioExt: string): Promise<void> {
           };
         }
       }
-      await jobsDb.updateJob(jobId, updates);
+      const after = await jobsDb.updateJob(jobId, updates);
+      emitJobUpdate(after);
     } catch (err) {
       console.warn(`Chunk detection failed for ${jobId} (non-fatal):`, err);
     }
   }
 
-  const updated = await jobsDb.updateJob(jobId, {
-    status: "synced",
-    progress: { pct: 100, stage: "synced" },
-    finishedAt: Date.now(),
-  });
-  emitJobUpdate(updated);
+  // Done — clear the sync op. The persisted data on the job row is the
+  // signal "this project is past sync" (videos[].sync filled, optionally
+  // chunks/triageEnvelope for longform).
+  useOpsStore.getState().clearSyncOp(jobId);
 }
 
 // -----------------------------------------------------------------------------
@@ -754,9 +737,8 @@ export async function runQuickRender(
   if (!job.sync) throw new Error("Cannot render before sync completes.");
 
   installRenderUnloadGuard(jobId);
+  useOpsStore.getState().startRenderOp(jobId, { pct: 5, stage: "render-prep" });
   try {
-    await reportProgress(jobId, { pct: 5, stage: "render-prep" }, "rendering");
-
     // V1 limitation (same as runEditRender): renders cam-1 only.
     const cam1 = job.videos?.[0];
     if (!cam1 || isImageAsset(cam1)) {
@@ -766,7 +748,7 @@ export async function runQuickRender(
     const videoFile = await loadAssetFile(cam1);
     const audioFile = await loadJobAudio(job, audioExt);
 
-    await reportProgress(jobId, { pct: 15, stage: "encoding" });
+    reportRenderProgress(jobId, { pct: 15, stage: "encoding" });
     const totalOffsetMs = job.sync.offsetMs + (opts.offsetOverrideMs ?? 0);
     const result = await quickRender({
       videoFile,
@@ -775,21 +757,20 @@ export async function runQuickRender(
       driftRatio: job.sync.driftRatio,
     });
 
-    await reportProgress(jobId, { pct: 90, stage: "writing" });
+    reportRenderProgress(jobId, { pct: 90, stage: "writing" });
     await opfs.writeFile(outputPath(jobId), result.output);
 
     const updated = await jobsDb.updateJob(jobId, {
-      status: "rendered",
-      hasOutput: true,
-      outputBytes: result.output.byteLength,
-      progress: { pct: 100, stage: "rendered" },
-      finishedAt: Date.now(),
+      lastRender: {
+        completedAt: Date.now(),
+        outputBytes: result.output.byteLength,
+      },
     });
     emitJobUpdate(updated);
+    useOpsStore.getState().finishRenderOp(jobId);
   } catch (err) {
-    // Crucial: without this the job stays stuck in "rendering" status
-    // forever and the JobPage shows no recovery actions.
-    await markFailed(jobId, err);
+    const message = err instanceof Error ? err.message : String(err);
+    useOpsStore.getState().failRenderOp(jobId, message);
     throw err;
   } finally {
     removeRenderUnloadGuard(jobId);
@@ -875,10 +856,9 @@ export async function runEditRender(
   }
 
   installRenderUnloadGuard(jobId);
+  useOpsStore.getState().startRenderOp(jobId, { pct: 5, stage: "render-prep" });
   let workerOwned: Worker | null = null;
   try {
-    await reportProgress(jobId, { pct: 5, stage: "render-prep" }, "rendering");
-
     const videos = job.videos ?? [];
     if (videos.length === 0) throw new Error("No video found for this job.");
     const audioExt = fileExtension(new File([], job.audioFilename), "wav");
@@ -888,7 +868,7 @@ export async function runEditRender(
     // AudioContext.decodeAudioData isn't available in workers. Both are
     // fast (a few seconds for a 3-min file) and the produced Float32Arrays
     // are transferred zero-copy into the worker.
-    await reportProgress(jobId, { pct: 10, stage: "audio-decode" });
+    reportRenderProgress(jobId, { pct: 10, stage: "audio-decode" });
     const audio = await decodeStudioAudioInterleaved(audioFile);
     // Bake the master-audio volume into the PCM in-place. Skipped when
     // unity (1.0 / undefined) so the common path stays a pure decode.
@@ -910,7 +890,7 @@ export async function runEditRender(
       (spec.visualizers && spec.visualizers.length > 0) ||
       spec.overlays.some((o) => o.reactiveBand);
     if (needsPcm) {
-      await reportProgress(jobId, { pct: 18, stage: "energy-curves" });
+      reportRenderProgress(jobId, { pct: 18, stage: "energy-curves" });
       const decoded = await decodeAudioToMonoPcm(audioFile, 22050);
       monoPcm = decoded.pcm;
       energy = computeEnergyCurves(monoPcm, 22050, 30);
@@ -927,7 +907,7 @@ export async function runEditRender(
       }
     }
 
-    await reportProgress(jobId, { pct: 25, stage: "encoding" });
+    reportRenderProgress(jobId, { pct: 25, stage: "encoding" });
     // Audio offset is anchored to cam-1 (the master clock cam), same sign
     // convention as the legacy single-cam pipeline.
     const totalOffsetMs = job.sync.offsetMs + (spec.offsetOverrideMs ?? 0);
@@ -1050,7 +1030,7 @@ export async function runEditRender(
             const pct = 25 + Math.floor((p.framesDone / p.framesTotal) * 60);
             if (pct === lastDispatchedPct) return;
             lastDispatchedPct = pct;
-            void reportProgress(jobId, {
+            reportRenderProgress(jobId, {
               pct: Math.min(85, pct),
               stage: "encoding",
               framesDone: p.framesDone,
@@ -1059,13 +1039,13 @@ export async function runEditRender(
           } else if (p.stage === "encoder-flush") {
             if (lastDispatchedPct === 87) return;
             lastDispatchedPct = 87;
-            void reportProgress(jobId, { pct: 87, stage: "encoder-flush" });
+            reportRenderProgress(jobId, { pct: 87, stage: "encoder-flush" });
           } else if (p.stage === "muxing" && p.framesTotal > 0) {
             // Streaming-mux: chunks-written / total-chunks scaled into 88-94 %.
             const pct = 88 + Math.floor((p.framesDone / p.framesTotal) * 6);
             if (pct === lastDispatchedPct) return;
             lastDispatchedPct = pct;
-            void reportProgress(jobId, {
+            reportRenderProgress(jobId, {
               pct: Math.min(94, pct),
               stage: "muxing",
               framesDone: p.framesDone,
@@ -1075,15 +1055,15 @@ export async function runEditRender(
             // Fallback for the initial muxing event before chunk progress.
             if (lastDispatchedPct === 88) return;
             lastDispatchedPct = 88;
-            void reportProgress(jobId, { pct: 88, stage: "muxing" });
+            reportRenderProgress(jobId, { pct: 88, stage: "muxing" });
           } else if (p.stage === "finalizing") {
             if (lastDispatchedPct === 95) return;
             lastDispatchedPct = 95;
-            void reportProgress(jobId, { pct: 95, stage: "finalizing" });
+            reportRenderProgress(jobId, { pct: 95, stage: "finalizing" });
           } else if (p.stage === "audio-encode") {
             if (lastDispatchedPct === 18) return;
             lastDispatchedPct = 18;
-            void reportProgress(jobId, { pct: 18, stage: "audio-encode" });
+            reportRenderProgress(jobId, { pct: 18, stage: "audio-encode" });
           }
         } else if (msg.type === "done") {
           resolve();
@@ -1098,21 +1078,22 @@ export async function runEditRender(
       worker.postMessage(startMsg, transferables);
     });
 
-    await reportProgress(jobId, { pct: 95, stage: "writing" });
+    reportRenderProgress(jobId, { pct: 95, stage: "writing" });
     const outputFile = await opfs.readFile(outputPath(jobId));
     const outputBytes = outputFile.size;
 
     const updated = await jobsDb.updateJob(jobId, {
-      status: "rendered",
-      hasOutput: true,
-      outputBytes,
-      progress: { pct: 100, stage: "rendered" },
-      finishedAt: Date.now(),
+      lastRender: {
+        completedAt: Date.now(),
+        outputBytes,
+      },
       editSpec: spec,
     });
     emitJobUpdate(updated);
+    useOpsStore.getState().finishRenderOp(jobId);
   } catch (err) {
-    await markFailed(jobId, err);
+    const message = err instanceof Error ? err.message : String(err);
+    useOpsStore.getState().failRenderOp(jobId, message);
     throw err;
   } finally {
     if (workerOwned) {
@@ -1125,8 +1106,8 @@ export async function runEditRender(
 
 /**
  * Cancel an in-progress edit render. Hard-terminates the worker, deletes
- * the partial OPFS output, and marks the job as failed with a "cancelled"
- * sentinel so the UI can distinguish it from a real failure.
+ * the partial OPFS output, and flags the render op as cancelled so the
+ * UI can distinguish it from a real failure.
  *
  * Safe to call when no render is active for the given job — it's a no-op.
  */
@@ -1138,17 +1119,7 @@ export async function cancelEditRender(jobId: string): Promise<void> {
   // Remove the half-written output file so a future render isn't fooled
   // by leftovers. Best-effort — the file may not exist yet.
   await opfs.deleteFile(outputPath(jobId)).catch(() => undefined);
-  try {
-    const updated = await jobsDb.updateJob(jobId, {
-      status: "failed",
-      error: "cancelled",
-      progress: { pct: 100, stage: "cancelled" },
-      finishedAt: Date.now(),
-    });
-    emitJobUpdate(updated);
-  } catch {
-    // ignore — job may have been deleted already
-  }
+  useOpsStore.getState().failRenderOp(jobId, "cancelled");
   removeRenderUnloadGuard(jobId);
 }
 
@@ -1294,4 +1265,4 @@ export async function removeCamFromJob(
 }
 
 export { jobsDb };
-export type { JobMode, LocalJob, SyncResult, JobProgress, Segment, TextOverlay };
+export type { JobMode, LocalJob, SyncResult, Segment, TextOverlay };

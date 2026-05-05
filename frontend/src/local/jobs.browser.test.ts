@@ -7,6 +7,7 @@ import {
   deleteJob,
   resolveJobAssetUrl,
 } from "./jobs";
+import { useOpsStore } from "./ops-store";
 import {
   isVideoAsset,
   jobsDb,
@@ -68,30 +69,38 @@ function pick(file: File): { file: File; handle: null } {
   return { file, handle: null };
 }
 
-function waitForJobStatus(
-  jobId: string,
-  target: string,
-  timeoutMs = 60_000,
-): Promise<void> {
+/** Wait until the sync op for `jobId` clears (success) or carries an
+ *  error (failure). Polls the in-memory ops-store. */
+function waitForSyncDone(jobId: string, timeoutMs = 60_000): Promise<void> {
   return new Promise((resolve, reject) => {
     const start = Date.now();
-    const onUpdate = (e: Event) => {
-      const detail = (e as CustomEvent<{ jobId: string; job: { status: string } }>).detail;
-      if (detail.jobId !== jobId) return;
-      if (detail.job.status === target) {
-        jobEvents.removeEventListener("update", onUpdate);
-        resolve();
-      } else if (detail.job.status === "failed") {
-        jobEvents.removeEventListener("update", onUpdate);
-        const reason = (detail.job as { error?: string }).error ?? "(no reason)";
-        reject(new Error(`Job failed: ${reason}`));
-      }
-    };
-    jobEvents.addEventListener("update", onUpdate);
     const tick = () => {
+      const op = useOpsStore.getState().ops[jobId]?.sync;
+      if (op?.error) {
+        reject(new Error(`Sync failed: ${op.error}`));
+        return;
+      }
+      if (!op) {
+        // No op = either never started yet, or finished. Disambiguate
+        // by checking whether the videos have a sync result.
+        jobsDb
+          .getJob(jobId)
+          .then((j) => {
+            if (j?.videos?.some((v) => isVideoAsset(v) && Boolean(v.sync))) {
+              resolve();
+              return;
+            }
+            if (Date.now() - start > timeoutMs) {
+              reject(new Error("Timed out waiting for sync to complete"));
+              return;
+            }
+            setTimeout(tick, 200);
+          })
+          .catch(reject);
+        return;
+      }
       if (Date.now() - start > timeoutMs) {
-        jobEvents.removeEventListener("update", onUpdate);
-        reject(new Error(`Timed out waiting for status=${target}`));
+        reject(new Error("Timed out waiting for sync to complete"));
         return;
       }
       setTimeout(tick, 200);
@@ -99,6 +108,7 @@ function waitForJobStatus(
     tick();
   });
 }
+
 
 describe("local jobs lifecycle", () => {
   beforeEach(async () => {
@@ -118,9 +128,8 @@ describe("local jobs lifecycle", () => {
     expect(await opfs.exists(`jobs/${jobId}/audio.wav`)).toBe(true);
 
     // Wait for sync to complete.
-    await waitForJobStatus(jobId, "synced");
+    await waitForSyncDone(jobId);
     const job = await jobsDb.getJob(jobId);
-    expect(job!.status).toBe("synced");
     expect(job!.schemaVersion).toBe(3);
     expect(job!.videos).toHaveLength(1);
     const cam0 = asVideo(job!.videos![0]);
@@ -151,7 +160,7 @@ describe("local jobs lifecycle", () => {
     expect(await opfs.exists(`jobs/${jobId}/cam-1.mp4`)).toBe(true);
     expect(await opfs.exists(`jobs/${jobId}/cam-2.mp4`)).toBe(true);
 
-    await waitForJobStatus(jobId, "synced");
+    await waitForSyncDone(jobId);
     const job = await jobsDb.getJob(jobId);
     expect(job!.videos).toHaveLength(2);
     expect(job!.videos![0].id).toBe("cam-1");
@@ -172,38 +181,31 @@ describe("local jobs lifecycle", () => {
     const audio = new File([makeWavBlob()], "studio.wav", { type: "audio/wav" });
 
     const jobId = await createJob([pick(video)], pick(audio));
-    await waitForJobStatus(jobId, "synced");
+    await waitForSyncDone(jobId);
 
     await runQuickRender(jobId);
     const job = await jobsDb.getJob(jobId);
-    expect(job!.status).toBe("rendered");
-    expect(job!.hasOutput).toBe(true);
-    expect(job!.outputBytes).toBeGreaterThan(1000);
+    expect(job!.lastRender).toBeDefined();
+    expect(job!.lastRender!.outputBytes).toBeGreaterThan(1000);
     expect(await opfs.exists(`jobs/${jobId}/output.mp4`)).toBe(true);
+    // The render op is in `done` state until something else clears it.
+    const renderOp = useOpsStore.getState().ops[jobId]?.render;
+    expect(renderOp?.done).toBe(true);
 
     const url = await resolveJobAssetUrl(jobId, "output");
     expect(url).toMatch(/^blob:/);
     if (url) URL.revokeObjectURL(url);
   }, 120_000);
 
-  it("if runQuickRender throws, the job is marked failed in IDB and an event is emitted", async () => {
+  it("if runQuickRender throws, the render op carries the error and the sync result on the job is preserved", async () => {
     const video = await fetchVideoFile();
     const audio = new File([makeWavBlob()], "studio.wav", { type: "audio/wav" });
     const jobId = await createJob([pick(video)], pick(audio));
-    await waitForJobStatus(jobId, "synced");
+    await waitForSyncDone(jobId);
 
     // Sabotage by deleting the audio file from OPFS — render will throw
     // when it tries to read it.
     await opfs.deletePath(`jobs/${jobId}/audio.wav`);
-
-    let observedFailedEvent = false;
-    const handler = (e: Event) => {
-      const detail = (e as CustomEvent<{ jobId: string; job: { status: string; error?: string } }>).detail;
-      if (detail.jobId === jobId && detail.job.status === "failed") {
-        observedFailedEvent = true;
-      }
-    };
-    jobEvents.addEventListener("update", handler);
 
     let threw = false;
     try {
@@ -211,22 +213,20 @@ describe("local jobs lifecycle", () => {
     } catch {
       threw = true;
     }
-    jobEvents.removeEventListener("update", handler);
-
     expect(threw, "runQuickRender should rethrow on failure").toBe(true);
 
+    const op = useOpsStore.getState().ops[jobId]?.render;
+    expect(op?.error).toBeTruthy();
     const after = await jobsDb.getJob(jobId);
-    expect(after?.status).toBe("failed");
-    expect(after?.error).toBeTruthy();
+    expect(after?.lastRender).toBeUndefined();
     expect(after?.sync).toBeDefined(); // sync result is preserved → user can retry
-    expect(observedFailedEvent).toBe(true);
   }, 120_000);
 
   it("deleteJob removes both OPFS files and the IndexedDB row", async () => {
     const video = await fetchVideoFile();
     const audio = new File([makeWavBlob()], "studio.wav", { type: "audio/wav" });
     const jobId = await createJob([pick(video)], pick(audio));
-    await waitForJobStatus(jobId, "synced");
+    await waitForSyncDone(jobId);
 
     await deleteJob(jobId);
     expect(await jobsDb.getJob(jobId)).toBeUndefined();
@@ -284,7 +284,7 @@ describe("addVideoToJob", () => {
     const v1 = await fetchVideoFile();
     const audio = new File([makeWavBlob()], "studio.wav", { type: "audio/wav" });
     const jobId = await createJob([pick(v1)], pick(audio), { title: "B-roll test" });
-    await waitForJobStatus(jobId, "synced");
+    await waitForSyncDone(jobId);
 
     const v2 = await fetchVideoFile();
     const camId = await addVideoToJob(jobId, pick(v2));
@@ -313,7 +313,7 @@ describe("addVideoToJob", () => {
     const v1 = await fetchVideoFile();
     const audio = new File([makeWavBlob()], "studio.wav", { type: "audio/wav" });
     const jobId = await createJob([pick(v1)], pick(audio));
-    await waitForJobStatus(jobId, "synced");
+    await waitForSyncDone(jobId);
 
     const v2 = await fetchVideoFile();
     const camId = await addVideoToJob(jobId, pick(v2), { skipSync: true });
@@ -332,7 +332,7 @@ describe("addVideoToJob", () => {
     const v1 = await fetchVideoFile();
     const audio = new File([makeWavBlob()], "studio.wav", { type: "audio/wav" });
     const jobId = await createJob([pick(v1)], pick(audio));
-    await waitForJobStatus(jobId, "synced");
+    await waitForSyncDone(jobId);
 
     const a = await addVideoToJob(jobId, pick(await fetchVideoFile()), { skipSync: true });
     expect(a).toBe("cam-2");
