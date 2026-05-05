@@ -1436,7 +1436,9 @@ export const useEditorStore = create<EditorState>()(
       set({ ui: { ...get().ui, activePanel: tab } });
     },
     setZoom(z) {
-      set({ ui: { ...get().ui, zoom: Math.max(1, Math.min(64, z)) } });
+      // Cap matches Timeline.tsx's MAX_ZOOM so wheel/pinch and a
+      // hypothetical programmatic zoom land in the same range.
+      set({ ui: { ...get().ui, zoom: Math.max(1, Math.min(1024, z)) } });
     },
     setScrollX(x) {
       set({ ui: { ...get().ui, scrollX: Math.max(0, x) } });

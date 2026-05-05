@@ -127,6 +127,14 @@ const TARGET_TILE_W = 64;
  *  Same on every zoom level — the time-domain threshold is derived per
  *  drag event from the live `pxPerSec`. */
 const PILL_SNAP_EDGE_PX = 6;
+/** Zoom-out cap (= the whole timeline visible, can't go further). */
+const MIN_ZOOM = 1;
+/** Zoom-in cap. 1024 lets the user resolve down to ~ms-level detail
+ *  on a 7-min long-form arrangement (~415s ÷ 1024 ≈ 0.4s visible).
+ *  The hard upper bound is governed by tick-density in the BeatRuler
+ *  + JS float precision in the px-per-sec math, both of which are
+ *  comfortable at 1024×. */
+const MAX_ZOOM = 1024;
 /** Minimum arr-window length the trim handlers will collapse a pill
  *  to. Anything thinner is the user mid-drag, not a usable chunk. */
 const PILL_MIN_WINDOW_S = 0.05;
@@ -1270,7 +1278,7 @@ export function Timeline({
       // Anchor zoom on the time the centroid was over when the gesture
       // started, then pan so that point follows the centroid (gives a
       // "pin the timeline under your fingers" feel).
-      const newZoom = Math.max(1, Math.min(64, g.startZoom * scale));
+      const newZoom = clamp(g.startZoom * scale, MIN_ZOOM, MAX_ZOOM);
       const newVisible = timelineSpan / newZoom;
       const desiredViewStart = g.startTAtCentroid - (centroid.x / canvasWidth) * newVisible;
       const newScroll = Math.max(
@@ -1412,7 +1420,7 @@ export function Timeline({
       const intensity = Math.min(1, Math.abs(e.deltaY) / 50);
       const step = 1 + 0.2 * intensity;
       const factor = e.deltaY < 0 ? step : 1 / step;
-      const newZoom = Math.max(1, Math.min(64, zoom * factor));
+      const newZoom = clamp(zoom * factor, MIN_ZOOM, MAX_ZOOM);
       if (newZoom === zoom) return;
       const newVisible = timelineSpan / newZoom;
       const desiredViewStart = viewAtCursor - (x / canvasWidth) * newVisible;
