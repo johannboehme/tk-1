@@ -30,7 +30,8 @@ import { masterToArr } from "./arrangement-time";
 import type { ArrangementItem, Chunk } from "../storage/jobs-db";
 import { classifyAspectRatio } from "./exportPresets";
 import { DEFAULT_VIEWPORT_TRANSFORM } from "./render/element-transform";
-import { LoopRegion, clampLoopRegion } from "./OffsetScheduler";
+import { LoopRegion } from "./OffsetScheduler";
+import { clampLoopToBounds } from "./arrangement-loop";
 import { activeCamAt, type CamRange } from "./cuts";
 import { gridStepSeconds, snapTime, type SnapMode } from "./snap";
 import { buildClipMatchPositions } from "./match-snap";
@@ -1239,8 +1240,8 @@ export const useEditorStore = create<EditorState>()(
       });
     },
     setLoop(loop) {
-      const { trim } = get();
-      const clamped = loop ? clampLoopRegion(loop, trim) : null;
+      const { trim, arrangementSegments } = get();
+      const clamped = clampLoopToBounds(loop, arrangementSegments, trim);
       set({
         playback: { ...get().playback, loop: clamped, pendingWrapAt: null },
       });
@@ -1343,7 +1344,7 @@ export const useEditorStore = create<EditorState>()(
         start: loop.start + direction * len,
         end: loop.end + direction * len,
       };
-      const clamped = clampLoopRegion(newLoop, s.trim);
+      const clamped = clampLoopToBounds(newLoop, s.arrangementSegments, s.trim);
       if (!clamped) return;
 
       const t = s.playback.currentTime;
@@ -1403,10 +1404,17 @@ export const useEditorStore = create<EditorState>()(
         tin = Math.max(0, tout - TRIM_EPS);
       }
       set({ trim: { in: tin, out: tout } });
-      // Re-clamp loop to new trim
+      // Re-clamp loop to new trim. In arr-mode the loop lives in arr-time
+      // and is bounded by `totalArrDuration` — trim has no say. In direct-
+      // mode trim and the loop share the master-time clock and the loop
+      // must stay inside trim.
       const loop = get().playback.loop;
       if (loop) {
-        const clamped = clampLoopRegion(loop, { in: tin, out: tout });
+        const clamped = clampLoopToBounds(
+          loop,
+          get().arrangementSegments,
+          { in: tin, out: tout },
+        );
         set({ playback: { ...get().playback, loop: clamped } });
       }
     },
