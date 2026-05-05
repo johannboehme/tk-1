@@ -83,6 +83,38 @@ function chunkId(startMs: number, endMs: number): string {
   return `chunk-${startMs}-${endMs}`;
 }
 
+/** Snap a chunk's `endMs` down to the nearest whole-bar boundary anchored
+ *  on its first onset (`audioStartMs`). Chunks already start on a
+ *  downbeat by construction (the Triage bar-grid is anchored on
+ *  `audioStartMs`); this aligns the END so a default-Triage handoff
+ *  produces fully bar-aligned segments without the user having to
+ *  hand-trim each chunk in/out marker. Returns the original `endMs`
+ *  when bpm is unavailable, when the snap would collapse the chunk
+ *  below half a bar, or when the chunk is too short for at least one
+ *  bar. */
+function snapChunkEndToBar(
+  startMs: number,
+  endMs: number,
+  audioStartMs: number,
+  bpm: number | undefined,
+  beatsPerBar: number,
+): number {
+  if (!bpm || bpm <= 0) return endMs;
+  const barMs = (60_000 / bpm) * beatsPerBar;
+  if (!Number.isFinite(barMs) || barMs <= 0) return endMs;
+  // The chunk must contain at least one full bar past the first onset
+  // for a bar-snap to be meaningful — otherwise we'd snap it to its
+  // own start and effectively kill the chunk. Fall back to raw endMs.
+  if (endMs - audioStartMs < barMs) return endMs;
+  const barsPastFirstBeat = Math.floor((endMs - audioStartMs) / barMs);
+  const snapped = audioStartMs + barsPastFirstBeat * barMs;
+  // Defensive lower bound — never snap below `startMs + half a bar`,
+  // even when audioStartMs is past the chunk's loud region's center
+  // (rare but possible in noisy detections).
+  if (snapped <= startMs + barMs / 2) return endMs;
+  return Math.round(snapped);
+}
+
 export async function detectChunks(
   pcm: Float32Array,
   sampleRate: number,
@@ -119,10 +151,22 @@ export async function detectChunksFromEnvelope(
       ? analyzeChunk(pcm, sampleRate, seg.start_ms, seg.end_ms)
       : null;
     const audioStartMs = chunkAnalysis?.audioStartMs ?? seg.start_ms;
+    // Auto-bar-align the chunk end. The bar grid is anchored on
+    // `audioStartMs` (= first downbeat); snapping end-of-chunk to the
+    // nearest preceding whole bar means a default-Triage handoff
+    // already produces rhythm-aligned segments — the user can hit
+    // "continue" without re-trimming every chunk by hand.
+    const snappedEndMs = snapChunkEndToBar(
+      seg.start_ms,
+      seg.end_ms,
+      audioStartMs,
+      chunkAnalysis?.bpm,
+      4,
+    );
     chunks.push({
-      id: chunkId(seg.start_ms, seg.end_ms),
+      id: chunkId(seg.start_ms, snappedEndMs),
       startMs: seg.start_ms,
-      endMs: seg.end_ms,
+      endMs: snappedEndMs,
       detectedBpm: chunkAnalysis?.bpm,
       bpmOctaveShift: 0,
       effectiveBpm: chunkAnalysis?.bpm ?? 0,
@@ -134,9 +178,10 @@ export async function detectChunksFromEnvelope(
       // button restores them. Subsequent re-detections (slider changes)
       // also overwrite these, since "what the detector says" is the
       // user's reference frame; manual splits/joins/inserts seed their
-      // own snapshots.
+      // own snapshots. Originals reflect the bar-aligned boundary so
+      // RESET keeps the rhythmic alignment too.
       originalStartMs: seg.start_ms,
-      originalEndMs: seg.end_ms,
+      originalEndMs: snappedEndMs,
       originalAudioStartMs: audioStartMs,
     });
     // Yield to event loop every 2 chunks so long-form sessions don't
