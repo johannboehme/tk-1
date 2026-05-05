@@ -380,6 +380,44 @@ describe("editRenderMulti — pill-mode + streaming muxer", () => {
   );
 
   it(
+    "1 cam, no pills, no cuts (= worker's unified default path) renders successfully",
+    async () => {
+      // After unifying the worker dispatcher every job — including a
+      // direct single-cam render with no pills and no cuts — goes
+      // through editRenderMulti. activeCamAt's fallback (no matching
+      // cut → first cam-with-material) keeps the cam on PROGRAM for
+      // the entire master timeline.
+      const videoBlob = await (await fetch(MULTI_KEYFRAME_FIXTURE_URL)).blob();
+      const audioBlob = makeSineWav(880, 2.0, 48000);
+      const result = await editRenderMulti({
+        cams: [
+          {
+            id: "only",
+            file: videoBlob,
+            masterStartS: 0,
+            sourceDurationS: 6,
+            kind: "video",
+          },
+        ],
+        cuts: [],
+        // pills omitted — direct mode
+        masterDurationS: 2,
+        audioFile: audioBlob,
+        segments: [{ in: 0, out: 2 }],
+        overlays: [],
+        offsetMs: 0,
+        driftRatio: 1.0,
+      });
+      expect(result.output).not.toBeNull();
+      const reparsed = await demuxVideoTrack(new Blob([result.output! as BlobPart]));
+      expect(reparsed).not.toBeNull();
+      expect(reparsed!.info.durationS).toBeGreaterThan(1.5);
+      expect(reparsed!.info.durationS).toBeLessThan(2.5);
+    },
+    120_000,
+  );
+
+  it(
     "two cams with cuts: alternates active cam and produces a valid MP4",
     async () => {
       const videoBlob = await (await fetch(MULTI_KEYFRAME_FIXTURE_URL)).blob();
