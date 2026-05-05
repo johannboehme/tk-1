@@ -1032,8 +1032,21 @@ export function Timeline({
 
   // Wrap a raw timeline-time through the active snap mode. Shift-hold
   // bypasses snapping (standard NLE-style anti-snap modifier).
+  //
+  // Domain note: callers pass MASTER-time (the canonical clock for
+  // seek/cuts/trim). In arrangement-mode the BeatRuler + `beatPhase`
+  // both live in ARR-time — the canvas axis the user actually sees —
+  // so we project the master-time into arr-time, snap it onto the
+  // visible bar grid, then project back. Without this round-trip the
+  // bar grid and the snap targets sit on different axes and snap=1
+  // visibly lands the playhead between bar marks.
   function snapped(t: number, e: { shiftKey: boolean }, candPositions?: number[]): number {
     if (e.shiftKey || snapMode === "off") return t;
+    if (isArrMode) {
+      const arrT = masterToView(t);
+      const snappedArr = snapTime(arrT, snapMode, buildSnapCtx(candPositions));
+      return viewToMaster(snappedArr);
+    }
     return snapTime(t, snapMode, buildSnapCtx(candPositions));
   }
 
