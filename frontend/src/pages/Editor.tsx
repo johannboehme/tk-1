@@ -31,7 +31,7 @@ import {
   type EditSpecLocal,
 } from "../local/jobs";
 import { isVideoAsset, type MediaAsset, type VideoAsset } from "../storage/jobs-db";
-import { arrangementToSegments } from "../local/arrange/chunks-to-segments";
+import { synthesizeJobLoadShape } from "../editor/job-synth";
 import { decodeAudioToMonoPcm } from "../local/codec";
 import { computeWaveformPeaks } from "../local/waveform-peaks";
 import { exportSpecToRenderOpts } from "../editor/exportPresets";
@@ -690,14 +690,16 @@ export default function Editor() {
                 }
               : null));
 
-      // Long-form jobs land here with a populated `arrangement[]` —
-      // translate it into a flat segment list so the editor's audio
-      // master walks the user's chunk sequence and `buildEditSpec`
-      // emits a multi-segment EditSpec the renderer slices natively.
-      const arrangementSegments =
-        j.mode === "longform" && Array.isArray(j.arrangement) && j.arrangement.length > 0
-          ? arrangementToSegments(j.arrangement, j.chunks ?? [])
-          : [];
+      // Mode-agnostic data shape: long-form jobs feed their persisted
+      // arrangement straight through; single-take jobs get a synthetic
+      // single-segment shape covering the full master audio. The editor
+      // walks every job through the same path from here on — the segment
+      // walker, pill generator, time projections, and loop clamping all
+      // run identically because every helper is Identity for a single
+      // [0, duration] segment.
+      const masterDurationS = wave?.duration ?? j.durationS ?? 0;
+      const { arrangementSegments, arrangement, chunks } =
+        synthesizeJobLoadShape(j, masterDurationS);
 
       loadJob(
         {
@@ -707,7 +709,7 @@ export default function Editor() {
           // and trim defaults are anchored here, not on cam-1's media
           // duration (which would put trim.out somewhere mid-audio if
           // cam-1 was shorter than the studio track).
-          duration: wave?.duration ?? j.durationS ?? 0,
+          duration: masterDurationS,
           width: j.width ?? 1920,
           height: j.height ?? 1080,
           algoOffsetMs: j.sync?.offsetMs ?? 0,
@@ -728,13 +730,8 @@ export default function Editor() {
           fx: j.fx ?? [],
           audioVolume: j.audioVolume,
           arrangementSegments,
-          // First-class pills: passed to loadJob so reconcileArrangementPills
-          // can splice user-edited pills (move / trim) on top of the
-          // freshly-generated default. `storedPills` is read from the
-          // LocalJob so a refresh / re-open keeps the user's edits.
-          arrangement:
-            j.mode === "longform" ? (j.arrangement ?? []) : undefined,
-          chunks: j.mode === "longform" ? (j.chunks ?? []) : undefined,
+          arrangement,
+          chunks,
           storedPills: j.pills ?? [],
         },
       );
