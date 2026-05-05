@@ -728,6 +728,14 @@ export default function Editor() {
           fx: j.fx ?? [],
           audioVolume: j.audioVolume,
           arrangementSegments,
+          // First-class pills: passed to loadJob so reconcileArrangementPills
+          // can splice user-edited pills (move / trim) on top of the
+          // freshly-generated default. `storedPills` is read from the
+          // LocalJob so a refresh / re-open keeps the user's edits.
+          arrangement:
+            j.mode === "longform" ? (j.arrangement ?? []) : undefined,
+          chunks: j.mode === "longform" ? (j.chunks ?? []) : undefined,
+          storedPills: j.pills ?? [],
         },
       );
       // E2E hook (dev only) — Playwright reads `arrangementSegments[]`
@@ -976,6 +984,11 @@ export default function Editor() {
       outputFilename: spec.export?.filename,
       clipOverrides,
       cuts,
+      // Forward arrangement-mode pills so the renderer composes the
+      // song from the same per-cam slots the user shaped in the
+      // editor's Timeline. Empty in direct-mode → renderer falls back
+      // to its legacy clip-range walk.
+      pills: liveState.pills,
       audioVolume: liveState.audioVolume,
     };
     // Fire-and-forget: the render screen owns the lifecycle from here.

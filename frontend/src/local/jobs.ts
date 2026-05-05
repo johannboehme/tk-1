@@ -827,6 +827,12 @@ export interface EditSpecLocal {
   audioVolume?: number;
   /** Multi-cam cuts — drives the multi-source frame loop. */
   cuts?: Array<{ atTimeS: number; camId: string }>;
+  /** Long-form arrangement-mode pills. Each pill anchors a cam-source
+   *  excerpt to a position on the song timeline; the renderer composes
+   *  video by walking pills in arr-time + applying cuts on top. Empty
+   *  in direct-mode, in which case the renderer falls back to the
+   *  legacy per-cam contiguous-range model. */
+  pills?: import("../editor/types").Pill[];
 }
 
 export interface ExportRenderOpts {
@@ -998,6 +1004,7 @@ export async function runEditRender(
     const workerInput: EditWorkerInput = {
       cams: camInputs,
       cuts,
+      pills: spec.pills,
       masterDurationS,
       outputPath: outputPath(jobId),
       audioPcm: audio,

@@ -16,6 +16,46 @@ export interface Segment {
   out: number;
 }
 
+/**
+ * One first-class slot of cam material on the song timeline.
+ *
+ * Pills are the unit the user manipulates in arrangement-mode: a pill can
+ * be clicked to select, dragged to reposition on the song timeline, and
+ * its edges dragged to retrim the cam-source range it draws from. Each
+ * pill is fully decoupled from the underlying `Clip` so a single cam can
+ * have many pills (one per chunk it appears in, or wherever the user
+ * dragged it). Cuts pick which pill is on PROGRAM at any given arr-time.
+ *
+ * Time conventions:
+ *   - `arrStartS` / `arrEndS` — placement on the song timeline. The pill
+ *     is visible (and active) over [arrStartS, arrEndS).
+ *   - `sourceInS` / `sourceOutS` — which excerpt of the cam's media is
+ *     played during the pill. For V1 pill duration MUST equal source
+ *     duration (no time-stretch); the renderer maps an arr-time `t` to
+ *     source-time `sourceInS + (t − arrStartS)`.
+ *
+ * `fromArrangementItemId` is a stable back-reference for the auto-
+ * generation pass that creates one pill per (cam × arrangement-item).
+ * Persisting it lets a re-load of the editor know which pill came from
+ * which arrangement-item without needing to re-run the slicer; user
+ * edits (move/trim) survive an Arrange round-trip as long as the
+ * arrangement-item still exists.
+ */
+export interface Pill {
+  id: string;
+  camId: string;
+  arrStartS: number;
+  arrEndS: number;
+  sourceInS: number;
+  sourceOutS: number;
+  fromArrangementItemId?: string;
+}
+
+/** Half-open arr-time range a pill occupies. */
+export function pillRangeS(pill: Pill): { startS: number; endS: number } {
+  return { startS: pill.arrStartS, endS: pill.arrEndS };
+}
+
 export interface ReactiveModulation {
   band: "bass" | "low_mids" | "mids" | "highs";
   param: "scale" | "y" | "rotate";

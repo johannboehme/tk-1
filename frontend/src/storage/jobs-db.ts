@@ -413,6 +413,13 @@ export interface LocalJob {
    *  Editor-Pre-Population. Wird in der Arrange-Phase gefüllt. */
   arrangement?: ArrangementItem[];
 
+  /** Editor-side pill list — first-class slots of cam material on the
+   *  song timeline. Auto-generated from `arrangement × cams × chunks`
+   *  on first editor mount; persisted here so user edits (move / trim)
+   *  survive across mounts / refreshes. Pills with ids whose underlying
+   *  arrangement-item disappears are reconciled out at load time. */
+  pills?: PillRecord[];
+
   /** Cached RMS-envelope of the master audio at 10 Hz, computed during
    *  sync. Lets Triage render the waveform overview without
    *  re-decoding the multi-GB PCM up front. ~144 KB per hour of
@@ -420,6 +427,19 @@ export interface LocalJob {
    *  structured-clone natively. Optional / undefined for jobs synced
    *  before this field existed (or direct-mode jobs). */
   triageEnvelope?: Float32Array;
+}
+
+/** Persisted shape of `Pill` (from editor/types). Mirrored here to keep
+ *  the storage layer free of editor-module imports. Same field semantics
+ *  as the runtime type. */
+export interface PillRecord {
+  id: string;
+  camId: string;
+  arrStartS: number;
+  arrEndS: number;
+  sourceInS: number;
+  sourceOutS: number;
+  fromArrangementItemId?: string;
 }
 
 /** Storage shape for a single Punch-in FX. Mirrors `PunchFx` from the

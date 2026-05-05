@@ -81,6 +81,10 @@ export interface EditWorkerInput {
    *  the worker dispatches to `editRenderMulti`. */
   cams?: CamWorkerInput[];
   cuts?: Cut[];
+  /** Long-form arrangement-mode pills. Honoured when present alongside
+   *  non-empty `segments`; the renderer composes video off the pill
+   *  table instead of the cams' contiguous master ranges. */
+  pills?: import("../../editor/types").Pill[];
   /** Master-timeline duration; defaults to longest cam's end. */
   masterDurationS?: number;
 
@@ -173,7 +177,9 @@ ctx.addEventListener("message", async (e: MessageEvent<EditWorkerMessage>) => {
 
     const useMultiCam =
       input.cams !== undefined &&
-      (input.cams.length > 1 || (input.cuts ?? []).length > 0);
+      (input.cams.length > 1 ||
+        (input.cuts ?? []).length > 0 ||
+        (input.pills ?? []).length > 0);
 
     if (useMultiCam) {
       const cams = input.cams!;
@@ -199,6 +205,7 @@ ctx.addEventListener("message", async (e: MessageEvent<EditWorkerMessage>) => {
           viewportTransform: c.viewportTransform,
         })),
         cuts: input.cuts ?? [],
+        pills: input.pills,
         masterDurationS: input.masterDurationS,
         audioPcm: input.audioPcm,
         segments: input.segments,

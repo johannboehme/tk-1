@@ -47,6 +47,7 @@ import type { BackendCapabilities } from "../../editor/render/factory";
 import { CamFrameStream } from "./cam-frame-stream";
 import { makeTestPatternCanvas } from "./test-pattern";
 import { activeCamAt } from "../../editor/cuts";
+import { activeCamAtArr as activeCamAtArrLocal } from "../../editor/arrangement-pills";
 import type { Cut } from "../../storage/jobs-db";
 import type { PunchFx } from "../../editor/fx/types";
 import type { TextOverlay, EnergyCurves } from "./ass-builder";
@@ -533,6 +534,18 @@ export interface MultiCamRenderInput
    * minus segment trims.
    */
   masterDurationS?: number;
+  /**
+   * Long-form arrangement-mode pills. When present (and `segments` is
+   * non-empty), the renderer composes video by walking pills in arr-time
+   * order instead of using the cams' contiguous master ranges directly.
+   * Each pill defines (camId, sourceIn/Out in cam-time, arr-time
+   * placement on the song); the active pill at song-time `tArr` is
+   * chosen via `activeCamAtArr` (mirroring the editor preview).
+   *
+   * Direct-mode jobs leave this empty and fall back to the legacy
+   * `activeCamAt` resolver against `camRanges`.
+   */
+  pills?: import("../../editor/types").Pill[];
 }
 
 /**
@@ -736,14 +749,43 @@ export async function editRenderMulti(
   const totalFrames = Math.max(1, Math.round(totalKept * fps));
   const frameDurationUs = Math.round(1_000_000 / fps);
 
+  // Arrangement-mode pill table. When present, the renderer dispatches
+  // each frame's active cam through `activeCamAtArr` so per-pill trim
+  // and arr-placement (the user's edits in the editor's pill toolbar)
+  // are honoured. Direct-mode jobs leave this empty and fall back to
+  // the legacy `activeCamAt` resolver against `camRanges`.
+  const pillsForRender = input.pills ?? [];
+  const pillMode = pillsForRender.length > 0 && input.segments.length > 0;
+
   let framesEmitted = 0;
   try {
+    // Per-segment arr-time cursor — accumulated so each frame's `tArr`
+    // matches the editor's masterToArr projection, which is what pills
+    // are anchored against.
+    let arrCursorPerSeg = 0;
     for (const seg of intervals) {
       const segStartFrame = framesEmitted;
       const segFrames = Math.max(0, Math.round((seg.out - seg.in) * fps));
       for (let i = 0; i < segFrames; i++) {
         const tMaster = seg.in + i / fps;
-        const camId = activeCamAt(input.cuts, tMaster, camRanges);
+        const tArr = arrCursorPerSeg + i / fps;
+        // Active cam: pill-aware in arrangement-mode, legacy clip-range
+        // in direct-mode. Pills also yield the active pill so we can
+        // pull source-time directly from its sourceIn/Out window.
+        let camId: string | null;
+        let activePill: import("../../editor/types").Pill | null = null;
+        if (pillMode) {
+          const active = activeCamAtArrLocal(
+            input.cuts,
+            tArr,
+            pillsForRender,
+            input.segments,
+          );
+          camId = active?.camId ?? null;
+          activePill = active?.pill ?? null;
+        } else {
+          camId = activeCamAt(input.cuts, tMaster, camRanges);
+        }
         let source: CanvasImageSource;
         let srcW: number;
         let srcH: number;
@@ -769,10 +811,22 @@ export async function editRenderMulti(
               viewportTransform: cam.cam.viewportTransform,
             };
           } else {
-            const sourceTimeUs = camSourceTimeUs(tMaster, {
-              masterStartS: cam.cam.masterStartS,
-              driftRatio: cam.cam.driftRatio ?? 1,
-            });
+            // Source-time selection.
+            //   Pill-mode: read straight from the active pill's
+            //   sourceIn/Out window — moving / trimming a pill in the
+            //   editor must change which frame the renderer fetches.
+            //   Direct-mode: master-to-cam-source via the cam's anchor
+            //   + drift, identical to the legacy path.
+            const sourceTimeS = activePill
+              ? activePill.sourceInS + (tArr - activePill.arrStartS)
+              : null;
+            const sourceTimeUs =
+              sourceTimeS != null
+                ? Math.max(0, Math.round(sourceTimeS * 1_000_000))
+                : camSourceTimeUs(tMaster, {
+                    masterStartS: cam.cam.masterStartS,
+                    driftRatio: cam.cam.driftRatio ?? 1,
+                  });
             const frame = await cam.stream.frameAtOrBefore(sourceTimeUs);
             if (frame) {
               source = frame as unknown as CanvasImageSource;
@@ -828,6 +882,7 @@ export async function editRenderMulti(
           await new Promise((r) => setTimeout(r, 0));
         }
       }
+      arrCursorPerSeg += seg.out - seg.in;
     }
 
     // The encoder still has pending frames to flush — on a 90 s clip

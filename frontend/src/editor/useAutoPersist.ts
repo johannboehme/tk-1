@@ -85,6 +85,10 @@ export function buildPersistPatch(
     fx: s.fx,
     audioVolume: s.audioVolume,
     exportSpec: s.exportSpec,
+    // Persist user-edited pills so a refresh / re-open keeps move + trim
+    // gestures. Direct-mode jobs leave pills empty; storing [] here is
+    // a no-op round-trip.
+    pills: s.pills,
   };
 }
 

@@ -13,6 +13,7 @@ import {
   EditSpec,
   ExportSpec,
   MatchCandidate,
+  Pill,
   Segment,
   TextOverlay,
   ViewportTransform,
@@ -21,6 +22,12 @@ import {
   clipRangeS,
   isVideoClip,
 } from "./types";
+import {
+  activeCamAtArr,
+  reconcileArrangementPills,
+} from "./arrangement-pills";
+import { masterToArr } from "./arrangement-time";
+import type { ArrangementItem, Chunk } from "../storage/jobs-db";
 import { classifyAspectRatio } from "./exportPresets";
 import { DEFAULT_VIEWPORT_TRANSFORM } from "./render/element-transform";
 import { LoopRegion, clampLoopRegion } from "./OffsetScheduler";
@@ -256,6 +263,15 @@ interface EditorState {
   clips: Clip[];
   cuts: Cut[];
   selectedClipId: string | null;
+  /** First-class pill list — the units the user manipulates on the song
+   *  timeline in arrangement-mode. Empty in direct-mode (the editor falls
+   *  back to clipRangeS-based rendering when no segments are present).
+   *  Populated by `loadJob` from the persisted arrangement on long-form
+   *  jobs; reconciled with stored pills so user edits (move / trim)
+   *  survive across editor mounts. */
+  pills: Pill[];
+  /** UI selection for per-pill editing. null = nothing selected. */
+  selectedPillId: string | null;
   /** Live indicator for an in-progress TAKE-button-or-hotkey hold. While
    * a key/button is pressed, this points to the held cam + the master-time
    * the press started at. Once the press passes the tap-vs-hold threshold,
@@ -341,11 +357,41 @@ interface EditorState {
        *  passed, the editor walks them sequentially during playback +
        *  emits them into EditSpec at render time. */
       arrangementSegments?: Segment[];
+      /** Source-of-truth for pill auto-generation. Pills are derived
+       *  from `(cams × arrangement-items × chunks)` on first mount; if
+       *  `storedPills` are non-empty their user-edited values (move /
+       *  trim) are reconciled in by id. */
+      arrangement?: ArrangementItem[];
+      chunks?: Chunk[];
+      storedPills?: Pill[];
     },
   ): void;
   /** Replace the arrangement-segment list. Empty array reverts to
    *  legacy single-trim behaviour. */
   setArrangementSegments(segments: Segment[]): void;
+
+  // ---- Pill actions (multi-pill arrangement editing) ----
+  /** Replace the entire pill list. Used when arrangement reorders or a
+   *  fresh job loads. */
+  setPills(pills: Pill[]): void;
+  /** UI selection target for per-pill edits. */
+  setSelectedPillId(id: string | null): void;
+  /** Drag-on-timeline: shift a pill's arr-time placement. The pill's
+   *  duration is preserved (arrEndS moves with arrStartS). Source-trim
+   *  is unchanged — only WHERE on the song the cam plays moves. */
+  setPillArrPlacement(id: string, arrStartS: number): void;
+  /** Edge-drag the LEFT edge of a pill: shrinks the pill's arr-window
+   *  + advances the cam-source-in by the same amount, so the cam still
+   *  plays "in sync" with the pill's content. Clamps to a 0.05 s
+   *  minimum window and never crosses the right edge. */
+  setPillLeftEdgeArrStartS(id: string, arrStartS: number): void;
+  /** Edge-drag the RIGHT edge of a pill: shrinks the pill's arr-window
+   *  + retreats the cam-source-out by the same amount. Clamps to a 0.05 s
+   *  minimum window and never crosses the left edge. */
+  setPillRightEdgeArrEndS(id: string, arrEndS: number): void;
+  /** Remove a pill. Cuts that target the same camId stay (they may apply
+   *  to other pills of that cam). */
+  removePill(id: string): void;
 
   /** Append a single clip to clips[] without resetting any other editor
    *  state. Used by the Editor's "+ Media" flow when addVideoToJob /
@@ -827,6 +873,8 @@ export const useEditorStore = create<EditorState>()(
     clips: [],
     cuts: [],
     selectedClipId: null,
+    pills: [],
+    selectedPillId: null,
     holdGesture: null,
     quantizePreview: null,
     notice: null,
@@ -852,6 +900,8 @@ export const useEditorStore = create<EditorState>()(
         clips: [],
         cuts: [],
         selectedClipId: null,
+        pills: [],
+        selectedPillId: null,
         holdGesture: null,
         quantizePreview: null,
         notice: null,
@@ -913,6 +963,20 @@ export const useEditorStore = create<EditorState>()(
         clips,
         cuts: opts?.cuts ?? [],
         selectedClipId,
+        // Pills are first-class in arrangement-mode. Reconcile any
+        // user-edited pills (move / trim) on top of the freshly
+        // generated default — dropped by id when the underlying
+        // arrangement-item disappears, kept verbatim when it survives.
+        pills:
+          opts?.arrangement && opts.arrangement.length > 0
+            ? reconcileArrangementPills(
+                opts.arrangement,
+                opts.chunks ?? [],
+                clips,
+                opts.storedPills ?? [],
+              )
+            : [],
+        selectedPillId: null,
         fx: opts?.fx ?? [],
         fxHolds: {},
         selectedFxKind: "vignette",
@@ -1383,6 +1447,72 @@ export const useEditorStore = create<EditorState>()(
       }
       set({ selectedClipId: id });
     },
+
+    // ---- Pill actions ----
+    setPills(pills) {
+      // Validate: drop pills referencing missing cams to keep the active-
+      // cam lookup well-defined.
+      const camIds = new Set(get().clips.map((c) => c.id));
+      const next = pills.filter((p) => camIds.has(p.camId));
+      const sel = get().selectedPillId;
+      const stillSelected = sel != null && next.some((p) => p.id === sel);
+      set({ pills: next, selectedPillId: stillSelected ? sel : null });
+    },
+    setSelectedPillId(id) {
+      // Allow null. If non-null but the id no longer exists, treat as null.
+      if (id != null) {
+        const exists = get().pills.some((p) => p.id === id);
+        if (!exists) {
+          set({ selectedPillId: null });
+          return;
+        }
+      }
+      set({ selectedPillId: id });
+    },
+    setPillArrPlacement(id, arrStartS) {
+      const pills = get().pills.map((p) => {
+        if (p.id !== id) return p;
+        const len = p.arrEndS - p.arrStartS;
+        const safe = Math.max(0, arrStartS);
+        return { ...p, arrStartS: safe, arrEndS: safe + len };
+      });
+      set({ pills });
+    },
+    setPillLeftEdgeArrStartS(id, arrStartS) {
+      const pills = get().pills.map((p) => {
+        if (p.id !== id) return p;
+        const minWindow = 0.05;
+        const maxStart = p.arrEndS - minWindow;
+        const oldStart = p.arrStartS;
+        const newStart = Math.max(0, Math.min(maxStart, arrStartS));
+        // The cam stays in sync with the pill: as we trim N seconds off
+        // the front of the arr-window, advance sourceInS by the same N.
+        // (V1: 1:1 mapping, no time-stretch.)
+        const delta = newStart - oldStart;
+        const newSourceIn = Math.max(0, p.sourceInS + delta);
+        return { ...p, arrStartS: newStart, sourceInS: newSourceIn };
+      });
+      set({ pills });
+    },
+    setPillRightEdgeArrEndS(id, arrEndS) {
+      const pills = get().pills.map((p) => {
+        if (p.id !== id) return p;
+        const minWindow = 0.05;
+        const minEnd = p.arrStartS + minWindow;
+        const oldEnd = p.arrEndS;
+        const newEnd = Math.max(minEnd, arrEndS);
+        const delta = newEnd - oldEnd;
+        const newSourceOut = Math.max(p.sourceInS + 0.001, p.sourceOutS + delta);
+        return { ...p, arrEndS: newEnd, sourceOutS: newSourceOut };
+      });
+      set({ pills });
+    },
+    removePill(id) {
+      const pills = get().pills.filter((p) => p.id !== id);
+      const sel = get().selectedPillId;
+      set({ pills, selectedPillId: sel === id ? null : sel });
+    },
+
     setClipSyncOverride(camId, ms) {
       const clips = get().clips.map((c): Clip => {
         if (c.id !== camId) return c;
@@ -1764,6 +1894,20 @@ export const useEditorStore = create<EditorState>()(
     activeCamId(t) {
       const s = get();
       const time = t ?? s.playback.currentTime;
+      // Arrangement-mode: pills determine cam availability at song
+      // position. Convert master-time to arr-time and look up via
+      // pills + cuts. Direct-mode jobs (no segments) fall through to
+      // the legacy clipRangeS-based resolver.
+      if (s.pills.length > 0 && s.arrangementSegments.length > 0) {
+        const arrT = masterToArr(time, s.arrangementSegments);
+        const active = activeCamAtArr(
+          s.cuts,
+          arrT,
+          s.pills,
+          s.arrangementSegments,
+        );
+        return active?.camId ?? null;
+      }
       return activeCamAt(s.cuts, time, computeCamRanges(s.clips));
     },
     snapMasterTime(t) {
