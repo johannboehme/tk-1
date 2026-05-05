@@ -3,14 +3,19 @@
 **Take 1.** A small, opinionated multi-cam music video editor for
 musicians who want to *play the edit*, not configure one.
 
-You record yourself playing along on whatever you have: phone,
-Ray-Bans, three GoPros on tripods. You also have the clean studio
-mix as MP3 or WAV. Drop both in the browser. TK-1 aligns every
-camera angle to the studio audio, opens a multi-track editor, and
-renders an MP4 you can post.
+Two ways in:
 
-Nothing leaves your laptop. No upload, no account; the editor and
-the render both run in the browser tab.
+- **Have a track. Want a video.** Drop a finished studio mix next
+  to a few phone takes. TK-1 lines every cam up to the song and
+  opens the editor.
+- **Have an hour. Want a song.** Drop a 90-minute jam recording.
+  TK-1 finds the songs inside it, slices them into bar-aligned
+  chunks, you sort the keepers on a contact sheet and sequence
+  them on a 35 mm film strip — *then* play the multi-cam cut on
+  top.
+
+Either way: nothing leaves your laptop. No upload, no account; the
+editor and the render run inside the browser tab.
 
 **Live demo:** <https://tk-1.app>
 
@@ -23,39 +28,78 @@ the render both run in the browser tab.
 The visual language and the workflow are both shamelessly inspired
 by Teenage Engineering. The OP-1, the OP-Z, the Pocket Operators:
 devices that pick one job and design every surface around being
-*operated*, not configured. This editor wants to feel the same
-way: a sampler for music videos.
+*operated*, not configured. TK-1 wants to feel the same way: a
+sampler for music videos.
 
-The expected loop: drop everything in, hit play, perform your
-cam-switches and effects live as the song plays, then quantize the
-cuts to the beat. Listen back and tweak.
+The loop now extends past the cuts. Picking which takes to keep
+is an instrument — silence detection drops chunk boundaries, you
+tap KEEP / DROP as the timeline scrubs under the playhead.
+Building the arrangement is an instrument — drag Polaroids of the
+chunks onto a 35 mm strip in the order you want them, with the
+PlayerCockpit reading out BPM, density and a 4-band audio meter as
+you scrub. *Then* hit the editor and perform your cam-switches
+and FX live as the song plays.
 
 Most "shortform video tools" are timeline editors with a phone
 preset. Most "pro NLEs" put a six-pane workspace, a project file,
 an asset bin and a render queue between you and a 22-second clip.
-This sits between those: *"that song, those phone takes, one
-finished video,"* designed to be played live.
+TK-1 sits between those: *that recording, those takes, one
+finished video,* designed to be played live.
 
 ## How it plays
 
 ### Lining up the takes
 
-Drop the studio audio plus however many video angles you have. The
-app pulls 12-bin chroma features out of the phone audio and the
-studio audio, cross-correlates them, refines the result with a
-sliding-window drift pass, and falls back to chroma-DTW when
-confidence is low. Each cam ends up with an algorithmic offset and
-a confidence number. Bad takes are flagged; good takes are usable
-on the first try.
+The phone audio gets matched against the studio mix even when the
+room is loud — five passes from coarse to fine, ending at
+sample-perfect alignment for same-source recordings (which is what
+every camera you brought is). Each cam ends up with an algorithmic
+offset and three sharpness numbers — bad takes are flagged, the
+rest are usable on the first try. Progress is honest now: a smooth
+bar through every stage instead of the old freeze-at-40-percent.
 
-Written in Rust, compiled to WASM, runs inside the page.
+Written in Rust, compiled to WASM, runs inside the page. Curious
+about the five passes? See [under the hood](#under-the-hood).
+
+### Triage — find the songs in the jam
+
+If you came in through the SESSION door, the editor has a 90-minute
+recording in front of it and no idea where the songs sit. Triage
+runs silence detection across the whole thing, drops chunk
+boundaries wherever it finds them, and hands you a rack: cam
+preview, inspector with a brass-plate BPM and signature plate,
+scrolling list of the chunks it found, KEPT counter on the right
+that updates live as you accept or drop. The DeckStrip across the
+middle sets the silence threshold and the minimum-pause length —
+one slider each, no dialog. Scrub the timeline, tap KEEP or DROP
+chunk by chunk.
+
+<p align="center">
+  <img src=".github/screenshots/triage-rack.png" alt="Triage rack: timeline with chunk bars, ChunksList, brass-plate BPM 180, threshold and min-pause sliders" width="900">
+</p>
+
+### Arrange — build the cut on a film strip
+
+Accepted chunks become Polaroids on a contact sheet, ordered as
+they were recorded. Drag them up onto the 35 mm film strip in
+whatever order you want them in the final video — repeats,
+re-orderings, dropouts, all by drag. The PlayerCockpit on top is
+a CRT LCD with the running TOTAL / current IDX / BPM / NOW
+readout plus a 4-band audio meter (DRMS · BASS · MEL · FRMT) and
+KEY / DENS / BRGT / PEAK glance reads as you scrub the strip. The
+MiniMap appears when the strip overflows the visible row.
+
+<p align="center">
+  <img src=".github/screenshots/arrange-filmstrip.png" alt="Arrange: 35mm sprocket-hole film strip on top, Polaroid contact sheet below, PlayerCockpit LCD with BPM and audio meters" width="900">
+</p>
 
 ### Snap to the bar, or to where the take actually is
 
 Beat detection runs on the master audio and gives you a real beat
-grid: 4/4 by default, configurable, with a bar-1 pickup so the grid
-lines up with the *song* and not with sample 0. Quantize down to
-sixteenth notes, up to whole bars.
+grid: 4/4 by default, configurable, with a bar-1 pickup so the
+grid lines up with the *song* and not with sample 0. Quantize
+down to sixteenth notes, up to whole bars. And the beat picker
+doesn't double-time slow songs anymore.
 
 When you drag a clip on the timeline, snap goes to the grid or to
 the audio-match positions where the take itself plays a downbeat.
@@ -63,7 +107,7 @@ So you're not snapping to "the nearest beat"; you're snapping to
 "the place where the take actually plays the downbeat."
 
 <p align="center">
-  <img src=".github/screenshots/04-editor-sync.png" alt="Editor with sync tuner, match lane, multi-cam timeline" width="900">
+  <img src=".github/screenshots/editor-sync.png" alt="Editor sync tab: USER OVERRIDE knob, NUDGE MS row, MATCH lane, bar-numbered ruler" width="900">
 </p>
 
 ### Cam keys: tap to cut, hold to paint
@@ -81,24 +125,28 @@ above it, and number keys.
 
 ### Punch-in FX, on a pad bank
 
-A separate FX rail above the cam lanes, with seven pads: vignette,
-wear, echo, rgb, tape, zoom, uv — each one a real shipping renderer
-(Canvas2D + WebGL2 backends, parity-checked). Hold a pad while the
-song plays to paint that effect under your finger; release to drop
-the tail. FX stack — they don't replace each other.
+A separate FX rail above the cam lanes, with seven pads: **VIGN,
+WEAR, ECHO, RGB, TAPE, ZOOM, UV** — each a real shipping renderer
+with WebGPU, WebGL2 and Canvas2D backends, parity-checked. Hold a
+pad while the song plays to paint that effect under your finger;
+release to drop the tail. FX stack — they don't replace each other.
 
-Below the rail sits a hardware-style panel: a CRT-green screen,
-two TE-orange/cobalt encoders, and the seven pads again. The
-encoders are the kind's two parameters (depth/edge, decay/drift,
-trail/mix, …) and are live: turning a knob during playback or
+Below the rail sits a hardware-style panel: a CRT-green LCD, two
+small `P` / `E` plastic buttons on its left edge (parameters vs.
+envelope), a TE-orange DEPTH encoder and a TE-cobalt EDGE encoder,
+and the seven pads again. The encoders are the kind's two
+parameters and are live — turning a knob during playback or
 preview reflects in the rendered frame immediately, no re-trigger.
 
-Each FX gets an ADSR envelope on top of its parameters. Two small
-plastic buttons next to the screen flip it between the parameter
-read-out and an envelope editor — drag the four phosphor knots on
-the curve to shape attack, decay, sustain and release. The release
-tail plays out properly when you let go: hold a pad for a beat,
-release, and the effect fades over the release time you dialed in.
+Each FX gets an ADSR envelope on top of its parameters. Hit `E`,
+the LCD switches to a phosphor trapezoid; drag the four green
+knots to shape attack, decay, sustain and release. Releases fade
+from wherever the envelope was when you let go, even mid-attack —
+feels like a real synth voice, not a fader.
+
+<p align="center">
+  <img src=".github/screenshots/fx-hardware-panel.png" alt="FX hardware panel: CRT-green LCD with ADSR envelope and phosphor knots, P/E mode buttons, DEPTH and EDGE encoders, seven colored pads VIGN WEAR ECHO RGB TAPE ZOOM UV" width="900">
+</p>
 
 While paused, the pads switch to **audition mode**: clicking (or
 hitting the keybind) latches a live preview of that kind on the
@@ -109,99 +157,59 @@ Click again to drop the latch, click another pad to swap.
 `X` is the eraser. While playing it wipes FX under the playhead;
 combine with a pad key (`X+V`, `X+W`, …) to wipe only that kind.
 While paused, holding `X` for three seconds clears the program
-strip wholesale — fx-only, cuts-only, or both, depending on the
-strip mode. Same red sweep-bar as holding the strip with a finger.
+strip wholesale.
 
-### Output frame
+### Transport you can play
 
-The output frame fits whatever cams you've dropped in: portrait next
-to landscape just widens the canvas. Render to a destination preset
-(Web, Archive, Mobile) or open the Custom panel for explicit
-resolution and bitrate. The output story is still being polished.
+`L` arms a 2-second loop region at the playhead — orange shading
+on the bar ruler and the audio waveform. `I` and `O` set the
+in-point and out-point; they re-aim depending on what's selected:
+loop active → loop ends, video clip selected → that clip's source
+trim, image clip selected → its master-time edges, otherwise the
+master export region. `Alt+←` and `Alt+→` shift the loop by its
+own length with a gapless wrap (sample-accurate crossfade, not a
+`currentTime` seek). Snap-aware arrow keys step to frame /
+match-point / beat / bar depending on the active snap mode.
+
+Tap `?` for the cheat sheet — every shortcut auto-registers itself
+in the overlay so the list never lies to you.
+
+### Output frame, stage, framing
+
+Pick a Stage shape — **WEB** (16:9 at 1920×1080), **MOBILE**
+(9:16 at 1080×1920), **ARCHIVE** (your aspect at H.265 / pristine
+quality), **CUSTOM** (any combination). Each clip then carries
+its own viewport over the Stage: drag in the preview to pan,
+wheel to zoom, double-click to reset, hold Alt for 5× precision.
+Four orange L-corner marks anchor the active clip's bounds, even
+when they overflow the Stage. Preview and export use the same
+math — what you see is what renders.
+
+Static images sit alongside videos on the timeline with the same
+framing controls and the same routing.
 
 ### Browser is the runtime
 
 WebCodecs does the heavy lifting. ffmpeg.wasm sits in the back of
-the cupboard for codecs WebCodecs doesn't reach. OPFS holds the raw
-media, IndexedDB holds the edit spec. There's no server-side state.
-Closing the tab takes nothing with it, and re-opening picks the
-project back up.
+the cupboard for codecs WebCodecs doesn't reach. Multi-GB session
+files stream in 4 MiB batches so the tab doesn't sit on a 9 GB
+heap. If your browser supports it, the editor remembers the *file
+handle* — re-open a job and TK-1 reads the originals from disk,
+no copy. On Safari and Firefox we keep an OPFS copy.
 
-The render path has two stages:
-
-- **Quick render** re-muxes your phone video with the studio audio
-  at the computed offset. Seconds, not minutes.
-- **Edit render** does the full pipeline: decode, composite (cuts,
-  FX, text, audio-viz), encode. WebGL2 if your browser has it,
-  Canvas2D fallback if it doesn't. About realtime on a recent
-  laptop.
-
-## Workflow, in pictures
-
-**1. Drop everything in.** One master audio, one or more videos. No
-project files, no settings dialog.
-
-<p align="center">
-  <img src=".github/screenshots/01-upload.png" alt="Upload page" width="800">
-</p>
-
-**2. Sync runs.** Each cam gets an offset and a confidence number.
-From the job page you can hit *Quick render* to ship a single-angle
-video right now, or *Open editor* to multi-cam.
-
-<p align="center">
-  <img src=".github/screenshots/03-job-detail.png" alt="Job detail with per-cam sync results" width="800">
-</p>
-
-**3. Play the edit.** SYNC tab keeps the algorithmic alignment plus
-a fine-tune knob; the timeline below has the master audio waveform,
-the cam lanes, the beat grid, the snap controls, the program-strip
-mode picker (`BOTH` / `CUTS` / `FX`) and the FX rail.
-
-<p align="center">
-  <img src=".github/screenshots/04-editor-sync.png" alt="Editor – sync tab and timeline" width="900">
-</p>
-
-**4. Per-clip options.** Rotate or flip per clip so portrait phone
-takes line up with landscape ones; source vs. output resolution
-readout sits next to the clip.
-
-<p align="center">
-  <img src=".github/screenshots/05-editor-options.png" alt="Options panel" width="900">
-</p>
-
-**5. Overlays.** Audio-reactive visualizers (showwaves, showfreqs,
-others) plus text overlays rendered through a Canvas2D ASS-subset
-engine: same font, same positioning, same fades you'd write in a
-`.ass` file, but applied inline.
-
-<p align="center">
-  <img src=".github/screenshots/06-editor-overlays.png" alt="Overlays panel" width="900">
-</p>
-
-**6. Render.** Pick a destination preset (Web, Archive, Mobile,
-Custom), slide a single quality slider, hit *Render*. Live size
-estimate, live duration, live codec readout.
-
-<p align="center">
-  <img src=".github/screenshots/07-editor-export.png" alt="Export panel" width="900">
-</p>
-
-**7. Tap `?` for the cheat sheet.** Every keyboard shortcut in the
-app auto-registers itself in the overlay, so the list never lies to
-you.
-
-<p align="center">
-  <img src=".github/screenshots/08-editor-help.png" alt="Keyboard help overlay" width="900">
-</p>
+Render runs through a single pipeline now: the same WebGPU →
+WebGL2 → Canvas2D ladder that drives live preview drives the
+encoder. About realtime on a recent laptop with WebGPU.
 
 ## Privacy
 
 There's no backend. The host nginx terminates TLS, the container's
 nginx serves the static SPA bundle, and that's the entire server.
 Phone video, studio audio, and your edits all live in your
-browser's OPFS and IndexedDB. To wipe a job, click its trash icon.
-There's nothing to delete server-side.
+browser's OPFS and IndexedDB — or, where the browser supports it,
+in the *original files on your disk* via native file handles, with
+the editor only holding a reference. To wipe a job, click its
+trash icon. There's nothing to delete server-side.
 
 Nothing leaves the browser, and nothing third-party gets loaded
 into it. No analytics in the bundle, no cookies, no fonts pulled
@@ -209,14 +217,18 @@ from a CDN — `@fontsource-variable/*` bundles them locally.
 
 ## Browser support
 
-- **Chrome, Edge, Brave, Arc** on desktop and Android: fully native
-  via WebCodecs.
-- **Firefox, Safari** (incl. iOS Safari 17.4+): falls back to
-  ffmpeg.wasm for codecs that aren't native.
+- **Chrome, Edge, Brave, Arc** on desktop and Android: WebGPU
+  preview and export, WebCodecs decode/encode, native file handles
+  via the File System Access API. Fastest tier.
+- **Firefox, Safari** (incl. iOS Safari 17.4+): WebGL2 preview,
+  ffmpeg.wasm fallback for codecs that aren't native, OPFS copy
+  for files (you re-pick them on every open).
 
-It runs on mobile too. The on-screen TAKE buttons do what the keys
-do on desktop, so you can drop a couple of takes on your phone,
-sync, perform the cuts and render, all from there.
+Mobile is a real surface — the on-screen TAKE buttons do what the
+number keys do on desktop, the FX hardware panel re-flows so the
+LCD sits above the encoders and pads, and the ADSR knots have an
+enlarged tap-zone. Drop a couple of takes on your phone, sync,
+perform the cuts, render — all from there.
 
 The app needs cross-origin isolation (COOP/COEP) for
 SharedArrayBuffer and threaded codecs.
@@ -225,22 +237,65 @@ SharedArrayBuffer and threaded codecs.
 
 ```
 Browser (everything runs here)
-├── Sync algorithm        Rust → WASM (frontend/wasm/sync-core)
-├── Codec layer           WebCodecs primary, ffmpeg.wasm fallback
-├── Render
-│   ├── Quick (audio re-encode + video pass-through)
-│   └── Edit  (decoder → compositor → encoder)
-├── FX                    Canvas2D + WebGL2 backends, per-kind drawers
-├── Subtitle burn-in      Custom Canvas2D ASS-subset renderer
-├── Visualizers           showwaves, showfreqs, others
+├── Sync                Rust → WASM (frontend/wasm/sync-core)
+│   └── 5-tier pipeline envelope → chroma+onset → phase-correlation
+│                       → salient-anchor consensus → drift
+├── Codec layer         WebCodecs primary, ffmpeg.wasm fallback
+├── Media loading       streaming demuxers (4 MiB batches),
+│                       native file handles | OPFS fallback
+├── Triage              silence-driven chunking + per-chunk BPM
+├── Arrange             film-strip arrangement + Polaroid contact sheet
+├── Render              single pipeline, preview == export,
+│                       WebGPU → WebGL2 → Canvas2D
+├── FX                  seven-pad bank, three backends per kind,
+│                       event-based ADSR envelopes
+├── Stage               explicit output frame + per-clip viewport
+├── Subtitle burn-in    custom Canvas2D ASS-subset renderer
+├── Visualizers         showwaves, showfreqs, others
 ├── Storage
-│   ├── OPFS              Raw video, raw audio, render output
-│   └── IndexedDB         Job metadata, sync results, edit specs
-└── UI                    React + Zustand + Canvas timeline
+│   ├── OPFS            raw video/audio when no native handle
+│   └── IndexedDB       job metadata, sync results, edit specs,
+│                       per-chunk thumbnails + mel-specs
+└── UI                  React + Zustand + Canvas timeline
 
 Server (just hosting)
 └── nginx + static SPA bundle (Dockerfile + deploy/nginx.conf)
 ```
+
+## Under the hood
+
+For the curious — this section is where the jargon lives. The
+prose above stays clean.
+
+### Sync pipeline
+
+Five tiers, coarse to fine:
+
+1. **Envelope** — RMS-envelope cross-correlation at 10 Hz. Robust
+   against mic EQ, room reverb and codec artifacts. Provides a
+   coarse seed and a search corridor for later stages.
+2. **Chroma + onset** — pitch-class fusion plus spectral-flux,
+   running inside the envelope corridor.
+3. **Phase correlation** — GCC-PHAT in a 20 s window for
+   sample-precise refinement. Phase-only correlation excels at
+   same-source multi-mic alignment.
+4. **Salient-anchor consensus** — picks K spectrally-unique
+   8 s windows in the cleaner track, runs sample-level phase
+   correlation on each within ±2 s, bucket-votes the offset.
+   Replaces uniform chunking; immune to bar-shifted impostors.
+5. **Drift correction** — per-window refinement against
+   sample-rate slop.
+
+Each cam surfaces three sharpness numbers — peak-to-second-ratio,
+peak-to-noise, and the phase-coherence reading — plus a percentage
+confidence and a per-stage progress bar.
+
+### Tempo prior
+
+Beat detection multiplies the autocorrelation by a Rayleigh prior
+centered at 110 BPM (Klapuri / Davies-style perceptual-tempo
+weighting). Lo-fi tracks at 85 BPM no longer get pushed into the
+170 BPM octave by the off-beat hi-hats.
 
 ## Local development
 

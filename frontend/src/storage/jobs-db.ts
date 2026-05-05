@@ -493,10 +493,28 @@ const CHUNK_THUMBS_STORE = "chunk-thumbnails";
 const CHUNK_MELS_STORE = "chunk-mel-specs";
 
 let dbPromise: Promise<IDBPDatabase> | null = null;
+let dbInstance: IDBPDatabase | null = null;
+
+// Safety net for the IndexedDB upgrade-blocked deadlock: when an older TK-1
+// tab without `blocking`/`blocked` handlers holds the previous schema version
+// open, a fresh tab on a newer DB_VERSION can sit on `openDB(...)` forever
+// because the older connection never responds to `versionchange`. We give the
+// browser a few seconds to fire `blocked`, and if even that doesn't surface
+// (some older Chromium builds), the timeout below ensures we reject with an
+// actionable message rather than an infinite "Loading…".
+const OPEN_TIMEOUT_MS = 5000;
 
 function db(): Promise<IDBPDatabase> {
   if (!dbPromise) {
-    dbPromise = openDB(DB_NAME, DB_VERSION, {
+    let externalReject: ((err: Error) => void) | null = null;
+    let cancelled = false;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
+    const externalFailure = new Promise<never>((_, reject) => {
+      externalReject = reject;
+    });
+
+    const openPromise = openDB(DB_NAME, DB_VERSION, {
       async upgrade(database, oldVersion, _newVersion, tx) {
         if (!database.objectStoreNames.contains(STORE)) {
           const store = database.createObjectStore(STORE, { keyPath: "id" });
@@ -602,7 +620,62 @@ function db(): Promise<IDBPDatabase> {
           }
         }
       },
+      blocked(currentVersion, blockedVersion) {
+        cancelled = true;
+        dbPromise = null;
+        if (timeoutId !== null) clearTimeout(timeoutId);
+        externalReject?.(
+          new Error(
+            `TK-1 needs to upgrade its local store from v${currentVersion} to ` +
+              `v${blockedVersion ?? DB_VERSION}, but another TK-1 tab is still open ` +
+              `at the older version. Close every other TK-1 tab and reload.`,
+          ),
+        );
+      },
+      blocking() {
+        // Another tab wants to upgrade to a newer schema. Drop our connection
+        // so its `openDB(...)` can proceed; the next `db()` call here will
+        // re-open at the new version.
+        dbInstance?.close();
+        dbInstance = null;
+        dbPromise = null;
+      },
+      terminated() {
+        // Browser-side close (DB deleted, storage quota, etc.). Reset so the
+        // next call opens a fresh connection.
+        dbInstance = null;
+        dbPromise = null;
+      },
     });
+
+    timeoutId = setTimeout(() => {
+      cancelled = true;
+      dbPromise = null;
+      externalReject?.(
+        new Error(
+          `TK-1 couldn't open its local store within ${OPEN_TIMEOUT_MS}ms. ` +
+            `If you have other TK-1 tabs open, close them and reload.`,
+        ),
+      );
+    }, OPEN_TIMEOUT_MS);
+
+    openPromise.then(
+      (d) => {
+        if (timeoutId !== null) clearTimeout(timeoutId);
+        if (cancelled) {
+          // Race already lost — close the orphan so future opens land cleanly.
+          d.close();
+        } else {
+          dbInstance = d;
+        }
+      },
+      () => {
+        if (timeoutId !== null) clearTimeout(timeoutId);
+        dbPromise = null;
+      },
+    );
+
+    dbPromise = Promise.race([openPromise, externalFailure]);
   }
   return dbPromise;
 }
