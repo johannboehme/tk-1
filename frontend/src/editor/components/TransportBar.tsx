@@ -1,5 +1,5 @@
 // Transport row with chunky play/pause + frame steppers + time readouts. Keyboard-aware.
-import { useEffect, useMemo } from "react";
+import { useEffect } from "react";
 import { useEditorStore } from "../store";
 import { effectiveAudioStartS } from "../selectors/timing";
 import {
@@ -106,38 +106,22 @@ export function TransportBar() {
   // user-corrected (effective) start.
   const audioStartS = meta?.audioStartS ?? 0;
   const arrSegments = useEditorStore((s) => s.arrangementSegments);
-  const isArrMode = arrSegments.length > 0;
   const effectiveStart = effectiveAudioStartS(meta, arrSegments);
-  // Skip-to-in / skip-to-out anchors. In direct-mode they follow the
-  // master-time trim (export region). In arrangement-mode the song's
-  // boundaries are the first and last segments — not the master trim
-  // (which ranges across the whole arrangement and may sit in a gap).
-  const seekStartS = useMemo(() => {
-    if (!isArrMode) return trim.in;
-    let lo = Infinity;
-    for (const s of arrSegments) if (s.in < lo) lo = s.in;
-    return Number.isFinite(lo) ? lo : 0;
-  }, [isArrMode, arrSegments, trim.in]);
-  const seekEndS = useMemo(() => {
-    if (!isArrMode) return trim.out;
-    // Step a hair before the very end so the audio walker keeps the
-    // last sample audible — landing exactly on segment[N-1].out trips
-    // the "past-last-segment → pause" branch instantly.
-    let hi = -Infinity;
-    for (const s of arrSegments) if (s.out > hi) hi = s.out;
-    return Number.isFinite(hi) ? hi - 1 / Math.max(1, fps) : 0;
-  }, [isArrMode, arrSegments, trim.out, fps]);
+  // Skip-to-in / skip-to-out land on the master-time trim window — same
+  // contract regardless of whether the job has one synthetic segment
+  // (single-take) or many (long-form). seek() takes master-time so this
+  // passes through unchanged.
+  const seekStartS = trim.in;
+  // Step a hair before the very end so the audio walker keeps the last
+  // sample audible — landing exactly on trim.out trips the "past-last-
+  // segment → pause" branch instantly.
+  const seekEndS = Math.max(trim.in, trim.out - 1 / Math.max(1, fps));
 
   function step(deltaSec: number) {
     const t = useEditorStore.getState().playback.currentTime;
-    if (!isArrMode) {
-      seek(t + deltaSec);
-      return;
-    }
-    // Arrangement-mode: stepping has to honour the discontinuity at
-    // chunk boundaries. Translate the desired step into arr-time then
-    // back to master so a "next frame" near a splice lands on the next
-    // segment's first frame instead of the master-time gap.
+    // Stepping always honours segment boundaries — `arrSegments` is
+    // populated for every job, so the round-trip through arr-time is
+    // Identity for single-take and snaps to chunk-edges for long-form.
     const arrNow = masterToArr(t, arrSegments);
     const total = totalArrDuration(arrSegments);
     const arrNext = Math.max(0, Math.min(total, arrNow + deltaSec));
@@ -162,10 +146,10 @@ export function TransportBar() {
     });
     switch (target.kind) {
       case "loop": {
-        // Loop lives in arr-time on the composed timeline: in direct-mode
-        // arr == master so this is identity; in arr-mode it converts so
-        // the user's I/O hits the same point on the visible tape they see.
-        const t_arr = isArrMode ? masterToArr(t, arrSegments) : t;
+        // Loop lives in arr-time on the composed timeline; project the
+        // playhead's master-time through `arrSegments` (Identity for
+        // single-take's whole-master segment).
+        const t_arr = masterToArr(t, arrSegments);
         const newStart = t_arr;
         const newEnd = Math.max(loop!.end, newStart + 1 / fps);
         setLoop({ start: newStart, end: newEnd });
@@ -198,7 +182,7 @@ export function TransportBar() {
     });
     switch (target.kind) {
       case "loop": {
-        const t_arr = isArrMode ? masterToArr(t, arrSegments) : t;
+        const t_arr = masterToArr(t, arrSegments);
         const newEnd = t_arr;
         const newStart = Math.min(loop!.start, newEnd - 1 / fps);
         setLoop({ start: newStart, end: newEnd });
@@ -225,16 +209,15 @@ export function TransportBar() {
       setLoop(null);
       return;
     }
-    // Anchor on the COMPOSED timeline (the user's tape): in direct-mode
-    // that's master-time, in arr-mode it's arr-time. Either way clamp
-    // to the playable bounds so a fresh-open playhead at t=0 doesn't
-    // propose a region outside the active range — `setLoop` would clamp
-    // it to null and the toggle would appear to do nothing.
+    // Anchor on the COMPOSED timeline (the user's tape). Loop bounds
+    // are arr-time; clamp to the playable arr-window so a fresh-open
+    // playhead at t=0 doesn't propose a region outside the active
+    // range — `setLoop` would clamp it to null and the toggle would
+    // appear to do nothing.
     const t = useEditorStore.getState().playback.currentTime;
-    const t_arr = isArrMode ? masterToArr(t, arrSegments) : t;
-    const lo = isArrMode ? 0 : trim.in;
-    const hi = isArrMode ? totalArrDuration(arrSegments) : trim.out;
-    const start = Math.max(lo, Math.min(hi - 1 / fps, t_arr));
+    const t_arr = masterToArr(t, arrSegments);
+    const hi = totalArrDuration(arrSegments);
+    const start = Math.max(0, Math.min(hi - 1 / fps, t_arr));
     const end = Math.min(hi, start + 2);
     setLoop({ start, end });
   }
@@ -258,18 +241,11 @@ export function TransportBar() {
         case "ArrowLeft":
           e.preventDefault();
           if (e.altKey) shiftLoop(-1);
-          // In arrangement-mode the bar grid is per-chunk (each segment
-          // has its own phase), so a global beat-snap step would land
-          // off-grid often. Keep it as a single-frame step in arr-time
-          // — the song reads as a continuous tape and that's what the
-          // user wants the arrow to skim through.
-          else if (isArrMode) step(-1 / fps);
           else stepByActiveSnap(-1);
           break;
         case "ArrowRight":
           e.preventDefault();
           if (e.altKey) shiftLoop(1);
-          else if (isArrMode) step(1 / fps);
           else stepByActiveSnap(1);
           break;
         case "i":
@@ -307,7 +283,6 @@ export function TransportBar() {
     trim.out,
     stepByActiveSnap,
     shiftLoop,
-    isArrMode,
     arrSegments,
   ]);
 
