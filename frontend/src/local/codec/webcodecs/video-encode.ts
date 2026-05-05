@@ -39,6 +39,14 @@ export interface VideoEncodeOptions {
   /** Override the auto-derived codec string (escape hatch for tests). */
   codec?: string;
   bitrateBps?: number;
+  /** When provided, encoded chunks are pushed straight through this
+   *  callback as they arrive — the encoder does NOT accumulate them in
+   *  `this.chunks`. Use this to stream chunks directly into a muxer
+   *  (or any other sink) so RAM stays constant regardless of render
+   *  duration. The optional `description` arg is the same value the
+   *  encoder will eventually return from `finish()`; it's set on the
+   *  first chunk and stable thereafter. */
+  onChunk?: (chunk: EncodedVideoChunkRecord, description?: Uint8Array) => void;
 }
 
 /**
@@ -80,9 +88,11 @@ export class StreamingVideoEncoder {
   private codecString: string;
   private muxerCodec: "avc" | "hevc";
   private opts: VideoEncodeOptions;
+  private onChunk?: (chunk: EncodedVideoChunkRecord, description?: Uint8Array) => void;
 
   constructor(opts: VideoEncodeOptions) {
     this.opts = opts;
+    this.onChunk = opts.onChunk;
     const videoCodec: VideoEncodeCodec = opts.videoCodec ?? "h264";
     this.muxerCodec = videoCodec === "h265" ? "hevc" : "avc";
     this.codecString =
@@ -93,14 +103,6 @@ export class StreamingVideoEncoder {
 
     this.encoder = new VideoEncoder({
       output: (chunk, metadata) => {
-        const data = new Uint8Array(chunk.byteLength);
-        chunk.copyTo(data);
-        this.chunks.push({
-          type: chunk.type as "key" | "delta",
-          timestampUs: chunk.timestamp,
-          durationUs: chunk.duration ?? 0,
-          data,
-        });
         if (this.description === undefined && metadata?.decoderConfig?.description) {
           const desc = metadata.decoderConfig.description as
             | ArrayBuffer
@@ -115,6 +117,22 @@ export class StreamingVideoEncoder {
               view.byteLength,
             );
           }
+        }
+        const data = new Uint8Array(chunk.byteLength);
+        chunk.copyTo(data);
+        const record: EncodedVideoChunkRecord = {
+          type: chunk.type as "key" | "delta",
+          timestampUs: chunk.timestamp,
+          durationUs: chunk.duration ?? 0,
+          data,
+        };
+        if (this.onChunk) {
+          // Streaming mode: push straight through, do not retain.
+          // RAM stays constant in render duration.
+          this.onChunk(record, this.description);
+        } else {
+          // Batch mode: accumulate for later finish() consumers.
+          this.chunks.push(record);
         }
       },
       error: (e) => {
@@ -157,6 +175,19 @@ export class StreamingVideoEncoder {
    * the render pipeline to apply backpressure and avoid runaway memory. */
   get encodeQueueSize(): number {
     return this.encoder.encodeQueueSize;
+  }
+
+  /** Codec string used by the encoder (e.g. "avc1.640028"). Available
+   *  immediately after construction — useful for callers that need to
+   *  configure a downstream consumer (e.g. a muxer's video meta) before
+   *  any frame is encoded. */
+  get codec(): string {
+    return this.codecString;
+  }
+
+  /** Container codec key consumed by mp4-muxer ("avc" | "hevc"). */
+  get muxerCodecKey(): "avc" | "hevc" {
+    return this.muxerCodec;
   }
 
   async finish(): Promise<VideoEncodeResult> {

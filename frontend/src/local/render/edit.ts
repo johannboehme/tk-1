@@ -740,12 +740,76 @@ export async function editRenderMulti(
   );
   await compositor.ensureSubtitleEngine();
 
+  // Construct the muxer EARLY so the video encoder can stream chunks
+  // straight in instead of buffering them in RAM until finish(). For a
+  // 30-min 4K render the previous batch path accumulated multi-GB of
+  // encoded bytes — streaming keeps RAM constant in render duration.
+  const target: MuxTarget = input.output
+    ? new FileSystemWritableFileStreamTarget(input.output)
+    : new ArrayBufferTarget();
+  const muxerVideoCodecKey: "avc" | "hevc" = videoCodec === "h265" ? "hevc" : "avc";
+  const muxer = new Muxer({
+    target,
+    video: {
+      codec: muxerVideoCodecKey,
+      width: outputWidth,
+      height: outputHeight,
+      frameRate: fps,
+    },
+    audio: {
+      codec: encodedAudio.muxerCodec,
+      numberOfChannels: encodedAudio.numberOfChannels,
+      sampleRate: encodedAudio.sampleRate,
+    },
+    fastStart: input.output ? false : "in-memory",
+    firstTimestampBehavior: "offset",
+  });
+
+  // Audio is fully encoded ahead of video — push all of its chunks now.
+  // (mp4-muxer interleaves on timestamps, so order between audio and
+  // video pushes is irrelevant.)
+  const audioMeta = {
+    decoderConfig: {
+      codec: encodedAudio.codec,
+      sampleRate: encodedAudio.sampleRate,
+      numberOfChannels: encodedAudio.numberOfChannels,
+      description: encodedAudio.description,
+    },
+  } as unknown as Parameters<Muxer<MuxTarget>["addAudioChunkRaw"]>[4];
+  for (const c of encodedAudio.chunks) {
+    muxer.addAudioChunkRaw(c.data, c.type, c.timestampUs, c.durationUs, audioMeta);
+  }
+
+  // Streaming video encoder: each emitted chunk goes straight into the
+  // muxer. The encoder no longer accumulates anything in `chunks`.
+  let videoMeta: Parameters<Muxer<MuxTarget>["addVideoChunkRaw"]>[4] | undefined;
+  let videoChunksWritten = 0;
   const encoder = new StreamingVideoEncoder({
     width: outputWidth,
     height: outputHeight,
     frameRate: fps,
     videoCodec,
     bitrateBps: input.videoBitrateBps ?? 4_000_000,
+    onChunk: (chunk, description) => {
+      if (!videoMeta && description) {
+        videoMeta = {
+          decoderConfig: {
+            codec: encoder.codec,
+            codedWidth: outputWidth,
+            codedHeight: outputHeight,
+            description,
+          },
+        } as unknown as Parameters<Muxer<MuxTarget>["addVideoChunkRaw"]>[4];
+      }
+      muxer.addVideoChunkRaw(
+        chunk.data,
+        chunk.type,
+        chunk.timestampUs,
+        chunk.durationUs,
+        videoMeta,
+      );
+      videoChunksWritten++;
+    },
   });
 
   // Output segments (trim regions on the master timeline).
@@ -1020,6 +1084,10 @@ export async function editRenderMulti(
       framesDone: framesEmitted,
       framesTotal: totalFrames,
     });
+    // encoder.finish() flushes pending frames; the streaming `onChunk`
+    // callback has already pushed every chunk into the muxer by then.
+    // The returned value is mostly a metadata bundle; chunks is empty
+    // in streaming mode.
     const encodedVideo = await encoder.finish();
     if (!encodedVideo.description) {
       throw new Error("Video encoder produced no description");
@@ -1027,76 +1095,8 @@ export async function editRenderMulti(
 
     input.onProgress?.({
       stage: "muxing",
-      framesDone: framesEmitted,
-      framesTotal: totalFrames,
-    });
-
-    const target: MuxTarget = input.output
-      ? new FileSystemWritableFileStreamTarget(input.output)
-      : new ArrayBufferTarget();
-
-    const muxer = new Muxer({
-      target,
-      video: {
-        codec: encodedVideo.muxerCodec,
-        width: outputWidth,
-        height: outputHeight,
-        frameRate: fps,
-      },
-      audio: {
-        codec: encodedAudio.muxerCodec,
-        numberOfChannels: encodedAudio.numberOfChannels,
-        sampleRate: encodedAudio.sampleRate,
-      },
-      fastStart: input.output ? false : "in-memory",
-      firstTimestampBehavior: "offset",
-    });
-
-    const videoMeta = {
-      decoderConfig: {
-        codec: encodedVideo.codec,
-        codedWidth: encodedVideo.width,
-        codedHeight: encodedVideo.height,
-        description: encodedVideo.description,
-      },
-    } as unknown as Parameters<Muxer<MuxTarget>["addVideoChunkRaw"]>[4];
-    // Push chunks in batches so the progress event fires periodically
-    // while the muxer streams to FileSystemWritableFileStream — without
-    // this, longer renders sit silent for several seconds while the file
-    // is written.
-    const totalChunks = encodedVideo.chunks.length + encodedAudio.chunks.length;
-    let chunksWritten = 0;
-    const reportMuxProgress = () => {
-      input.onProgress?.({
-        stage: "muxing",
-        framesDone: chunksWritten,
-        framesTotal: totalChunks,
-      });
-    };
-    for (const c of encodedVideo.chunks) {
-      muxer.addVideoChunkRaw(c.data, c.type, c.timestampUs, c.durationUs, videoMeta);
-      chunksWritten++;
-      if ((chunksWritten & 0x3f) === 0) reportMuxProgress();
-    }
-
-    const audioMeta = {
-      decoderConfig: {
-        codec: encodedAudio.codec,
-        sampleRate: encodedAudio.sampleRate,
-        numberOfChannels: encodedAudio.numberOfChannels,
-        description: encodedAudio.description,
-      },
-    } as unknown as Parameters<Muxer<MuxTarget>["addAudioChunkRaw"]>[4];
-    for (const c of encodedAudio.chunks) {
-      muxer.addAudioChunkRaw(c.data, c.type, c.timestampUs, c.durationUs, audioMeta);
-      chunksWritten++;
-      if ((chunksWritten & 0x3f) === 0) reportMuxProgress();
-    }
-
-    input.onProgress?.({
-      stage: "finalizing",
-      framesDone: chunksWritten,
-      framesTotal: totalChunks,
+      framesDone: videoChunksWritten,
+      framesTotal: framesEmitted,
     });
     muxer.finalize();
 
