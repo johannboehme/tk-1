@@ -31,14 +31,12 @@ devices that pick one job and design every surface around being
 *operated*, not configured. TK-1 wants to feel the same way: a
 sampler for music videos.
 
-The loop now extends past the cuts. Picking which takes to keep
-is an instrument — silence detection drops chunk boundaries, you
-tap KEEP / DROP as the timeline scrubs under the playhead.
-Building the arrangement is an instrument — drag Polaroids of the
-chunks onto a 35 mm strip in the order you want them, with the
-PlayerCockpit reading out BPM, density and a 4-band audio meter as
-you scrub. *Then* hit the editor and perform your cam-switches
-and FX live as the song plays.
+The loop extends past the cuts. Silence detection finds the chunk
+boundaries in your recording; you scrub the timeline and tap KEEP
+or DROP. Then drag Polaroids of the keepers onto a 35 mm strip in
+the order you want, while a small LCD reads out BPM, density and a
+4-band audio meter under your hand. *Then* hit the editor and
+perform your cam-switches and FX live as the song plays.
 
 Most "shortform video tools" are timeline editors with a phone
 preset. Most "pro NLEs" put a six-pane workspace, a project file,
@@ -54,12 +52,10 @@ The phone audio gets matched against the studio mix even when the
 room is loud — five passes from coarse to fine, ending at
 sample-perfect alignment for same-source recordings (which is what
 every camera you brought is). Each cam ends up with an algorithmic
-offset and three sharpness numbers — bad takes are flagged, the
-rest are usable on the first try. Progress is honest now: a smooth
-bar through every stage instead of the old freeze-at-40-percent.
+offset and three sharpness numbers; bad takes are flagged, the
+rest land where they should.
 
-Written in Rust, compiled to WASM, runs inside the page. Curious
-about the five passes? See [under the hood](#under-the-hood).
+Written in Rust, compiled to WASM, runs inside the page.
 
 ### Triage — find the songs in the jam
 
@@ -67,15 +63,14 @@ If you came in through the SESSION door, the editor has a 90-minute
 recording in front of it and no idea where the songs sit. Triage
 runs silence detection across the whole thing, drops chunk
 boundaries wherever it finds them, and hands you a rack: cam
-preview, inspector with a brass-plate BPM and signature plate,
-scrolling list of the chunks it found, KEPT counter on the right
-that updates live as you accept or drop. The DeckStrip across the
-middle sets the silence threshold and the minimum-pause length —
-one slider each, no dialog. Scrub the timeline, tap KEEP or DROP
-chunk by chunk.
+preview, inspector with the song's BPM and time signature, scrolling
+list of the chunks it found, KEPT counter on the right that updates
+live as you accept or drop. The DeckStrip across the middle sets the
+silence threshold and the minimum-pause length — one slider each,
+no dialog. Scrub the timeline, tap KEEP or DROP chunk by chunk.
 
 <p align="center">
-  <img src=".github/screenshots/triage-rack.png" alt="Triage rack: timeline with chunk bars, ChunksList, brass-plate BPM 180, threshold and min-pause sliders" width="900">
+  <img src=".github/screenshots/triage-rack.png" alt="Triage rack: timeline with chunk bars, scrolling chunks list, BPM and signature inspector, threshold and min-pause sliders" width="900">
 </p>
 
 ### Arrange — build the cut on a film strip
@@ -98,8 +93,7 @@ MiniMap appears when the strip overflows the visible row.
 Beat detection runs on the master audio and gives you a real beat
 grid: 4/4 by default, configurable, with a bar-1 pickup so the
 grid lines up with the *song* and not with sample 0. Quantize
-down to sixteenth notes, up to whole bars. And the beat picker
-doesn't double-time slow songs anymore.
+down to sixteenth notes, up to whole bars.
 
 When you drag a clip on the timeline, snap goes to the grid or to
 the audio-match positions where the take itself plays a downbeat.
@@ -126,23 +120,22 @@ above it, and number keys.
 ### Punch-in FX, on a pad bank
 
 A separate FX rail above the cam lanes, with seven pads: **VIGN,
-WEAR, ECHO, RGB, TAPE, ZOOM, UV** — each a real shipping renderer
-with WebGPU, WebGL2 and Canvas2D backends, parity-checked. Hold a
-pad while the song plays to paint that effect under your finger;
-release to drop the tail. FX stack — they don't replace each other.
+WEAR, ECHO, RGB, TAPE, ZOOM, UV**. Each kind ships with WebGPU,
+WebGL2 and Canvas2D backends, parity-checked. Hold a pad while the
+song plays to paint that effect under your finger; release to drop
+the tail. FX stack — they don't replace each other.
 
-Below the rail sits a hardware-style panel: a CRT-green LCD, two
-small `P` / `E` plastic buttons on its left edge (parameters vs.
-envelope), a TE-orange DEPTH encoder and a TE-cobalt EDGE encoder,
-and the seven pads again. The encoders are the kind's two
-parameters and are live — turning a knob during playback or
-preview reflects in the rendered frame immediately, no re-trigger.
+Below the rail sits a small panel: CRT-green LCD, two encoders for
+the kind's two parameters (DEPTH and EDGE for VIGN; the labels
+change per kind), the seven pads again, and a `P` / `E` toggle on
+the LCD edge that flips between parameter readout and envelope
+editor. The encoders are live — turn a knob during playback or
+preview and the rendered frame reflects it immediately.
 
-Each FX gets an ADSR envelope on top of its parameters. Hit `E`,
-the LCD switches to a phosphor trapezoid; drag the four green
-knots to shape attack, decay, sustain and release. Releases fade
-from wherever the envelope was when you let go, even mid-attack —
-feels like a real synth voice, not a fader.
+Each FX gets an ADSR envelope on top of its parameters. Hit `E`
+and the LCD switches to the envelope curve; drag the four knots to
+shape attack, decay, sustain and release. Releases fade from
+wherever the envelope was when you let go, even mid-attack.
 
 <p align="center">
   <img src=".github/screenshots/fx-hardware-panel.png" alt="FX hardware panel: CRT-green LCD with ADSR envelope and phosphor knots, P/E mode buttons, DEPTH and EDGE encoders, seven colored pads VIGN WEAR ECHO RGB TAPE ZOOM UV" width="900">
@@ -182,8 +175,8 @@ quality), **CUSTOM** (any combination). Each clip then carries
 its own viewport over the Stage: drag in the preview to pan,
 wheel to zoom, double-click to reset, hold Alt for 5× precision.
 Four orange L-corner marks anchor the active clip's bounds, even
-when they overflow the Stage. Preview and export use the same
-math — what you see is what renders.
+when they overflow the Stage. Preview and export share the same
+placement math.
 
 Static images sit alongside videos on the timeline with the same
 framing controls and the same routing.
@@ -197,19 +190,17 @@ heap. If your browser supports it, the editor remembers the *file
 handle* — re-open a job and TK-1 reads the originals from disk,
 no copy. On Safari and Firefox we keep an OPFS copy.
 
-Render runs through a single pipeline now: the same WebGPU →
+Render runs through a single pipeline: the same WebGPU →
 WebGL2 → Canvas2D ladder that drives live preview drives the
 encoder. About realtime on a recent laptop with WebGPU.
 
 ## Privacy
 
-There's no backend. The host nginx terminates TLS, the container's
-nginx serves the static SPA bundle, and that's the entire server.
-Phone video, studio audio, and your edits all live in your
-browser's OPFS and IndexedDB — or, where the browser supports it,
-in the *original files on your disk* via native file handles, with
-the editor only holding a reference. To wipe a job, click its
-trash icon. There's nothing to delete server-side.
+There's no backend. The server hands out a static SPA bundle and
+nothing else. Phone video, studio audio, and your edits live in
+your browser's OPFS and IndexedDB — or, where the browser supports
+it, in the original files on your disk, with the editor only
+holding a reference. Click a job's trash icon to wipe it.
 
 Nothing leaves the browser, and nothing third-party gets loaded
 into it. No analytics in the bundle, no cookies, no fonts pulled
@@ -224,11 +215,10 @@ from a CDN — `@fontsource-variable/*` bundles them locally.
   ffmpeg.wasm fallback for codecs that aren't native, OPFS copy
   for files (you re-pick them on every open).
 
-Mobile is a real surface — the on-screen TAKE buttons do what the
-number keys do on desktop, the FX hardware panel re-flows so the
-LCD sits above the encoders and pads, and the ADSR knots have an
-enlarged tap-zone. Drop a couple of takes on your phone, sync,
-perform the cuts, render — all from there.
+Mobile works end-to-end. On-screen TAKE buttons do what the number
+keys do on desktop, the FX panel re-flows so the LCD sits above the
+encoders and pads, and the ADSR knots get an enlarged tap-zone for
+fingers. Drop a couple of takes on your phone, sync, cut, render.
 
 The app needs cross-origin isolation (COOP/COEP) for
 SharedArrayBuffer and threaded codecs.
@@ -259,13 +249,10 @@ Browser (everything runs here)
 └── UI                  React + Zustand + Canvas timeline
 
 Server (just hosting)
-└── nginx + static SPA bundle (Dockerfile + deploy/nginx.conf)
+└── static SPA bundle, no backend
 ```
 
 ## Under the hood
-
-For the curious — this section is where the jargon lives. The
-prose above stays clean.
 
 ### Sync pipeline
 
@@ -294,8 +281,8 @@ confidence and a per-stage progress bar.
 
 Beat detection multiplies the autocorrelation by a Rayleigh prior
 centered at 110 BPM (Klapuri / Davies-style perceptual-tempo
-weighting). Lo-fi tracks at 85 BPM no longer get pushed into the
-170 BPM octave by the off-beat hi-hats.
+weighting), so lo-fi tracks with strong off-beat hi-hats stay on
+their true tempo instead of locking onto the doubled octave.
 
 ## Local development
 
@@ -336,7 +323,7 @@ npm run wasm:test         # cargo test on the Rust sync-core
 
 ## Self-hosting
 
-Imprint config, nginx setup and DE compliance notes live in
+Imprint config, server setup and DE compliance notes live in
 [DEPLOY.md](DEPLOY.md).
 
 ## License
