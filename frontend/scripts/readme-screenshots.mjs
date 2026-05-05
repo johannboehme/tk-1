@@ -8,6 +8,8 @@
 //   node scripts/readme-screenshots.mjs        # writes to ../.github/screenshots/
 import { chromium } from "playwright";
 import { mkdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { execSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -20,12 +22,68 @@ await mkdir(outDir, { recursive: true });
 // solid-colour synthetic clips the test suite uses. See ATTRIBUTION.md
 // in the fixture dir for sources and licenses.
 const fixtures = resolve(here, "..", "public", "__readme_fixtures__");
-const audioPath = join(fixtures, "studio.mp3");
-const videoPaths = [
+const sourceAudio = join(fixtures, "studio.mp3");
+const sourceVideos = [
   join(fixtures, "take-1.mp4"),
   join(fixtures, "take-2.mp4"),
   join(fixtures, "take-3.mp4"),
 ];
+
+// The 30 s source audio produces a single chunk in Triage (no internal
+// silences), which makes the Triage rack and Arrange contact sheet look
+// half-baked in the README. Stitch three 10 s slices together with 5 s
+// of true silence between them — three musical chunks, two clean silence
+// gaps, total ~40 s. Match the videos so the editor's timeline doesn't
+// trail into 30 s of empty lane. Both are derived outputs (gitignored)
+// regenerated only when missing.
+const audioPath = join(fixtures, "long-studio.mp3");
+const videoPaths = [
+  join(fixtures, "long-take-1.mp4"),
+  join(fixtures, "long-take-2.mp4"),
+  join(fixtures, "long-take-3.mp4"),
+];
+
+if (!existsSync(audioPath)) {
+  console.log("generating long-studio.mp3 (3 chunks, 2 silence gaps)…");
+  execSync(
+    [
+      "ffmpeg -y -loglevel error",
+      `-i "${sourceAudio}" -i "${sourceAudio}" -i "${sourceAudio}"`,
+      `-filter_complex "[0:a]atrim=duration=10,apad=pad_dur=5[a0];[1:a]atrim=duration=10,apad=pad_dur=5[a1];[2:a]atrim=duration=10[a2];[a0][a1][a2]concat=n=3:v=0:a=1[out]"`,
+      `-map "[out]" -b:a 128k "${audioPath}"`,
+    ].join(" "),
+    { stdio: "inherit" },
+  );
+}
+
+for (let i = 0; i < sourceVideos.length; i++) {
+  if (!existsSync(videoPaths[i])) {
+    console.log(`generating ${videoPaths[i].split("/").pop()}…`);
+    // Trim + pad with black/silence + concat. Audio lives alongside video so
+    // sync has something to correlate against the master — `-an` here would
+    // wedge sync forever (no source audio to align to).
+    execSync(
+      [
+        "ffmpeg -y -loglevel error",
+        `-i "${sourceVideos[i]}"`,
+        `-f lavfi -i "color=c=black:s=1280x720:r=30:d=5"`,
+        `-f lavfi -i "anullsrc=cl=stereo:r=44100:d=5"`,
+        `-filter_complex "`,
+        `[0:v]trim=duration=10,setpts=PTS-STARTPTS,format=yuv420p[v0];`,
+        `[0:a]atrim=duration=10,asetpts=PTS-STARTPTS[a0];`,
+        `[1:v]format=yuv420p[bk];`,
+        `[2:a]asetpts=PTS-STARTPTS[sil];`,
+        `[v0][a0][bk][sil][v0][a0][bk][sil][v0][a0]concat=n=5:v=1:a=1[outv][outa]`,
+        `"`,
+        `-map "[outv]" -map "[outa]"`,
+        `-c:v libx264 -crf 28 -preset veryfast`,
+        `-c:a aac -b:a 96k`,
+        `"${videoPaths[i]}"`,
+      ].join(" "),
+      { stdio: "inherit" },
+    );
+  }
+}
 
 const base = process.env.VAS_BASE_URL ?? "http://localhost:5173";
 
@@ -117,7 +175,7 @@ await page.waitForURL(/\/job\/[^/]+$/, { timeout: 30_000 });
 // directly; DIRECT mode shows "Quick render" + "Open editor". Match either.
 await page.waitForSelector(
   "text=/quick render|^triage$|^arrange$|^editor$|open editor/i",
-  { timeout: 120_000 },
+  { timeout: 300_000 },
 );
 const jobUrl = page.url();
 const jobId = jobUrl.match(/\/job\/([^/?#]+)/)[1];
@@ -129,22 +187,39 @@ await gotoShot("02-jobs.png", "/jobs");
 // Job detail (sync results — confidence + sharpness numbers + per-cam offsets)
 await gotoShot("03-job-detail.png", `/job/${jobId}`);
 
+// Helper: trigger playback for a moment so cam previews / video previews
+// have a decoded frame painted. Empty black previews look like a half-loaded
+// app; one play-then-pause cycle gives every panel real content.
+async function paintPreview(holdMs = 1_500) {
+  await page.locator("body").click({ position: { x: 50, y: 50 } });
+  await page.keyboard.press("Space");
+  await page.waitForTimeout(holdMs);
+  await page.keyboard.press("Space");
+  await page.waitForTimeout(400);
+}
+
 // ─── Triage rack ───────────────────────────────────────────────────────────
-// Chunk detection runs on Triage mount; wait for the ChunksList to populate
-// before screenshotting the rack.
+// Chunk detection runs on Triage mount; wait for the ChunksList to populate,
+// click into the first chunk so the inspector populates, then play briefly
+// so the cam preview shows a frame instead of a black box.
 console.log("opening triage…");
 await page.goto(`${base}/job/${jobId}/triage`, { waitUntil: "networkidle" });
 await page.waitForSelector("text=/CHUNKS/i", { timeout: 30_000 });
-await page.waitForTimeout(2_000); // let detection settle + waveform render
+await page.waitForTimeout(2_500); // let detection settle + waveform render
+await page.locator("text=/^#01/").first().click().catch(() => {});
+await page.waitForTimeout(400);
+await paintPreview(1_500);
 await shot("triage-rack.png");
 
 // ─── Arrange film strip ────────────────────────────────────────────────────
 // First-mount of Arrange seeds arrangement = triage.kept, which gives the
-// FilmStrip + ContactSheet content to render.
+// FilmStrip + ContactSheet content to render. Play briefly so the
+// PlayerCockpit LCD shows a real audio readout instead of "AWAITING SIGNAL".
 console.log("opening arrange…");
 await page.goto(`${base}/job/${jobId}/arrange`, { waitUntil: "networkidle" });
 await page.waitForSelector("text=/CHUNKS/i", { timeout: 15_000 });
 await page.waitForTimeout(2_000); // let Polaroids develop
+await paintPreview(1_500);
 await shot("arrange-filmstrip.png");
 
 // ─── Editor — SYNC tab (USER OVERRIDE knob, NUDGE MS row, MATCH lane) ─────
@@ -152,7 +227,8 @@ console.log("opening editor…");
 await page.goto(`${base}/job/${jobId}/edit`, { waitUntil: "networkidle" });
 await page.waitForTimeout(2_500);
 await page.getByRole("button", { name: /^cam 1$/i }).first().click().catch(() => {});
-await shot("editor-sync.png", { wait: 600 });
+await paintPreview(1_500);
+await shot("editor-sync.png", { wait: 400 });
 // Keep legacy filename for backwards-compat with any external links.
 await shot("04-editor-sync.png", { wait: 0 });
 
