@@ -106,7 +106,7 @@ export function TransportBar() {
   // user-corrected (effective) start.
   const audioStartS = meta?.audioStartS ?? 0;
   const arrSegments = useEditorStore((s) => s.arrangementSegments);
-  const effectiveStart = effectiveAudioStartS(meta, arrSegments);
+  const effectiveStart = effectiveAudioStartS(meta);
   // Skip-to-in / skip-to-out land on the master-time trim window — same
   // contract regardless of whether the job has one synthetic segment
   // (single-take) or many (long-form). seek() takes master-time so this

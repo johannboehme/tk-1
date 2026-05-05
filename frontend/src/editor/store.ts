@@ -1335,7 +1335,7 @@ export const useEditorStore = create<EditorState>()(
       const probe = t + direction * step * 0.5;
       const candidate = snapTime(probe, mode, {
         bpm,
-        beatPhase: effectiveBeatPhaseS(s.jobMeta, s.arrangementSegments),
+        beatPhase: effectiveBeatPhaseS(s.jobMeta),
         beatsPerBar,
         barOffsetBeats: effectiveBarOffsetBeats(s.jobMeta),
       });
@@ -2024,7 +2024,7 @@ export const useEditorStore = create<EditorState>()(
         s.ui.snapMode,
         {
           bpm: s.jobMeta?.bpm?.value ?? null,
-          beatPhase: effectiveBeatPhaseS(s.jobMeta, s.arrangementSegments),
+          beatPhase: effectiveBeatPhaseS(s.jobMeta),
           beatsPerBar: effectiveBeatsPerBar(s.jobMeta),
           barOffsetBeats: effectiveBarOffsetBeats(s.jobMeta),
         },
@@ -2195,7 +2195,7 @@ export const useEditorStore = create<EditorState>()(
       if (mode === "off" || mode === "match") return t;
       return snapTime(t, mode, {
         bpm: s.jobMeta?.bpm?.value ?? null,
-        beatPhase: effectiveBeatPhaseS(s.jobMeta, s.arrangementSegments),
+        beatPhase: effectiveBeatPhaseS(s.jobMeta),
         beatsPerBar: effectiveBeatsPerBar(s.jobMeta),
         barOffsetBeats: effectiveBarOffsetBeats(s.jobMeta),
       });
