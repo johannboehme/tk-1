@@ -78,28 +78,41 @@ export default function Triage() {
     if (!state.jobId) return;
     const fresh = await jobsDb.getJob(state.jobId);
     const existing = fresh?.arrangement ?? [];
-    const inArrangement = new Set(existing.map((a) => a.chunkId));
-    // Seed only chunks that are user-kept AND pass the active
-    // min-bars filter.
     const jobBpmValue = state.jobBpm?.value ?? null;
-    const acceptedSorted = [...state.chunks]
-      .filter((c) =>
-        isChunkEffectivelyAccepted(
-          c,
-          state.minChunkBars,
-          jobBpmValue,
-          state.beatsPerBar,
-        ),
-      )
-      .sort((a, b) => a.startMs - b.startMs);
-    const additions = acceptedSorted
-      .filter((c) => !inArrangement.has(c.id))
+    // The set of chunks the user is actually keeping at this moment —
+    // accepted-flag AND passes the active min-bars filter.
+    const acceptedIds = new Set(
+      state.chunks
+        .filter((c) =>
+          isChunkEffectivelyAccepted(
+            c,
+            state.minChunkBars,
+            jobBpmValue,
+            state.beatsPerBar,
+          ),
+        )
+        .map((c) => c.id),
+    );
+    // Step 1: prune the existing arrangement against the live accepted
+    // set. Without this, a chunk the user kept earlier and rejected
+    // later would still ship into Arrange (and the editor) as a stale
+    // item — exactly the "double the chunks" bug from the report.
+    const prunedExisting = existing.filter((it) =>
+      acceptedIds.has(it.chunkId),
+    );
+    // Step 2: append any newly-accepted chunks that aren't in the
+    // arrangement yet, in master-time order. Existing items keep
+    // their position so an established arrangement isn't rewritten.
+    const inArrangement = new Set(prunedExisting.map((a) => a.chunkId));
+    const additions = state.chunks
+      .filter((c) => acceptedIds.has(c.id) && !inArrangement.has(c.id))
+      .sort((a, b) => a.startMs - b.startMs)
       .map((c, i) => ({
         id: `arr-${c.id}-${Date.now()}-${i}`,
         chunkId: c.id,
       }));
     await jobsDb.updateJob(state.jobId, {
-      arrangement: [...existing, ...additions],
+      arrangement: [...prunedExisting, ...additions],
     });
     navigate(jobRoutePath(id, "arrange"));
   }

@@ -83,20 +83,37 @@ export default function Arrange() {
         ),
       );
       if (!active) return;
-      // If the user came here via "Continue → Arrange" but the
-      // arrangement is empty for some reason (e.g. legacy long-form
-      // job pre-handoff), seed it with all accepted chunks now so
-      // the user lands on a usable strip.
-      let arrangement = j.arrangement ?? [];
+      // Reconcile arrangement against the latest Triage state at every
+      // mount. Triage toggles `chunk.accepted` directly on the chunks
+      // list but doesn't reach into the persisted arrangement, so a
+      // previously-arranged chunk that the user has since rejected
+      // would otherwise still show up here. Drop those items.
       const acceptedChunks = (j.chunks ?? []).filter((c) => c.accepted);
-      if (arrangement.length === 0 && acceptedChunks.length > 0) {
+      const acceptedIds = new Set(acceptedChunks.map((c) => c.id));
+      const persistedArr = j.arrangement ?? [];
+      let arrangement = persistedArr.filter((it) =>
+        acceptedIds.has(it.chunkId),
+      );
+      const wasPruned = arrangement.length < persistedArr.length;
+      // First-time seed — only when the user has never touched the
+      // arrangement (no items at all and pruning didn't just empty it).
+      // Once they've curated something, an arrangement that ends up
+      // empty after pruning is their decision and we leave it alone.
+      const isFirstTimeSeed =
+        !wasPruned && arrangement.length === 0 && acceptedChunks.length > 0;
+      if (isFirstTimeSeed) {
         arrangement = acceptedChunks
+          .slice()
           .sort((a, b) => a.startMs - b.startMs)
           .map((c, i) => ({
             id: `arr-${c.id}-${Date.now()}-${i}`,
             chunkId: c.id,
           }));
-        // Persist the seed so the next mount doesn't re-seed
+      }
+      // Persist any divergence (pruning or first-time seed) so the
+      // next mount sees consistent state and we don't re-prune the
+      // same items every time.
+      if (wasPruned || isFirstTimeSeed) {
         void jobsDb.updateJob(j.id, { arrangement });
       }
       setJob(j);
