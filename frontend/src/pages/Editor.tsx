@@ -529,18 +529,8 @@ export default function Editor() {
       if (tag === "INPUT" || tag === "TEXTAREA" || ae?.isContentEditable) {
         return;
       }
-      const s = useEditorStore.getState();
-      // Cmd/Ctrl+Z = undo / Cmd/Ctrl+Shift+Z = redo. Pill-history-only —
-      // Cuts/FX have their own gesture model (paint/erase) and aren't
-      // candidates for this stack. Process even when other modifiers
-      // overlap; let the platform's standard chord win.
-      if ((e.metaKey || e.ctrlKey) && (e.key === "z" || e.key === "Z")) {
-        e.preventDefault();
-        if (e.shiftKey) s.redoPillEdit();
-        else s.undoPillEdit();
-        return;
-      }
       if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const s = useEditorStore.getState();
       if (e.key === "q" || e.key === "Q") {
         if (e.repeat) return;
         e.preventDefault();
@@ -548,40 +538,6 @@ export default function Editor() {
       } else if (e.key === "Escape" && s.quantizePreview !== null) {
         e.preventDefault();
         s.cancelQuantizePreview();
-      } else if (e.key === "r" || e.key === "R") {
-        // Reset the selected pill to its auto-generated default.
-        if (s.selectedPillId) {
-          e.preventDefault();
-          s.commitPillEdit();
-          s.resetPill(s.selectedPillId);
-        }
-      } else if (e.key === "," || e.key === ".") {
-        // Pill source nudge ±1 frame. Selected pill plays a slightly
-        // earlier (`,`) / later (`.`) excerpt of the cam at the same
-        // arr-position. Shift bumps the step to ±10 frames.
-        if (!s.selectedPillId) return;
-        e.preventDefault();
-        const fps = s.jobMeta?.fps && s.jobMeta.fps > 0 ? s.jobMeta.fps : 30;
-        const stepMs = (1000 / fps) * (e.shiftKey ? 10 : 1);
-        const sign = e.key === "," ? -1 : 1;
-        s.commitPillEdit();
-        s.nudgePillSourceMs(s.selectedPillId, sign * stepMs);
-      } else if (e.key === "[" || e.key === "]") {
-        // Cam-track nudge ±1 frame. Shifts every pill of the cam the
-        // selected pill belongs to (or the selected cam if no pill is
-        // selected) so the user can re-time a whole take. Shift =
-        // ±10 frames.
-        const targetCam =
-          (s.selectedPillId &&
-            s.pills.find((p) => p.id === s.selectedPillId)?.camId) ||
-          s.selectedClipId;
-        if (!targetCam) return;
-        e.preventDefault();
-        const fps = s.jobMeta?.fps && s.jobMeta.fps > 0 ? s.jobMeta.fps : 30;
-        const stepMs = (1000 / fps) * (e.shiftKey ? 10 : 1);
-        const sign = e.key === "[" ? -1 : 1;
-        s.commitPillEdit();
-        s.nudgeCamSourceMs(targetCam, sign * stepMs);
       }
     };
     const onKeyUp = (e: KeyboardEvent) => {
@@ -1073,32 +1029,6 @@ export default function Editor() {
       "Hold to preview-snap every cut to the active grid; release commits, Esc cancels",
     group: "Edit",
     icon: <MagnetIcon />,
-  });
-  useRegisterShortcut({
-    id: "editor.pill-reset",
-    keys: ["R"],
-    description: "Reset the selected pill to its auto-generated default",
-    group: "Pills",
-  });
-  useRegisterShortcut({
-    id: "editor.pill-source-nudge",
-    keys: [",", "."],
-    description:
-      "Selected pill: source-nudge by ±1 frame (Shift = ±10 frames). The cam plays a slightly earlier / later excerpt at the same arr-position.",
-    group: "Pills",
-  });
-  useRegisterShortcut({
-    id: "editor.cam-source-nudge",
-    keys: ["[", "]"],
-    description:
-      "Cam track: source-nudge every pill of the selected cam by ±1 frame (Shift = ±10 frames). Re-times a whole take in lockstep.",
-    group: "Pills",
-  });
-  useRegisterShortcut({
-    id: "editor.pill-undo",
-    keys: ["⌘Z", "⌘⇧Z"],
-    description: "Undo / redo the most recent pill edit (move / trim / nudge / reset)",
-    group: "Pills",
   });
 
   if (err) {

@@ -1655,12 +1655,42 @@ export const useEditorStore = create<EditorState>()(
     },
 
     setClipSyncOverride(camId, ms) {
+      const prev = get().clips.find((c) => c.id === camId);
+      const prevMs =
+        prev && isVideoClip(prev) ? prev.syncOverrideMs : 0;
       const clips = get().clips.map((c): Clip => {
         if (c.id !== camId) return c;
         if (!isVideoClip(c)) return c; // images have no sync override
         return { ...c, syncOverrideMs: ms };
       });
       set({ clips });
+      // The cam-track-anchor change is reflected in pill source-time:
+      // every pill of this cam plays its excerpt N ms later (positive)
+      // or earlier (negative) than before. We update both the live and
+      // the original source bounds so a per-pill RESET targets the
+      // post-anchor baseline (= where the cam currently belongs in the
+      // song). Without this the SyncTuner's nudge would change the
+      // cam-master-anchor field but the rendered pill audio/video
+      // wouldn't move at all — pills are authoritative for source-time.
+      const deltaMs = ms - prevMs;
+      if (Math.abs(deltaMs) > 1e-6) {
+        const deltaS = deltaMs / 1000;
+        const pills = get().pills.map((p) =>
+          p.camId === camId
+            ? {
+                ...p,
+                sourceInS: Math.max(0, p.sourceInS + deltaS),
+                sourceOutS: Math.max(p.sourceInS + 0.05, p.sourceOutS + deltaS),
+                originalSourceInS: Math.max(0, p.originalSourceInS + deltaS),
+                originalSourceOutS: Math.max(
+                  p.originalSourceInS + 0.05,
+                  p.originalSourceOutS + deltaS,
+                ),
+              }
+            : p,
+        );
+        set({ pills });
+      }
       // Mirror cam-1 changes into legacy offset slice (SyncTuner).
       const cam1 = clips[0];
       if (cam1 && cam1.id === camId && isVideoClip(cam1)) {

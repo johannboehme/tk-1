@@ -90,6 +90,16 @@ type DragKind =
       origArrStartS: number;
     }
   | {
+      /** MATCH snap-mode pill-body drag. The whole cam track moves —
+       *  every pill of `camId` shifts by the same arr-delta so the
+       *  user can align the entire take against a candidate's
+       *  master-time tick (visible as the match-marker). */
+      kind: "cam-track-move";
+      camId: string;
+      grabArrT: number;
+      origStartsByPillId: Record<string, number>;
+    }
+  | {
       /** Drag a pill's LEFT edge — narrows the arr-window from the
        *  left and advances `sourceInS` by the same amount, so the cam
        *  still plays in sync with the visible window. */
@@ -180,6 +190,10 @@ export function Timeline({
     (s) => s.setPillRightEdgeArrEndS,
   );
   const commitPillEdit = useEditorStore((s) => s.commitPillEdit);
+  const undoPillEdit = useEditorStore((s) => s.undoPillEdit);
+  const redoPillEdit = useEditorStore((s) => s.redoPillEdit);
+  const canUndoPill = useEditorStore((s) => s.pillHistory.length > 0);
+  const canRedoPill = useEditorStore((s) => s.pillFuture.length > 0);
   const resetClipAlignment = useEditorStore((s) => s.resetClipAlignment);
   const removeCutAt = useEditorStore((s) => s.removeCutAt);
   const clearCuts = useEditorStore((s) => s.clearCuts);
@@ -572,6 +586,22 @@ export function Timeline({
         aspect: cams[clip.id]?.aspect ?? 16 / 9,
         clipSelected: clip.id === selectedClipId,
       });
+      // Match-point candidate ticks. Visible whenever MATCH snap-mode
+      // is on (or while the user is doing a track-nudge drag in MATCH)
+      // so the user can see the cam's alternative master-anchor
+      // alignments and aim a drag at one. Image clips early-out
+      // inside drawMatchMarkers.
+      if (snapMode === "match") {
+        drawMatchMarkers({
+          ctx,
+          clip,
+          bandTop: band.top,
+          bandH: videoLaneHeight,
+          tToX,
+          canvasWidth,
+          emphasized: clip.id === selectedClipId,
+        });
+      }
       // Lane separator line below each video lane (subtle sepia rule).
       ctx.fillStyle = "#D8CFB8";
       ctx.fillRect(0, band.bottom - 1, canvasWidth, 1);
@@ -1081,12 +1111,31 @@ export function Timeline({
           } else {
             const arrAtGrab =
               viewStart + (x / canvasWidth) * visibleDur;
-            dragRef.current = {
-              kind: "pill-move",
-              pillId: p.id,
-              grabArrT: arrAtGrab,
-              origArrStartS: p.arrStartS,
-            };
+            // MATCH snap-mode promotes the body-drag from a single
+            // pill move to a CAM-TRACK move: every pill of this
+            // camera shifts in lockstep so the user can align the
+            // whole take against a candidate-implied anchor.
+            if (snapMode === "match") {
+              const origStartsByPillId: Record<string, number> = {};
+              for (const sib of pills) {
+                if (sib.camId === p.camId) {
+                  origStartsByPillId[sib.id] = sib.arrStartS;
+                }
+              }
+              dragRef.current = {
+                kind: "cam-track-move",
+                camId: p.camId,
+                grabArrT: arrAtGrab,
+                origStartsByPillId,
+              };
+            } else {
+              dragRef.current = {
+                kind: "pill-move",
+                pillId: p.id,
+                grabArrT: arrAtGrab,
+                origArrStartS: p.arrStartS,
+              };
+            }
           }
           return;
         }
@@ -1184,6 +1233,20 @@ export function Timeline({
       const deltaArrT = arrAtPointer - drag.grabArrT;
       const newArrStartS = Math.max(0, drag.origArrStartS + deltaArrT);
       setPillArrPlacement(drag.pillId, newArrStartS);
+    } else if (drag.kind === "cam-track-move") {
+      // Cam-track move (MATCH snap-mode body drag) — apply the same
+      // arr-delta to every pill of `camId` from its drag-start
+      // snapshot. Each pill keeps its own source-trim; only WHERE on
+      // the song each pill plays moves. Snapshot-based so the math
+      // doesn't cascade as we mutate the store mid-drag.
+      const arrAtPointer = viewStart + (x / canvasWidth) * visibleDur;
+      const deltaArrT = arrAtPointer - drag.grabArrT;
+      for (const [pillId, origStart] of Object.entries(
+        drag.origStartsByPillId,
+      )) {
+        const next = Math.max(0, origStart + deltaArrT);
+        setPillArrPlacement(pillId, next);
+      }
     } else if (drag.kind === "pill-trim-in") {
       // Drag left edge: arr-window narrows from the left + sourceInS
       // advances by the same delta so the cam still plays in sync
@@ -1390,8 +1453,18 @@ export function Timeline({
           snapMode={snapMode}
           clips={clips}
         />
-        <div className="sm:ml-auto flex items-center gap-3">
-          <span className="text-[10px] tabular text-ink-3 font-mono">
+        <div className="sm:ml-auto flex items-center gap-2">
+          <PillUndoButton
+            label="UNDO"
+            disabled={!canUndoPill}
+            onClick={undoPillEdit}
+          />
+          <PillUndoButton
+            label="REDO"
+            disabled={!canRedoPill}
+            onClick={redoPillEdit}
+          />
+          <span className="text-[10px] tabular text-ink-3 font-mono ml-2">
             {zoomPercent}%
           </span>
           <span className="text-[10px] tabular text-ink-3 font-mono">
@@ -2038,6 +2111,106 @@ function hexToRgba(hex: string, alpha: number): string {
   const g = parseInt(c.slice(2, 4), 16);
   const b = parseInt(c.slice(4, 6), 16);
   return `rgba(${r},${g},${b},${alpha})`;
+}
+
+/** Skeuomorph mini-button used for the per-edit undo / redo pair in
+ *  the Timeline header. Cross-platform — no `⌘`/`Ctrl` hint in the
+ *  label since the pair is meant to be operated by mouse. Disabled
+ *  state reads as a recessed bezel so the user gets feedback when the
+ *  history is exhausted. */
+function PillUndoButton({
+  label,
+  disabled,
+  onClick,
+}: {
+  label: string;
+  disabled: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={onClick}
+      className="text-[10px] tabular tracking-label uppercase font-mono px-2 py-1 rounded-sm border border-rule transition-colors"
+      style={{
+        background: disabled
+          ? "linear-gradient(180deg, #DDD4BE 0%, #C9BFA6 100%)"
+          : "linear-gradient(180deg, #FAF6EC 0%, #DDD4BE 50%, #C9BFA6 100%)",
+        boxShadow: disabled
+          ? "inset 0 1px 2px rgba(0,0,0,0.18)"
+          : [
+              "inset 0 1px 0 rgba(255,255,255,0.85)",
+              "inset 0 -1px 0 rgba(0,0,0,0.18)",
+              "0 1px 2px rgba(0,0,0,0.18)",
+            ].join(", "),
+        color: disabled ? "rgba(26,24,22,0.35)" : "#1A1816",
+        cursor: disabled ? "default" : "pointer",
+      }}
+      title={disabled ? `${label} unavailable` : `${label} pill edit`}
+    >
+      {label}
+    </button>
+  );
+}
+
+interface DrawMatchMarkersArgs {
+  ctx: CanvasRenderingContext2D;
+  clip: Clip;
+  bandTop: number;
+  bandH: number;
+  tToX: (masterT: number) => number;
+  canvasWidth: number;
+  emphasized: boolean;
+}
+
+/** Render small ticks at each candidate-implied cam-master-anchor. The
+ *  active candidate (= clip.selectedCandidateIdx) is rendered as a
+ *  chunky filled triangle, alternates as thinner ticks fading out with
+ *  confidence. Visible when MATCH snap-mode is on (or a MATCH drag is
+ *  in progress), so the user can read the cam's alignment options at
+ *  a glance and snap a track-nudge drag onto a candidate. Image clips
+ *  have no candidates → early-out. */
+function drawMatchMarkers({
+  ctx,
+  clip,
+  bandTop,
+  bandH,
+  tToX,
+  canvasWidth,
+  emphasized,
+}: DrawMatchMarkersArgs) {
+  if (!isVideoClip(clip)) return;
+  if (!clip.candidates || clip.candidates.length === 0) return;
+  ctx.save();
+  for (let i = 0; i < clip.candidates.length; i++) {
+    const c = clip.candidates[i];
+    // The candidate's master-time anchor: the spot on the master
+    // timeline where the cam's source-time 0 would sit if this
+    // candidate's offset were the active one. Adding the user's
+    // current syncOverrideMs lets the markers track the live nudge.
+    const totalMs = c.offsetMs + clip.syncOverrideMs;
+    const startS = -totalMs / 1000;
+    const x = tToX(startS);
+    if (x < -8 || x > canvasWidth + 8) continue;
+    const isPrimary = i === clip.selectedCandidateIdx;
+    const conf = Math.max(0, Math.min(1, c.confidence));
+    const baseOpacity = (isPrimary ? 1 : 0.35) * (emphasized ? 1 : 0.55);
+    const opacity = baseOpacity * (0.4 + 0.6 * conf);
+    const tickW = isPrimary ? 3 : 2;
+    const tickH = isPrimary ? bandH - 6 : Math.round(bandH * 0.45);
+    ctx.fillStyle = `rgba(255,87,34,${opacity})`; // hot
+    ctx.fillRect(Math.floor(x), bandTop + 2, tickW, tickH);
+    if (isPrimary) {
+      ctx.beginPath();
+      ctx.moveTo(x - 4, bandTop);
+      ctx.lineTo(x + 4, bandTop);
+      ctx.lineTo(x, bandTop + 6);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+  ctx.restore();
 }
 
 /** Big "currently snapped to" readout that lights up only while a
