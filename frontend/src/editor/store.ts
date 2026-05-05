@@ -26,7 +26,7 @@ import {
   activeCamAtArr,
   reconcilePills,
 } from "./arrangement-pills";
-import { masterToArr } from "./arrangement-time";
+import { masterToArr, sliceByArrSegments } from "./arrangement-time";
 import type { ArrangementItem, Chunk } from "../storage/jobs-db";
 import { classifyAspectRatio } from "./exportPresets";
 import { DEFAULT_VIEWPORT_TRANSFORM } from "./render/element-transform";
@@ -1112,7 +1112,16 @@ export const useEditorStore = create<EditorState>()(
           typeof opts?.audioVolume === "number" && opts.audioVolume >= 0
             ? Math.min(4, opts.audioVolume)
             : 1.0,
-        arrangementSegments: opts?.arrangementSegments ?? [],
+        // Composed-timeline invariant: every loaded job carries at least
+        // one segment. Editor.tsx feeds the synthesized shape from
+        // synthesizeJobLoadShape; callers that omit it (legacy tests,
+        // simplified harnesses) get a default single-segment covering
+        // the whole master so the segment walker has a real range to
+        // walk and arr-time projections stay Identity for direct-mode.
+        arrangementSegments:
+          opts?.arrangementSegments && opts.arrangementSegments.length > 0
+            ? opts.arrangementSegments
+            : [{ in: 0, out: meta.duration }],
       });
     },
 
@@ -2126,14 +2135,32 @@ export const useEditorStore = create<EditorState>()(
 
     buildEditSpec() {
       const s = get();
-      // Long-form jobs: emit the arrangement-segment list verbatim so
-      // the renderer slices the master audio + video to match the
-      // user's chunk arrangement. Direct-mode jobs fall back to the
-      // single-trim region.
-      const segments =
-        s.arrangementSegments.length > 0
-          ? s.arrangementSegments
-          : [{ in: s.trim.in, out: s.trim.out }];
+      // Master-trim is universal: every job slices its arrangement
+      // segments to the trim window. Single-take jobs come in with one
+      // segment [0, duration] so the slice collapses to [trim.in, trim.out];
+      // long-form jobs slice each chunk at the trim boundaries (chunks
+      // entirely outside the trim window drop, chunks partially inside
+      // get clipped). Slice ranges keep their original master-time
+      // bounds — the renderer reads `segments[i].{in, out}` as
+      // master-time slices to extract.
+      const slices = sliceByArrSegments(
+        s.trim.in,
+        s.trim.out,
+        s.arrangementSegments,
+      );
+      const segments = slices.map((sl) => {
+        const out: Segment = { in: sl.masterStartS, out: sl.masterEndS };
+        // Pass through audioStartMs / chunkId for any chunk-anchored
+        // metadata the renderer might inspect downstream — we don't
+        // re-derive it from the slice (the original segment's anchor
+        // doesn't move with a trim cut).
+        const seg = s.arrangementSegments.find(
+          (g) => g.in <= sl.masterStartS && g.out >= sl.masterEndS,
+        );
+        if (seg?.audioStartMs != null) out.audioStartMs = seg.audioStartMs;
+        if (seg?.chunkId != null) out.chunkId = seg.chunkId;
+        return out;
+      });
       return {
         version: 1,
         segments,

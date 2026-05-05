@@ -14,6 +14,7 @@ import type { LoopRegion, TrimRegion } from "./OffsetScheduler";
 import { clampLoopRegion } from "./OffsetScheduler";
 import {
   arrToMaster,
+  masterToArr,
   segmentIndexAtArr,
   totalArrDuration,
 } from "./arrangement-time";
@@ -66,9 +67,14 @@ export function nextLoopWrapMasterT(
   };
 }
 
-/** Mode-aware clamp. With segments → clamp to `[0, totalArrDuration]`.
- *  Without → fall back to legacy trim-clamp. Returns null when the loop
- *  collapses to zero length. */
+/** Clamp the loop to the playable arr-time window: the intersection of
+ *  the segments' totalArrDuration and the master-trim's projection into
+ *  arr-time. Master-trim universally narrows the loop in both single-take
+ *  (where arr-time == master-time) and long-form (where trim cuts across
+ *  chunks). Returns null when the loop collapses to zero length.
+ *
+ *  Defensive: with empty segments falls back to legacy trim-clamp so a
+ *  pre-load store snapshot doesn't crash. */
 export function clampLoopToBounds(
   loop: LoopRegion | null,
   segments: readonly Segment[],
@@ -77,8 +83,10 @@ export function clampLoopToBounds(
   if (!loop) return null;
   if (segments.length === 0) return clampLoopRegion(loop, trim);
   const total = totalArrDuration(segments);
-  const start = Math.max(0, loop.start);
-  const end = Math.min(total, loop.end);
+  const trimInArr = Math.max(0, Math.min(total, masterToArr(trim.in, segments)));
+  const trimOutArr = Math.max(trimInArr, Math.min(total, masterToArr(trim.out, segments)));
+  const start = Math.max(trimInArr, loop.start);
+  const end = Math.min(trimOutArr, loop.end);
   if (end <= start) return null;
   return { start, end };
 }

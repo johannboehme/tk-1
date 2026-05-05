@@ -121,12 +121,12 @@ describe("clampLoopToBounds", () => {
     ).toBeNull();
   });
 
-  test("with segments → clamps to [0, totalArrDuration] (arr-time domain)", () => {
+  test("with segments + wide-open trim → clamps to [0, totalArrDuration]", () => {
     const segs: Segment[] = [
       { in: 10, out: 15 },
       { in: 20, out: 25 },
     ];
-    // totalArr = 10. trim is irrelevant in arr-mode.
+    // totalArr = 10; trim covers all of it.
     expect(
       clampLoopToBounds({ start: 1, end: 5 }, segs, { in: 0, out: 100 }),
     ).toEqual({ start: 1, end: 5 });
@@ -136,6 +136,32 @@ describe("clampLoopToBounds", () => {
     expect(
       clampLoopToBounds({ start: -2, end: 3 }, segs, { in: 0, out: 100 }),
     ).toEqual({ start: 0, end: 3 });
+  });
+
+  test("with segments + narrow trim → trim wins over arr range (master-trim universal)", () => {
+    // Single-take after Phase A: arrangementSegments=[{in:0, out:60}].
+    // Master-trim={5, 50} narrows the playable region; the loop must
+    // clamp to the trim's arr-projection, not the full segment range.
+    const segs: Segment[] = [{ in: 0, out: 60 }];
+    expect(
+      clampLoopToBounds({ start: 1, end: 60 }, segs, { in: 5, out: 50 }),
+    ).toEqual({ start: 5, end: 50 });
+    expect(
+      clampLoopToBounds({ start: 20, end: 25 }, segs, { in: 0, out: 10 }),
+    ).toBeNull();
+  });
+
+  test("long-form + master-trim → clamp via masterToArr projection", () => {
+    // Long-form arrangement with two 5-second chunks (totalArr=10).
+    // Master-trim {12, 22} cuts: master 12 → arr-time 2 (mid-seg0);
+    // master 22 → arr-time 7 (mid-seg1). Loop must clamp to [2, 7].
+    const segs: Segment[] = [
+      { in: 10, out: 15 },
+      { in: 20, out: 25 },
+    ];
+    expect(
+      clampLoopToBounds({ start: 0, end: 10 }, segs, { in: 12, out: 22 }),
+    ).toEqual({ start: 2, end: 7 });
   });
 
   test("with segments + null loop → null", () => {

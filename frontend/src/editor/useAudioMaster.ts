@@ -438,7 +438,6 @@ export function useAudioMaster(
         rafRef.current = null;
         return;
       }
-      const dur = store.jobMeta?.duration ?? Infinity;
       const state = stateRef.current;
       const active = state.active === "A" ? refA : refB;
       const idle = state.active === "A" ? refB : refA;
@@ -504,12 +503,12 @@ export function useAudioMaster(
         return;
       }
 
-      // ─── Composed-timeline walker (single path for direct + arrangement) ──
-      // Long-form jobs carry real `arrangementSegments` (master-time slices
-      // of the source recording). Direct-mode jobs synthesize a single
-      // segment covering the full master audio — arr-time then equals
-      // master-time and every helper is identity, so the user's loop
-      // markers map straight through.
+      // ─── Composed-timeline walker ─────────────────────────────────
+      // Every job lands here with at least one segment — single-take
+      // jobs synthesize `[{in:0, out:duration}]` in synthesizeJobLoadShape,
+      // long-form jobs feed their full chunk arrangement. arr-time then
+      // equals master-time for single-take and the user's loop markers
+      // map straight through.
       //
       // The walker uses an AUTHORITATIVE state.currentSegmentIdx instead
       // of re-deriving from master-time on every tick — duplicate chunks
@@ -517,13 +516,8 @@ export function useAudioMaster(
       // share master-time bounds, so a "scan-for-first-match" lookup
       // would lock the playback into the first occurrence forever. The
       // index advances on each crossfade hop and re-binds on user-seek.
-      const segs =
-        store.arrangementSegments.length > 0
-          ? store.arrangementSegments
-          : Number.isFinite(dur) && dur > 0
-            ? [{ in: 0, out: dur }]
-            : null;
-      if (segs && segs.length > 0) {
+      const segs = store.arrangementSegments;
+      if (segs.length > 0) {
         let curIdx = state.currentSegmentIdx ?? -1;
         // Validate the cached index — if master-time has drifted out of
         // its window (e.g. browser nudged currentTime past the end while
