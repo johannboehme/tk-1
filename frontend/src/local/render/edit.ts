@@ -766,6 +766,14 @@ export async function editRenderMulti(
   const pillMode = pillsForRender.length > 0 && input.segments.length > 0;
 
   let framesEmitted = 0;
+  let pendingError: Error | null = null;
+  // Pipeline parallelisation: the main loop awaits frameAtOrBefore (the
+  // decoder runs ahead inside CamFrameStream), then queues compositor +
+  // encoder work onto a Promise chain. While the chain processes frame N
+  // (compositor await + encoder push), the main loop can already pull
+  // frame N+1. Decoder, compositor, encoder run nebenläufig.
+  let outputQueue: Promise<void> = Promise.resolve();
+  let chainInFlight = 0;
   try {
     // Per-segment arr-time cursor — accumulated so each frame's `tArr`
     // matches the editor's masterToArr projection, which is what pills
@@ -775,6 +783,7 @@ export async function editRenderMulti(
       const segStartFrame = framesEmitted;
       const segFrames = Math.max(0, Math.round((seg.out - seg.in) * fps));
       for (let i = 0; i < segFrames; i++) {
+        if (pendingError) throw pendingError;
         const tMaster = seg.in + i / fps;
         const tArr = arrCursorPerSeg + i / fps;
         // Active cam: pill-aware in arrangement-mode, legacy clip-range
@@ -794,29 +803,55 @@ export async function editRenderMulti(
         } else {
           camId = activeCamAt(input.cuts, tMaster, camRanges);
         }
-        let source: CanvasImageSource;
-        let srcW: number;
-        let srcH: number;
-        let srcRot: 0 | 90 | 180 | 270 = 0;
-        let userTransform: {
-          rotation?: number;
-          flipX?: boolean;
-          flipY?: boolean;
-          viewportTransform?: import("../../editor/types").ViewportTransform;
-        } = {};
+        // Resolve the source for this frame. For video cams we own the
+        // returned VideoFrame (cloned from the stream-owned one) and
+        // must close it after the chain composites it. Static sources
+        // (image cams, test pattern) are not owned.
+        type Src =
+          | {
+              kind: "frame";
+              frame: VideoFrame;
+              w: number;
+              h: number;
+              rot: 0 | 90 | 180 | 270;
+              transform: {
+                rotation?: number;
+                flipX?: boolean;
+                flipY?: boolean;
+                viewportTransform?: import("../../editor/types").ViewportTransform;
+              };
+            }
+          | {
+              kind: "static";
+              img: CanvasImageSource;
+              w: number;
+              h: number;
+              rot: 0 | 90 | 180 | 270;
+              transform: {
+                rotation?: number;
+                flipX?: boolean;
+                flipY?: boolean;
+                viewportTransform?: import("../../editor/types").ViewportTransform;
+              };
+            };
+        let src: Src;
         if (camId) {
           const cam = demuxResults.find((d) => d.cam.id === camId)!;
           if (cam.kind === "image") {
             // Image cam: same bitmap for every frame in range. No
             // source-time math, no drift — the bitmap *is* the frame.
-            source = cam.bitmap;
-            srcW = cam.info.width;
-            srcH = cam.info.height;
-            userTransform = {
-              rotation: cam.cam.rotation,
-              flipX: cam.cam.flipX,
-              flipY: cam.cam.flipY,
-              viewportTransform: cam.cam.viewportTransform,
+            src = {
+              kind: "static",
+              img: cam.bitmap,
+              w: cam.info.width,
+              h: cam.info.height,
+              rot: 0,
+              transform: {
+                rotation: cam.cam.rotation,
+                flipX: cam.cam.flipX,
+                flipY: cam.cam.flipY,
+                viewportTransform: cam.cam.viewportTransform,
+              },
             };
           } else {
             // Source-time selection.
@@ -850,9 +885,9 @@ export async function editRenderMulti(
                     masterStartS: cam.cam.masterStartS,
                     driftRatio: cam.cam.driftRatio ?? 1,
                   });
-            let frame: VideoFrame | null = null;
+            let streamFrame: VideoFrame | null = null;
             try {
-              frame = await cam.stream.frameAtOrBefore(sourceTimeUs);
+              streamFrame = await cam.stream.frameAtOrBefore(sourceTimeUs);
             } catch (err) {
               // The native VideoDecoder error message is just
               // "Decoding error" — useless for debugging. Re-throw
@@ -867,68 +902,115 @@ export async function editRenderMulti(
                   `frame ${framesEmitted}): ${orig}`,
               );
             }
-            if (frame) {
-              source = frame as unknown as CanvasImageSource;
-              srcW = cam.info.width;
-              srcH = cam.info.height;
-              srcRot = cam.info.rotationDeg;
-              userTransform = {
-                rotation: cam.cam.rotation,
-                flipX: cam.cam.flipX,
-                flipY: cam.cam.flipY,
-                viewportTransform: cam.cam.viewportTransform,
+            if (streamFrame) {
+              // Clone the stream-owned frame so it stays alive past the
+              // next frameAtOrBefore call. WebCodecs' VideoFrame
+              // constructor is a cheap reference-clone (shared buffer,
+              // refcounted) — not a pixel copy.
+              const owned = new VideoFrame(streamFrame, {
+                timestamp: streamFrame.timestamp,
+              });
+              src = {
+                kind: "frame",
+                frame: owned,
+                w: cam.info.width,
+                h: cam.info.height,
+                rot: cam.info.rotationDeg,
+                transform: {
+                  rotation: cam.cam.rotation,
+                  flipX: cam.cam.flipX,
+                  flipY: cam.cam.flipY,
+                  viewportTransform: cam.cam.viewportTransform,
+                },
               };
             } else {
-              source = testPattern;
-              srcW = outputWidth;
-              srcH = outputHeight;
+              src = {
+                kind: "static",
+                img: testPattern,
+                w: outputWidth,
+                h: outputHeight,
+                rot: 0,
+                transform: {},
+              };
             }
           }
         } else {
-          source = testPattern;
-          srcW = outputWidth;
-          srcH = outputHeight;
+          src = {
+            kind: "static",
+            img: testPattern,
+            w: outputWidth,
+            h: outputHeight,
+            rot: 0,
+            transform: {},
+          };
         }
         const outTimestampUs = framesEmitted * frameDurationUs;
-        const composed = await compositor.compositeImage(
-          source,
-          srcW,
-          srcH,
-          outTimestampUs,
-          frameDurationUs,
-          srcRot,
-          userTransform,
-          // FX must be looked up at master time (tMaster), not the
-          // segment-relative output timestamp — segments shift output
-          // time so FX queries with output time miss every FX.
-          tMaster,
-        );
-        encoder.pushFrame(composed, {
-          keyFrame: framesEmitted === segStartFrame,
-        });
-        composed.close();
+        const isFirstInSeg = framesEmitted === segStartFrame;
+        const myFrameNum = framesEmitted;
+        const captured = { src, outTs: outTimestampUs, isFirstInSeg, tMaster };
         framesEmitted++;
-        if (framesEmitted % 30 === 0 || framesEmitted === totalFrames) {
-          input.onProgress?.({
-            stage: "video-encode",
-            framesDone: framesEmitted,
-            framesTotal: totalFrames,
-          });
-        }
-        // Hard backpressure on the encoder. Without this the per-frame
-        // loop pushes raw VideoFrames into the WebCodecs encoder
-        // faster than the encoder can drain them — at 4K each VideoFrame
-        // is ~12 MB, so a few seconds of overflow runs into multi-GB
-        // territory and crashes the tab. Same threshold the single-cam
-        // path uses; matches HW encoder pipeline depth (~4 frames) with
-        // headroom. The 1 ms sleep yields the event loop so the
-        // encoder's output callback can fire and frames drain.
-        while (encoder.encodeQueueSize > 16) {
+        chainInFlight++;
+        outputQueue = outputQueue.then(async () => {
+          try {
+            if (pendingError) return;
+            const composed = await compositor.compositeImage(
+              captured.src.kind === "frame"
+                ? (captured.src.frame as unknown as CanvasImageSource)
+                : captured.src.img,
+              captured.src.w,
+              captured.src.h,
+              captured.outTs,
+              frameDurationUs,
+              captured.src.rot,
+              captured.src.transform,
+              // FX must be looked up at master time (tMaster), not the
+              // segment-relative output timestamp — segments shift
+              // output time so FX queries with output time miss every
+              // FX.
+              captured.tMaster,
+            );
+            encoder.pushFrame(composed, { keyFrame: captured.isFirstInSeg });
+            composed.close();
+            const done = myFrameNum + 1;
+            if (done % 30 === 0 || done === totalFrames) {
+              input.onProgress?.({
+                stage: "video-encode",
+                framesDone: done,
+                framesTotal: totalFrames,
+              });
+            }
+          } catch (e) {
+            pendingError = e instanceof Error ? e : new Error(String(e));
+          } finally {
+            if (captured.src.kind === "frame") {
+              try {
+                captured.src.frame.close();
+              } catch {
+                /* already closed */
+              }
+            }
+            chainInFlight--;
+          }
+        });
+        // Hard backpressure on encoder + composite chain. Without this
+        // the main loop would queue chains faster than the GPU
+        // compositor + encoder can drain them — at 4K each in-flight
+        // VideoFrame is ~12 MB, so a few seconds of overflow runs into
+        // multi-GB territory and crashes the tab. Encoder threshold (16)
+        // matches the single-cam path. Chain-depth threshold (4) bounds
+        // queued composite work — compositor takes ~10-30 ms per 4K
+        // frame so 4 means the main loop can run ~50-100 ms ahead of
+        // the GPU.
+        while (encoder.encodeQueueSize > 16 || chainInFlight > 4) {
+          if (pendingError) throw pendingError;
           await new Promise((r) => setTimeout(r, 1));
         }
       }
       arrCursorPerSeg += seg.out - seg.in;
     }
+    // Drain pending compositor + encoder work before advancing to flush.
+    await outputQueue;
+    if (pendingError) throw pendingError;
 
     // The encoder still has pending frames to flush — on a 90 s clip
     // that's 1-3 s of opaque waiting. Surface it as its own stage so the
