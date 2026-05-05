@@ -1551,15 +1551,31 @@ export function Timeline({
   const zoomPercent = useMemo(() => Math.round(zoom * 100), [zoom]);
 
   // Build CamLookups for the PROGRAM strip.
-  const camLookupsForStrip = useMemo(
-    () =>
-      clips.map((c) => ({
+  // ProgramStrip is drawn in `stripDuration` units — master-time in direct-
+  // mode, arr-time when an arrangement is loaded. The cam ranges fed into
+  // `buildProgram` MUST be in the same domain as the strip's sampling
+  // axis or the cuts strip diverges from the cam-lane (and from the
+  // compositor, which uses `activeCamAtArr` with pills). Direct-mode is
+  // identity, so `clipRangeS` works as-is. In arr-mode, pills already
+  // hold per-cam arr-time ranges (one entry per chunk×clip intersection,
+  // or one per single-take cam), so use them as the lookup directly —
+  // multiple entries with the same `id` are fine, `activeCamAt` returns
+  // a cam id whenever ANY range contains the sample.
+  const camLookupsForStrip = useMemo(() => {
+    if (!isArrMode) {
+      return clips.map((c) => ({
         id: c.id,
         color: c.color,
         range: clipRangeS(c),
-      })),
-    [clips],
-  );
+      }));
+    }
+    const colorById = new Map(clips.map((c) => [c.id, c.color]));
+    return pills.map((p) => ({
+      id: p.camId,
+      color: colorById.get(p.camId) ?? "#888888",
+      range: { startS: p.arrStartS, endS: p.arrEndS },
+    }));
+  }, [clips, isArrMode, pills]);
 
   return (
     <div ref={wrapRef} className="w-full select-none">
