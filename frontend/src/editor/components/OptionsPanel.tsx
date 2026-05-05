@@ -22,6 +22,7 @@ import {
   type ImageClip,
   type VideoClip,
 } from "../types";
+import { isPillDirty } from "../arrangement-pills";
 import { ChunkyButton } from "./ChunkyButton";
 import { Knob } from "./Knob";
 import { MonoReadout } from "./MonoReadout";
@@ -184,11 +185,7 @@ function SelectedPillSection({ clipId }: { clipId: string }) {
   );
   const resetPill = useEditorStore((s) => s.resetPill);
   if (!pill || pill.camId !== clipId) return null;
-  const dirty =
-    Math.abs(pill.arrStartS - pill.originalArrStartS) > 1e-3 ||
-    Math.abs(pill.arrEndS - pill.originalArrEndS) > 1e-3 ||
-    Math.abs(pill.sourceInS - pill.originalSourceInS) > 1e-3 ||
-    Math.abs(pill.sourceOutS - pill.originalSourceOutS) > 1e-3;
+  const dirty = isPillDirty(pill);
   return (
     <section className="flex flex-col gap-2 rounded-md border border-rule px-3 py-2 bg-paper-deep">
       <div className="label">Selected pill</div>

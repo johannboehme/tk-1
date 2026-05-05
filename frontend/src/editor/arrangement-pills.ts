@@ -32,6 +32,23 @@ import {
  *  across editor mounts even when the job has no arrangement. */
 const DEFAULT_ITEM_ID = "__default__";
 
+/** Tolerance for pill-dirtiness comparisons. Anything sub-millisecond
+ *  is rounding noise, not a user edit. */
+const DIRTY_EPS_S = 1e-3;
+
+/** True when a pill's arr-window or source-trim has been edited off its
+ *  auto-generated baseline. Drives the floating ↺ reset-button on the
+ *  canvas, the lane-header reset enable-state, and the per-pill RESET
+ *  button in the OptionsPanel — one source of truth for "needs reset". */
+export function isPillDirty(p: Pill): boolean {
+  return (
+    Math.abs(p.arrStartS - p.originalArrStartS) > DIRTY_EPS_S ||
+    Math.abs(p.arrEndS - p.originalArrEndS) > DIRTY_EPS_S ||
+    Math.abs(p.sourceInS - p.originalSourceInS) > DIRTY_EPS_S ||
+    Math.abs(p.sourceOutS - p.originalSourceOutS) > DIRTY_EPS_S
+  );
+}
+
 /**
  * Build the editor's pill list from the persisted job state.
  *

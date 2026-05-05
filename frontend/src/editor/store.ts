@@ -895,6 +895,78 @@ function neighbourBoundsForCam(
   return { prevEnd, nextStart };
 }
 
+/** Minimum arr-window length for a pill — anything narrower is the user
+ *  in the middle of a trim drag, not a usable chunk. Keep above the
+ *  decoder's typical seek granularity so playback can land on it. */
+const PILL_MIN_WINDOW_S = 0.05;
+
+/** Bounded clamp `min ≤ x ≤ max`. Order-of-args mirrors `Math.max(min,
+ *  Math.min(max, x))` so reading the call as `clamp(value, lo, hi)` is
+ *  natural. */
+function clamp(x: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, x));
+}
+
+/** Restore a pill to its auto-generated arr-window + source-trim. Used
+ *  by both per-pill (`resetPill`) and per-cam (`resetPillsForCam`)
+ *  reset paths so they share one definition of "baseline". */
+function restorePillBaseline(p: Pill): Pill {
+  return {
+    ...p,
+    arrStartS: p.originalArrStartS,
+    arrEndS: p.originalArrEndS,
+    sourceInS: p.originalSourceInS,
+    sourceOutS: p.originalSourceOutS,
+  };
+}
+
+/** Shift a pill's source-trim by `deltaS`, clamped against zero +
+ *  minimum window. Shared by `nudgePillSourceMs` and
+ *  `nudgeCamSourceMs` (which fans this out across the cam's pills). */
+function shiftPillSource(p: Pill, deltaS: number): Pill {
+  return {
+    ...p,
+    sourceInS: Math.max(0, p.sourceInS + deltaS),
+    sourceOutS: Math.max(p.sourceInS + 0.05, p.sourceOutS + deltaS),
+  };
+}
+
+/** Pure helper — apply `fn` to the one pill matching `id` and return a
+ *  new pills array. Other pills are returned by reference so React's
+ *  shallow comparison + rerender machinery only re-keys the changed
+ *  one. Centralised so every per-pill setter has the same shape and we
+ *  don't sprinkle `.map(p => p.id === id ? {...} : p)` across the
+ *  store. */
+function mutatePill(
+  pills: readonly Pill[],
+  id: string,
+  fn: (p: Pill) => Pill,
+): Pill[] {
+  return pills.map((p) => (p.id === id ? fn(p) : p));
+}
+
+/** Pure helper — apply `fn` to every pill of `camId`. Same rationale as
+ *  `mutatePill` but for cam-wide gestures (RESET cam, nudge whole take,
+ *  etc.). */
+function mutatePillsForCam(
+  pills: readonly Pill[],
+  camId: string,
+  fn: (p: Pill) => Pill,
+): Pill[] {
+  return pills.map((p) => (p.camId === camId ? fn(p) : p));
+}
+
+/** Pure helper — apply `fn` to the one clip matching `camId`. Same idea
+ *  as `mutatePill` for the dozen-or-so per-clip setters (sync override,
+ *  trim, rotation, …). */
+function mutateClip(
+  clips: readonly Clip[],
+  camId: string,
+  fn: (c: Clip) => Clip,
+): Clip[] {
+  return clips.map((c) => (c.id === camId ? fn(c) : c));
+}
+
 function insertCutSorted(existing: readonly Cut[], cut: Cut): Cut[] {
   // Binary search for the insertion index.
   let lo = 0;
@@ -1376,12 +1448,9 @@ export const useEditorStore = create<EditorState>()(
       set({ ui: { ...get().ui, lanesLocked: locked } });
     },
     resetClipAlignment(camId) {
-      const clips = get().clips.map((c): Clip => {
-        if (c.id !== camId) return c;
+      const clips = mutateClip(get().clips, camId, (c) => {
         // Image clips have no sync alignment — only their startOffsetS.
-        if (!isVideoClip(c)) {
-          return { ...c, startOffsetS: 0 };
-        }
+        if (!isVideoClip(c)) return { ...c, startOffsetS: 0 };
         const primary = c.candidates[0];
         return {
           ...c,
@@ -1457,15 +1526,14 @@ export const useEditorStore = create<EditorState>()(
       set({ jobMeta: { ...meta, barOffsetBeats: off } });
     },
     setSelectedCandidateIdx(camId, idx) {
-      const clips = get().clips.map((c): Clip => {
-        if (c.id !== camId) return c;
-        if (!isVideoClip(c)) return c; // image clips have no candidates
-        const max = Math.max(0, c.candidates.length - 1);
-        const clamped = Math.max(0, Math.min(idx, max));
-        const newOffset = c.candidates[clamped]?.offsetMs ?? c.syncOffsetMs;
-        return { ...c, selectedCandidateIdx: clamped, syncOffsetMs: newOffset };
+      set({
+        clips: mutateClip(get().clips, camId, (c) => {
+          if (!isVideoClip(c)) return c; // image clips have no candidates
+          const clamped = clamp(idx, 0, Math.max(0, c.candidates.length - 1));
+          const newOffset = c.candidates[clamped]?.offsetMs ?? c.syncOffsetMs;
+          return { ...c, selectedCandidateIdx: clamped, syncOffsetMs: newOffset };
+        }),
       });
-      set({ clips });
     },
 
     setSelectedClipId(id) {
@@ -1522,55 +1590,57 @@ export const useEditorStore = create<EditorState>()(
       if (!me) return;
       const len = me.arrEndS - me.arrStartS;
       // Same-cam neighbour bounds — pills in one cam-lane can't overlap.
-      // Compute bounds from the CURRENT positions of siblings; the pill
-      // we're dragging is excluded so its own current placement doesn't
-      // pin itself in place.
+      // Computed from the CURRENT positions of siblings (the pill being
+      // dragged is excluded so its own placement doesn't pin itself).
       const { prevEnd, nextStart } = neighbourBoundsForCam(allPills, me);
-      const minStart = prevEnd;
-      const maxStart = Math.max(minStart, nextStart - len);
-      const safe = Math.max(minStart, Math.min(maxStart, Math.max(0, arrStartS)));
-      const pills = allPills.map((p) =>
-        p.id === id ? { ...p, arrStartS: safe, arrEndS: safe + len } : p,
+      const safe = clamp(
+        Math.max(0, arrStartS),
+        prevEnd,
+        Math.max(prevEnd, nextStart - len),
       );
-      set({ pills });
+      set({
+        pills: mutatePill(allPills, id, (p) => ({
+          ...p,
+          arrStartS: safe,
+          arrEndS: safe + len,
+        })),
+      });
     },
     setPillLeftEdgeArrStartS(id, arrStartS) {
       const allPills = get().pills;
       const me = allPills.find((p) => p.id === id);
       if (!me) return;
-      const minWindow = 0.05;
       const { prevEnd } = neighbourBoundsForCam(allPills, me);
-      const maxStart = me.arrEndS - minWindow;
-      const newStart = Math.max(prevEnd, Math.min(maxStart, arrStartS));
+      const newStart = clamp(arrStartS, prevEnd, me.arrEndS - PILL_MIN_WINDOW_S);
       // The cam stays in sync with the pill: as we trim N seconds off
       // the front of the arr-window, advance sourceInS by the same N.
       // (V1: 1:1 mapping, no time-stretch.)
-      const delta = newStart - me.arrStartS;
-      const newSourceIn = Math.max(0, me.sourceInS + delta);
-      const pills = allPills.map((p) =>
-        p.id === id
-          ? { ...p, arrStartS: newStart, sourceInS: newSourceIn }
-          : p,
-      );
-      set({ pills });
+      const newSourceIn = Math.max(0, me.sourceInS + (newStart - me.arrStartS));
+      set({
+        pills: mutatePill(allPills, id, (p) => ({
+          ...p,
+          arrStartS: newStart,
+          sourceInS: newSourceIn,
+        })),
+      });
     },
     setPillRightEdgeArrEndS(id, arrEndS) {
       const allPills = get().pills;
       const me = allPills.find((p) => p.id === id);
       if (!me) return;
-      const minWindow = 0.05;
       const { nextStart } = neighbourBoundsForCam(allPills, me);
-      const minEnd = me.arrStartS + minWindow;
-      const newEnd = Math.max(minEnd, Math.min(nextStart, arrEndS));
-      const delta = newEnd - me.arrEndS;
+      const newEnd = clamp(arrEndS, me.arrStartS + PILL_MIN_WINDOW_S, nextStart);
       const newSourceOut = Math.max(
         me.sourceInS + 0.001,
-        me.sourceOutS + delta,
+        me.sourceOutS + (newEnd - me.arrEndS),
       );
-      const pills = allPills.map((p) =>
-        p.id === id ? { ...p, arrEndS: newEnd, sourceOutS: newSourceOut } : p,
-      );
-      set({ pills });
+      set({
+        pills: mutatePill(allPills, id, (p) => ({
+          ...p,
+          arrEndS: newEnd,
+          sourceOutS: newSourceOut,
+        })),
+      });
     },
     removePill(id) {
       const pills = get().pills.filter((p) => p.id !== id);
@@ -1578,91 +1648,54 @@ export const useEditorStore = create<EditorState>()(
       set({ pills, selectedPillId: sel === id ? null : sel });
     },
     resetPill(id) {
-      const pills = get().pills.map((p) =>
-        p.id === id
-          ? {
-              ...p,
-              arrStartS: p.originalArrStartS,
-              arrEndS: p.originalArrEndS,
-              sourceInS: p.originalSourceInS,
-              sourceOutS: p.originalSourceOutS,
-            }
-          : p,
-      );
-      set({ pills });
+      set({ pills: mutatePill(get().pills, id, restorePillBaseline) });
     },
     resetPillsForCam(camId) {
-      const pills = get().pills.map((p) =>
-        p.camId === camId
-          ? {
-              ...p,
-              arrStartS: p.originalArrStartS,
-              arrEndS: p.originalArrEndS,
-              sourceInS: p.originalSourceInS,
-              sourceOutS: p.originalSourceOutS,
-            }
-          : p,
-      );
-      set({ pills });
+      set({
+        pills: mutatePillsForCam(get().pills, camId, restorePillBaseline),
+      });
     },
     nudgePillSourceMs(id, deltaMs) {
-      const deltaS = deltaMs / 1000;
-      const pills = get().pills.map((p) => {
-        if (p.id !== id) return p;
-        return {
-          ...p,
-          sourceInS: Math.max(0, p.sourceInS + deltaS),
-          sourceOutS: Math.max(p.sourceInS + 0.05, p.sourceOutS + deltaS),
-        };
+      set({
+        pills: mutatePill(get().pills, id, (p) =>
+          shiftPillSource(p, deltaMs / 1000),
+        ),
       });
-      set({ pills });
     },
     setPillSourceOffsetMs(id, offsetMs) {
       const offsetS = offsetMs / 1000;
-      const pills = get().pills.map((p) => {
-        if (p.id !== id) return p;
-        return {
+      set({
+        pills: mutatePill(get().pills, id, (p) => ({
           ...p,
           sourceInS: Math.max(0, p.originalSourceInS + offsetS),
           sourceOutS: Math.max(
             p.originalSourceInS + offsetS + 0.05,
             p.originalSourceOutS + offsetS,
           ),
-        };
+        })),
       });
-      set({ pills });
     },
     nudgePillArrMs(id, deltaMs) {
       const deltaS = deltaMs / 1000;
-      const pills = get().pills.map((p) => {
-        if (p.id !== id) return p;
-        const newStart = Math.max(0, p.arrStartS + deltaS);
-        const len = p.arrEndS - p.arrStartS;
-        return { ...p, arrStartS: newStart, arrEndS: newStart + len };
+      set({
+        pills: mutatePill(get().pills, id, (p) => {
+          const newStart = Math.max(0, p.arrStartS + deltaS);
+          return { ...p, arrStartS: newStart, arrEndS: newStart + (p.arrEndS - p.arrStartS) };
+        }),
       });
-      set({ pills });
     },
     nudgeCamSourceMs(camId, deltaMs) {
-      const deltaS = deltaMs / 1000;
-      const pills = get().pills.map((p) => {
-        if (p.camId !== camId) return p;
-        return {
-          ...p,
-          sourceInS: Math.max(0, p.sourceInS + deltaS),
-          sourceOutS: Math.max(p.sourceInS + 0.05, p.sourceOutS + deltaS),
-        };
-      });
+      const pills = mutatePillsForCam(get().pills, camId, (p) =>
+        shiftPillSource(p, deltaMs / 1000),
+      );
       set({ pills });
     },
     setClipSyncOverride(camId, ms) {
       const prev = get().clips.find((c) => c.id === camId);
-      const prevMs =
-        prev && isVideoClip(prev) ? prev.syncOverrideMs : 0;
-      const clips = get().clips.map((c): Clip => {
-        if (c.id !== camId) return c;
-        if (!isVideoClip(c)) return c; // images have no sync override
-        return { ...c, syncOverrideMs: ms };
-      });
+      const prevMs = prev && isVideoClip(prev) ? prev.syncOverrideMs : 0;
+      const clips = mutateClip(get().clips, camId, (c) =>
+        isVideoClip(c) ? { ...c, syncOverrideMs: ms } : c,
+      );
       set({ clips });
       // The cam-track-anchor change is reflected in pill source-time:
       // every pill of this cam plays its excerpt N ms later (positive)
@@ -1675,21 +1708,16 @@ export const useEditorStore = create<EditorState>()(
       const deltaMs = ms - prevMs;
       if (Math.abs(deltaMs) > 1e-6) {
         const deltaS = deltaMs / 1000;
-        const pills = get().pills.map((p) =>
-          p.camId === camId
-            ? {
-                ...p,
-                sourceInS: Math.max(0, p.sourceInS + deltaS),
-                sourceOutS: Math.max(p.sourceInS + 0.05, p.sourceOutS + deltaS),
-                originalSourceInS: Math.max(0, p.originalSourceInS + deltaS),
-                originalSourceOutS: Math.max(
-                  p.originalSourceInS + 0.05,
-                  p.originalSourceOutS + deltaS,
-                ),
-              }
-            : p,
-        );
-        set({ pills });
+        set({
+          pills: mutatePillsForCam(get().pills, camId, (p) => ({
+            ...shiftPillSource(p, deltaS),
+            originalSourceInS: Math.max(0, p.originalSourceInS + deltaS),
+            originalSourceOutS: Math.max(
+              p.originalSourceInS + 0.05,
+              p.originalSourceOutS + deltaS,
+            ),
+          })),
+        });
       }
       // Mirror cam-1 changes into legacy offset slice (SyncTuner).
       const cam1 = clips[0];
@@ -1704,81 +1732,76 @@ export const useEditorStore = create<EditorState>()(
       get().setClipSyncOverride(camId, next);
     },
     setImageClipDuration(camId, durationS) {
-      const next = get().clips.map((c): Clip => {
-        if (c.id !== camId) return c;
-        if (c.kind !== "image") return c;
-        // Hard min so the pill never collapses to an unhittable sliver.
-        const clamped = Math.max(0.1, durationS);
-        return { ...c, durationS: clamped };
+      set({
+        clips: mutateClip(get().clips, camId, (c) => {
+          if (c.kind !== "image") return c;
+          // Hard min so the pill never collapses to an unhittable sliver.
+          return { ...c, durationS: Math.max(0.1, durationS) };
+        }),
       });
-      set({ clips: next });
     },
 
     setVideoClipTrim(camId, trimInS, trimOutS) {
-      const next = get().clips.map((c): Clip => {
-        if (c.id !== camId) return c;
-        if (!isVideoClip(c)) return c;
-        const minWindow = 0.05;
-        const inS = Math.max(
-          0,
-          Math.min(c.sourceDurationS - minWindow, trimInS),
-        );
-        const outS = Math.max(
-          inS + minWindow,
-          Math.min(c.sourceDurationS, trimOutS),
-        );
-        return { ...c, trimInS: inS, trimOutS: outS };
+      set({
+        clips: mutateClip(get().clips, camId, (c) => {
+          if (!isVideoClip(c)) return c;
+          const inS = clamp(trimInS, 0, c.sourceDurationS - PILL_MIN_WINDOW_S);
+          const outS = clamp(trimOutS, inS + PILL_MIN_WINDOW_S, c.sourceDurationS);
+          return { ...c, trimInS: inS, trimOutS: outS };
+        }),
       });
-      set({ clips: next });
     },
 
     setClipStartOffset(camId, startOffsetS) {
-      const clips = get().clips.map((c) =>
-        c.id === camId ? { ...c, startOffsetS } : c,
-      );
-      set({ clips });
+      set({
+        clips: mutateClip(get().clips, camId, (c) => ({ ...c, startOffsetS })),
+      });
     },
     setClipRotation(camId, deg) {
-      const clips = get().clips.map((c): Clip =>
-        c.id === camId ? { ...c, rotation: deg } : c,
-      );
-      set({ clips });
+      set({
+        clips: mutateClip(get().clips, camId, (c) => ({ ...c, rotation: deg })),
+      });
     },
     setClipFlip(camId, axis, on) {
       const key = axis === "x" ? "flipX" : "flipY";
-      const clips = get().clips.map((c): Clip =>
-        c.id === camId ? { ...c, [key]: on } : c,
-      );
-      set({ clips });
+      set({
+        clips: mutateClip(get().clips, camId, (c) => ({ ...c, [key]: on })),
+      });
     },
     resetClipTransform(camId) {
-      const clips = get().clips.map((c): Clip =>
-        c.id === camId ? { ...c, rotation: 0, flipX: false, flipY: false } : c,
-      );
-      set({ clips });
+      set({
+        clips: mutateClip(get().clips, camId, (c) => ({
+          ...c,
+          rotation: 0,
+          flipX: false,
+          flipY: false,
+        })),
+      });
     },
     setClipViewportTransform(camId, partial) {
-      const clips = get().clips.map((c): Clip => {
-        if (c.id !== camId) return c;
-        const cur: ViewportTransform =
-          c.viewportTransform ?? DEFAULT_VIEWPORT_TRANSFORM;
-        const merged: ViewportTransform = {
-          scale: partial.scale ?? cur.scale,
-          x: partial.x ?? cur.x,
-          y: partial.y ?? cur.y,
-        };
-        return { ...c, viewportTransform: merged };
+      set({
+        clips: mutateClip(get().clips, camId, (c) => {
+          const cur: ViewportTransform =
+            c.viewportTransform ?? DEFAULT_VIEWPORT_TRANSFORM;
+          return {
+            ...c,
+            viewportTransform: {
+              scale: partial.scale ?? cur.scale,
+              x: partial.x ?? cur.x,
+              y: partial.y ?? cur.y,
+            },
+          };
+        }),
       });
-      set({ clips });
     },
     resetClipViewportTransform(camId) {
-      const clips = get().clips.map((c): Clip => {
-        if (c.id !== camId) return c;
-        const { viewportTransform: _drop, ...rest } = c;
-        void _drop;
-        return rest as Clip;
+      set({
+        clips: mutateClip(get().clips, camId, (c) => {
+          const { viewportTransform: _drop, ...rest } = c;
+          void _drop;
+          return rest as Clip;
+        }),
       });
-      set({ clips });
     },
     setMasterAudioVolume(v) {
       const clamped = Math.max(0, Math.min(4, v));

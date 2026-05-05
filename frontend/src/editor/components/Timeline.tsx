@@ -20,7 +20,7 @@ import {
   useState,
 } from "react";
 import { useEditorStore } from "../store";
-import { clipRangeS, isVideoClip, type Clip } from "../types";
+import { clipRangeS, isVideoClip, type Clip, type Pill } from "../types";
 import {
   arrToMaster,
   masterToArr,
@@ -30,6 +30,7 @@ import {
   sliceByArrSegments,
   totalArrDuration,
 } from "../arrangement-time";
+import { isPillDirty } from "../arrangement-pills";
 import { LaneHeader, type CamStatus } from "./timeline/LaneHeader";
 import { AddMediaButton } from "./AddMediaButton";
 import { ProgramStrip } from "./timeline/ProgramStrip";
@@ -122,6 +123,17 @@ type DragKind =
 
 const HANDLE_HIT = 14;
 const TARGET_TILE_W = 64;
+/** Edge-to-edge magnetic-snap reach during a pill drag, in CSS pixels.
+ *  Same on every zoom level — the time-domain threshold is derived per
+ *  drag event from the live `pxPerSec`. */
+const PILL_SNAP_EDGE_PX = 6;
+/** Minimum arr-window length the trim handlers will collapse a pill
+ *  to. Anything thinner is the user mid-drag, not a usable chunk. */
+const PILL_MIN_WINDOW_S = 0.05;
+
+function clamp(x: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, x));
+}
 /** Default lane-header column width on desktop. The narrow-viewport
  *  variant (`HEADER_W_COMPACT`) is used on phone-sized screens — see
  *  LaneHeader.tsx for the matching compact body. */
@@ -572,13 +584,7 @@ export function Timeline({
       });
       const pillIds: (string | null)[] = lanePills.map((p) => p.id);
       const selectedSlice = lanePills.map((p) => p.id === selectedPillId);
-      const dirtySlice = lanePills.map(
-        (p) =>
-          Math.abs(p.arrStartS - p.originalArrStartS) > 1e-3 ||
-          Math.abs(p.arrEndS - p.originalArrEndS) > 1e-3 ||
-          Math.abs(p.sourceInS - p.originalSourceInS) > 1e-3 ||
-          Math.abs(p.sourceOutS - p.originalSourceOutS) > 1e-3,
-      );
+      const dirtySlice = lanePills.map(isPillDirty);
       drawVideoLane({
         ctx,
         clip,
@@ -591,12 +597,6 @@ export function Timeline({
         dirtyPerSlice: dirtySlice,
         img: camImagesRef.current.get(clip.id) ?? null,
         aspect: cams[clip.id]?.aspect ?? 16 / 9,
-        // Pill-level selection is the only highlight unit. The cam-level
-        // `selectedClipId` drives panel routing (SyncTuner / Options
-        // follow the cam) but must NOT promote to a lane-wide glow —
-        // otherwise clicking one pill would light up every other pill
-        // of the same cam and drown the real selection.
-        clipSelected: false,
       });
       // Match-point candidate ticks — drawn ALWAYS (subtly when not in
       // MATCH snap-mode, emphasised when MATCH is active) so the user
@@ -885,25 +885,35 @@ export function Timeline({
   ]);
 
   // ---- Hit-testing & drag ----
-  function findClipAt(x: number, y: number): { clip: Clip; band: { top: number; bottom: number } } | null {
+
+  /** Single source of truth for "which video lane is `y` over". Other
+   *  hit-tests build on this so every Lane-Y-check looks the same. */
+  function videoLaneAt(
+    y: number,
+  ): { clip: Clip; band: { top: number; bottom: number } } | null {
     for (let i = 0; i < clips.length; i++) {
       const band = videoBands[i];
-      if (y < band.top || y >= band.bottom) continue;
-      const range = clipRangeS(clips[i]);
-      // Walk the projected slices — direct-mode is one passthrough slice,
-      // arrangement-mode is one per intersected segment. The pointer hits
-      // the clip iff it lands inside any slice's pixel range.
-      const slices = sliceByArrSegments(
-        range.startS,
-        range.endS,
-        isArrMode ? arrangementSegments : [],
-      );
-      for (const s of slices) {
-        const x1 = ((s.arrStartS - viewStart) / visibleDur) * canvasWidth;
-        const x2 = ((s.arrEndS - viewStart) / visibleDur) * canvasWidth;
-        if (x >= x1 && x <= x2) return { clip: clips[i], band };
-      }
-      return null; // hit the lane but missed every slice → no clip selected
+      if (y >= band.top && y < band.bottom) return { clip: clips[i], band };
+    }
+    return null;
+  }
+
+  function findClipAt(x: number, y: number): { clip: Clip; band: { top: number; bottom: number } } | null {
+    const lane = videoLaneAt(y);
+    if (!lane) return null;
+    const range = clipRangeS(lane.clip);
+    // Walk the projected slices — direct-mode is one passthrough slice,
+    // arrangement-mode is one per intersected segment. The pointer hits
+    // the clip iff it lands inside any slice's pixel range.
+    const slices = sliceByArrSegments(
+      range.startS,
+      range.endS,
+      isArrMode ? arrangementSegments : [],
+    );
+    for (const s of slices) {
+      const x1 = ((s.arrStartS - viewStart) / visibleDur) * canvasWidth;
+      const x2 = ((s.arrEndS - viewStart) / visibleDur) * canvasWidth;
+      if (x >= x1 && x <= x2) return { clip: lane.clip, band: lane.band };
     }
     return null;
   }
@@ -918,85 +928,55 @@ export function Timeline({
     y: number,
   ): { pillId: string; zone: "left" | "right" | "body" | "reset" } | null {
     if (!isArrMode) return null;
-    for (let i = 0; i < clips.length; i++) {
-      const band = videoBands[i];
-      if (y < band.top || y >= band.bottom) continue;
-      const camId = clips[i].id;
-      // Pass 1 — strict body hit. Whatever pill the cursor pixel sits
-      // INSIDE wins, full stop. Reset-button + edge-grip zones live
-      // entirely within that pill's `[x1, x2]` band so they never steal
-      // a click meant for a neighbour's body.
-      for (const p of pills) {
-        if (p.camId !== camId) continue;
-        const x1 = arrTToX(p.arrStartS);
-        const x2 = arrTToX(p.arrEndS);
-        if (x < x1 || x > x2) continue;
-        // Edge-grip width tapers on tiny pills — without this a 12-px
-        // wide chunk would have NO body zone (HANDLE_HIT * 2 ≥ 12).
-        const grip = Math.min(HANDLE_HIT, Math.max(2, (x2 - x1) / 3));
-        const dirty =
-          Math.abs(p.arrStartS - p.originalArrStartS) > 1e-3 ||
-          Math.abs(p.arrEndS - p.originalArrEndS) > 1e-3 ||
-          Math.abs(p.sourceInS - p.originalSourceInS) > 1e-3 ||
-          Math.abs(p.sourceOutS - p.originalSourceOutS) > 1e-3;
-        if (dirty && x2 - x1 > 32) {
-          const rb = resetButtonRect(x1, x2, band.top);
-          if (
-            x >= rb.x &&
-            x <= rb.x + rb.size &&
-            y >= rb.y &&
-            y <= rb.y + rb.size
-          ) {
-            return { pillId: p.id, zone: "reset" };
-          }
-        }
-        if (x - x1 <= grip) return { pillId: p.id, zone: "left" };
-        if (x2 - x <= grip) return { pillId: p.id, zone: "right" };
-        return { pillId: p.id, zone: "body" };
-      }
-      // Pass 2 — gap hit. Cursor sits in a gap between pills (or just
-      // past the last pill); allow a small `HANDLE_HIT` reach so the
-      // user can still grab a trim-edge that lives just outside the
-      // pill body. Closest edge wins so two adjacent pill edges don't
-      // race.
-      let bestPillId: string | null = null;
-      let bestZone: "left" | "right" = "left";
-      let bestDist = HANDLE_HIT;
-      for (const p of pills) {
-        if (p.camId !== camId) continue;
-        const x1 = arrTToX(p.arrStartS);
-        const x2 = arrTToX(p.arrEndS);
-        const dl = Math.abs(x - x1);
-        const dr = Math.abs(x - x2);
-        if (dl < bestDist) {
-          bestDist = dl;
-          bestPillId = p.id;
-          bestZone = "left";
-        }
-        if (dr < bestDist) {
-          bestDist = dr;
-          bestPillId = p.id;
-          bestZone = "right";
+    const lane = videoLaneAt(y);
+    if (!lane) return null;
+    const { clip: laneClip, band } = lane;
+    // Pass 1 — strict body hit. Whatever pill the cursor pixel sits
+    // INSIDE wins, full stop. Reset-button + edge-grip zones live
+    // entirely within that pill's `[x1, x2]` band so they never steal
+    // a click meant for a neighbour's body.
+    for (const p of pills) {
+      if (p.camId !== laneClip.id) continue;
+      const x1 = arrTToX(p.arrStartS);
+      const x2 = arrTToX(p.arrEndS);
+      if (x < x1 || x > x2) continue;
+      // Edge-grip width tapers on tiny pills — without this a 12-px
+      // wide chunk would have NO body zone (HANDLE_HIT * 2 ≥ 12).
+      const grip = Math.min(HANDLE_HIT, Math.max(2, (x2 - x1) / 3));
+      if (isPillDirty(p) && x2 - x1 > 32) {
+        const rb = resetButtonRect(x1, x2, band.top);
+        if (x >= rb.x && x <= rb.x + rb.size && y >= rb.y && y <= rb.y + rb.size) {
+          return { pillId: p.id, zone: "reset" };
         }
       }
-      if (bestPillId) return { pillId: bestPillId, zone: bestZone };
-      return null; // hit the lane band but no pill / edge in reach
+      if (x - x1 <= grip) return { pillId: p.id, zone: "left" };
+      if (x2 - x <= grip) return { pillId: p.id, zone: "right" };
+      return { pillId: p.id, zone: "body" };
     }
-    return null;
+    // Pass 2 — gap hit. Cursor sits in a gap between pills (or just past
+    // the last pill); allow a small `HANDLE_HIT` reach so the user can
+    // still grab a trim-edge that lives just outside the pill body.
+    // Closest edge wins so two adjacent pill edges don't race.
+    let bestPillId: string | null = null;
+    let bestZone: "left" | "right" = "left";
+    let bestDist = HANDLE_HIT;
+    for (const p of pills) {
+      if (p.camId !== laneClip.id) continue;
+      const x1 = arrTToX(p.arrStartS);
+      const x2 = arrTToX(p.arrEndS);
+      const dl = Math.abs(x - x1);
+      const dr = Math.abs(x - x2);
+      if (dl < bestDist) { bestDist = dl; bestPillId = p.id; bestZone = "left"; }
+      if (dr < bestDist) { bestDist = dr; bestPillId = p.id; bestZone = "right"; }
+    }
+    if (bestPillId) return { pillId: bestPillId, zone: bestZone };
+    return null; // hit the lane band but no pill / edge in reach
   }
 
 
-  /** Lane-only hit-test: returns the clip whose lane band contains `y`,
-   *  regardless of whether the pointer's `x` lands inside the pill. Used
-   *  to make the WHOLE row a selection target so the user can park the
-   *  playhead with a normal click and still send I/O to that clip. */
-  function findLaneAt(y: number): { clip: Clip; band: { top: number; bottom: number } } | null {
-    for (let i = 0; i < clips.length; i++) {
-      const band = videoBands[i];
-      if (y >= band.top && y < band.bottom) return { clip: clips[i], band };
-    }
-    return null;
-  }
+  /** Lane-only hit-test — alias for `videoLaneAt`. Kept under its
+   *  caller-facing name so the empty-lane click handlers stay readable. */
+  const findLaneAt = videoLaneAt;
 
   function classifyAudioHit(x: number): "trim-in" | "trim-out" | "playhead" | "loop" | null {
     const xp = tToX(currentTime);
@@ -1321,39 +1301,21 @@ export function Timeline({
       // Pill body drag — shift arrStartS by the pointer-delta in arr-time.
       // Source-trim stays put: only the pill's WHEN moves.
       const arrAtPointer = viewStart + (x / canvasWidth) * visibleDur;
-      const deltaArrT = arrAtPointer - drag.grabArrT;
-      let newArrStartS = Math.max(0, drag.origArrStartS + deltaArrT);
-      // Edge-to-edge snap to same-cam neighbour pills. Either the
-      // dragged pill's left edge can attach to a neighbour's edge, or
-      // its right edge can — whichever is closer wins, only when within
-      // the px-equivalent threshold. The store-side clamp will still
-      // hard-stop overlap; this just makes the magnetic feel.
+      let newArrStartS = Math.max(0, drag.origArrStartS + (arrAtPointer - drag.grabArrT));
+      // Edge-to-edge snap to same-cam neighbour pills — whichever edge
+      // (left or right) is closer to a neighbour wins. The store-side
+      // clamp still hard-stops overlap; this just makes the magnetic
+      // feel.
       const me = pills.find((pp) => pp.id === drag.pillId);
       if (me) {
         const len = me.arrEndS - me.arrStartS;
-        const edges: number[] = [];
-        for (const sib of pills) {
-          if (sib.id === me.id || sib.camId !== me.camId) continue;
-          edges.push(sib.arrStartS, sib.arrEndS);
-        }
-        if (edges.length > 0) {
-          const thresholdT = 6 / Math.max(1, canvasWidth / visibleDur);
-          let bestDelta = thresholdT;
-          let bestStart = newArrStartS;
-          for (const ee of edges) {
-            const dl = Math.abs(ee - newArrStartS);
-            if (dl < bestDelta) {
-              bestDelta = dl;
-              bestStart = ee;
-            }
-            const dr = Math.abs(ee - (newArrStartS + len));
-            if (dr < bestDelta) {
-              bestDelta = dr;
-              bestStart = ee - len;
-            }
-          }
-          newArrStartS = Math.max(0, bestStart);
-        }
+        const edges = neighbourEdges(pills, me.id, me.camId, "all");
+        const thresholdT = PILL_SNAP_EDGE_PX / Math.max(1, canvasWidth / visibleDur);
+        const snapL = snapToNearest(newArrStartS, edges, thresholdT);
+        const snapR = snapToNearest(newArrStartS + len, edges, thresholdT);
+        const dL = Math.abs(snapL - newArrStartS);
+        const dR = Math.abs(snapR - (newArrStartS + len));
+        newArrStartS = Math.max(0, dL <= dR ? snapL : snapR - len);
       }
       setPillArrPlacement(drag.pillId, newArrStartS);
     } else if (drag.kind === "cam-track-move") {
@@ -1375,45 +1337,25 @@ export function Timeline({
       // advances by the same delta so the cam still plays in sync
       // with what's visible inside the pill. Same snap pipeline as
       // the body-drag — Shift bypasses, Snap modes round to grid /
-      // MATCH candidates, "off" passes through.
+      // MATCH candidates, "off" passes through. Plus magnetic snap
+      // onto the previous neighbour's right edge so a trim-in
+      // attaches chunks back-to-back when dragged near the gap.
       const arrAtPointer = viewStart + (x / canvasWidth) * visibleDur;
-      let snappedT = snapped(arrAtPointer, e);
-      // Edge-snap onto the previous neighbour pill's right edge, so a
-      // trim-in attaches the chunks back-to-back when the user drags
-      // close to the gap.
       const me = pills.find((pp) => pp.id === drag.pillId);
-      if (me) {
-        const thresholdT = 6 / Math.max(1, canvasWidth / visibleDur);
-        for (const sib of pills) {
-          if (sib.id === me.id || sib.camId !== me.camId) continue;
-          if (Math.abs(sib.arrEndS - snappedT) < thresholdT) {
-            snappedT = sib.arrEndS;
-            break;
-          }
-        }
-      }
-      const minWindow = 0.05;
-      const clamped = Math.max(
-        0,
-        Math.min(drag.origArrEndS - minWindow, snappedT),
-      );
+      const thresholdT = PILL_SNAP_EDGE_PX / Math.max(1, canvasWidth / visibleDur);
+      const edgeSnap = me
+        ? snapToNearest(snapped(arrAtPointer, e), neighbourEdges(pills, me.id, me.camId, "ends"), thresholdT)
+        : snapped(arrAtPointer, e);
+      const clamped = clamp(edgeSnap, 0, drag.origArrEndS - PILL_MIN_WINDOW_S);
       setPillLeftEdgeArrStartS(drag.pillId, clamped);
     } else if (drag.kind === "pill-trim-out") {
       const arrAtPointer = viewStart + (x / canvasWidth) * visibleDur;
-      let snappedT = snapped(arrAtPointer, e);
       const me = pills.find((pp) => pp.id === drag.pillId);
-      if (me) {
-        const thresholdT = 6 / Math.max(1, canvasWidth / visibleDur);
-        for (const sib of pills) {
-          if (sib.id === me.id || sib.camId !== me.camId) continue;
-          if (Math.abs(sib.arrStartS - snappedT) < thresholdT) {
-            snappedT = sib.arrStartS;
-            break;
-          }
-        }
-      }
-      const minWindow = 0.05;
-      const clamped = Math.max(drag.origArrStartS + minWindow, snappedT);
+      const thresholdT = PILL_SNAP_EDGE_PX / Math.max(1, canvasWidth / visibleDur);
+      const edgeSnap = me
+        ? snapToNearest(snapped(arrAtPointer, e), neighbourEdges(pills, me.id, me.camId, "starts"), thresholdT)
+        : snapped(arrAtPointer, e);
+      const clamped = Math.max(drag.origArrStartS + PILL_MIN_WINDOW_S, edgeSnap);
       setPillRightEdgeArrEndS(drag.pillId, clamped);
     }
   };
@@ -1807,13 +1749,7 @@ export function Timeline({
                     clip.startOffsetS !== 0 ||
                     clip.selectedCandidateIdx !== 0 ||
                     pills.some(
-                      (p) =>
-                        p.camId === clip.id &&
-                        (Math.abs(p.arrStartS - p.originalArrStartS) > 1e-3 ||
-                          Math.abs(p.arrEndS - p.originalArrEndS) > 1e-3 ||
-                          Math.abs(p.sourceInS - p.originalSourceInS) > 1e-3 ||
-                          Math.abs(p.sourceOutS - p.originalSourceOutS) >
-                            1e-3),
+                      (p) => p.camId === clip.id && isPillDirty(p),
                     ))
                 }
                 onReset={() => {
@@ -1964,6 +1900,48 @@ interface ClipPillSlice {
   masterEndS: number;
 }
 
+/** Collect the arr-time edges of all same-cam neighbour pills (the
+ *  pill being dragged is excluded). `side` filters which edges count:
+ *  `"starts"` for trim-out (snap to a next pill's left edge),
+ *  `"ends"` for trim-in (snap to a prev pill's right edge), `"all"`
+ *  for a body drag where either edge of the dragged pill can attach
+ *  to either edge of a neighbour. */
+function neighbourEdges(
+  pills: readonly Pill[],
+  myId: string,
+  myCamId: string,
+  side: "all" | "starts" | "ends",
+): number[] {
+  const out: number[] = [];
+  for (const sib of pills) {
+    if (sib.id === myId || sib.camId !== myCamId) continue;
+    if (side !== "ends") out.push(sib.arrStartS);
+    if (side !== "starts") out.push(sib.arrEndS);
+  }
+  return out;
+}
+
+/** Snap `t` to the closest entry in `candidates` within `thresholdT`.
+ *  Returns `t` unchanged when nothing is in reach. Used by all three
+ *  pill-drag edge-snaps; threshold is derived from `PILL_SNAP_EDGE_PX`
+ *  scaled to the live arr-time/px ratio. */
+function snapToNearest(
+  t: number,
+  candidates: readonly number[],
+  thresholdT: number,
+): number {
+  let best = t;
+  let bestDist = thresholdT;
+  for (const c of candidates) {
+    const d = Math.abs(c - t);
+    if (d < bestDist) {
+      bestDist = d;
+      best = c;
+    }
+  }
+  return best;
+}
+
 /** Geometry of the floating ↺ reset button on a dirty pill. Pure
  *  function — shared between the renderer (drawVideoLane) and the
  *  hit-test (findPillAt) so the painted glyph and the click area stay
@@ -1995,17 +1973,16 @@ interface DrawVideoLaneArgs {
   /** Aligned with `slices`. Pill id for arrangement-mode pills (used by
    *  hit-testing) or null for direct-mode passthrough slices. */
   pillIds: (string | null)[];
-  /** Aligned with `slices`. Highlight individual pills via the
-   *  selectedPillId, falling back to the cam-level `clipSelected` for
-   *  direct-mode where the whole clip is the selection unit. */
+  /** Aligned with `slices`. True for the slice whose pill matches the
+   *  current `selectedPillId`. Pill-selection is the only canvas
+   *  highlight unit — the cam-level `selectedClipId` drives panel
+   *  routing only and must NOT promote to a lane-wide glow. */
   selectedPerSlice: boolean[];
   /** Aligned with `slices`. True when the underlying pill has been
    *  edited off its baseline; drives the floating ↺ reset-button. */
   dirtyPerSlice: boolean[];
   img: HTMLImageElement | null;
   aspect: number;
-  /** Direct-mode lane outline + glow (when the whole clip is selected). */
-  clipSelected: boolean;
 }
 
 function drawVideoLane({
@@ -2020,7 +1997,6 @@ function drawVideoLane({
   dirtyPerSlice,
   img,
   aspect,
-  clipSelected,
 }: DrawVideoLaneArgs) {
   // Lane background — paper-deep, same as canvas BG, so video lanes feel
   // continuous and the audio lane reads as the contrasting band below.
@@ -2035,7 +2011,7 @@ function drawVideoLane({
 
   for (let sliceIdx = 0; sliceIdx < slices.length; sliceIdx++) {
     const slice = slices[sliceIdx];
-    const sliceSelected = selectedPerSlice[sliceIdx] || clipSelected;
+    const sliceSelected = selectedPerSlice[sliceIdx];
     if (slice.xEnd <= 0 || slice.xStart >= canvasWidth) continue;
     const pillX = Math.max(0, slice.xStart);
     const pillW = Math.min(canvasWidth, slice.xEnd) - pillX;
