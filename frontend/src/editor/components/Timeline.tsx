@@ -591,24 +591,27 @@ export function Timeline({
         dirtyPerSlice: dirtySlice,
         img: camImagesRef.current.get(clip.id) ?? null,
         aspect: cams[clip.id]?.aspect ?? 16 / 9,
-        clipSelected: clip.id === selectedClipId,
+        // Pill-level selection is the only highlight unit. The cam-level
+        // `selectedClipId` drives panel routing (SyncTuner / Options
+        // follow the cam) but must NOT promote to a lane-wide glow —
+        // otherwise clicking one pill would light up every other pill
+        // of the same cam and drown the real selection.
+        clipSelected: false,
       });
-      // Match-point candidate ticks. Visible whenever MATCH snap-mode
-      // is on (or while the user is doing a track-nudge drag in MATCH)
-      // so the user can see the cam's alternative master-anchor
-      // alignments and aim a drag at one. Image clips early-out
-      // inside drawMatchMarkers.
-      if (snapMode === "match") {
-        drawMatchMarkers({
-          ctx,
-          clip,
-          bandTop: band.top,
-          bandH: videoLaneHeight,
-          tToX,
-          canvasWidth,
-          emphasized: clip.id === selectedClipId,
-        });
-      }
+      // Match-point candidate ticks — drawn ALWAYS (subtly when not in
+      // MATCH snap-mode, emphasised when MATCH is active) so the user
+      // can read the cam's alignment options at a glance regardless of
+      // the active snap-mode, matching the pre-refactor behaviour.
+      // Image clips early-out inside drawMatchMarkers.
+      drawMatchMarkers({
+        ctx,
+        clip,
+        bandTop: band.top,
+        bandH: videoLaneHeight,
+        tToX,
+        canvasWidth,
+        emphasized: snapMode === "match",
+      });
       // Lane separator line below each video lane (subtle sepia rule).
       ctx.fillStyle = "#D8CFB8";
       ctx.fillRect(0, band.bottom - 1, canvasWidth, 1);
@@ -788,15 +791,21 @@ export function Timeline({
       );
     }
 
-    // Playhead — spans all lanes.
-    const xp = tToX(currentTime);
+    // Playhead — spans all lanes. Snap to a half-pixel column so the
+    // 1.5-px stroke renders crisply on the SAME canvas-x as the
+    // BeatRuler's `Math.floor(x)` bar tick. Without the snap the
+    // sub-pixel smear of an odd-width stroke makes the playhead read
+    // as 1-2 px right of the bar mark even when the time math is exact.
+    const xpFloat = tToX(currentTime);
+    const xp = Math.floor(xpFloat) + 0.5;
     ctx.strokeStyle = "#FF5722";
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     ctx.moveTo(xp, 0);
     ctx.lineTo(xp, canvasH);
     ctx.stroke();
-    // Playhead grip (top).
+    // Playhead grip (top). Use the same snapped x so the triangle
+    // points exactly at the playhead column.
     ctx.fillStyle = "#FF5722";
     ctx.beginPath();
     ctx.moveTo(xp - 6, 0);
@@ -913,15 +922,18 @@ export function Timeline({
       const band = videoBands[i];
       if (y < band.top || y >= band.bottom) continue;
       const camId = clips[i].id;
+      // Pass 1 — strict body hit. Whatever pill the cursor pixel sits
+      // INSIDE wins, full stop. Reset-button + edge-grip zones live
+      // entirely within that pill's `[x1, x2]` band so they never steal
+      // a click meant for a neighbour's body.
       for (const p of pills) {
         if (p.camId !== camId) continue;
         const x1 = arrTToX(p.arrStartS);
         const x2 = arrTToX(p.arrEndS);
-        if (x < x1 - HANDLE_HIT || x > x2 + HANDLE_HIT) continue;
-        // Floating ↺ reset-button hit-zone — sits at the top-right of
-        // the pill body when the pill is dirty (= moved / trimmed off
-        // its baseline). Tested BEFORE edge zones so the trim-out grip
-        // that lives on the same right edge doesn't swallow the click.
+        if (x < x1 || x > x2) continue;
+        // Edge-grip width tapers on tiny pills — without this a 12-px
+        // wide chunk would have NO body zone (HANDLE_HIT * 2 ≥ 12).
+        const grip = Math.min(HANDLE_HIT, Math.max(2, (x2 - x1) / 3));
         const dirty =
           Math.abs(p.arrStartS - p.originalArrStartS) > 1e-3 ||
           Math.abs(p.arrEndS - p.originalArrEndS) > 1e-3 ||
@@ -938,15 +950,37 @@ export function Timeline({
             return { pillId: p.id, zone: "reset" };
           }
         }
-        if (Math.abs(x - x1) <= HANDLE_HIT) {
-          return { pillId: p.id, zone: "left" };
-        }
-        if (Math.abs(x - x2) <= HANDLE_HIT) {
-          return { pillId: p.id, zone: "right" };
-        }
-        if (x >= x1 && x <= x2) return { pillId: p.id, zone: "body" };
+        if (x - x1 <= grip) return { pillId: p.id, zone: "left" };
+        if (x2 - x <= grip) return { pillId: p.id, zone: "right" };
+        return { pillId: p.id, zone: "body" };
       }
-      return null; // hit the lane band but missed every pill on it
+      // Pass 2 — gap hit. Cursor sits in a gap between pills (or just
+      // past the last pill); allow a small `HANDLE_HIT` reach so the
+      // user can still grab a trim-edge that lives just outside the
+      // pill body. Closest edge wins so two adjacent pill edges don't
+      // race.
+      let bestPillId: string | null = null;
+      let bestZone: "left" | "right" = "left";
+      let bestDist = HANDLE_HIT;
+      for (const p of pills) {
+        if (p.camId !== camId) continue;
+        const x1 = arrTToX(p.arrStartS);
+        const x2 = arrTToX(p.arrEndS);
+        const dl = Math.abs(x - x1);
+        const dr = Math.abs(x - x2);
+        if (dl < bestDist) {
+          bestDist = dl;
+          bestPillId = p.id;
+          bestZone = "left";
+        }
+        if (dr < bestDist) {
+          bestDist = dr;
+          bestPillId = p.id;
+          bestZone = "right";
+        }
+      }
+      if (bestPillId) return { pillId: bestPillId, zone: bestZone };
+      return null; // hit the lane band but no pill / edge in reach
     }
     return null;
   }
@@ -1065,12 +1099,16 @@ export function Timeline({
     if (activePointersRef.current.size >= 2) {
       dragRef.current = null;
       const centroid = pointersCentroid();
+      // View-space anchor for pinch-zoom (see wheel-zoom comment).
+      // Master-time would diverge from the canvas axis in arr-mode.
+      const centroidViewT =
+        viewStart + (centroid.x / canvasWidth) * visibleDur;
       gestureRef.current = {
         startDist: pointersDistance() || 1,
         startZoom: zoom,
         startScroll: clampedScroll,
         startCentroidX: centroid.x,
-        startTAtCentroid: xToT(centroid.x),
+        startTAtCentroid: centroidViewT,
         lastCentroidX: centroid.x,
       };
       return;
@@ -1102,24 +1140,36 @@ export function Timeline({
 
     // Video lane interaction model (uniform across job kinds — pills
     // ARE the editing surface):
-    //   * LOCK ON (default): everything in a video lane scrubs the
-    //     playhead. Pills stay visible and selectable but no drag is
-    //     initiated. Same `lanesLocked` shield the user toggles to
-    //     scrub freely without accidentally moving content.
+    //   * LOCK ON (default): pill-hits SELECT but don't start a drag —
+    //     the SyncTuner + OptionsPanel still need a target, and the
+    //     reset-button still needs to fire. Empty lane / non-pill
+    //     pixels scrub the playhead.
     //   * LOCK OFF: pill-edge hits start a trim drag, pill-body hits
     //     start a move drag; empty lane area still scrubs.
-    if (!lanesLocked) {
+    {
       const pillHit = findPillAt(x, y);
       if (pillHit) {
         const p = pills.find((pp) => pp.id === pillHit.pillId);
         if (p) {
           // Floating ↺ reset-button → revert this pill, no drag.
+          // Allowed regardless of lock state — it's a destructive-revert
+          // action, not an edit gesture.
           if (pillHit.zone === "reset") {
             resetPill(p.id);
             return;
           }
+          // Selection always works — including under LOCK — so the
+          // user can target this pill in the SyncTuner + OptionsPanel
+          // even when drag is intentionally disabled.
           setSelectedPillId(p.id);
           setSelectedClipId(p.camId);
+          if (lanesLocked) {
+            // Lock on → no drag setup. Fall back to a normal scrub
+            // click so the playhead still follows the user's pointer.
+            seekFromX(x, snapped(tRaw, e));
+            dragRef.current = { kind: "playhead" };
+            return;
+          }
           if (pillHit.zone === "left") {
             dragRef.current = {
               kind: "pill-trim-in",
@@ -1395,7 +1445,12 @@ export function Timeline({
       e.preventDefault();
       const rect = e.currentTarget.getBoundingClientRect();
       const x = e.clientX - rect.left;
-      const tAtCursor = xToT(x);
+      // Anchor in VIEW-space, not master-time. In arr-mode `xToT`
+      // returns master-time (cross-segment), but the zoom math has to
+      // stay inside the linear arr-time axis the canvas is laid out
+      // on — otherwise the next-frame `viewStart` lands somewhere the
+      // scroll-clamp pins to maxScroll. Same fix below for pinch.
+      const viewAtCursor = viewStart + (x / canvasWidth) * visibleDur;
       // Pinch gestures emit small smooth deltas; mouse wheel emits
       // chunky 100+ ones. Scale the factor so the pinch feels natural
       // without making the mouse wheel laggy.
@@ -1405,7 +1460,7 @@ export function Timeline({
       const newZoom = Math.max(1, Math.min(64, zoom * factor));
       if (newZoom === zoom) return;
       const newVisible = timelineSpan / newZoom;
-      const desiredViewStart = tAtCursor - (x / canvasWidth) * newVisible;
+      const desiredViewStart = viewAtCursor - (x / canvasWidth) * newVisible;
       const newScroll = Math.max(
         0,
         Math.min(timelineSpan - newVisible, desiredViewStart - timelineStartS),
@@ -1538,7 +1593,7 @@ export function Timeline({
           ]}
         />
         <ActiveMatchReadout
-          camId={null}
+          camId={selectedClipId}
           snapMode={snapMode}
           clips={clips}
         />
