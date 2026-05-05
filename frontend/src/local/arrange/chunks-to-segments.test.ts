@@ -33,8 +33,8 @@ describe("arrangementToSegments", () => {
     const arrangement = [arr("a1", "c2"), arr("a2", "c1")];
     const segs = arrangementToSegments(arrangement, chunks);
     expect(segs).toEqual([
-      { in: 5, out: 9 },
-      { in: 1, out: 3 },
+      { in: 5, out: 9, chunkId: "c2" },
+      { in: 1, out: 3, chunkId: "c1" },
     ]);
   });
 
@@ -50,7 +50,7 @@ describe("arrangementToSegments", () => {
     const chunks = [chunk("c1", 0, 1000)];
     const arrangement = [arr("a1", "c1"), arr("a2", "c-deleted")];
     const segs = arrangementToSegments(arrangement, chunks);
-    expect(segs).toEqual([{ in: 0, out: 1 }]);
+    expect(segs).toEqual([{ in: 0, out: 1, chunkId: "c1" }]);
   });
 
   it("applies endTrimMs to all segments", () => {
@@ -58,7 +58,7 @@ describe("arrangementToSegments", () => {
     const segs = arrangementToSegments([arr("a1", "c1")], chunks, {
       endTrimMs: 100,
     });
-    expect(segs).toEqual([{ in: 0, out: 0.9 }]);
+    expect(segs).toEqual([{ in: 0, out: 0.9, chunkId: "c1" }]);
   });
 
   it("drops segments where endTrim makes the window collapse", () => {

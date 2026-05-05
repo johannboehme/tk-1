@@ -14,6 +14,20 @@ export const MASTER_AUDIO_ID = "master-audio";
 export interface Segment {
   in: number;
   out: number;
+  /** Master-time of the first detected onset *inside* this segment, in
+   *  seconds. When present, the editor uses the FIRST segment's value
+   *  as the beat-grid anchor instead of the global `jobMeta.bpm.phase`
+   *  — that's how the BeatRuler stays correct when the arrangement puts
+   *  a chunk with leading silence at the very front, or when the user
+   *  re-orders chunks so a different chunk is now "bar 1".
+   *  Optional: legacy single-mp3 jobs and segments built without
+   *  arrangement context (no chunk source) leave this undefined and the
+   *  selectors fall back to the global phase. */
+  audioStartMs?: number;
+  /** Originating chunk id, when this segment came from an arrangement
+   *  item. Useful for diagnostics and for picking the right per-chunk
+   *  metadata downstream. */
+  chunkId?: string;
 }
 
 /**

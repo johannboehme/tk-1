@@ -189,12 +189,9 @@ export function Timeline({
   const setPillRightEdgeArrEndS = useEditorStore(
     (s) => s.setPillRightEdgeArrEndS,
   );
-  const commitPillEdit = useEditorStore((s) => s.commitPillEdit);
-  const undoPillEdit = useEditorStore((s) => s.undoPillEdit);
-  const redoPillEdit = useEditorStore((s) => s.redoPillEdit);
-  const canUndoPill = useEditorStore((s) => s.pillHistory.length > 0);
-  const canRedoPill = useEditorStore((s) => s.pillFuture.length > 0);
   const resetClipAlignment = useEditorStore((s) => s.resetClipAlignment);
+  const resetPillsForCam = useEditorStore((s) => s.resetPillsForCam);
+  const resetPill = useEditorStore((s) => s.resetPill);
   const removeCutAt = useEditorStore((s) => s.removeCutAt);
   const clearCuts = useEditorStore((s) => s.clearCuts);
   const clearAllFx = useEditorStore((s) => s.clearAllFx);
@@ -204,7 +201,9 @@ export function Timeline({
   const snapMode = useEditorStore((s) => s.ui.snapMode);
   const lanesLocked = useEditorStore((s) => s.ui.lanesLocked);
   const bpm = useEditorStore((s) => s.jobMeta?.bpm?.value ?? null);
-  const beatPhase = useEditorStore((s) => effectiveBeatPhaseS(s.jobMeta));
+  const beatPhase = useEditorStore((s) =>
+    effectiveBeatPhaseS(s.jobMeta, s.arrangementSegments),
+  );
   const beatsPerBar = useEditorStore((s) => effectiveBeatsPerBar(s.jobMeta));
   const barOffsetBeats = useEditorStore((s) =>
     effectiveBarOffsetBeats(s.jobMeta),
@@ -573,6 +572,13 @@ export function Timeline({
       });
       const pillIds: (string | null)[] = lanePills.map((p) => p.id);
       const selectedSlice = lanePills.map((p) => p.id === selectedPillId);
+      const dirtySlice = lanePills.map(
+        (p) =>
+          Math.abs(p.arrStartS - p.originalArrStartS) > 1e-3 ||
+          Math.abs(p.arrEndS - p.originalArrEndS) > 1e-3 ||
+          Math.abs(p.sourceInS - p.originalSourceInS) > 1e-3 ||
+          Math.abs(p.sourceOutS - p.originalSourceOutS) > 1e-3,
+      );
       drawVideoLane({
         ctx,
         clip,
@@ -582,6 +588,7 @@ export function Timeline({
         slices,
         pillIds,
         selectedPerSlice: selectedSlice,
+        dirtyPerSlice: dirtySlice,
         img: camImagesRef.current.get(clip.id) ?? null,
         aspect: cams[clip.id]?.aspect ?? 16 / 9,
         clipSelected: clip.id === selectedClipId,
@@ -900,7 +907,7 @@ export function Timeline({
   function findPillAt(
     x: number,
     y: number,
-  ): { pillId: string; zone: "left" | "right" | "body" } | null {
+  ): { pillId: string; zone: "left" | "right" | "body" | "reset" } | null {
     if (!isArrMode) return null;
     for (let i = 0; i < clips.length; i++) {
       const band = videoBands[i];
@@ -911,6 +918,26 @@ export function Timeline({
         const x1 = arrTToX(p.arrStartS);
         const x2 = arrTToX(p.arrEndS);
         if (x < x1 - HANDLE_HIT || x > x2 + HANDLE_HIT) continue;
+        // Floating ↺ reset-button hit-zone — sits at the top-right of
+        // the pill body when the pill is dirty (= moved / trimmed off
+        // its baseline). Tested BEFORE edge zones so the trim-out grip
+        // that lives on the same right edge doesn't swallow the click.
+        const dirty =
+          Math.abs(p.arrStartS - p.originalArrStartS) > 1e-3 ||
+          Math.abs(p.arrEndS - p.originalArrEndS) > 1e-3 ||
+          Math.abs(p.sourceInS - p.originalSourceInS) > 1e-3 ||
+          Math.abs(p.sourceOutS - p.originalSourceOutS) > 1e-3;
+        if (dirty && x2 - x1 > 32) {
+          const rb = resetButtonRect(x1, x2, band.top);
+          if (
+            x >= rb.x &&
+            x <= rb.x + rb.size &&
+            y >= rb.y &&
+            y <= rb.y + rb.size
+          ) {
+            return { pillId: p.id, zone: "reset" };
+          }
+        }
         if (Math.abs(x - x1) <= HANDLE_HIT) {
           return { pillId: p.id, zone: "left" };
         }
@@ -923,6 +950,7 @@ export function Timeline({
     }
     return null;
   }
+
 
   /** Lane-only hit-test: returns the clip whose lane band contains `y`,
    *  regardless of whether the pointer's `x` lands inside the pill. Used
@@ -1085,13 +1113,13 @@ export function Timeline({
       if (pillHit) {
         const p = pills.find((pp) => pp.id === pillHit.pillId);
         if (p) {
+          // Floating ↺ reset-button → revert this pill, no drag.
+          if (pillHit.zone === "reset") {
+            resetPill(p.id);
+            return;
+          }
           setSelectedPillId(p.id);
           setSelectedClipId(p.camId);
-          // Snapshot pre-mutation pills onto the undo stack ONCE per
-          // gesture; the move/trim updates that follow are batched into
-          // the same step so Cmd+Z reverts the whole drag, not one
-          // pixel.
-          commitPillEdit();
           if (pillHit.zone === "left") {
             dragRef.current = {
               kind: "pill-trim-in",
@@ -1231,7 +1259,39 @@ export function Timeline({
       // Source-trim stays put: only the pill's WHEN moves.
       const arrAtPointer = viewStart + (x / canvasWidth) * visibleDur;
       const deltaArrT = arrAtPointer - drag.grabArrT;
-      const newArrStartS = Math.max(0, drag.origArrStartS + deltaArrT);
+      let newArrStartS = Math.max(0, drag.origArrStartS + deltaArrT);
+      // Edge-to-edge snap to same-cam neighbour pills. Either the
+      // dragged pill's left edge can attach to a neighbour's edge, or
+      // its right edge can — whichever is closer wins, only when within
+      // the px-equivalent threshold. The store-side clamp will still
+      // hard-stop overlap; this just makes the magnetic feel.
+      const me = pills.find((pp) => pp.id === drag.pillId);
+      if (me) {
+        const len = me.arrEndS - me.arrStartS;
+        const edges: number[] = [];
+        for (const sib of pills) {
+          if (sib.id === me.id || sib.camId !== me.camId) continue;
+          edges.push(sib.arrStartS, sib.arrEndS);
+        }
+        if (edges.length > 0) {
+          const thresholdT = 6 / Math.max(1, canvasWidth / visibleDur);
+          let bestDelta = thresholdT;
+          let bestStart = newArrStartS;
+          for (const ee of edges) {
+            const dl = Math.abs(ee - newArrStartS);
+            if (dl < bestDelta) {
+              bestDelta = dl;
+              bestStart = ee;
+            }
+            const dr = Math.abs(ee - (newArrStartS + len));
+            if (dr < bestDelta) {
+              bestDelta = dr;
+              bestStart = ee - len;
+            }
+          }
+          newArrStartS = Math.max(0, bestStart);
+        }
+      }
       setPillArrPlacement(drag.pillId, newArrStartS);
     } else if (drag.kind === "cam-track-move") {
       // Cam-track move (MATCH snap-mode body drag) — apply the same
@@ -1250,18 +1310,47 @@ export function Timeline({
     } else if (drag.kind === "pill-trim-in") {
       // Drag left edge: arr-window narrows from the left + sourceInS
       // advances by the same delta so the cam still plays in sync
-      // with what's visible inside the pill.
+      // with what's visible inside the pill. Same snap pipeline as
+      // the body-drag — Shift bypasses, Snap modes round to grid /
+      // MATCH candidates, "off" passes through.
       const arrAtPointer = viewStart + (x / canvasWidth) * visibleDur;
+      let snappedT = snapped(arrAtPointer, e);
+      // Edge-snap onto the previous neighbour pill's right edge, so a
+      // trim-in attaches the chunks back-to-back when the user drags
+      // close to the gap.
+      const me = pills.find((pp) => pp.id === drag.pillId);
+      if (me) {
+        const thresholdT = 6 / Math.max(1, canvasWidth / visibleDur);
+        for (const sib of pills) {
+          if (sib.id === me.id || sib.camId !== me.camId) continue;
+          if (Math.abs(sib.arrEndS - snappedT) < thresholdT) {
+            snappedT = sib.arrEndS;
+            break;
+          }
+        }
+      }
       const minWindow = 0.05;
       const clamped = Math.max(
         0,
-        Math.min(drag.origArrEndS - minWindow, arrAtPointer),
+        Math.min(drag.origArrEndS - minWindow, snappedT),
       );
       setPillLeftEdgeArrStartS(drag.pillId, clamped);
     } else if (drag.kind === "pill-trim-out") {
       const arrAtPointer = viewStart + (x / canvasWidth) * visibleDur;
+      let snappedT = snapped(arrAtPointer, e);
+      const me = pills.find((pp) => pp.id === drag.pillId);
+      if (me) {
+        const thresholdT = 6 / Math.max(1, canvasWidth / visibleDur);
+        for (const sib of pills) {
+          if (sib.id === me.id || sib.camId !== me.camId) continue;
+          if (Math.abs(sib.arrStartS - snappedT) < thresholdT) {
+            snappedT = sib.arrStartS;
+            break;
+          }
+        }
+      }
       const minWindow = 0.05;
-      const clamped = Math.max(drag.origArrStartS + minWindow, arrAtPointer);
+      const clamped = Math.max(drag.origArrStartS + minWindow, snappedT);
       setPillRightEdgeArrEndS(drag.pillId, clamped);
     }
   };
@@ -1454,16 +1543,6 @@ export function Timeline({
           clips={clips}
         />
         <div className="sm:ml-auto flex items-center gap-2">
-          <PillUndoButton
-            label="UNDO"
-            disabled={!canUndoPill}
-            onClick={undoPillEdit}
-          />
-          <PillUndoButton
-            label="REDO"
-            disabled={!canRedoPill}
-            onClick={redoPillEdit}
-          />
           <span className="text-[10px] tabular text-ink-3 font-mono ml-2">
             {zoomPercent}%
           </span>
@@ -1479,24 +1558,26 @@ export function Timeline({
       </div>
 
       <div className="rounded-md overflow-hidden border border-rule shadow-panel bg-paper-hi-deep">
-        {/* Bar/beat ruler row — direct-mode only.
-         *  In arrangement-mode each chunk has its own bar phase (per the
-         *  triage tempo model), so a single continuous ruler over arr-time
-         *  would lie. The ruler is dropped here; the audio waveform's
-         *  splice marks already give the user a positional anchor. */}
-        {!isArrMode && (
-          <div className="flex border-b border-rule">
-            <BarsHeader width={HEADER_W} height={26} />
-            <div className="flex-1" style={{ width: canvasWidth }}>
-              <BeatRuler
-                contentWidthPx={canvasWidth}
-                viewStartS={viewStart}
-                viewEndS={viewEnd}
-                height={26}
-              />
-            </div>
+        {/* Bar/beat ruler row — always visible. In direct-mode the ruler
+         *  rides on the master-mp3's BPM/phase. In arrangement-mode the
+         *  ruler runs in arr-time and anchors beat 0 on the FIRST
+         *  segment's `audioStartMs` (see selectors/timing.ts), so a
+         *  chunk reordering still puts bar 1 on the first real onset.
+         *  Multi-tempo arrangements (per-chunk BPMs) currently still
+         *  read the global `jobMeta.bpm.value` for the grid step —
+         *  that's an architectural follow-up, not a regression vs
+         *  main. */}
+        <div className="flex border-b border-rule">
+          <BarsHeader width={HEADER_W} height={26} />
+          <div className="flex-1" style={{ width: canvasWidth }}>
+            <BeatRuler
+              contentWidthPx={canvasWidth}
+              viewStartS={viewStart}
+              viewEndS={viewEnd}
+              height={26}
+            />
           </div>
-        )}
+        </div>
 
         {/* PROGRAM-Strip row — header cell hosts the "+ Add" entry so
          *  there's no separate strip pushing the timeline taller. The
@@ -1656,9 +1737,21 @@ export function Timeline({
                   isVideoClip(clip) &&
                   (clip.syncOverrideMs !== 0 ||
                     clip.startOffsetS !== 0 ||
-                    clip.selectedCandidateIdx !== 0)
+                    clip.selectedCandidateIdx !== 0 ||
+                    pills.some(
+                      (p) =>
+                        p.camId === clip.id &&
+                        (Math.abs(p.arrStartS - p.originalArrStartS) > 1e-3 ||
+                          Math.abs(p.arrEndS - p.originalArrEndS) > 1e-3 ||
+                          Math.abs(p.sourceInS - p.originalSourceInS) > 1e-3 ||
+                          Math.abs(p.sourceOutS - p.originalSourceOutS) >
+                            1e-3),
+                    ))
                 }
-                onReset={() => resetClipAlignment(clip.id)}
+                onReset={() => {
+                  resetClipAlignment(clip.id);
+                  resetPillsForCam(clip.id);
+                }}
                 preparing={preparingCamIds.has(clip.id)}
                 onDelete={() => onDeleteClip?.(clip.id)}
                 height={videoLaneHeight}
@@ -1803,6 +1896,24 @@ interface ClipPillSlice {
   masterEndS: number;
 }
 
+/** Geometry of the floating ↺ reset button on a dirty pill. Pure
+ *  function — shared between the renderer (drawVideoLane) and the
+ *  hit-test (findPillAt) so the painted glyph and the click area stay
+ *  pixel-aligned. */
+function resetButtonRect(
+  pillX1: number,
+  pillX2: number,
+  bandTop: number,
+): { x: number; y: number; size: number } {
+  const size = 14;
+  const margin = 4;
+  return {
+    x: Math.max(pillX1 + 2, pillX2 - size - margin),
+    y: bandTop + margin,
+    size,
+  };
+}
+
 interface DrawVideoLaneArgs {
   ctx: CanvasRenderingContext2D;
   clip: Clip;
@@ -1820,6 +1931,9 @@ interface DrawVideoLaneArgs {
    *  selectedPillId, falling back to the cam-level `clipSelected` for
    *  direct-mode where the whole clip is the selection unit. */
   selectedPerSlice: boolean[];
+  /** Aligned with `slices`. True when the underlying pill has been
+   *  edited off its baseline; drives the floating ↺ reset-button. */
+  dirtyPerSlice: boolean[];
   img: HTMLImageElement | null;
   aspect: number;
   /** Direct-mode lane outline + glow (when the whole clip is selected). */
@@ -1835,6 +1949,7 @@ function drawVideoLane({
   slices,
   pillIds: _pillIds,
   selectedPerSlice,
+  dirtyPerSlice,
   img,
   aspect,
   clipSelected,
@@ -1936,20 +2051,25 @@ function drawVideoLane({
     );
     ctx.fillStyle = hexToRgba(clip.color, 0.1);
     ctx.fill();
-    ctx.lineWidth = sliceSelected ? 2 : 1;
+    ctx.lineWidth = sliceSelected ? 3 : 1;
     ctx.strokeStyle = sliceSelected ? clip.color : hexToRgba(clip.color, 0.6);
     ctx.stroke();
     if (sliceSelected) {
-      ctx.shadowColor = hexToRgba(clip.color, 0.5);
-      ctx.shadowBlur = 6;
+      // Outer glow — strong, full-alpha cam color so the active pill
+      // is unmistakable against unselected siblings on the same lane.
+      ctx.shadowColor = clip.color;
+      ctx.shadowBlur = 12;
+      ctx.stroke();
       ctx.stroke();
     }
     ctx.restore();
 
     // Top color stripe — strong cam-color tab so the lane is identifiable
-    // even when the pill is compressed.
+    // even when the pill is compressed. Selected pills get a thicker
+    // stripe so the active chunk stands out from its same-cam siblings
+    // even where the body glow gets clipped at the lane edge.
     ctx.fillStyle = clip.color;
-    ctx.fillRect(pillX, bandTop, pillW, 3);
+    ctx.fillRect(pillX, bandTop, pillW, sliceSelected ? 5 : 3);
 
     // Resize grips on both edges. Image and video clips both resize in
     // direct-mode (image: durationS / startOffsetS; video: trim in/out).
@@ -1967,6 +2087,44 @@ function drawVideoLane({
       if (slice.xStart >= 0) drawGrip(Math.max(0, slice.xStart) + 4);
       if (slice.xEnd <= canvasWidth)
         drawGrip(Math.min(canvasWidth - 1, slice.xEnd) - 4);
+      ctx.restore();
+    }
+
+    // Floating ↺ reset button — visible on dirty pills (= moved/trimmed
+    // off baseline) when the pill is wide enough to host a 14 px button
+    // without crowding the trim grip. Click is wired in findPillAt
+    // → onPointerDown via `zone === "reset"`.
+    if (dirtyPerSlice[sliceIdx] && pillW > 32) {
+      const rb = resetButtonRect(slice.xStart, slice.xEnd, bandTop);
+      ctx.save();
+      // Paper-bg with sepia rule — matches the lane palette.
+      ctx.fillStyle = "#F2EBD8";
+      ctx.strokeStyle = "rgba(26,24,22,0.45)";
+      ctx.lineWidth = 1;
+      roundRectPath(ctx, rb.x, rb.y, rb.size, rb.size, 3);
+      ctx.fill();
+      ctx.stroke();
+      // ↺ glyph — drawn as an arc with an arrow tip so it reads as
+      // "revert" without depending on a font glyph that may not be
+      // available cross-platform.
+      ctx.strokeStyle = "#1A1816"; // ink
+      ctx.lineWidth = 1.4;
+      ctx.lineCap = "round";
+      const cx = rb.x + rb.size / 2;
+      const cy = rb.y + rb.size / 2;
+      const r = rb.size * 0.32;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, Math.PI * 0.25, Math.PI * 1.85);
+      ctx.stroke();
+      // Arrow head at the open end of the arc (top-right).
+      const ax = cx + r * Math.cos(Math.PI * 0.25);
+      const ay = cy + r * Math.sin(Math.PI * 0.25);
+      ctx.beginPath();
+      ctx.moveTo(ax, ay);
+      ctx.lineTo(ax - 3, ay - 1);
+      ctx.moveTo(ax, ay);
+      ctx.lineTo(ax + 1, ay + 3);
+      ctx.stroke();
       ctx.restore();
     }
   }
@@ -2113,46 +2271,6 @@ function hexToRgba(hex: string, alpha: number): string {
   return `rgba(${r},${g},${b},${alpha})`;
 }
 
-/** Skeuomorph mini-button used for the per-edit undo / redo pair in
- *  the Timeline header. Cross-platform — no `⌘`/`Ctrl` hint in the
- *  label since the pair is meant to be operated by mouse. Disabled
- *  state reads as a recessed bezel so the user gets feedback when the
- *  history is exhausted. */
-function PillUndoButton({
-  label,
-  disabled,
-  onClick,
-}: {
-  label: string;
-  disabled: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      disabled={disabled}
-      onClick={onClick}
-      className="text-[10px] tabular tracking-label uppercase font-mono px-2 py-1 rounded-sm border border-rule transition-colors"
-      style={{
-        background: disabled
-          ? "linear-gradient(180deg, #DDD4BE 0%, #C9BFA6 100%)"
-          : "linear-gradient(180deg, #FAF6EC 0%, #DDD4BE 50%, #C9BFA6 100%)",
-        boxShadow: disabled
-          ? "inset 0 1px 2px rgba(0,0,0,0.18)"
-          : [
-              "inset 0 1px 0 rgba(255,255,255,0.85)",
-              "inset 0 -1px 0 rgba(0,0,0,0.18)",
-              "0 1px 2px rgba(0,0,0,0.18)",
-            ].join(", "),
-        color: disabled ? "rgba(26,24,22,0.35)" : "#1A1816",
-        cursor: disabled ? "default" : "pointer",
-      }}
-      title={disabled ? `${label} unavailable` : `${label} pill edit`}
-    >
-      {label}
-    </button>
-  );
-}
 
 interface DrawMatchMarkersArgs {
   ctx: CanvasRenderingContext2D;

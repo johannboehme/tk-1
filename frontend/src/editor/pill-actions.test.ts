@@ -158,45 +158,4 @@ describe("pill mutation actions", () => {
     });
   });
 
-  describe("undo / redo via commitPillEdit", () => {
-    it("undoPillEdit restores the snapshot pushed before the change", () => {
-      const p = makePill({ arrStartS: 0, arrEndS: 5 });
-      useEditorStore.getState().setPills([p]);
-      useEditorStore.getState().commitPillEdit();
-      useEditorStore.getState().setPillArrPlacement("p1", 7);
-      expect(useEditorStore.getState().pills[0].arrStartS).toBe(7);
-      useEditorStore.getState().undoPillEdit();
-      expect(useEditorStore.getState().pills[0].arrStartS).toBe(0);
-    });
-
-    it("redoPillEdit re-applies the undone change", () => {
-      const p = makePill({ arrStartS: 0, arrEndS: 5 });
-      useEditorStore.getState().setPills([p]);
-      useEditorStore.getState().commitPillEdit();
-      useEditorStore.getState().setPillArrPlacement("p1", 7);
-      useEditorStore.getState().undoPillEdit();
-      useEditorStore.getState().redoPillEdit();
-      expect(useEditorStore.getState().pills[0].arrStartS).toBe(7);
-    });
-
-    it("commitPillEdit clears the redo future", () => {
-      const p = makePill({ arrStartS: 0, arrEndS: 5 });
-      useEditorStore.getState().setPills([p]);
-      // Commit + edit + undo gives us a populated redo future.
-      useEditorStore.getState().commitPillEdit();
-      useEditorStore.getState().setPillArrPlacement("p1", 3);
-      useEditorStore.getState().undoPillEdit();
-      expect(useEditorStore.getState().pillFuture.length).toBe(1);
-      // A new commit clears it — the user took a fresh branch.
-      useEditorStore.getState().commitPillEdit();
-      expect(useEditorStore.getState().pillFuture.length).toBe(0);
-    });
-
-    it("undo with empty history is a no-op", () => {
-      const p = makePill({ arrStartS: 5 });
-      useEditorStore.getState().setPills([p]);
-      useEditorStore.getState().undoPillEdit();
-      expect(useEditorStore.getState().pills[0].arrStartS).toBe(5);
-    });
-  });
 });

@@ -182,7 +182,6 @@ function SelectedPillSection({ clipId }: { clipId: string }) {
   const pill = useEditorStore((s) =>
     s.pills.find((p) => p.id === selectedPillId) ?? null,
   );
-  const commitPillEdit = useEditorStore((s) => s.commitPillEdit);
   const resetPill = useEditorStore((s) => s.resetPill);
   if (!pill || pill.camId !== clipId) return null;
   const dirty =
@@ -204,13 +203,10 @@ function SelectedPillSection({ clipId }: { clipId: string }) {
         </span>
       </div>
       <ChunkyButton
-        variant="ghost"
+        variant={dirty ? "primary" : "ghost"}
         size="sm"
         disabled={!dirty}
-        onClick={() => {
-          commitPillEdit();
-          resetPill(pill.id);
-        }}
+        onClick={() => resetPill(pill.id)}
         title="Restore the pill to its auto-generated arr-time + source-trim defaults"
       >
         Reset pill

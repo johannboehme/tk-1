@@ -270,14 +270,6 @@ interface EditorState {
   pills: Pill[];
   /** UI selection for per-pill editing. null = nothing selected. */
   selectedPillId: string | null;
-  /** Undo stack of pill snapshots. Pushed by `commitPillEdit` BEFORE a
-   *  discrete mutation (drag-start, hotkey-nudge, reset). Continuous
-   *  drag updates intentionally don't snapshot — the user gets one
-   *  undo step per gesture, not one per pixel. */
-  pillHistory: Pill[][];
-  /** Redo stack — populated when the user pops via `undoPillEdit`,
-   *  cleared on any new mutation. */
-  pillFuture: Pill[][];
   /** Live indicator for an in-progress TAKE-button-or-hotkey hold. While
    * a key/button is pressed, this points to the held cam + the master-time
    * the press started at. Once the press passes the tap-vs-hold threshold,
@@ -408,6 +400,11 @@ interface EditorState {
    *  its arr-window where it is. The cam plays a slightly earlier /
    *  later excerpt at the same song-position. */
   nudgePillSourceMs(id: string, deltaMs: number): void;
+  /** Set a pill's source-trim to `originalSource* + offsetMs/1000`. Lets
+   *  the SyncTuner knob drive an absolute per-pill source-offset that
+   *  reads symmetrically against the per-pill RESET (which restores the
+   *  offset to 0). */
+  setPillSourceOffsetMs(id: string, offsetMs: number): void;
   /** Nudge a pill's arr-time placement (shifts `arrStartS` + `arrEndS`
    *  by the same delta). Source-trim is unchanged — only WHERE on the
    *  song the cam plays moves. */
@@ -416,17 +413,6 @@ interface EditorState {
    *  source-time. Equivalent to calling `nudgePillSourceMs` on each
    *  one, but only one history entry. */
   nudgeCamSourceMs(camId: string, deltaMs: number): void;
-  /** Snapshot the current pill list onto the undo stack. Drag-start
-   *  and discrete edit gestures call this BEFORE mutating; the
-   *  continuous drag updates that follow are batched into the same
-   *  undo step. */
-  commitPillEdit(): void;
-  /** Undo the most recent pill mutation. No-op when the history is
-   *  empty. */
-  undoPillEdit(): void;
-  /** Redo the most recently undone pill mutation. No-op when the
-   *  redo stack is empty. */
-  redoPillEdit(): void;
 
   /** Append a single clip to clips[] without resetting any other editor
    *  state. Used by the Editor's "+ Media" flow when addVideoToJob /
@@ -881,6 +867,34 @@ function computeCamRanges(clips: readonly Clip[]): CamRange[] {
  * `existing` MUST already be sorted ascending by `atTimeS`. O(n) — beats
  * O(n log n) `[...arr, x].sort()` because we already know where it goes.
  */
+/**
+ * Find the arr-time bounds within which a pill can move in its cam-lane
+ * without overlapping a same-cam neighbour. Pills derselben cam can't
+ * occupy the same arr-time range — they're sliced through `cuts` to
+ * pick which one is on PROGRAM. The pill being moved/trimmed is excluded
+ * so its own current placement doesn't pin itself.
+ */
+function neighbourBoundsForCam(
+  pills: readonly Pill[],
+  me: Pill,
+): { prevEnd: number; nextStart: number } {
+  let prevEnd = 0;
+  let nextStart = Number.POSITIVE_INFINITY;
+  for (const sib of pills) {
+    if (sib.id === me.id) continue;
+    if (sib.camId !== me.camId) continue;
+    // Sibling sits left of me — its right edge bounds my left.
+    if (sib.arrEndS <= me.arrStartS && sib.arrEndS > prevEnd) {
+      prevEnd = sib.arrEndS;
+    }
+    // Sibling sits right of me — its left edge bounds my right.
+    if (sib.arrStartS >= me.arrEndS && sib.arrStartS < nextStart) {
+      nextStart = sib.arrStartS;
+    }
+  }
+  return { prevEnd, nextStart };
+}
+
 function insertCutSorted(existing: readonly Cut[], cut: Cut): Cut[] {
   // Binary search for the insertion index.
   let lo = 0;
@@ -910,8 +924,6 @@ export const useEditorStore = create<EditorState>()(
     selectedClipId: null,
     pills: [],
     selectedPillId: null,
-    pillHistory: [],
-    pillFuture: [],
     holdGesture: null,
     quantizePreview: null,
     notice: null,
@@ -939,8 +951,6 @@ export const useEditorStore = create<EditorState>()(
         selectedClipId: null,
         pills: [],
         selectedPillId: null,
-        pillHistory: [],
-        pillFuture: [],
         holdGesture: null,
         quantizePreview: null,
         notice: null,
@@ -1014,8 +1024,6 @@ export const useEditorStore = create<EditorState>()(
           opts?.storedPills ?? [],
         ),
         selectedPillId: null,
-        pillHistory: [],
-        pillFuture: [],
         fx: opts?.fx ?? [],
         fxHolds: {},
         selectedFxKind: "vignette",
@@ -1239,7 +1247,7 @@ export const useEditorStore = create<EditorState>()(
       const probe = t + direction * step * 0.5;
       const candidate = snapTime(probe, mode, {
         bpm,
-        beatPhase: effectiveBeatPhaseS(s.jobMeta),
+        beatPhase: effectiveBeatPhaseS(s.jobMeta, s.arrangementSegments),
         beatsPerBar,
         barOffsetBeats: effectiveBarOffsetBeats(s.jobMeta),
       });
@@ -1509,41 +1517,59 @@ export const useEditorStore = create<EditorState>()(
       set({ selectedPillId: id });
     },
     setPillArrPlacement(id, arrStartS) {
-      const pills = get().pills.map((p) => {
-        if (p.id !== id) return p;
-        const len = p.arrEndS - p.arrStartS;
-        const safe = Math.max(0, arrStartS);
-        return { ...p, arrStartS: safe, arrEndS: safe + len };
-      });
+      const allPills = get().pills;
+      const me = allPills.find((p) => p.id === id);
+      if (!me) return;
+      const len = me.arrEndS - me.arrStartS;
+      // Same-cam neighbour bounds — pills in one cam-lane can't overlap.
+      // Compute bounds from the CURRENT positions of siblings; the pill
+      // we're dragging is excluded so its own current placement doesn't
+      // pin itself in place.
+      const { prevEnd, nextStart } = neighbourBoundsForCam(allPills, me);
+      const minStart = prevEnd;
+      const maxStart = Math.max(minStart, nextStart - len);
+      const safe = Math.max(minStart, Math.min(maxStart, Math.max(0, arrStartS)));
+      const pills = allPills.map((p) =>
+        p.id === id ? { ...p, arrStartS: safe, arrEndS: safe + len } : p,
+      );
       set({ pills });
     },
     setPillLeftEdgeArrStartS(id, arrStartS) {
-      const pills = get().pills.map((p) => {
-        if (p.id !== id) return p;
-        const minWindow = 0.05;
-        const maxStart = p.arrEndS - minWindow;
-        const oldStart = p.arrStartS;
-        const newStart = Math.max(0, Math.min(maxStart, arrStartS));
-        // The cam stays in sync with the pill: as we trim N seconds off
-        // the front of the arr-window, advance sourceInS by the same N.
-        // (V1: 1:1 mapping, no time-stretch.)
-        const delta = newStart - oldStart;
-        const newSourceIn = Math.max(0, p.sourceInS + delta);
-        return { ...p, arrStartS: newStart, sourceInS: newSourceIn };
-      });
+      const allPills = get().pills;
+      const me = allPills.find((p) => p.id === id);
+      if (!me) return;
+      const minWindow = 0.05;
+      const { prevEnd } = neighbourBoundsForCam(allPills, me);
+      const maxStart = me.arrEndS - minWindow;
+      const newStart = Math.max(prevEnd, Math.min(maxStart, arrStartS));
+      // The cam stays in sync with the pill: as we trim N seconds off
+      // the front of the arr-window, advance sourceInS by the same N.
+      // (V1: 1:1 mapping, no time-stretch.)
+      const delta = newStart - me.arrStartS;
+      const newSourceIn = Math.max(0, me.sourceInS + delta);
+      const pills = allPills.map((p) =>
+        p.id === id
+          ? { ...p, arrStartS: newStart, sourceInS: newSourceIn }
+          : p,
+      );
       set({ pills });
     },
     setPillRightEdgeArrEndS(id, arrEndS) {
-      const pills = get().pills.map((p) => {
-        if (p.id !== id) return p;
-        const minWindow = 0.05;
-        const minEnd = p.arrStartS + minWindow;
-        const oldEnd = p.arrEndS;
-        const newEnd = Math.max(minEnd, arrEndS);
-        const delta = newEnd - oldEnd;
-        const newSourceOut = Math.max(p.sourceInS + 0.001, p.sourceOutS + delta);
-        return { ...p, arrEndS: newEnd, sourceOutS: newSourceOut };
-      });
+      const allPills = get().pills;
+      const me = allPills.find((p) => p.id === id);
+      if (!me) return;
+      const minWindow = 0.05;
+      const { nextStart } = neighbourBoundsForCam(allPills, me);
+      const minEnd = me.arrStartS + minWindow;
+      const newEnd = Math.max(minEnd, Math.min(nextStart, arrEndS));
+      const delta = newEnd - me.arrEndS;
+      const newSourceOut = Math.max(
+        me.sourceInS + 0.001,
+        me.sourceOutS + delta,
+      );
+      const pills = allPills.map((p) =>
+        p.id === id ? { ...p, arrEndS: newEnd, sourceOutS: newSourceOut } : p,
+      );
       set({ pills });
     },
     removePill(id) {
@@ -1591,6 +1617,21 @@ export const useEditorStore = create<EditorState>()(
       });
       set({ pills });
     },
+    setPillSourceOffsetMs(id, offsetMs) {
+      const offsetS = offsetMs / 1000;
+      const pills = get().pills.map((p) => {
+        if (p.id !== id) return p;
+        return {
+          ...p,
+          sourceInS: Math.max(0, p.originalSourceInS + offsetS),
+          sourceOutS: Math.max(
+            p.originalSourceInS + offsetS + 0.05,
+            p.originalSourceOutS + offsetS,
+          ),
+        };
+      });
+      set({ pills });
+    },
     nudgePillArrMs(id, deltaMs) {
       const deltaS = deltaMs / 1000;
       const pills = get().pills.map((p) => {
@@ -1613,47 +1654,6 @@ export const useEditorStore = create<EditorState>()(
       });
       set({ pills });
     },
-    commitPillEdit() {
-      // Snapshot the current pill list onto the undo stack and clear
-      // the redo future. Discrete edit gestures (drag-start, hotkey
-      // nudges, reset) call this BEFORE mutating; subsequent
-      // continuous updates within the gesture batch into the same
-      // undo step.
-      const cur = get();
-      // Cap history depth so a long editing session doesn't hold
-      // megabytes of pill state in memory. 200 steps is plenty for
-      // an interactive editor.
-      const HISTORY_CAP = 200;
-      const trimmed =
-        cur.pillHistory.length >= HISTORY_CAP
-          ? cur.pillHistory.slice(cur.pillHistory.length - HISTORY_CAP + 1)
-          : cur.pillHistory;
-      set({
-        pillHistory: [...trimmed, cur.pills],
-        pillFuture: [],
-      });
-    },
-    undoPillEdit() {
-      const cur = get();
-      if (cur.pillHistory.length === 0) return;
-      const prev = cur.pillHistory[cur.pillHistory.length - 1];
-      set({
-        pills: prev,
-        pillHistory: cur.pillHistory.slice(0, -1),
-        pillFuture: [...cur.pillFuture, cur.pills],
-      });
-    },
-    redoPillEdit() {
-      const cur = get();
-      if (cur.pillFuture.length === 0) return;
-      const next = cur.pillFuture[cur.pillFuture.length - 1];
-      set({
-        pills: next,
-        pillHistory: [...cur.pillHistory, cur.pills],
-        pillFuture: cur.pillFuture.slice(0, -1),
-      });
-    },
-
     setClipSyncOverride(camId, ms) {
       const prev = get().clips.find((c) => c.id === camId);
       const prevMs =
@@ -1935,7 +1935,7 @@ export const useEditorStore = create<EditorState>()(
         s.ui.snapMode,
         {
           bpm: s.jobMeta?.bpm?.value ?? null,
-          beatPhase: effectiveBeatPhaseS(s.jobMeta),
+          beatPhase: effectiveBeatPhaseS(s.jobMeta, s.arrangementSegments),
           beatsPerBar: effectiveBeatsPerBar(s.jobMeta),
           barOffsetBeats: effectiveBarOffsetBeats(s.jobMeta),
         },
@@ -2088,7 +2088,7 @@ export const useEditorStore = create<EditorState>()(
       if (mode === "off" || mode === "match") return t;
       return snapTime(t, mode, {
         bpm: s.jobMeta?.bpm?.value ?? null,
-        beatPhase: effectiveBeatPhaseS(s.jobMeta),
+        beatPhase: effectiveBeatPhaseS(s.jobMeta, s.arrangementSegments),
         beatsPerBar: effectiveBeatsPerBar(s.jobMeta),
         barOffsetBeats: effectiveBarOffsetBeats(s.jobMeta),
       });

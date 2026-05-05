@@ -38,7 +38,10 @@ export function arrangementToSegments(
     const inS = ck.startMs / 1000;
     const outS = ck.endMs / 1000 - endTrimS;
     if (outS <= inS) continue;
-    segments.push({ in: inS, out: outS });
+    const seg: Segment = { in: inS, out: outS };
+    if (ck.audioStartMs != null) seg.audioStartMs = ck.audioStartMs;
+    if (item.chunkId) seg.chunkId = item.chunkId;
+    segments.push(seg);
   }
   return segments;
 }

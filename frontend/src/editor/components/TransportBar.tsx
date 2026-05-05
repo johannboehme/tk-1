@@ -105,10 +105,9 @@ export function TransportBar() {
   // we have nothing meaningful to jump to. The seek target itself uses the
   // user-corrected (effective) start.
   const audioStartS = meta?.audioStartS ?? 0;
-  const effectiveStart = effectiveAudioStartS(meta);
-
   const arrSegments = useEditorStore((s) => s.arrangementSegments);
   const isArrMode = arrSegments.length > 0;
+  const effectiveStart = effectiveAudioStartS(meta, arrSegments);
   // Skip-to-in / skip-to-out anchors. In direct-mode they follow the
   // master-time trim (export region). In arrangement-mode the song's
   // boundaries are the first and last segments — not the master trim
