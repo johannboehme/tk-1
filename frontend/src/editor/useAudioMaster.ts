@@ -38,7 +38,6 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useEditorStore } from "./store";
-import { shouldArmCrossfade, loopWrapTime } from "./OffsetScheduler";
 import { nextLoopWrapMasterT } from "./arrangement-loop";
 import { segmentArrStarts } from "./arrangement-time";
 import { attachLoopGlitchProbe, isProbeEnabled } from "./audio-glitch-probe";
@@ -444,14 +443,6 @@ export function useAudioMaster(
       const active = state.active === "A" ? refA : refB;
       const idle = state.active === "A" ? refB : refA;
       const t = active.currentTime;
-
-      // Auto-pause at master end.
-      if (t >= dur) {
-        store.setCurrentTime(dur);
-        store.setPlaying(false);
-        rafRef.current = null;
-        return;
-      }
       store.setCurrentTime(t);
 
       // Has an armed crossfade fired already? Detect by
@@ -513,13 +504,12 @@ export function useAudioMaster(
         return;
       }
 
-      // ─── Arrangement-segment walker ───────────────────────────────────
-      // When the editor was opened from a long-form Arrange handoff, the
-      // store carries a list of `arrangementSegments` (in master-time).
-      // Playback should walk them in order, gapless-hopping at each
-      // segment boundary instead of streaming straight through the
-      // master audio. Direct-mode jobs leave this empty and the legacy
-      // loop logic below runs as before.
+      // ─── Composed-timeline walker (single path for direct + arrangement) ──
+      // Long-form jobs carry real `arrangementSegments` (master-time slices
+      // of the source recording). Direct-mode jobs synthesize a single
+      // segment covering the full master audio — arr-time then equals
+      // master-time and every helper is identity, so the user's loop
+      // markers map straight through.
       //
       // The walker uses an AUTHORITATIVE state.currentSegmentIdx instead
       // of re-deriving from master-time on every tick — duplicate chunks
@@ -527,8 +517,13 @@ export function useAudioMaster(
       // share master-time bounds, so a "scan-for-first-match" lookup
       // would lock the playback into the first occurrence forever. The
       // index advances on each crossfade hop and re-binds on user-seek.
-      const segs = store.arrangementSegments;
-      if (segs.length > 0) {
+      const segs =
+        store.arrangementSegments.length > 0
+          ? store.arrangementSegments
+          : Number.isFinite(dur) && dur > 0
+            ? [{ in: 0, out: dur }]
+            : null;
+      if (segs && segs.length > 0) {
         let curIdx = state.currentSegmentIdx ?? -1;
         // Validate the cached index — if master-time has drifted out of
         // its window (e.g. browser nudged currentTime past the end while
@@ -750,62 +745,12 @@ export function useAudioMaster(
             useEditorStore.getState().setPlaying(false);
           }, Math.max(0, distToEnd * 1000));
         }
-        // Skip the legacy loop arming below — segment-walk owns the
-        // crossfade scheduling for arrangement playback.
         rafRef.current = requestAnimationFrame(tick);
         return;
       }
 
-      // Should we arm a crossfade now? Pure helper makes the rule
-      // testable in isolation.
-      const lp = store.playback.loop;
-      const pendingWrapAt = store.playback.pendingWrapAt;
-      if (
-        lp &&
-        shouldArmCrossfade({
-          masterT: t,
-          loop: lp,
-          pendingWrapAt,
-          leadTimeS: LEAD_TIME_S,
-          alreadyArmed: state.armed != null,
-        })
-      ) {
-        const wrapT = loopWrapTime(lp, pendingWrapAt) ?? lp.end;
-        // Distance to wrap in master-time. AudioContext-time advances
-        // at the same rate as master-time (no playbackRate mod), so
-        // the offset translates 1:1.
-        const distToWrap = Math.max(0, wrapT - t);
-        const fireAtCtxTime = graph.ctx.currentTime + distToWrap;
-
-        // Park idle element at loop.start and start it playing so its
-        // decoder is producing samples by the time the gain ramp hits.
-        try {
-          if (Math.abs(idle.currentTime - lp.start) > 0.01) {
-            idle.currentTime = clampSeek(lp.start, idle.duration);
-          }
-        } catch {
-          /* ignore */
-        }
-        if (idle.paused) {
-          idle.play().catch(() => undefined);
-        }
-
-        // Schedule the gain ramps. setValueAtTime "anchors" the ramp's
-        // start value at fireAtCtxTime — without this anchor, the ramp
-        // begins from now, which would slowly fade during the lead
-        // window instead of at the wrap point.
-        const activeGain = state.active === "A" ? graph.gainA : graph.gainB;
-        const idleGain = state.active === "A" ? graph.gainB : graph.gainA;
-        activeGain.gain.cancelScheduledValues(graph.ctx.currentTime);
-        idleGain.gain.cancelScheduledValues(graph.ctx.currentTime);
-        activeGain.gain.setValueAtTime(1, fireAtCtxTime);
-        activeGain.gain.linearRampToValueAtTime(0, fireAtCtxTime + CROSSFADE_S);
-        idleGain.gain.setValueAtTime(0, fireAtCtxTime);
-        idleGain.gain.linearRampToValueAtTime(1, fireAtCtxTime + CROSSFADE_S);
-
-        state.armed = { fireAtCtxTime, fromSide: state.active };
-      }
-
+      // No segments + no finite duration: nothing to play. Yield until
+      // the audio loads (`isReady` flips and the effect re-runs).
       rafRef.current = requestAnimationFrame(tick);
     }
 
