@@ -1363,15 +1363,10 @@ export const useEditorStore = create<EditorState>()(
       if (!clamped) return;
 
       // Defer the wrap to the OLD loop end whenever the playhead is OUTSIDE
-      // the new loop region. Loop bounds + pendingWrapAt all live in arr-
-      // time on the composed timeline (= master in direct-mode), so the
-      // playhead's master-time is projected into arr-time before the
-      // inside/outside test.
-      const t_master = s.playback.currentTime;
-      const t_view =
-        s.arrangementSegments.length > 0
-          ? masterToArr(t_master, s.arrangementSegments)
-          : t_master;
+      // the new loop region. Loop bounds + pendingWrapAt live in arr-time
+      // on the composed timeline; master-time is projected through the
+      // segments (Identity for single-take's whole-master segment).
+      const t_view = masterToArr(s.playback.currentTime, s.arrangementSegments);
       const insideNew = t_view >= clamped.start && t_view < clamped.end;
       const pendingWrapAt = insideNew ? null : loop.end;
 
@@ -1398,11 +1393,7 @@ export const useEditorStore = create<EditorState>()(
       }
       const clamped = clampLoopToBounds(loop, s.arrangementSegments, s.trim);
       if (!clamped) return;
-      const t_master = s.playback.currentTime;
-      const t_view =
-        s.arrangementSegments.length > 0
-          ? masterToArr(t_master, s.arrangementSegments)
-          : t_master;
+      const t_view = masterToArr(s.playback.currentTime, s.arrangementSegments);
       const insideNew = t_view >= clamped.start && t_view < clamped.end;
       // Preserve any existing pendingWrapAt — multiple drags before the
       // first wrap fires should keep the earliest old-end as the trigger
