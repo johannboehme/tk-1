@@ -214,10 +214,39 @@ export default function Triage() {
         });
         setDetection({ kind: "ready" });
 
-        void decodePcmInBackground(job!).then((pcm) => {
-          if (cancelled || !pcm) return;
-          useTriageStore.setState({ pcm: pcm.pcm, pcmSampleRate: pcm.sampleRate });
-        });
+        // PCM decode runs in the background so the timeline paints
+        // instantly off the cached envelope. Conform needs the full
+        // PCM and waits on `pcmDecoding`; we flip it here so the
+        // wait knows when to stop. On failure we surface the reason
+        // through `pcmDecodeError`.
+        //
+        // We DON'T gate the post-decode store updates on the local
+        // `cancelled` flag — `setDetection({ kind: "ready" })` inside
+        // this effect triggers a re-render that flips `cancelled` to
+        // true (the effect's deps include `detection.kind`), which
+        // would otherwise leave the long-running decode's resolution
+        // stranded. Instead we check against the store's `jobId` to
+        // guard against the user navigating to a different job.
+        const decodeJobId = job!.id;
+        useTriageStore.setState({ pcmDecoding: true, pcmDecodeError: null });
+        void decodePcmInBackground(job!)
+          .then((outcome) => {
+            if (useTriageStore.getState().jobId !== decodeJobId) return;
+            if (outcome.ok) {
+              useTriageStore.setState({
+                pcm: outcome.pcm,
+                pcmSampleRate: outcome.sampleRate,
+                pcmDecodeError: null,
+              });
+            } else {
+              useTriageStore.setState({ pcmDecodeError: outcome.reason });
+            }
+          })
+          .finally(() => {
+            if (useTriageStore.getState().jobId === decodeJobId) {
+              useTriageStore.setState({ pcmDecoding: false });
+            }
+          });
       });
       return () => {
         cancelled = true;
@@ -376,17 +405,22 @@ function toBpmValue(persisted: NonNullable<LocalJob["bpm"]>): {
   };
 }
 
-async function decodePcmInBackground(
-  job: LocalJob,
-): Promise<{ pcm: Float32Array; sampleRate: number } | null> {
-  if (!job.audioSource) return null;
+type PcmDecodeOutcome =
+  | { ok: true; pcm: Float32Array; sampleRate: number }
+  | { ok: false; reason: string };
+
+async function decodePcmInBackground(job: LocalJob): Promise<PcmDecodeOutcome> {
+  if (!job.audioSource) {
+    return { ok: false, reason: "no audio source on job" };
+  }
   try {
     const file = await loadAssetFile({ source: job.audioSource });
     const decoded = await decodeAudioToMonoPcm(file, 22050);
-    return { pcm: decoded.pcm, sampleRate: decoded.sampleRate };
+    return { ok: true, pcm: decoded.pcm, sampleRate: decoded.sampleRate };
   } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
     console.warn("Triage background PCM decode failed:", err);
-    return null;
+    return { ok: false, reason: message };
   }
 }
 

@@ -40,6 +40,7 @@ export function TriageTransportBar() {
   const splitChunkAt = useTriageStore((s) => s.splitChunkAt);
   const joinChunks = useTriageStore((s) => s.joinChunks);
   const resetChunk = useTriageStore((s) => s.resetChunk);
+  const conformChunk = useTriageStore((s) => s.conformChunk);
   const insertChunkAtPlayhead = useTriageStore((s) => s.insertChunkAtPlayhead);
   const acceptedCount = chunks.filter((c) => c.accepted).length;
 
@@ -105,6 +106,12 @@ export function TriageTransportBar() {
     group: "Triage · Edit",
   });
   useRegisterShortcut({
+    id: "triage.conform",
+    keys: ["C"],
+    description: "Re-fit focused chunk's bar grid from its audio",
+    group: "Triage · Edit",
+  });
+  useRegisterShortcut({
     id: "triage.reset-chunk",
     keys: ["R"],
     description: "Reset focused chunk to detection boundaries",
@@ -161,6 +168,10 @@ export function TriageTransportBar() {
       } else if (e.code === "KeyN" && !e.metaKey && !e.ctrlKey && !e.altKey) {
         e.preventDefault();
         insertChunkAtPlayhead();
+      } else if (e.code === "KeyC" && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+        e.preventDefault();
+        const st = useTriageStore.getState();
+        if (st.focusedChunkId) conformChunk(st.focusedChunkId);
       } else if (e.code === "KeyR" && !e.metaKey && !e.ctrlKey && !e.altKey) {
         e.preventDefault();
         const st = useTriageStore.getState();
@@ -177,6 +188,7 @@ export function TriageTransportBar() {
     setLoopEnabled,
     splitChunkAt,
     joinChunks,
+    conformChunk,
     insertChunkAtPlayhead,
     resetChunk,
   ]);

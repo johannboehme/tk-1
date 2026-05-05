@@ -22,6 +22,7 @@
  * No Keep/Drop buttons — the TransportBar is the sole accept/reject
  * surface (Enter/Backspace).
  */
+import { useEffect, useRef, useState } from "react";
 import { ChunkyButton } from "../../editor/components/ChunkyButton";
 import { BpmReadoutView } from "../../editor/components/BpmReadoutView";
 import {
@@ -38,6 +39,15 @@ import {
 } from "../../local/triage/triage-store";
 import type { Chunk } from "../../storage/jobs-db";
 
+const CONFORM_STATUS_LABEL: Record<string, string> = {
+  ok: "✓ conformed",
+  unchanged: "already in phase",
+  "no-bpm": "no global BPM yet",
+  "too-short": "no audio loaded",
+  "no-beats": "no beats detected",
+  "no-chunk": "",
+};
+
 export function ChunkInspector() {
   const focusedId = useTriageStore((s) => s.focusedChunkId);
   const chunks = useTriageStore((s) => s.chunks);
@@ -51,6 +61,8 @@ export function ChunkInspector() {
   const splitChunkAt = useTriageStore((s) => s.splitChunkAt);
   const joinChunks = useTriageStore((s) => s.joinChunks);
   const resetChunk = useTriageStore((s) => s.resetChunk);
+  const conformChunk = useTriageStore((s) => s.conformChunk);
+  const revertConform = useTriageStore((s) => s.revertConform);
   const insertChunkAtPlayhead = useTriageStore((s) => s.insertChunkAtPlayhead);
   // Subscribe to currentTime so canSplit stays live as the playhead
   // moves — without this the Split button would only refresh when
@@ -112,10 +124,13 @@ export function ChunkInspector() {
           onJoinPrev={() => joinChunks(focused.id, "prev")}
           onJoinNext={() => joinChunks(focused.id, "next")}
           onReset={() => resetChunk(focused.id)}
+          onConform={() => conformChunk(focused.id)}
+          onRevertConform={() => revertConform(focused.id)}
           canSplit={canSplitAtPlayhead(focused, currentTime)}
           canJoinPrev={hasPrev}
           canJoinNext={hasNext}
           canReset={canReset(focused)}
+          canRevertConform={focused.preConformSnapshot != null}
         />
       )}
     </section>
@@ -165,10 +180,13 @@ interface BodyProps {
   onJoinPrev: () => void;
   onJoinNext: () => void;
   onReset: () => void;
+  onConform: () => ReturnType<ReturnType<typeof useTriageStore.getState>["conformChunk"]>;
+  onRevertConform: () => void;
   canSplit: boolean;
   canJoinPrev: boolean;
   canJoinNext: boolean;
   canReset: boolean;
+  canRevertConform: boolean;
 }
 
 function ChunkBody({
@@ -180,10 +198,13 @@ function ChunkBody({
   onJoinPrev,
   onJoinNext,
   onReset,
+  onConform,
+  onRevertConform,
   canSplit,
   canJoinPrev,
   canJoinNext,
   canReset,
+  canRevertConform,
 }: BodyProps) {
   const lengthMs = chunk.endMs - chunk.startMs;
   const lengthS = lengthMs / 1000;
@@ -193,16 +214,133 @@ function ChunkBody({
   const phaseS = chunkBeatPhaseS(chunk);
   const phaseDeltaMs = phaseS * 1000 - chunk.startMs;
 
+  // Inline status for the Conform action: shows "✓ conformed · anchor
+  // +N ms" with the actual shift on success (so the user can see WHAT
+  // changed, not just that something happened), or the no-op reason on
+  // failure. Auto-fades after 3 s.
+  //
+  // The button is also disabled while the analysis runs. STFT on a
+  // long chunk blocks the main thread for a few hundred ms, during
+  // which the click feels "dead" — easy to think nothing happened and
+  // click again. We yield via setTimeout so React paints the disabled
+  // state before we kick off the synchronous work.
+  const [conformStatus, setConformStatus] = useState<
+    { kind: "success" | "error"; message: string } | null
+  >(null);
+  const [isConforming, setIsConforming] = useState(false);
+  const conformTimer = useRef<number | null>(null);
+  useEffect(
+    () => () => {
+      if (conformTimer.current != null) window.clearTimeout(conformTimer.current);
+    },
+    [],
+  );
+  async function handleConform() {
+    if (isConforming) return;
+    setIsConforming(true);
+    setConformStatus(null);
+    if (conformTimer.current != null) window.clearTimeout(conformTimer.current);
+
+    const beforeAnchor = chunk.audioStartMs ?? chunk.startMs;
+    const beforeStart = chunk.startMs;
+    const beforeEnd = chunk.endMs;
+
+    // Wait for the background PCM decode to finish, if it's still in
+    // flight. The Triage page kicks decode off async on the cached
+    // path, so a fast click after entering Triage can land here with
+    // no PCM yet.
+    if (
+      (useTriageStore.getState().pcm?.length ?? 0) === 0 &&
+      useTriageStore.getState().pcmDecoding
+    ) {
+      setConformStatus({ kind: "success", message: "decoding audio…" });
+      const start = Date.now();
+      while (
+        useTriageStore.getState().pcmDecoding &&
+        Date.now() - start < 30_000
+      ) {
+        await new Promise((r) => window.setTimeout(r, 100));
+      }
+    }
+
+    // Decode finished and produced no PCM → surface the actual reason
+    // (file handle stale, codec unsupported, etc.) rather than the
+    // generic "no audio loaded".
+    const decodeError = useTriageStore.getState().pcmDecodeError;
+    if (
+      (useTriageStore.getState().pcm?.length ?? 0) === 0 &&
+      decodeError != null
+    ) {
+      setConformStatus({
+        kind: "error",
+        message: `decode failed · ${decodeError}`,
+      });
+      setIsConforming(false);
+      conformTimer.current = window.setTimeout(
+        () => setConformStatus(null),
+        5000,
+      );
+      return;
+    }
+
+    // Yield once so the disabled state paints before STFT blocks.
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    {
+      const status = onConform();
+      if (status === "unchanged") {
+        setConformStatus({ kind: "success", message: "already in phase" });
+      } else if (status === "ok") {
+        const after = useTriageStore
+          .getState()
+          .chunks.find((c) => c.id === chunk.id);
+        if (after) {
+          const anchorDelta = Math.round(
+            (after.audioStartMs ?? after.startMs) - beforeAnchor,
+          );
+          const startDelta = Math.round(after.startMs - beforeStart);
+          const endDelta = Math.round(after.endMs - beforeEnd);
+          const parts: string[] = [];
+          const sign = (n: number) => (n >= 0 ? `+${n}` : `${n}`);
+          if (anchorDelta !== 0) parts.push(`anchor ${sign(anchorDelta)} ms`);
+          if (startDelta !== 0) parts.push(`in ${sign(startDelta)} ms`);
+          if (endDelta !== 0) parts.push(`out ${sign(endDelta)} ms`);
+          const detail = parts.length > 0 ? ` · ${parts.join(", ")}` : " · no shift";
+          setConformStatus({ kind: "success", message: `✓ conformed${detail}` });
+        } else {
+          setConformStatus({ kind: "success", message: "✓ conformed" });
+        }
+      } else {
+        setConformStatus({
+          kind: "error",
+          message: CONFORM_STATUS_LABEL[status] ?? status,
+        });
+      }
+      setIsConforming(false);
+      conformTimer.current = window.setTimeout(
+        () => setConformStatus(null),
+        3000,
+      );
+    }
+  }
+
   return (
     <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-3 text-sm">
-      <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[11px]">
-        <KV label="In" value={formatTime(chunk.startMs / 1000)} />
-        <KV label="Out" value={formatTime(chunk.endMs / 1000)} />
-        <KV label="Length" value={`${lengthS.toFixed(1)}s`} />
-        <KV label="Bars" value={bars > 0 ? `≈ ${bars.toFixed(1)}` : "—"} />
-        <KV
-          label="Anchor"
-          value={phaseDeltaMs > 1 ? `+${phaseDeltaMs.toFixed(0)}ms` : "at start"}
+      {/* Compact stat strip — five values laid out inline so the rest
+       *  of the inspector (TRIM / EDIT) has room. Wraps on narrow
+       *  inspector widths instead of pushing the buttons below the
+       *  fold. */}
+      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-[10.5px] font-mono tabular leading-tight">
+        <Stat label="IN" value={formatTime(chunk.startMs / 1000)} />
+        <Sep />
+        <Stat label="OUT" value={formatTime(chunk.endMs / 1000)} />
+        <Sep />
+        <Stat label="LEN" value={`${lengthS.toFixed(1)}s`} />
+        <Sep />
+        <Stat label="BARS" value={bars > 0 ? `~${bars.toFixed(1)}` : "—"} />
+        <Sep />
+        <Stat
+          label="ANCH"
+          value={phaseDeltaMs > 1 ? `+${phaseDeltaMs.toFixed(0)}ms` : "0"}
         />
       </div>
 
@@ -274,6 +412,40 @@ function ChunkBody({
           >
             Split here
           </ChunkyButton>
+          <div className="flex flex-col">
+            <div className="grid grid-cols-2 gap-1">
+              <ChunkyButton
+                variant="secondary"
+                size="xs"
+                disabled={isConforming}
+                onClick={handleConform}
+                title="Re-fit this chunk's bar grid from its audio · C"
+              >
+                {isConforming ? "…" : "Conform"}
+              </ChunkyButton>
+              <ChunkyButton
+                variant="secondary"
+                size="xs"
+                disabled={!canRevertConform}
+                onClick={onRevertConform}
+                title="Restore this chunk to its state before the last Conform"
+              >
+                Original
+              </ChunkyButton>
+            </div>
+            {conformStatus && (
+              <span
+                className="font-mono text-[10px] tabular tracking-label mt-1 self-center text-center leading-tight"
+                style={{
+                  color:
+                    conformStatus.kind === "success" ? "#7A5E1F" : "#B85450",
+                  fontWeight: 700,
+                }}
+              >
+                {conformStatus.message}
+              </span>
+            )}
+          </div>
           <div className="grid grid-cols-2 gap-1">
             <ChunkyButton
               variant="secondary"
@@ -336,15 +508,17 @@ function Section({
   );
 }
 
-function KV({ label, value }: { label: string; value: string }) {
+function Stat({ label, value }: { label: string; value: string }) {
   return (
-    <>
-      <span className="font-display tracking-label uppercase text-[9px] text-ink-3">
-        {label}
-      </span>
-      <span className="font-mono tabular text-ink text-right">{value}</span>
-    </>
+    <span className="whitespace-nowrap">
+      <span className="tracking-label text-ink-3 mr-1">{label}</span>
+      <span className="text-ink">{value}</span>
+    </span>
   );
+}
+
+function Sep() {
+  return <span className="text-ink-3">·</span>;
 }
 
 function formatTime(s: number): string {

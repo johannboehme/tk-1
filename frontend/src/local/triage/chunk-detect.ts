@@ -30,13 +30,11 @@
 
 import { analyzeAudio } from "../render/audio-analysis/analyze";
 import type { Chunk, SilenceConfig } from "../../storage/jobs-db";
+import { MIN_CHUNK_MS_FOR_BPM, snapChunkEndToBar } from "./chunk-bar-grid";
+
+export { MIN_CHUNK_MS_FOR_BPM, snapChunkEndToBar };
 
 export const TRIAGE_ENVELOPE_HZ = 10;
-
-/** Below this chunk length the autocorrelation tempo detector tends to
- *  lock onto sub-bar harmonics. Threshold detection still finds the
- *  chunk; we just skip the BPM step. */
-const MIN_CHUNK_MS_FOR_BPM = 4_000;
 
 /** Tempo-confidence floor below which the autocorrelation pick is
  *  ignored. Picked low — chunk-level windows are short, the runner-up
@@ -81,38 +79,6 @@ export function dbToLinear(db: number): number {
 
 function chunkId(startMs: number, endMs: number): string {
   return `chunk-${startMs}-${endMs}`;
-}
-
-/** Snap a chunk's `endMs` down to the nearest whole-bar boundary anchored
- *  on its first onset (`audioStartMs`). Chunks already start on a
- *  downbeat by construction (the Triage bar-grid is anchored on
- *  `audioStartMs`); this aligns the END so a default-Triage handoff
- *  produces fully bar-aligned segments without the user having to
- *  hand-trim each chunk in/out marker. Returns the original `endMs`
- *  when bpm is unavailable, when the snap would collapse the chunk
- *  below half a bar, or when the chunk is too short for at least one
- *  bar. */
-function snapChunkEndToBar(
-  startMs: number,
-  endMs: number,
-  audioStartMs: number,
-  bpm: number | undefined,
-  beatsPerBar: number,
-): number {
-  if (!bpm || bpm <= 0) return endMs;
-  const barMs = (60_000 / bpm) * beatsPerBar;
-  if (!Number.isFinite(barMs) || barMs <= 0) return endMs;
-  // The chunk must contain at least one full bar past the first onset
-  // for a bar-snap to be meaningful — otherwise we'd snap it to its
-  // own start and effectively kill the chunk. Fall back to raw endMs.
-  if (endMs - audioStartMs < barMs) return endMs;
-  const barsPastFirstBeat = Math.floor((endMs - audioStartMs) / barMs);
-  const snapped = audioStartMs + barsPastFirstBeat * barMs;
-  // Defensive lower bound — never snap below `startMs + half a bar`,
-  // even when audioStartMs is past the chunk's loud region's center
-  // (rare but possible in noisy detections).
-  if (snapped <= startMs + barMs / 2) return endMs;
-  return Math.round(snapped);
 }
 
 export async function detectChunks(

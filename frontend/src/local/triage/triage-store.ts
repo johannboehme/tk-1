@@ -19,7 +19,9 @@
 import { create } from "zustand";
 import type { BpmValue } from "../../editor/components/BpmReadoutView";
 import type { SnapMode } from "../../editor/snap";
+import { analyzeAudio } from "../render/audio-analysis/analyze";
 import type { Chunk, SilenceConfig, VideoAsset } from "../../storage/jobs-db";
+import { snapChunkEndToBar } from "./chunk-bar-grid";
 
 export interface TriagePlayback {
   currentTime: number;
@@ -46,6 +48,15 @@ export interface TriageState {
   audioDuration: number;
   pcm: Float32Array | null;
   pcmSampleRate: number;
+  /** True while the master-audio PCM is being decoded in the
+   *  background (hasCached path). Conform waits on this flag so it
+   *  doesn't bail with "no audio loaded" right after the user opens
+   *  the page from cache. */
+  pcmDecoding: boolean;
+  /** Set when the background PCM decode failed — propagates to
+   *  Conform so the inspector can surface the actual cause instead
+   *  of a generic "no audio loaded" message. */
+  pcmDecodeError: string | null;
   envelope: Float32Array | null;
   envelopeHz: number;
   cams: VideoAsset[];
@@ -110,12 +121,33 @@ export interface TriageState {
   extendChunkBars(id: string, barsBack: number, barsFwd: number): void;
   /** Manually slice a chunk in two at the given master-audio time
    *  (ms). Both halves inherit the user's accept-flag and BPM
-   *  metadata; the right half's `audioStartMs` becomes the split
-   *  point so its bar grid re-anchors there. Returns the new ID of
-   *  the right half, or null if the cut would be degenerate
-   *  (≤50 ms from either edge or outside the chunk). The left half
-   *  keeps the original ID so persistent references survive. */
+   *  metadata, and each computes its own `audioStartMs` as the bar
+   *  boundary of the original grid that lies inside its range — so
+   *  splitting a coherent take preserves the rhythm in both halves
+   *  without re-detecting phase. Returns the new ID of the right
+   *  half, or null if the cut would be degenerate (≤50 ms from
+   *  either edge or outside the chunk). The left half keeps the
+   *  original ID so persistent references survive. */
   splitChunkAt(id: string, atMs: number): string | null;
+  /** Re-fit a chunk's bar-grid phase from its current audio range,
+   *  holding the song-global BPM as the period. Snaps `startMs` and
+   *  `endMs` onto bar boundaries of the new grid so two conformed
+   *  chunks line up seamlessly when assembled. BPM fields are not
+   *  touched — BPM is global. Returns a status string the inspector
+   *  surfaces inline:
+   *    - "ok"        — bounds re-fitted, snapshot stashed
+   *    - "unchanged" — already in phase + on-grid; nothing to do
+   *    - "no-chunk"  — id not found
+   *    - "no-bpm"    — global BPM not resolved yet
+   *    - "too-short" — no PCM loaded
+   *    - "no-beats"  — analyzer + onset fallback both came up empty */
+  conformChunk(
+    id: string,
+  ): "ok" | "unchanged" | "no-chunk" | "no-bpm" | "too-short" | "no-beats";
+  /** Restore a chunk to its pre-conform state. No-op when there's no
+   *  snapshot (chunk has never been conformed, or has been edited
+   *  since). */
+  revertConform(id: string): void;
   /** Merge a focused chunk with its chronological neighbour. The
    *  combined chunk wins audioStartMs from whichever half started
    *  first (preserves musical phase) and inherits accept = a OR b
@@ -187,6 +219,8 @@ export const useTriageStore = create<TriageState>((set, get) => ({
   audioDuration: 0,
   pcm: null,
   pcmSampleRate: 22050,
+  pcmDecoding: false,
+  pcmDecodeError: null,
   envelope: null,
   envelopeHz: 10,
   cams: [],
@@ -236,6 +270,8 @@ export const useTriageStore = create<TriageState>((set, get) => ({
       jobId: null,
       audioDuration: 0,
       pcm: null,
+      pcmDecoding: false,
+      pcmDecodeError: null,
       envelope: null,
       cams: [],
       chunks: [],
@@ -293,7 +329,14 @@ export const useTriageStore = create<TriageState>((set, get) => ({
         Math.round(anchorMs + nextEndBars * msPerBar),
       ),
     );
-    s.updateChunk(id, { startMs: nextStart, endMs: nextEnd, trimMode: "bar" });
+    // Trim invalidates any conform snapshot — its bounds belonged to the
+    // pre-trim range and would restore stale values.
+    s.updateChunk(id, {
+      startMs: nextStart,
+      endMs: nextEnd,
+      trimMode: "bar",
+      preConformSnapshot: undefined,
+    });
     if (s.focusedChunkId === id) {
       set({
         playback: {
@@ -314,6 +357,25 @@ export const useTriageStore = create<TriageState>((set, get) => ({
     }
     const splitMs = Math.round(atMs);
     const newId = `${chunk.id}-r-${Date.now().toString(36)}`;
+    // Both halves keep the **same bar grid** as the pre-split chunk —
+    // the user expects "split here" to slice a coherent take into two
+    // coherent pieces, not to throw away the rhythm. Each half stores
+    // its own anchor (a bar boundary of the original grid that lies
+    // inside the half's range) so chunks remain self-contained in the
+    // data model.
+    //
+    // Cold-start fallback (no global BPM yet): preserve the legacy
+    // behaviour of keeping the original anchor on the left and using
+    // the click point on the right. With no msPerBar to project onto,
+    // there's nothing better to compute.
+    const originalAnchor = chunk.audioStartMs ?? chunk.startMs;
+    const hasGrid = chunk.effectiveBpm > 0 && chunk.beatsPerBar > 0;
+    const leftAnchor = hasGrid
+      ? anchorInRange(originalAnchor, chunk.effectiveBpm, chunk.beatsPerBar, chunk.startMs)
+      : originalAnchor;
+    const rightAnchor = hasGrid
+      ? anchorInRange(originalAnchor, chunk.effectiveBpm, chunk.beatsPerBar, splitMs)
+      : splitMs;
     // Each half snapshots its own current bounds as its origin — Reset
     // pulls back to "right after the split", not to the pre-split chunk
     // (which no longer exists). Predictable: split, edit one side, hit
@@ -321,20 +383,26 @@ export const useTriageStore = create<TriageState>((set, get) => ({
     const left: Chunk = {
       ...chunk,
       endMs: splitMs,
+      audioStartMs: leftAnchor,
       trimMode: "free",
       originalStartMs: chunk.startMs,
       originalEndMs: splitMs,
-      originalAudioStartMs: chunk.audioStartMs ?? chunk.startMs,
+      originalAudioStartMs: leftAnchor,
+      // Snapshot was scoped to the pre-split chunk; meaningless on the
+      // halves. Drop it so the inspector's Original button doesn't
+      // surface a stale undo target.
+      preConformSnapshot: undefined,
     };
     const right: Chunk = {
       ...chunk,
       id: newId,
       startMs: splitMs,
-      audioStartMs: splitMs,
+      audioStartMs: rightAnchor,
       trimMode: "free",
       originalStartMs: splitMs,
       originalEndMs: chunk.endMs,
-      originalAudioStartMs: splitMs,
+      originalAudioStartMs: rightAnchor,
+      preConformSnapshot: undefined,
     };
     const others = s.chunks.filter((c) => c.id !== id);
     set({ chunks: [...others, left, right] });
@@ -343,6 +411,116 @@ export const useTriageStore = create<TriageState>((set, get) => ({
       next.focusChunk(newId);
     }
     return newId;
+  },
+
+  conformChunk(id) {
+    const s = get();
+    const chunk = s.chunks.find((c) => c.id === id);
+    if (!chunk) return "no-chunk";
+    const bpm = effectiveChunkBpm(chunk, s.jobBpm?.value ?? null);
+    if (!bpm || bpm <= 0) return "no-bpm";
+    const beatsPerBar = chunk.beatsPerBar > 0 ? chunk.beatsPerBar : s.beatsPerBar;
+    const pcm = s.pcm;
+    if (!pcm || pcm.length === 0) return "too-short";
+    const sampleRate = s.pcmSampleRate;
+    const startSample = Math.max(0, Math.floor((chunk.startMs / 1000) * sampleRate));
+    const endSample = Math.min(pcm.length, Math.ceil((chunk.endMs / 1000) * sampleRate));
+    if (endSample <= startSample) return "too-short";
+    const slice = pcm.subarray(startSample, endSample);
+    const existingAnchor = chunk.audioStartMs ?? chunk.startMs;
+
+    // Idempotence: if this chunk was already Conformed (its bounds
+    // were stashed as a snapshot), trust the existing anchor and just
+    // re-snap endMs to whole bars. The analyzer's STFT frame
+    // quantization (~46 ms wobble around frame centers) means
+    // successive analyses on shifted slices can keep "discovering" a
+    // ~46 ms gap, eating into the chunk a sliver at a time. Snapshots
+    // are cleared on split/join/extend/reset, so a freshly-edited
+    // chunk falls into the analyse path again as expected.
+    let newAnchorMs: number;
+    let newStartMs: number;
+    if (chunk.preConformSnapshot != null) {
+      newAnchorMs = existingAnchor;
+      newStartMs = chunk.startMs;
+    } else {
+      const analysis = analyzeAudio(slice, sampleRate);
+      // `audioStartS` is the first significant onset (with 30 ms
+      // backoff if the first 300 ms is absolute silence) — same value
+      // initial detection seeds `audioStartMs` from. We deliberately
+      // don't use the LS-fit `tempo.phase`: the DP beat-tracker can
+      // pick beat 2 or 3 as its chain start, shifting the LS phase by
+      // a beat and snapping startMs PAST the first onset, eating into
+      // the first beat of music.
+      const candidateAnchor = chunk.startMs + analysis.audioStartS * 1000;
+      newAnchorMs = anchorInRange(candidateAnchor, bpm, beatsPerBar, chunk.startMs);
+      // Trim leading silence: if the analyzer detected a silent intro
+      // inside the slice, advance startMs to where music begins (= the
+      // anchor). Otherwise leave startMs alone — the chunk already
+      // starts on audio and we'd be cutting into actual music.
+      const hasSilentIntro = analysis.audioStartS > 0;
+      newStartMs = hasSilentIntro ? Math.round(newAnchorMs) : chunk.startMs;
+    }
+    const newEndMs = snapChunkEndToBar(
+      newStartMs,
+      chunk.endMs,
+      newAnchorMs,
+      bpm,
+      beatsPerBar,
+    );
+
+    // Truly idempotent: same anchor, same edges → no-op. Don't touch
+    // state, don't stash a snapshot (there's nothing to revert).
+    const POSITION_TOL_MS = 1;
+    const samePosition =
+      Math.abs(newStartMs - chunk.startMs) <= POSITION_TOL_MS &&
+      Math.abs(newEndMs - chunk.endMs) <= POSITION_TOL_MS &&
+      Math.abs(newAnchorMs - existingAnchor) <= POSITION_TOL_MS;
+    if (samePosition) return "unchanged";
+
+    set({
+      chunks: s.chunks.map((c) =>
+        c.id === id
+          ? {
+              ...c,
+              startMs: newStartMs,
+              endMs: newEndMs,
+              audioStartMs: newAnchorMs,
+              trimMode: "bar",
+              // Stash the pre-conform bounds so the user can revert
+              // via the "Original" button next to Conform. Replaces
+              // any prior snapshot — only the most recent conform is
+              // undoable.
+              preConformSnapshot: {
+                startMs: chunk.startMs,
+                endMs: chunk.endMs,
+                audioStartMs: chunk.audioStartMs,
+              },
+            }
+          : c,
+      ),
+    });
+    return "ok";
+  },
+
+  revertConform(id) {
+    const s = get();
+    const chunk = s.chunks.find((c) => c.id === id);
+    if (!chunk) return;
+    const snap = chunk.preConformSnapshot;
+    if (!snap) return;
+    set({
+      chunks: s.chunks.map((c) =>
+        c.id === id
+          ? {
+              ...c,
+              startMs: snap.startMs,
+              endMs: snap.endMs,
+              audioStartMs: snap.audioStartMs,
+              preConformSnapshot: undefined,
+            }
+          : c,
+      ),
+    });
   },
 
   joinChunks(id, direction) {
@@ -370,6 +548,9 @@ export const useTriageStore = create<TriageState>((set, get) => ({
       originalStartMs: mergedStart,
       originalEndMs: mergedEnd,
       originalAudioStartMs: mergedAudioStart,
+      // Snapshots from either half were scoped to a smaller range;
+      // discard.
+      preConformSnapshot: undefined,
     };
     const remaining = s.chunks.filter((c) => c.id !== a.id && c.id !== b.id);
     set({ chunks: [...remaining, merged] });
@@ -429,6 +610,9 @@ export const useTriageStore = create<TriageState>((set, get) => ({
       endMs: chunk.originalEndMs,
       audioStartMs: chunk.originalAudioStartMs ?? chunk.originalStartMs,
       trimMode: "auto",
+      // Reset goes back to detection-time bounds; any pre-conform
+      // snapshot was scoped to bounds that no longer exist.
+      preConformSnapshot: undefined,
     });
     if (s.focusedChunkId === id && s.playback.loopEnabled) {
       set({
@@ -660,6 +844,29 @@ export function chunkBeatPhaseS(chunk: {
   audioStartMs?: number;
 }): number {
   return (chunk.audioStartMs ?? chunk.startMs) / 1000;
+}
+
+/** Find the bar boundary of a grid `originalAnchor + N * msPerBar` that
+ *  lies at or after `boundaryMs`. Used by `splitChunkAt` to give each
+ *  half its own self-contained anchor on the same grid as the pre-split
+ *  chunk, and by `conformChunk` to land the freshly-detected phase on
+ *  the earliest in-range bar boundary.
+ *
+ *  Returns `boundaryMs` itself when BPM is unknown (cold start before
+ *  global BPM resolves). The result is always within
+ *  `[boundaryMs, boundaryMs + msPerBar)`. */
+export function anchorInRange(
+  originalAnchor: number,
+  bpm: number | undefined,
+  beatsPerBar: number,
+  boundaryMs: number,
+): number {
+  if (!bpm || bpm <= 0 || !Number.isFinite(bpm)) return boundaryMs;
+  if (!beatsPerBar || beatsPerBar <= 0) return boundaryMs;
+  const msPerBar = (60_000 / bpm) * beatsPerBar;
+  if (!Number.isFinite(msPerBar) || msPerBar <= 0) return boundaryMs;
+  const k = Math.ceil((boundaryMs - originalAnchor) / msPerBar);
+  return Math.round(originalAnchor + k * msPerBar);
 }
 
 /** Pure predicate: does this chunk meet the active min-bars filter?

@@ -246,11 +246,27 @@ export interface Chunk {
    *  * 2^bpmOctaveShift; default = job.bpm wenn der User keinen
    *  per-Chunk-Override gesetzt hat. */
   effectiveBpm: number;
-  /** Master-Audio-Zeit (ms) des ersten erkannten Onsets innerhalb
-   *  des Chunks. Damit ist der Chunk-eigene Bar-Grid anchored — Chunks
-   *  sind nicht zueinander aligned, jeder hat seinen eigenen Phase.
-   *  Default = startMs (kein Onset detected). */
+  /** Bar-grid phase anchor (master-audio time, ms). Marks a single point
+   *  the chunk's bar grid is anchored on; the rendered grid is then
+   *  `audioStartMs + N * msPerBar`. Misnamed for legacy reasons — does
+   *  NOT necessarily mark where audio starts. The detector seeds it from
+   *  the first onset; `splitChunkAt` projects it onto the new range as
+   *  a bar boundary of the original grid; `conformChunk` re-fits it
+   *  from the chunk's current audio range. Chunks are not aligned to
+   *  each other — each carries its own anchor. Default = startMs when
+   *  no onset was detected. */
   audioStartMs?: number;
+  /** Snapshot of (startMs, endMs, audioStartMs) taken just before the
+   *  most recent `conformChunk` call — undefined when the chunk has
+   *  never been conformed (or has been reverted/edited since). Powers
+   *  the "Original" button next to Conform: revert to this state and
+   *  clear the snapshot. Cleared on split/join/extend/reset to avoid
+   *  surfacing a stale undo target. */
+  preConformSnapshot?: {
+    startMs: number;
+    endMs: number;
+    audioStartMs?: number;
+  };
   /** Berechnete Bar-Anzahl (Dauer / Sekunden-pro-Bar). Optional — UI
    *  kann das auf der Fly berechnen falls nicht persistiert. */
   bars?: number;

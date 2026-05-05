@@ -23,6 +23,7 @@ import {
 } from "../../local/triage/triage-store";
 import { snapTime } from "../../editor/snap";
 import type { Chunk } from "../../storage/jobs-db";
+import { autoFollowScrollX } from "./triage-auto-follow";
 
 // Visual hierarchy (top to bottom):
 //   Time ruler — secondary, MM:SS for absolute reference, faint
@@ -102,6 +103,36 @@ export function TriageTimeline() {
     Math.max(0, audioDuration - visibleDuration),
   );
   const viewEndS = viewStartS + visibleDuration;
+
+  // Auto-follow: pan the timeline to the focused chunk so the user can
+  // see what they're hearing in the loop. Triggers on focus-id changes
+  // only — user pan/zoom afterwards is respected until the next focus
+  // change. Direct clicks ON the timeline (chunk blocks, waveform,
+  // bar-ruler) suppress the follow — the user already pointed at the
+  // location they care about; re-centring would yank the cursor off
+  // its target. Set in onPointerDownCapture below; consumed here.
+  const suppressAutoFollowRef = useRef(false);
+  useEffect(() => {
+    if (!focusedChunkId) {
+      suppressAutoFollowRef.current = false;
+      return;
+    }
+    if (suppressAutoFollowRef.current) {
+      suppressAutoFollowRef.current = false;
+      return;
+    }
+    const chunk = chunks.find((c) => c.id === focusedChunkId);
+    if (!chunk) return;
+    const next = autoFollowScrollX({
+      chunkStartS: chunk.startMs / 1000,
+      chunkEndS: chunk.endMs / 1000,
+      viewStartS,
+      viewEndS,
+      audioDuration,
+    });
+    if (next != null) setScrollX(next);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally only re-pan on focus-id changes
+  }, [focusedChunkId]);
 
   function timeToX(tS: number): number {
     return (tS - viewStartS) * pxPerSec;
@@ -596,6 +627,18 @@ export function TriageTimeline() {
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerUp}
+      // Capture-phase: runs before child handlers that mutate
+      // focusedChunkId. Marks the next focus change as user-initiated
+      // from this surface so the auto-follow effect skips it.
+      onPointerDownCapture={() => {
+        suppressAutoFollowRef.current = true;
+      }}
+      // Reset on release so a click that didn't end up changing the
+      // focused chunk doesn't leave a stale flag for the next
+      // shortcut-driven focus change.
+      onPointerUpCapture={() => {
+        suppressAutoFollowRef.current = false;
+      }}
     >
       {/* Time ruler — secondary surface. Faint MM:SS for absolute
        *  reference; visually subordinate to the bar ruler below so
@@ -700,6 +743,55 @@ export function TriageTimeline() {
             </span>
           );
         })}
+        {/* Anchor flag — marks the focused chunk's bar-grid phase anchor
+         *  (audioStartMs). Distinct brass colour + a "1" glyph so the
+         *  user can read at-a-glance whether the grid is in phase with
+         *  the audio. After Conform shifts the anchor, this is the only
+         *  immediate visual cue that something changed. */}
+        {focusedChunkId &&
+          (() => {
+            const focused = chunks.find((c) => c.id === focusedChunkId);
+            if (!focused) return null;
+            const anchorS = chunkBeatPhaseS(focused);
+            if (anchorS < viewStartS || anchorS > viewEndS) return null;
+            const x = timeToX(anchorS);
+            return (
+              <span
+                aria-hidden
+                className="absolute pointer-events-none"
+                style={{
+                  left: x,
+                  top: 0,
+                  bottom: 0,
+                  width: 0,
+                }}
+              >
+                <span
+                  className="absolute"
+                  style={{
+                    left: -1,
+                    top: 0,
+                    width: 2,
+                    height: "100%",
+                    background: "#C9A95A",
+                    boxShadow: "0 0 4px rgba(201,169,90,0.6)",
+                  }}
+                />
+                <span
+                  className="absolute font-display tracking-[0.05em] uppercase tabular leading-none select-none"
+                  style={{
+                    left: 3,
+                    top: 3,
+                    fontSize: 9,
+                    fontWeight: 700,
+                    color: "#7A5E1F",
+                  }}
+                >
+                  1
+                </span>
+              </span>
+            );
+          })()}
       </div>
 
       <div

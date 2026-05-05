@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { analyzeAudio } from "./analyze";
+import { analyzeAudio, analyzeAudioFixedBpm } from "./analyze";
 
 const SR = 22050;
 
@@ -209,4 +209,84 @@ describe("analyzeAudio — pure pipeline", () => {
     }
     expect(maxResid).toBeLessThan(tol);
   });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase-only refit at a fixed period.
+//
+// Used by Triage's "Conform" action: the user has already fixed the global
+// BPM (via majority vote across chunks or manual override), and just wants
+// the bar-grid phase of one chunk re-detected from its current audio range.
+// The period is held; only the phase residual is fit. More robust than the
+// joint period+phase refit when a chunk's local BPM detection would
+// disagree with the global decision.
+// ────────────────────────────────────────────────────────────────────────────
+
+describe("analyzeAudioFixedBpm — phase-only refit", () => {
+  it("recovers a known phase offset within one analysis hop", () => {
+    // 0.137 s of silence, then 8 s of 120 BPM clicks. With BPM held at
+    // 120, the LS-fit phase should land on the click grid (any
+    // phase + k*period is equivalent — same grid). Tolerance is one
+    // analysis hop (~33 ms at fps=30) — the resolution of the
+    // spectral-flux peak picker before sub-frame refinement averages out.
+    const intro = 0.137;
+    const clicks = buildClickTrack(120, 8);
+    const pcm = new Float32Array(Math.round(SR * intro) + clicks.length);
+    pcm.set(clicks, Math.round(SR * intro));
+    const result = analyzeAudioFixedBpm(pcm, SR, 120, 4);
+    expect(result).not.toBeNull();
+    const period = 60 / 120;
+    const offset = result!.phaseS - intro;
+    const mod = ((offset % period) + period) % period;
+    const distToGrid = Math.min(mod, period - mod);
+    // 1/30 ≈ 33 ms; same tolerance the analyzeAudio test uses.
+    expect(distToGrid).toBeLessThan(1 / 30);
+  });
+
+  it("returns a finite phase even when fixedBpm slightly disagrees with audio", () => {
+    // Audio is at 115 BPM, caller passes 120. Period is held; phase is
+    // best-effort (the residuals won't average down to zero noise, but
+    // the function must still return *something* without throwing).
+    const pcm = buildClickTrack(115, 8);
+    const result = analyzeAudioFixedBpm(pcm, SR, 120, 4);
+    expect(result).not.toBeNull();
+    expect(Number.isFinite(result!.phaseS)).toBe(true);
+  });
+
+  it("returns null on too-short input", () => {
+    const pcm = new Float32Array(SR / 50); // ~20 ms
+    const result = analyzeAudioFixedBpm(pcm, SR, 120, 4);
+    expect(result).toBeNull();
+  });
+
+  it("returns null when fixedBpm is non-positive", () => {
+    const pcm = buildClickTrack(120, 8);
+    expect(analyzeAudioFixedBpm(pcm, SR, 0, 4)).toBeNull();
+    expect(analyzeAudioFixedBpm(pcm, SR, -120, 4)).toBeNull();
+  });
+
+  it("falls back to the first onset when there aren't enough beats for an LS-fit", () => {
+    // 600 ms of mostly silence with a single click at ~100 ms. The DP
+    // beat-tracker can't chain beats from a single peak, but we should
+    // still return a phase anchored on that one onset — better than
+    // nothing for the user's "Conform" workflow on short fragments.
+    const totalSamples = Math.round(SR * 0.6);
+    const pcm = new Float32Array(totalSamples);
+    for (let i = 0; i < totalSamples; i++) pcm[i] = (Math.random() - 0.5) * 0.005;
+    const clickStart = Math.round(SR * 0.1);
+    const clickLen = Math.round(0.005 * SR);
+    for (let k = 0; k < clickLen; k++) {
+      const env = Math.exp((-k / clickLen) * 4);
+      pcm[clickStart + k] += 0.8 * env * Math.sin((2 * Math.PI * 200 * k) / SR);
+    }
+    const result = analyzeAudioFixedBpm(pcm, SR, 120, 4);
+    expect(result).not.toBeNull();
+    expect(Number.isFinite(result!.phaseS)).toBe(true);
+    // Phase should land near the click position (~100 ms) within one
+    // analysis hop. Confidence is low because we couldn't verify the
+    // period from multiple beats.
+    expect(Math.abs(result!.phaseS - 0.1)).toBeLessThan(1 / 30);
+    expect(result!.confidence).toBeLessThan(0.5);
+  });
+
 });

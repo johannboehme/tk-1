@@ -91,8 +91,77 @@ describe("triage-store · splitChunkAt", () => {
     expect(b.effectiveBpm).toBe(180);
   });
 
-  it("preserves left half audioStartMs, sets right half audioStartMs to split point", () => {
-    seed([makeChunk({ id: "c1", startMs: 1000, endMs: 5000, audioStartMs: 1200 })]);
+  it("derives both halves' audioStartMs from the original grid (no inheritance, no click-point)", () => {
+    // Original chunk: anchor=1000ms, span 1000-5000, BPM=120 4/4 → msPerBar=2000ms.
+    // Grid is ..., 1000, 3000, 5000, 7000, ... Split at 3500ms.
+    // Left half [1000, 3500): first grid bar ≥ 1000 = 1000.
+    // Right half [3500, 5000]: first grid bar ≥ 3500 = 5000.
+    seed([
+      makeChunk({
+        id: "c1",
+        startMs: 1000,
+        endMs: 5000,
+        audioStartMs: 1000,
+        effectiveBpm: 120,
+        beatsPerBar: 4,
+      }),
+    ]);
+    useTriageStore.getState().splitChunkAt("c1", 3500);
+    const [a, b] = useTriageStore.getState().chunks.sort((x, y) => x.startMs - y.startMs);
+    expect(a.audioStartMs).toBe(1000);
+    expect(b.audioStartMs).toBe(5000);
+  });
+
+  it("right half anchor lands on the first bar boundary of the original grid past splitMs", () => {
+    // Anchor=1137ms (deliberately not on a round number), msPerBar=2000ms.
+    // Grid: 1137, 3137, 5137, 7137, ... Split at 4000.
+    // Left [1000, 4000): bars in range 1137, 3137 → first = 1137.
+    // Right [4000, 9000]: first bar ≥ 4000 = 5137.
+    seed([
+      makeChunk({
+        id: "c1",
+        startMs: 1000,
+        endMs: 9000,
+        audioStartMs: 1137,
+        effectiveBpm: 120,
+        beatsPerBar: 4,
+      }),
+    ]);
+    useTriageStore.getState().splitChunkAt("c1", 4000);
+    const [a, b] = useTriageStore.getState().chunks.sort((x, y) => x.startMs - y.startMs);
+    expect(a.audioStartMs).toBe(1137);
+    expect(b.audioStartMs).toBe(5137);
+  });
+
+  it("origin snapshots reflect the newly-computed anchors, not the click point", () => {
+    seed([
+      makeChunk({
+        id: "c1",
+        startMs: 1000,
+        endMs: 9000,
+        audioStartMs: 1137,
+        effectiveBpm: 120,
+        beatsPerBar: 4,
+      }),
+    ]);
+    useTriageStore.getState().splitChunkAt("c1", 4000);
+    const [a, b] = useTriageStore.getState().chunks.sort((x, y) => x.startMs - y.startMs);
+    expect(a.originalAudioStartMs).toBe(1137);
+    expect(b.originalAudioStartMs).toBe(5137);
+  });
+
+  it("falls back to splitMs as the right-half anchor when effectiveBpm is unknown", () => {
+    // Cold-start case before global BPM is known. Don't crash, don't divide-by-zero.
+    seed([
+      makeChunk({
+        id: "c1",
+        startMs: 1000,
+        endMs: 5000,
+        audioStartMs: 1200,
+        effectiveBpm: 0,
+        detectedBpm: undefined,
+      }),
+    ]);
     useTriageStore.getState().splitChunkAt("c1", 3000);
     const [a, b] = useTriageStore.getState().chunks.sort((x, y) => x.startMs - y.startMs);
     expect(a.audioStartMs).toBe(1200);
@@ -269,5 +338,363 @@ describe("triage-store · resetChunk", () => {
     const c = useTriageStore.getState().chunks[0];
     expect(c.startMs).toBe(1500);
     expect(c.endMs).toBe(4500);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// conformChunk — re-fit a chunk's bar-grid phase from its current audio
+// range, holding the song-global BPM as the period. Used after manual
+// trims/splits placed a chunk in audio whose phase doesn't match its
+// stored anchor anymore (mid-take restart, or simply detection that
+// landed on a stumble).
+// ────────────────────────────────────────────────────────────────────────────
+
+const SR = 22050;
+
+function buildClickTrack(bpm: number, seconds: number, introS = 0): Float32Array {
+  const total = Math.round(SR * (seconds + introS));
+  const beatPeriod = 60 / bpm;
+  const beatStride = Math.round(beatPeriod * SR);
+  const clickLen = Math.round(0.005 * SR);
+  const introSamples = Math.round(SR * introS);
+  const pcm = new Float32Array(total);
+  // Noise floor — but only AFTER the silent intro, so analyzeAudio's
+  // silent-intro probe (-80 dBFS gate over the first 300 ms) actually
+  // fires. Real long-form recordings hit floating-point silence between
+  // takes; the synthetic data has to match that behaviour for Conform's
+  // first-onset anchor to be testable.
+  for (let i = introSamples; i < total; i++) pcm[i] = (Math.random() - 0.5) * 0.01;
+  for (let beat = 0; ; beat++) {
+    const start = introSamples + beat * beatStride;
+    if (start + clickLen >= total) break;
+    for (let k = 0; k < clickLen; k++) {
+      const env = Math.exp((-k / clickLen) * 4);
+      const tone =
+        Math.sin((2 * Math.PI * 200 * k) / SR) +
+        0.6 * Math.sin((2 * Math.PI * 1500 * k) / SR);
+      pcm[start + k] += 0.8 * env * tone;
+    }
+  }
+  return pcm;
+}
+
+describe("triage-store · conformChunk", () => {
+  beforeEach(() => useTriageStore.getState().reset());
+
+  it("anchors at the first onset and trims the leading silence", () => {
+    // 0.5 s of true silence + 8 s of 120 BPM clicks. Conform should
+    // detect the silent intro, anchor at the first click, and advance
+    // startMs to that point — same behaviour as initial detection.
+    // Intro is > 300 ms so analyzeAudio's silent-intro probe fires.
+    const intro = 0.5;
+    const pcm = buildClickTrack(120, 8, intro);
+    const totalMs = Math.round((pcm.length / SR) * 1000);
+    seed(
+      [
+        makeChunk({
+          id: "c1",
+          startMs: 0,
+          endMs: totalMs,
+          audioStartMs: 0,
+          effectiveBpm: 120,
+          beatsPerBar: 4,
+        }),
+      ],
+      { jobBpm: 120 },
+    );
+    useTriageStore.setState({ pcm, pcmSampleRate: SR });
+
+    const status = useTriageStore.getState().conformChunk("c1");
+    expect(status).toBe("ok");
+
+    const c = useTriageStore.getState().chunks[0];
+    const period = 60_000 / 120; // 500 ms per beat
+    const msPerBar = period * 4; // 2000
+
+    // Anchor near the first click (500 ms minus the 30 ms backoff +
+    // one analysis hop ≈ 470 ms ± 50). Wide tolerance to account for
+    // STFT framing.
+    expect(c.audioStartMs).toBeGreaterThan(intro * 1000 - 100);
+    expect(c.audioStartMs).toBeLessThan(intro * 1000 + 100);
+
+    // Silent intro detected → startMs advances to the anchor (no
+    // leading silence kept).
+    expect(c.startMs).toBe(c.audioStartMs);
+
+    // endMs sits on a whole bar past the anchor so chunks join
+    // seamlessly in the arrangement.
+    expect((c.endMs - c.audioStartMs!) % msPerBar).toBe(0);
+  });
+
+  it("does not modify any BPM field — BPM is global", () => {
+    const intro = 0.13;
+    const pcm = buildClickTrack(120, 8, intro);
+    const totalMs = Math.round((pcm.length / SR) * 1000);
+    seed(
+      [
+        makeChunk({
+          id: "c1",
+          startMs: 0,
+          endMs: totalMs,
+          audioStartMs: 0,
+          detectedBpm: 121,
+          effectiveBpm: 121,
+          bpmOctaveShift: 0,
+        }),
+      ],
+      { jobBpm: 120 },
+    );
+    useTriageStore.setState({ pcm, pcmSampleRate: SR });
+    useTriageStore.getState().conformChunk("c1");
+    const c = useTriageStore.getState().chunks[0];
+    expect(c.detectedBpm).toBe(121);
+    expect(c.effectiveBpm).toBe(121);
+    expect(c.bpmOctaveShift).toBe(0);
+  });
+
+  it("returns 'no-bpm' when no global BPM is available", () => {
+    const pcm = buildClickTrack(120, 4);
+    const totalMs = Math.round((pcm.length / SR) * 1000);
+    seed([
+      makeChunk({
+        id: "c1",
+        startMs: 0,
+        endMs: totalMs,
+        audioStartMs: 0,
+        effectiveBpm: 0,
+        detectedBpm: undefined,
+      }),
+    ]);
+    useTriageStore.setState({ pcm, pcmSampleRate: SR });
+    const before = useTriageStore.getState().chunks[0];
+    const status = useTriageStore.getState().conformChunk("c1");
+    expect(status).toBe("no-bpm");
+    const after = useTriageStore.getState().chunks[0];
+    expect(after).toEqual(before);
+  });
+
+  it("is a no-op on a too-short PCM range (analyzer can't find anything)", () => {
+    // No artificial chunk-length cap — we let `analyzeAudio` decide
+    // via its own minimums. ~20 ms isn't enough material for even one
+    // full STFT frame, so the analyzer returns the empty-shape result
+    // (audioStartS = 0). Conform sees no shift to apply and surfaces
+    // "unchanged" — chunk is left exactly where it was.
+    const pcm = new Float32Array(SR / 50); // ~20 ms
+    seed(
+      [
+        makeChunk({
+          id: "c1",
+          startMs: 0,
+          endMs: 20,
+          audioStartMs: 0,
+          effectiveBpm: 120,
+        }),
+      ],
+      { jobBpm: 120 },
+    );
+    useTriageStore.setState({ pcm, pcmSampleRate: SR });
+    const before = useTriageStore.getState().chunks[0];
+    const status = useTriageStore.getState().conformChunk("c1");
+    expect(status).toBe("unchanged");
+    const after = useTriageStore.getState().chunks[0];
+    expect(after).toEqual(before);
+  });
+
+  it("returns 'too-short' only when there's no PCM loaded at all", () => {
+    seed(
+      [makeChunk({ id: "c1", startMs: 0, endMs: 8000, effectiveBpm: 120 })],
+      { jobBpm: 120 },
+    );
+    // Empty pcm — sentinel for "audio not yet decoded".
+    useTriageStore.setState({ pcm: new Float32Array(0), pcmSampleRate: SR });
+    expect(useTriageStore.getState().conformChunk("c1")).toBe("too-short");
+  });
+
+
+  it("preserves origin snapshots so Reset still pulls back to detection-time", () => {
+    const intro = 0.13;
+    const pcm = buildClickTrack(120, 8, intro);
+    const totalMs = Math.round((pcm.length / SR) * 1000);
+    seed(
+      [
+        makeChunk({
+          id: "c1",
+          startMs: 0,
+          endMs: totalMs,
+          audioStartMs: 0,
+          effectiveBpm: 120,
+          beatsPerBar: 4,
+          originalStartMs: 0,
+          originalEndMs: totalMs,
+          originalAudioStartMs: 0,
+        }),
+      ],
+      { jobBpm: 120 },
+    );
+    useTriageStore.setState({ pcm, pcmSampleRate: SR });
+    useTriageStore.getState().conformChunk("c1");
+    const c = useTriageStore.getState().chunks[0];
+    expect(c.originalStartMs).toBe(0);
+    expect(c.originalEndMs).toBe(totalMs);
+    expect(c.originalAudioStartMs).toBe(0);
+  });
+
+  it("returns 'no-chunk' when the id doesn't match any chunk", () => {
+    seed([makeChunk({ id: "c1", startMs: 0, endMs: 1000 })], { jobBpm: 120 });
+    expect(useTriageStore.getState().conformChunk("nope")).toBe("no-chunk");
+  });
+
+  it("stashes a preConformSnapshot on success that captures the pre-conform bounds", () => {
+    const intro = 0.13;
+    const pcm = buildClickTrack(120, 8, intro);
+    const totalMs = Math.round((pcm.length / SR) * 1000);
+    seed(
+      [
+        makeChunk({
+          id: "c1",
+          startMs: 0,
+          endMs: totalMs,
+          audioStartMs: 0,
+          effectiveBpm: 120,
+          beatsPerBar: 4,
+        }),
+      ],
+      { jobBpm: 120 },
+    );
+    useTriageStore.setState({ pcm, pcmSampleRate: SR });
+    useTriageStore.getState().conformChunk("c1");
+    const c = useTriageStore.getState().chunks[0];
+    expect(c.preConformSnapshot).toBeDefined();
+    expect(c.preConformSnapshot!.startMs).toBe(0);
+    expect(c.preConformSnapshot!.endMs).toBe(totalMs);
+    expect(c.preConformSnapshot!.audioStartMs).toBe(0);
+  });
+
+  it("does not stash a snapshot on no-op outcomes", () => {
+    seed([makeChunk({ id: "c1", startMs: 0, endMs: 1000, effectiveBpm: 0 })]);
+    useTriageStore.getState().conformChunk("c1");
+    expect(useTriageStore.getState().chunks[0].preConformSnapshot).toBeUndefined();
+  });
+});
+
+describe("triage-store · revertConform", () => {
+  beforeEach(() => useTriageStore.getState().reset());
+
+  it("restores the chunk's pre-conform state and clears the snapshot", () => {
+    const intro = 0.13;
+    const pcm = buildClickTrack(120, 8, intro);
+    const totalMs = Math.round((pcm.length / SR) * 1000);
+    seed(
+      [
+        makeChunk({
+          id: "c1",
+          startMs: 0,
+          endMs: totalMs,
+          audioStartMs: 0,
+          effectiveBpm: 120,
+          beatsPerBar: 4,
+        }),
+      ],
+      { jobBpm: 120 },
+    );
+    useTriageStore.setState({ pcm, pcmSampleRate: SR });
+    useTriageStore.getState().conformChunk("c1");
+    // Sanity: conform did mutate the chunk.
+    expect(useTriageStore.getState().chunks[0].audioStartMs).not.toBe(0);
+
+    useTriageStore.getState().revertConform("c1");
+    const c = useTriageStore.getState().chunks[0];
+    expect(c.startMs).toBe(0);
+    expect(c.endMs).toBe(totalMs);
+    expect(c.audioStartMs).toBe(0);
+    expect(c.preConformSnapshot).toBeUndefined();
+  });
+
+  it("is a no-op when the chunk has no snapshot", () => {
+    seed([makeChunk({ id: "c1", startMs: 100, endMs: 5000, audioStartMs: 200 })]);
+    useTriageStore.getState().revertConform("c1");
+    const c = useTriageStore.getState().chunks[0];
+    expect(c.startMs).toBe(100);
+    expect(c.endMs).toBe(5000);
+    expect(c.audioStartMs).toBe(200);
+  });
+
+  it("is a no-op when the id doesn't match any chunk", () => {
+    seed([makeChunk({ id: "c1", startMs: 0, endMs: 1000 })]);
+    expect(() => useTriageStore.getState().revertConform("nope")).not.toThrow();
+  });
+});
+
+describe("triage-store · snapshot housekeeping", () => {
+  beforeEach(() => useTriageStore.getState().reset());
+
+  it("splitChunkAt clears the preConformSnapshot on both halves", () => {
+    seed([
+      makeChunk({
+        id: "c1",
+        startMs: 0,
+        endMs: 8000,
+        audioStartMs: 0,
+        effectiveBpm: 120,
+        beatsPerBar: 4,
+        preConformSnapshot: { startMs: 0, endMs: 8000, audioStartMs: 100 },
+      }),
+    ]);
+    useTriageStore.getState().splitChunkAt("c1", 4000);
+    const halves = useTriageStore.getState().chunks;
+    expect(halves).toHaveLength(2);
+    for (const h of halves) {
+      expect(h.preConformSnapshot).toBeUndefined();
+    }
+  });
+
+  it("joinChunks clears the preConformSnapshot on the merged chunk", () => {
+    seed([
+      makeChunk({
+        id: "a",
+        startMs: 0,
+        endMs: 2000,
+        preConformSnapshot: { startMs: 0, endMs: 2000, audioStartMs: 0 },
+      }),
+      makeChunk({ id: "b", startMs: 2200, endMs: 4000 }),
+    ]);
+    useTriageStore.getState().joinChunks("a", "next");
+    expect(useTriageStore.getState().chunks[0].preConformSnapshot).toBeUndefined();
+  });
+
+  it("extendChunkBars clears the preConformSnapshot", () => {
+    seed(
+      [
+        makeChunk({
+          id: "c1",
+          startMs: 4000,
+          endMs: 8000,
+          audioStartMs: 4000,
+          effectiveBpm: 120,
+          beatsPerBar: 4,
+          preConformSnapshot: { startMs: 4000, endMs: 8000, audioStartMs: 4000 },
+        }),
+      ],
+      { jobBpm: 120 },
+    );
+    useTriageStore.getState().extendChunkBars("c1", 1, 0);
+    expect(useTriageStore.getState().chunks[0].preConformSnapshot).toBeUndefined();
+  });
+
+  it("resetChunk clears the preConformSnapshot", () => {
+    seed([
+      makeChunk({
+        id: "c1",
+        startMs: 1500,
+        endMs: 4500,
+        audioStartMs: 1700,
+        originalStartMs: 1000,
+        originalEndMs: 5000,
+        originalAudioStartMs: 1200,
+        preConformSnapshot: { startMs: 1500, endMs: 4500, audioStartMs: 1700 },
+      }),
+    ]);
+    useTriageStore.getState().resetChunk("c1");
+    expect(useTriageStore.getState().chunks[0].preConformSnapshot).toBeUndefined();
   });
 });
