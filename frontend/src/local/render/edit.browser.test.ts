@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { editRender } from "./edit";
+import { editRender, editRenderMulti } from "./edit";
 import { decodeAudioToMonoPcm } from "../codec/webcodecs/audio-decode";
 import { demuxVideoTrack } from "../codec/webcodecs/demux";
 import { ShowwavesVisualizer } from "./visualizer/showwaves";
@@ -7,6 +7,7 @@ import { ShowfreqsVisualizer } from "./visualizer/showfreqs";
 import { computeEnergyCurves } from "./energy";
 
 const VIDEO_FIXTURE_URL = "/__test_fixtures__/tone-3s.mp4";
+const MULTI_KEYFRAME_FIXTURE_URL = "/__test_fixtures__/video-multi-keyframe.mp4";
 
 function makeWav(samples: Float32Array, channels: number, sampleRate: number): Blob {
   const numSamples = samples.length / channels;
@@ -275,6 +276,188 @@ describe("editRender (real Chromium WebCodecs + mp4-muxer)", () => {
       decoder.close();
 
       expect(nonRedPixelCount).toBeGreaterThan(1000);
+    },
+    120_000,
+  );
+});
+
+describe("editRenderMulti — pill-mode + streaming muxer", () => {
+  it(
+    "renders a 1-cam pill arrangement with sparse source-time access (validates GOP-seek + parallel pipeline + streaming encoder→muxer)",
+    async () => {
+      // 6-second source with keyframes every 1s. We build pills that
+      // pull from non-monotonic source-time windows — late, then early,
+      // then mid — to exercise both auto-seek directions.
+      const videoBlob = await (await fetch(MULTI_KEYFRAME_FIXTURE_URL)).blob();
+      const audioBlob = makeSineWav(440, 3.0, 48000);
+      const camId = "cam-A";
+
+      const pills = [
+        // Pill 1: arr [0..1), source [4..5)  — far forward of t=0
+        {
+          id: "p1",
+          camId,
+          arrStartS: 0,
+          arrEndS: 1,
+          sourceInS: 4,
+          sourceOutS: 5,
+          originalArrStartS: 0,
+          originalArrEndS: 1,
+          originalSourceInS: 4,
+          originalSourceOutS: 5,
+        },
+        // Pill 2: arr [1..2), source [0..1)  — backwards seek to start
+        {
+          id: "p2",
+          camId,
+          arrStartS: 1,
+          arrEndS: 2,
+          sourceInS: 0,
+          sourceOutS: 1,
+          originalArrStartS: 1,
+          originalArrEndS: 2,
+          originalSourceInS: 0,
+          originalSourceOutS: 1,
+        },
+        // Pill 3: arr [2..3), source [2..3)  — forward seek
+        {
+          id: "p3",
+          camId,
+          arrStartS: 2,
+          arrEndS: 3,
+          sourceInS: 2,
+          sourceOutS: 3,
+          originalArrStartS: 2,
+          originalArrEndS: 3,
+          originalSourceInS: 2,
+          originalSourceOutS: 3,
+        },
+      ];
+
+      const result = await editRenderMulti({
+        cams: [
+          {
+            id: camId,
+            file: videoBlob,
+            masterStartS: 0,
+            sourceDurationS: 6,
+            kind: "video",
+          },
+        ],
+        cuts: [],
+        pills,
+        masterDurationS: 3,
+        audioFile: audioBlob,
+        segments: [{ in: 0, out: 3 }],
+        overlays: [],
+        offsetMs: 0,
+        driftRatio: 1.0,
+      });
+
+      expect(result.output).not.toBeNull();
+      const outBytes = result.output!;
+      expect(outBytes.byteLength).toBeGreaterThan(1000);
+
+      // Re-parse — pills span 3s of arr-time, output should be ~3s.
+      const reparsed = await demuxVideoTrack(new Blob([outBytes as BlobPart]));
+      expect(reparsed).not.toBeNull();
+      expect(reparsed!.info.durationS).toBeGreaterThan(2.5);
+      expect(reparsed!.info.durationS).toBeLessThan(3.5);
+
+      // Audio is the studio tone (440 Hz) — verify zero-crossing rate
+      // over a 1-second window.
+      const audio = await decodeAudioToMonoPcm(new Blob([outBytes as BlobPart]), 22050);
+      const window = audio.pcm.slice(11025, 11025 + 22050);
+      let zc = 0;
+      for (let i = 1; i < window.length; i++) {
+        if (window[i - 1] <= 0 && window[i] > 0) zc++;
+      }
+      // 440 Hz → ~440 zero-crossings/s. Allow margin for encoder rounding.
+      expect(zc).toBeGreaterThan(400);
+      expect(zc).toBeLessThan(480);
+    },
+    120_000,
+  );
+
+  it(
+    "1 cam, no pills, no cuts (= worker's unified default path) renders successfully",
+    async () => {
+      // After unifying the worker dispatcher every job — including a
+      // direct single-cam render with no pills and no cuts — goes
+      // through editRenderMulti. activeCamAt's fallback (no matching
+      // cut → first cam-with-material) keeps the cam on PROGRAM for
+      // the entire master timeline.
+      const videoBlob = await (await fetch(MULTI_KEYFRAME_FIXTURE_URL)).blob();
+      const audioBlob = makeSineWav(880, 2.0, 48000);
+      const result = await editRenderMulti({
+        cams: [
+          {
+            id: "only",
+            file: videoBlob,
+            masterStartS: 0,
+            sourceDurationS: 6,
+            kind: "video",
+          },
+        ],
+        cuts: [],
+        // pills omitted — direct mode
+        masterDurationS: 2,
+        audioFile: audioBlob,
+        segments: [{ in: 0, out: 2 }],
+        overlays: [],
+        offsetMs: 0,
+        driftRatio: 1.0,
+      });
+      expect(result.output).not.toBeNull();
+      const reparsed = await demuxVideoTrack(new Blob([result.output! as BlobPart]));
+      expect(reparsed).not.toBeNull();
+      expect(reparsed!.info.durationS).toBeGreaterThan(1.5);
+      expect(reparsed!.info.durationS).toBeLessThan(2.5);
+    },
+    120_000,
+  );
+
+  it(
+    "two cams with cuts: alternates active cam and produces a valid MP4",
+    async () => {
+      const videoBlob = await (await fetch(MULTI_KEYFRAME_FIXTURE_URL)).blob();
+      const audioBlob = makeSineWav(440, 2.0, 48000);
+
+      const result = await editRenderMulti({
+        cams: [
+          {
+            id: "A",
+            file: videoBlob,
+            masterStartS: 0,
+            sourceDurationS: 6,
+            kind: "video",
+          },
+          {
+            id: "B",
+            file: videoBlob,
+            masterStartS: 0,
+            sourceDurationS: 6,
+            kind: "video",
+          },
+        ],
+        // Switch from A → B at 1s.
+        cuts: [
+          { atTimeS: 0, camId: "A" },
+          { atTimeS: 1, camId: "B" },
+        ],
+        masterDurationS: 2,
+        audioFile: audioBlob,
+        segments: [{ in: 0, out: 2 }],
+        overlays: [],
+        offsetMs: 0,
+        driftRatio: 1.0,
+      });
+
+      expect(result.output).not.toBeNull();
+      const reparsed = await demuxVideoTrack(new Blob([result.output! as BlobPart]));
+      expect(reparsed).not.toBeNull();
+      expect(reparsed!.info.durationS).toBeGreaterThan(1.5);
+      expect(reparsed!.info.durationS).toBeLessThan(2.5);
     },
     120_000,
   );

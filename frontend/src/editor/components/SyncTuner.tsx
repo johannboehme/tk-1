@@ -4,6 +4,11 @@
 // master-audio start nudge — selecting the audio waveform in the timeline
 // flips this UI into MASTER_AUDIO_ID mode and the knob/buttons drive
 // `audioStartNudgeS` on JobMeta instead of a clip's sync override.
+//
+// Pill-aware branch: when the user has a single pill selected (arr-mode,
+// non-MATCH snap), the knob + nudge buttons drive that ONE pill's source
+// offset instead of the whole cam — so a single chunk can be tuned without
+// disturbing the rest of the take.
 import { useEditorStore } from "../store";
 import { isVideoClip, MASTER_AUDIO_ID } from "../types";
 import { ChunkyButton } from "./ChunkyButton";
@@ -22,6 +27,27 @@ export function SyncTuner({ lastSyncOverrideMs }: Props) {
   const setSelectedClipId = useEditorStore((s) => s.setSelectedClipId);
   const setClipSyncOverride = useEditorStore((s) => s.setClipSyncOverride);
   const nudgeClipSyncOverride = useEditorStore((s) => s.nudgeClipSyncOverride);
+  const selectedPillId = useEditorStore((s) => s.selectedPillId);
+  const selectedPill = useEditorStore((s) =>
+    s.selectedPillId
+      ? (s.pills.find((p) => p.id === s.selectedPillId) ?? null)
+      : null,
+  );
+  const pillIndexInCam = useEditorStore((s) => {
+    if (!s.selectedPillId) return -1;
+    const sp = s.pills.find((p) => p.id === s.selectedPillId);
+    if (!sp) return -1;
+    const camPills = s.pills
+      .filter((p) => p.camId === sp.camId)
+      .slice()
+      .sort((a, b) => a.arrStartS - b.arrStartS);
+    return camPills.findIndex((p) => p.id === sp.id);
+  });
+  const nudgePillSourceMs = useEditorStore((s) => s.nudgePillSourceMs);
+  const setPillSourceOffsetMs = useEditorStore(
+    (s) => s.setPillSourceOffsetMs,
+  );
+  const resetPill = useEditorStore((s) => s.resetPill);
   const abBypass = useEditorStore((s) => s.offset.abBypass);
   const setAbBypass = useEditorStore((s) => s.setAbBypass);
   // currentTime read imperatively in the loop-around-playhead handler
@@ -44,8 +70,20 @@ export function SyncTuner({ lastSyncOverrideMs }: Props) {
     ? clips.findIndex((c) => c.id === selectedClip.id)
     : -1;
 
+  // Pill-mode = a pill is selected AND it belongs to the cam this panel
+  // is currently tuning. Otherwise fall back to cam-level sync override.
+  const pillMode =
+    selectedPill !== null &&
+    selectedClip !== null &&
+    selectedPill.camId === selectedClip.id;
+  const pillOffsetMs = pillMode
+    ? Math.round(
+        (selectedPill.sourceInS - selectedPill.originalSourceInS) * 1e6,
+      ) / 1e3
+    : 0;
+
   const algoMs = selectedClip?.syncOffsetMs ?? 0;
-  const userOverrideMs = selectedClip?.syncOverrideMs ?? 0;
+  const userOverrideMs = pillMode ? pillOffsetMs : (selectedClip?.syncOverrideMs ?? 0);
   const totalMs = abBypass ? algoMs : algoMs + userOverrideMs;
 
   function setLoopAroundPlayhead(seconds: number) {
@@ -58,7 +96,11 @@ export function SyncTuner({ lastSyncOverrideMs }: Props) {
 
   function nudgeWithHaptic(delta: number) {
     if (!selectedClip) return;
-    nudgeClipSyncOverride(selectedClip.id, delta);
+    if (pillMode && selectedPillId) {
+      nudgePillSourceMs(selectedPillId, delta);
+    } else {
+      nudgeClipSyncOverride(selectedClip.id, delta);
+    }
     if (typeof navigator !== "undefined" && "vibrate" in navigator) {
       try {
         navigator.vibrate(8);
@@ -70,10 +112,18 @@ export function SyncTuner({ lastSyncOverrideMs }: Props) {
 
   function setOverride(ms: number) {
     if (!selectedClip) return;
-    setClipSyncOverride(selectedClip.id, ms);
+    if (pillMode && selectedPillId) {
+      setPillSourceOffsetMs(selectedPillId, ms);
+    } else {
+      setClipSyncOverride(selectedClip.id, ms);
+    }
   }
 
+  // Reset-to-last is a cam-level concept (carried across clips on a job).
+  // Skip it in pill-mode — RESET on a pill goes back to its baseline via
+  // resetPill, which is the only meaningful "previous" for a single chunk.
   const showResetToLast =
+    !pillMode &&
     lastSyncOverrideMs !== null &&
     selectedClip !== null &&
     lastSyncOverrideMs !== userOverrideMs;
@@ -87,7 +137,11 @@ export function SyncTuner({ lastSyncOverrideMs }: Props) {
         <div className="flex items-center gap-2 text-ink min-w-0">
           <SyncIcon width={18} height={18} />
           <h2 className="font-display text-lg leading-none truncate">
-            {selectedClip ? `Sync · Cam ${selectedIdx + 1}` : "Sync Tuner"}
+            {selectedClip
+              ? pillMode && pillIndexInCam >= 0
+                ? `Sync · Cam ${selectedIdx + 1} · Chunk ${pillIndexInCam + 1}`
+                : `Sync · Cam ${selectedIdx + 1}`
+              : "Sync Tuner"}
           </h2>
         </div>
         <SegmentedControl
@@ -149,7 +203,7 @@ export function SyncTuner({ lastSyncOverrideMs }: Props) {
           {/* Knob */}
           <div className="flex flex-col items-center gap-2 py-2">
             <Knob
-              label="USER OVERRIDE"
+              label={pillMode ? "PILL OFFSET" : "USER OVERRIDE"}
               value={userOverrideMs}
               min={-2000}
               max={2000}
@@ -217,10 +271,13 @@ export function SyncTuner({ lastSyncOverrideMs }: Props) {
             <ChunkyButton
               variant="ghost"
               size="sm"
-              onClick={() => setOverride(0)}
+              onClick={() => {
+                if (pillMode && selectedPillId) resetPill(selectedPillId);
+                else setOverride(0);
+              }}
               disabled={userOverrideMs === 0}
             >
-              RESET TO ALGO
+              {pillMode ? "RESET PILL" : "RESET TO ALGO"}
             </ChunkyButton>
             {showResetToLast && (
               <ChunkyButton

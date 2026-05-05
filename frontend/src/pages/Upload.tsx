@@ -1,9 +1,9 @@
-import { FormEvent, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { ChunkyButton } from "../editor/components/ChunkyButton";
 import { RuleStrip } from "../editor/components/RuleStrip";
 import { formatBytes } from "../components/ProgressBar";
 import { createJob } from "../local/jobs";
+import type { JobMode } from "../local/jobs";
 import type { PickedAsset } from "../local/asset-source";
 import {
   pickAudioFile,
@@ -43,13 +43,21 @@ export default function Upload() {
     );
   }
 
-  async function handleSubmit(e: FormEvent) {
-    e.preventDefault();
+  async function handleSubmit(mode: JobMode) {
     if (!audio || videos.length === 0) return;
     setBusy(true);
     setErr(null);
     try {
-      const jobId = await createJob(videos, audio, { title: title || null });
+      const jobId = await createJob(videos, audio, {
+        title: title || null,
+        mode,
+      });
+      // Both modes go to /job/:id first — sync needs to run before
+      // any further phase. Triage's silence detection wants the
+      // decoded master audio, BPM-per-chunk wants audio analysis,
+      // and Cam-Preview wants the per-cam frame strips. JobPage's
+      // "Continue → Triage" / "Open editor" button (driven by
+      // nextRouteForJob) takes over once sync completes.
       navigate(`/job/${jobId}`);
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Could not start the project");
@@ -134,7 +142,10 @@ export default function Upload() {
         </div>
       )}
 
-      <form onSubmit={handleSubmit} className="flex flex-col gap-6">
+      <form
+        onSubmit={(e) => e.preventDefault()}
+        className="flex flex-col gap-6"
+      >
         <div className="grid lg:grid-cols-[1fr_1.6fr] gap-3 items-stretch">
           <AudioDropZone picked={audio} onPick={pickAudioGuarded} />
           <VideoDropList picks={videos} onAdd={pickVideosGuarded} onRemove={removeVideo} />
@@ -165,17 +176,56 @@ export default function Upload() {
           </div>
         )}
 
-        <div className="grid sm:grid-cols-[1fr_auto] gap-3 items-stretch border-t border-rule pt-5 mt-2">
-          <ReadinessStatus audio={audio} videos={videos} busy={busy} />
-          <ChunkyButton
-            type="submit"
-            variant="primary"
-            size="lg"
-            disabled={!ready}
-            className="sm:min-w-[200px]"
-          >
-            {busy ? "Preparing…" : "Sync & open editor"}
-          </ChunkyButton>
+        <div className="border-t border-rule pt-5 mt-2 flex flex-col gap-4">
+          <div className="flex items-center justify-between gap-3">
+            <ReadinessStatus audio={audio} videos={videos} busy={busy} />
+            <span className="font-mono text-[10px] tracking-label uppercase text-ink-3 hidden sm:inline">
+              03 · Routing
+            </span>
+          </div>
+
+          <div className="grid sm:grid-cols-2 gap-3">
+            <ModeCard
+              tag="03A · DIRECT"
+              headline={
+                <>
+                  Have a track.
+                  <br />
+                  Want a video.
+                </>
+              }
+              path={
+                <>
+                  <span className="text-ink-3">●━━━━━━▶</span>{" "}
+                  <span className="text-ink-2 group-hover:text-hot transition-colors">EDITOR</span>
+                </>
+              }
+              onClick={() => handleSubmit("direct")}
+              disabled={!ready}
+              busy={busy}
+            />
+            <ModeCard
+              tag="03B · SESSION"
+              headline={
+                <>
+                  Have an hour.
+                  <br />
+                  Want a song.
+                </>
+              }
+              path={
+                <>
+                  <span className="text-ink-3">●━━▶</span>{" "}
+                  <span className="text-ink-2 group-hover:text-hot transition-colors">TRIAGE</span>{" "}
+                  <span className="text-ink-3">━▶</span>{" "}
+                  <span className="text-ink-2 group-hover:text-hot transition-colors">EDITOR</span>
+                </>
+              }
+              onClick={() => handleSubmit("longform")}
+              disabled={!ready}
+              busy={busy}
+            />
+          </div>
         </div>
       </form>
     </main>
@@ -324,6 +374,58 @@ function ReadinessStatus({
         {busy ? "PREPARING" : audio && videos.length > 0 ? "READY → SYNC" : "WAITING"}
       </span>
     </div>
+  );
+}
+
+function ModeCard({
+  tag,
+  headline,
+  path,
+  onClick,
+  disabled,
+  busy,
+}: {
+  tag: string;
+  headline: React.ReactNode;
+  path: React.ReactNode;
+  onClick: () => void;
+  disabled: boolean;
+  busy: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={[
+        "group relative block text-left rounded-lg min-h-[180px] p-5 pt-4 transition-all",
+        // Hardware-button affordance: bevel via shadow-emboss, depresses
+        // on click. NO dashed border — that reads as a drop-target, which
+        // these are not.
+        disabled
+          ? "bg-paper-hi opacity-40 cursor-not-allowed"
+          : "bg-paper-hi shadow-emboss hover:bg-paper-deep active:shadow-pressed active:translate-y-[1px] cursor-pointer",
+      ].join(" ")}
+    >
+      <div className="flex items-start justify-between mb-4">
+        <span className="font-display tracking-label uppercase text-[11px] text-ink-2">
+          {tag}
+        </span>
+        {busy && (
+          <span className="font-mono text-[10px] tracking-label uppercase text-hot">
+            PREP
+          </span>
+        )}
+      </div>
+
+      <div className="font-display font-semibold text-2xl sm:text-[28px] leading-[1.05] text-ink mb-5">
+        {headline}
+      </div>
+
+      <div className="font-mono text-[11px] tracking-tight text-ink-2 tabular">
+        {path}
+      </div>
+    </button>
   );
 }
 

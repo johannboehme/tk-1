@@ -11,6 +11,8 @@
 import { motion, useReducedMotion } from "framer-motion";
 import { useMemo } from "react";
 import type { LocalJob, MediaAsset } from "../../storage/jobs-db";
+import { isVideoAsset } from "../../storage/jobs-db";
+import { useSyncOp } from "../../local/ops-store";
 import {
   buildSyncProgressView,
   type CamProgressView,
@@ -21,15 +23,25 @@ import { RuleStrip } from "../../editor/components/RuleStrip";
 
 export function SyncProgressPanel({ job }: { job: LocalJob }) {
   const cams: MediaAsset[] = useMemo(() => job.videos ?? [], [job.videos]);
+  const op = useSyncOp(job.id);
+  // "Done" = no live op AND every video cam has its sync result on
+  // the job. Image cams skip sync entirely so they don't gate this.
+  const dataDone = useMemo(
+    () => cams.every((c) => !isVideoAsset(c) || Boolean(c.sync)),
+    [cams],
+  );
+  const stage = op?.stage ?? "queued";
+  const pct = op?.pct ?? 0;
   const view = useMemo(
     () =>
       buildSyncProgressView({
-        status: job.status,
-        stage: job.progress.stage,
-        pct: job.progress.pct,
+        stage,
+        pct,
         cams,
+        done: !op && dataDone,
+        error: op?.error,
       }),
-    [job.status, job.progress.stage, job.progress.pct, cams],
+    [stage, pct, cams, op, dataDone],
   );
 
   const camById = new Map(cams.map((c) => [c.id, c]));
@@ -83,11 +95,13 @@ function ConsoleLabel({ state }: { state: MasterState }) {
       ? "Sync · halted"
       : state === "done"
         ? "Sync · finalising"
-        : state === "analyzing"
-          ? "Sync · analysing audio"
-          : state === "decoding"
-            ? "Sync · decoding master"
-            : "Sync · queued";
+        : state === "detecting"
+          ? "Sync · detecting chunks"
+          : state === "analyzing"
+            ? "Sync · analysing audio"
+            : state === "decoding"
+              ? "Sync · decoding master"
+              : "Sync · queued";
 
   return (
     <div className="flex items-center gap-2">
@@ -101,7 +115,8 @@ function ConsoleLabel({ state }: { state: MasterState }) {
 
 function RegistrationDot({ state }: { state: MasterState }) {
   const reduce = useReducedMotion();
-  const isActive = state === "decoding" || state === "analyzing";
+  const isActive =
+    state === "decoding" || state === "analyzing" || state === "detecting";
   const isFailed = state === "failed";
   const color = isFailed
     ? "#C0392B"
@@ -157,7 +172,8 @@ function MasterStrip({
   state: MasterState;
   audioFilename: string;
 }) {
-  const isActive = state === "decoding" || state === "analyzing";
+  const isActive =
+    state === "decoding" || state === "analyzing" || state === "detecting";
   return (
     <motion.div
       className="grid grid-cols-[auto_1fr_auto_auto] gap-x-3 px-3 py-3 items-center bg-paper-deep/60 border-b-2 border-rule"
@@ -195,6 +211,9 @@ function MasterActivity({ state }: { state: MasterState }) {
   }
   if (state === "analyzing") {
     return <BarsAnimator label="ANALYSE" />;
+  }
+  if (state === "detecting") {
+    return <BarsAnimator label="CHUNKS" />;
   }
   if (state === "done") {
     return (
@@ -557,11 +576,13 @@ function FooterHint({ master }: { master: MasterState }) {
       ? "All set — opening editor."
       : master === "failed"
         ? "Sync halted. See error below."
-        : master === "analyzing"
-          ? "Listening for tempo + downbeats…"
-          : master === "decoding"
-            ? "Decoding the master audio for matching."
-            : "Reading the song. Cams next.";
+        : master === "detecting"
+          ? "Marking chunks for the Triage step…"
+          : master === "analyzing"
+            ? "Listening for tempo + downbeats…"
+            : master === "decoding"
+              ? "Decoding the master audio for matching."
+              : "Reading the song. Cams next.";
   return (
     <span className="font-mono text-[11px] text-ink-3 italic">{text}</span>
   );

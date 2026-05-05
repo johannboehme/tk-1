@@ -63,7 +63,7 @@ pub struct EnvelopeResult {
 }
 
 /// Compute the RMS envelope of `y` at `envelope_hz` Hz.
-fn rms_envelope(y: &[f32], sample_rate: u32, envelope_hz: f32) -> Vec<f32> {
+pub fn rms_envelope(y: &[f32], sample_rate: u32, envelope_hz: f32) -> Vec<f32> {
     let win = (sample_rate as f32 / envelope_hz).max(1.0) as usize;
     let n = y.len() / win;
     let mut env = Vec::with_capacity(n);

@@ -1,24 +1,31 @@
 /**
- * Pure helper that translates a job's `progress.stage` + `progress.pct` +
- * `status` into a UI-ready view: which master phase is active, which cam
- * is active and in which sub-stage, plus a local 0..1 fraction for the
- * active cam (so its row can show a meaningful sub-progress bar).
+ * Pure helper that translates a sync op's `stage` + `pct` (+ optional
+ * `error`) into a UI-ready view: which master phase is active, which
+ * cam is active and in which sub-stage, plus a local 0..1 fraction for
+ * the active cam (so its row can show a meaningful sub-progress bar).
  *
  * Mirrors the stage strings emitted by `runSync` in `local/jobs.ts`:
  *   - "queued" / "loading" / "decoding-studio-audio"      → master decoding
  *   - "syncing-{camId}"                                    → that cam is syncing
  *   - "frames-{camId}"                                     → that cam is in frames
  *   - "analyzing-audio"                                    → master analyzing
- *   - status === "synced"                                  → all done
- *   - status === "failed"                                  → mark active cam failed
+ *   - "detecting-chunks"                                   → master detecting (long-form only)
+ *
+ * Caller passes `done: true` after the sync op clears (the project's
+ * data — `videos[].sync` — is the source of truth there). Errors come
+ * via the `error` field on the op.
  *
  * The progress fractions assume runSync's band layout: cams share the
  * 5..95 pct range equally (band = 90 / numCams, cam-i starts at 5 + i*band).
  */
 
-import type { JobStatus } from "../../storage/jobs-db";
-
-export type MasterState = "pending" | "decoding" | "analyzing" | "done" | "failed";
+export type MasterState =
+  | "pending"
+  | "decoding"
+  | "analyzing"
+  | "detecting"
+  | "done"
+  | "failed";
 export type CamState = "pending" | "syncing" | "frames" | "done" | "failed";
 
 export interface CamProgressView {
@@ -36,10 +43,15 @@ export interface SyncProgressView {
 }
 
 interface BuildInput {
-  status: JobStatus;
   stage: string;
   pct: number;
   cams: ReadonlyArray<{ id: string }>;
+  /** True when the sync data is fully on the job — cleared op + all
+   *  cams have a sync result. UI shows everything as done. */
+  done?: boolean;
+  /** Set when the op carries an error. Active cam (if any) is
+   *  highlighted as failed; cams before it are kept as done. */
+  error?: string;
 }
 
 /** Match "syncing-{id}" or "frames-{id}". Returns { kind, camId } or null. */
@@ -50,11 +62,11 @@ function parseCamStage(stage: string): { kind: "syncing" | "frames"; camId: stri
 }
 
 export function buildSyncProgressView(input: BuildInput): SyncProgressView {
-  const { status, stage, pct, cams } = input;
+  const { stage, pct, cams, done, error } = input;
   const numCams = cams.length;
 
-  // Terminal states.
-  if (status === "synced" || status === "rendered" || status === "rendering") {
+  // Terminal: sync data is on the job.
+  if (done) {
     return {
       master: "done",
       cams: cams.map((c) => ({ id: c.id, state: "done", fraction: 0 })),
@@ -62,9 +74,7 @@ export function buildSyncProgressView(input: BuildInput): SyncProgressView {
     };
   }
 
-  // Failure: the cam referenced by the stage (if any) is the one that
-  // failed; cams before it succeeded, cams after it never started.
-  if (status === "failed") {
+  if (error) {
     const cam = parseCamStage(stage);
     if (!cam) {
       // No specific cam — master-level failure.
@@ -111,6 +121,16 @@ export function buildSyncProgressView(input: BuildInput): SyncProgressView {
   if (stage === "analyzing-audio") {
     return {
       master: "analyzing",
+      cams: cams.map((c) => ({ id: c.id, state: "done", fraction: 0 })),
+      globalPct: pct,
+    };
+  }
+
+  // Long-form Triage: silence + per-chunk BPM run on the master audio
+  // after the per-cam stages. Cams are already done by then.
+  if (stage === "detecting-chunks") {
+    return {
+      master: "detecting",
       cams: cams.map((c) => ({ id: c.id, state: "done", fraction: 0 })),
       globalPct: pct,
     };

@@ -42,7 +42,9 @@ export function BeatRuler({
 }: BeatRulerProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const bpm = useEditorStore((s) => s.jobMeta?.bpm?.value ?? null);
-  const beatPhase = useEditorStore((s) => effectiveBeatPhaseS(s.jobMeta));
+  const beatPhase = useEditorStore((s) =>
+    effectiveBeatPhaseS(s.jobMeta, s.arrangementSegments),
+  );
   const beatsPerBar = useEditorStore((s) => effectiveBeatsPerBar(s.jobMeta));
   const barOffsetBeats = useEditorStore((s) =>
     effectiveBarOffsetBeats(s.jobMeta),

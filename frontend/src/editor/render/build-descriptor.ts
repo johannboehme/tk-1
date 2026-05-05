@@ -10,11 +10,13 @@
  * No side effects, no DOM access. Returns a fresh descriptor on every
  * call — caller decides about diffing.
  */
-import type { Clip, ExportSpec } from "../types";
+import type { Clip, ExportSpec, Pill, Segment } from "../types";
 import { clipRangeS, isImageClip, normaliseRotation } from "../types";
 import type { Cut } from "../../storage/jobs-db";
 import type { FxKind, PunchFx } from "../fx/types";
 import { activeCamAt, type CamRange } from "../cuts";
+import { activeCamAtArr } from "../arrangement-pills";
+import { masterToArr } from "../arrangement-time";
 import { activeFxAt } from "../fx/active";
 import { fxCatalog } from "../fx/catalog";
 import { envelopeAt, INSTANT_ENVELOPE, type ADSREnvelope } from "../fx/envelope";
@@ -49,6 +51,13 @@ export interface EditorStoreSnapshot {
   cuts: readonly Cut[];
   fx: readonly PunchFx[];
   exportSpec: ExportSpec;
+  /** Optional. When non-empty (alongside non-empty `arrangementSegments`)
+   *  the descriptor builder dispatches each preview frame's active cam
+   *  through `activeCamAtArr` so per-pill source-trim is honoured. */
+  pills?: readonly Pill[];
+  /** Optional. Required for pill-aware rendering — the audio walker's
+   *  segment list governs the master↔arr mapping. */
+  arrangementSegments?: readonly Segment[];
   /** Active live holds keyed by slot — `mode: "preview"` entries are
    *  synthesised into transient FrameFx (no timeline write). Optional so
    *  test stubs and the export compositor can omit it. */
@@ -86,11 +95,41 @@ export function buildPreviewFrameDescriptor(
     return { tMaster, output: null, layers: [], fx: fxOut };
   }
 
-  const ranges: CamRange[] = computeCamRanges(snapshot.clips);
-  const activeId = activeCamAt(snapshot.cuts, tMaster, ranges);
-  const layers = activeId
-    ? buildPreviewLayers(snapshot.clips, activeId, tMaster, output)
-    : [];
+  // Active-cam resolution forks on whether this is a long-form session.
+  //
+  //   Arrangement-mode (pills + segments populated): the preview's
+  //   "what cam is on PROGRAM at song-time `tArr`" question is answered
+  //   from the same pill+cuts table the renderer uses. Source-time of
+  //   the active cam comes from the active pill's stored sourceIn/Out
+  //   so user trim/move edits show up in the preview without a
+  //   re-extraction round-trip.
+  //
+  //   Direct-mode: legacy clipRangeS-based resolver.
+  const useArrMode =
+    (snapshot.pills?.length ?? 0) > 0 &&
+    (snapshot.arrangementSegments?.length ?? 0) > 0;
+  let layers: FrameLayer[] = [];
+  if (useArrMode) {
+    const segments = snapshot.arrangementSegments!;
+    const pills = snapshot.pills!;
+    const tArr = masterToArr(tMaster, segments);
+    const active = activeCamAtArr(snapshot.cuts, tArr, pills, segments);
+    if (active) {
+      layers = buildPreviewLayersFromPill(
+        snapshot.clips,
+        active.camId,
+        active.pill,
+        tArr,
+        output,
+      );
+    }
+  } else {
+    const ranges: CamRange[] = computeCamRanges(snapshot.clips);
+    const activeId = activeCamAt(snapshot.cuts, tMaster, ranges);
+    if (activeId) {
+      layers = buildPreviewLayers(snapshot.clips, activeId, tMaster, output);
+    }
+  }
 
   return { tMaster, output, layers, fx: fxOut };
 }
@@ -111,6 +150,56 @@ function computeOutputSnapped(
   const raw = resolveOutputDims(clips, resolution);
   if (!raw) return null;
   return { w: Math.round(raw.w), h: Math.round(raw.h) };
+}
+
+/** Arrangement-mode variant: the active pill's `sourceIn/Out` is the
+ *  authoritative source-time mapping (user-edited via the Timeline's
+ *  pill-trim handles), so we read it directly and ignore the cam's
+ *  master-time anchor. */
+function buildPreviewLayersFromPill(
+  clips: readonly Clip[],
+  activeId: string,
+  pill: Pill,
+  tArr: number,
+  output: OutputDims,
+): FrameLayer[] {
+  const clip = clips.find((c) => c.id === activeId);
+  if (!clip) return [];
+  const userRot = normaliseRotation(clip.rotation);
+  const flipX = !!clip.flipX;
+  const flipY = !!clip.flipY;
+  const baseW = clip.displayW ?? 0;
+  const baseH = clip.displayH ?? 0;
+  if (baseW <= 0 || baseH <= 0) return [];
+  const swap = userRot === 90 || userRot === 270;
+  const dispW = swap ? baseH : baseW;
+  const dispH = swap ? baseW : baseH;
+  const fitRect: FitRect = buildElementFitRect(
+    { w: dispW, h: dispH },
+    { w: output.w, h: output.h },
+    clip.viewportTransform ?? DEFAULT_VIEWPORT_TRANSFORM,
+  );
+  const source = isImageClip(clip)
+    ? { kind: "image" as const, clipId: clip.id }
+    : {
+        kind: "video" as const,
+        clipId: clip.id,
+        sourceTimeS: pill.sourceInS + (tArr - pill.arrStartS),
+        sourceDurS: clip.sourceDurationS,
+      };
+  return [
+    {
+      layerId: clip.id,
+      source,
+      weight: 1,
+      fitRect,
+      rotationDeg: userRot,
+      flipX,
+      flipY,
+      displayW: dispW,
+      displayH: dispH,
+    },
+  ];
 }
 
 function buildPreviewLayers(

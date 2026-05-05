@@ -5,8 +5,8 @@ import { RuleStrip } from "../editor/components/RuleStrip";
 import { TrashIcon } from "../editor/components/icons";
 import { formatDuration } from "../components/ProgressBar";
 import { jobsDb, deleteJob, jobEvents, type LocalJob } from "../local/jobs";
-
-const ACTIVE_STATUSES: LocalJob["status"][] = ["queued", "syncing", "rendering"];
+import { useOpsStore, type JobOps } from "../local/ops-store";
+import { isVideoAsset } from "../storage/jobs-db";
 
 export default function History() {
   const [jobs, setJobs] = useState<LocalJob[] | null>(null);
@@ -88,14 +88,36 @@ export default function History() {
   );
 }
 
+type BadgeKind = "queued" | "syncing" | "rendering" | "rendered" | "synced" | "failed" | "needs-sync";
+
+function jobBadge(job: LocalJob, ops: JobOps | undefined): BadgeKind {
+  if (ops?.render && !ops.render.error) return "rendering";
+  if (ops?.sync && !ops.sync.error) return "syncing";
+  if (ops?.render?.error || ops?.sync?.error) return "failed";
+  const cams = job.videos ?? [];
+  const hasSyncData =
+    cams.length > 0 && cams.every((c) => !isVideoAsset(c) || Boolean(c.sync));
+  if (job.lastRender) return "rendered";
+  if (hasSyncData) return "synced";
+  return "needs-sync";
+}
+
+function activePct(ops: JobOps | undefined): number | null {
+  if (ops?.render) return ops.render.pct;
+  if (ops?.sync) return ops.sync.pct;
+  return null;
+}
+
 function JobCard({ job, onDelete }: { job: LocalJob; onDelete: () => void }) {
-  const isActive = ACTIVE_STATUSES.includes(job.status);
+  const ops = useOpsStore((s) => s.ops[job.id]);
+  const pct = activePct(ops);
+  const badge = jobBadge(job, ops);
   return (
     <li className="group relative bg-paper-hi border border-rule rounded-lg overflow-hidden hover:border-ink-2 transition-colors">
       <Link to={`/job/${job.id}`} className="block">
         <div className="aspect-[16/7] bg-sunken overflow-hidden relative">
           <div className="absolute top-2 left-2 flex items-center gap-1.5">
-            <StatusBadge status={job.status} />
+            <StatusBadge kind={badge} />
           </div>
           {job.durationS != null && (
             <span className="absolute bottom-2 right-2 font-mono text-[10px] tabular tracking-label uppercase text-paper-hi bg-sunken/70 px-1.5 py-0.5 rounded-sm">
@@ -118,22 +140,22 @@ function JobCard({ job, onDelete }: { job: LocalJob; onDelete: () => void }) {
             )}
           </div>
 
-          {isActive && (
+          {pct !== null && (
             <div className="flex items-center gap-2 mt-1">
               <div
                 role="progressbar"
                 aria-valuemin={0}
                 aria-valuemax={100}
-                aria-valuenow={Math.round(job.progress.pct)}
+                aria-valuenow={Math.round(pct)}
                 className="flex-1 h-1 bg-paper-deep rounded-full overflow-hidden"
               >
                 <div
                   className="h-full bg-hot transition-all"
-                  style={{ width: `${job.progress.pct}%` }}
+                  style={{ width: `${pct}%` }}
                 />
               </div>
               <span className="font-mono text-[10px] tabular text-ink-2 shrink-0">
-                {Math.round(job.progress.pct)}%
+                {Math.round(pct)}%
               </span>
             </div>
           )}
@@ -153,16 +175,17 @@ function JobCard({ job, onDelete }: { job: LocalJob; onDelete: () => void }) {
   );
 }
 
-function StatusBadge({ status }: { status: LocalJob["status"] }) {
-  const map: Record<string, { bg: string; text: string }> = {
+function StatusBadge({ kind }: { kind: BadgeKind }) {
+  const map: Record<BadgeKind, { bg: string; text: string }> = {
     queued: { bg: "bg-ink/80 text-paper-hi", text: "QUEUED" },
     syncing: { bg: "bg-hot/90 text-paper-hi", text: "SYNC" },
     synced: { bg: "bg-success/80 text-paper-hi", text: "SYNCED" },
     rendering: { bg: "bg-hot/90 text-paper-hi", text: "RENDER" },
     rendered: { bg: "bg-success/90 text-paper-hi", text: "DONE" },
     failed: { bg: "bg-danger/90 text-paper-hi", text: "FAIL" },
+    "needs-sync": { bg: "bg-ink/40 text-paper-hi", text: "NEW" },
   };
-  const it = map[status] ?? map.queued;
+  const it = map[kind];
   return (
     <span
       className={[

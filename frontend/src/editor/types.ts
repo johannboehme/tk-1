@@ -14,6 +14,67 @@ export const MASTER_AUDIO_ID = "master-audio";
 export interface Segment {
   in: number;
   out: number;
+  /** Master-time of the first detected onset *inside* this segment, in
+   *  seconds. When present, the editor uses the FIRST segment's value
+   *  as the beat-grid anchor instead of the global `jobMeta.bpm.phase`
+   *  — that's how the BeatRuler stays correct when the arrangement puts
+   *  a chunk with leading silence at the very front, or when the user
+   *  re-orders chunks so a different chunk is now "bar 1".
+   *  Optional: legacy single-mp3 jobs and segments built without
+   *  arrangement context (no chunk source) leave this undefined and the
+   *  selectors fall back to the global phase. */
+  audioStartMs?: number;
+  /** Originating chunk id, when this segment came from an arrangement
+   *  item. Useful for diagnostics and for picking the right per-chunk
+   *  metadata downstream. */
+  chunkId?: string;
+}
+
+/**
+ * One first-class slot of cam material on the song timeline.
+ *
+ * Pills are the unit the user manipulates in the editor — every job
+ * (arrangement OR single-take) renders through pills. A pill can be
+ * clicked to select, dragged to reposition on the song timeline, and
+ * its edges dragged to retrim the cam-source range it draws from.
+ * Cuts pick which pill is on PROGRAM at any given arr-time.
+ *
+ * Time conventions:
+ *   - `arrStartS` / `arrEndS` — placement on the song timeline. The pill
+ *     is visible (and active) over [arrStartS, arrEndS).
+ *   - `sourceInS` / `sourceOutS` — which excerpt of the cam's media is
+ *     played during the pill. Pill duration = source duration (no
+ *     time-stretch); the renderer maps an arr-time `t` to source-time
+ *     `sourceInS + (t − arrStartS)`.
+ *
+ * `originalArr*S / originalSource*S` snapshot the auto-generated default
+ * the moment this pill was emitted. The per-pill RESET action restores
+ * those values so a user-mangled pill can return to a clean baseline
+ * without nuking the rest of the arrangement.
+ *
+ * `fromArrangementItemId` is a stable back-reference for the auto-
+ * generation pass that creates one pill per (cam × arrangement-item).
+ * Single-take jobs (no arrangement) emit one pill per cam with this
+ * field set to "__default__"; reconcilePills uses the id to round-trip
+ * user edits across editor mounts.
+ */
+export interface Pill {
+  id: string;
+  camId: string;
+  arrStartS: number;
+  arrEndS: number;
+  sourceInS: number;
+  sourceOutS: number;
+  originalArrStartS: number;
+  originalArrEndS: number;
+  originalSourceInS: number;
+  originalSourceOutS: number;
+  fromArrangementItemId?: string;
+}
+
+/** Half-open arr-time range a pill occupies. */
+export function pillRangeS(pill: Pill): { startS: number; endS: number } {
+  return { startS: pill.arrStartS, endS: pill.arrEndS };
 }
 
 export interface ReactiveModulation {

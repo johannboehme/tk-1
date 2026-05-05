@@ -1,5 +1,5 @@
 // Transport row with chunky play/pause + frame steppers + time readouts. Keyboard-aware.
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 import { useEditorStore } from "../store";
 import { effectiveAudioStartS } from "../selectors/timing";
 import {
@@ -8,6 +8,11 @@ import {
   imageOutAtPlayhead,
   videoSourceTimeAtPlayhead,
 } from "../io-points";
+import {
+  arrToMaster,
+  masterToArr,
+  totalArrDuration,
+} from "../arrangement-time";
 import { useRegisterShortcut } from "../shortcuts/useRegisterShortcut";
 import { useIsNarrowViewport } from "../use-is-narrow";
 import { ChunkyButton } from "./ChunkyButton";
@@ -100,11 +105,43 @@ export function TransportBar() {
   // we have nothing meaningful to jump to. The seek target itself uses the
   // user-corrected (effective) start.
   const audioStartS = meta?.audioStartS ?? 0;
-  const effectiveStart = effectiveAudioStartS(meta);
+  const arrSegments = useEditorStore((s) => s.arrangementSegments);
+  const isArrMode = arrSegments.length > 0;
+  const effectiveStart = effectiveAudioStartS(meta, arrSegments);
+  // Skip-to-in / skip-to-out anchors. In direct-mode they follow the
+  // master-time trim (export region). In arrangement-mode the song's
+  // boundaries are the first and last segments — not the master trim
+  // (which ranges across the whole arrangement and may sit in a gap).
+  const seekStartS = useMemo(() => {
+    if (!isArrMode) return trim.in;
+    let lo = Infinity;
+    for (const s of arrSegments) if (s.in < lo) lo = s.in;
+    return Number.isFinite(lo) ? lo : 0;
+  }, [isArrMode, arrSegments, trim.in]);
+  const seekEndS = useMemo(() => {
+    if (!isArrMode) return trim.out;
+    // Step a hair before the very end so the audio walker keeps the
+    // last sample audible — landing exactly on segment[N-1].out trips
+    // the "past-last-segment → pause" branch instantly.
+    let hi = -Infinity;
+    for (const s of arrSegments) if (s.out > hi) hi = s.out;
+    return Number.isFinite(hi) ? hi - 1 / Math.max(1, fps) : 0;
+  }, [isArrMode, arrSegments, trim.out, fps]);
 
   function step(deltaSec: number) {
     const t = useEditorStore.getState().playback.currentTime;
-    seek(t + deltaSec);
+    if (!isArrMode) {
+      seek(t + deltaSec);
+      return;
+    }
+    // Arrangement-mode: stepping has to honour the discontinuity at
+    // chunk boundaries. Translate the desired step into arr-time then
+    // back to master so a "next frame" near a splice lands on the next
+    // segment's first frame instead of the master-time gap.
+    const arrNow = masterToArr(t, arrSegments);
+    const total = totalArrDuration(arrSegments);
+    const arrNext = Math.max(0, Math.min(total, arrNow + deltaSec));
+    seek(arrToMaster(arrNext, arrSegments));
   }
 
   // IN/OUT semantics are contextual:
@@ -179,6 +216,18 @@ export function TransportBar() {
   }
 
   function toggleLoop() {
+    // Loop is direct-mode-only: a master-time loop region inside the
+    // arrangement either spans a chunk-gap (silence, broken playback)
+    // or fights the audio walker's segment-hop crossfade. The button
+    // stays visible (so the user knows what they'd lose) but it's a
+    // no-op + a toast — the proper "loop my song" feature would be
+    // arrangement-time-aware and is deferred.
+    if (isArrMode) {
+      useEditorStore
+        .getState()
+        .pushNotice("Loop is disabled while playing an arrangement");
+      return;
+    }
     if (loop) {
       setLoop(null);
       return;
@@ -214,11 +263,18 @@ export function TransportBar() {
         case "ArrowLeft":
           e.preventDefault();
           if (e.altKey) shiftLoop(-1);
+          // In arrangement-mode the bar grid is per-chunk (each segment
+          // has its own phase), so a global beat-snap step would land
+          // off-grid often. Keep it as a single-frame step in arr-time
+          // — the song reads as a continuous tape and that's what the
+          // user wants the arrow to skim through.
+          else if (isArrMode) step(-1 / fps);
           else stepByActiveSnap(-1);
           break;
         case "ArrowRight":
           e.preventDefault();
           if (e.altKey) shiftLoop(1);
+          else if (isArrMode) step(1 / fps);
           else stepByActiveSnap(1);
           break;
         case "i":
@@ -256,6 +312,8 @@ export function TransportBar() {
     trim.out,
     stepByActiveSnap,
     shiftLoop,
+    isArrMode,
+    arrSegments,
   ]);
 
   useRegisterShortcut({
@@ -320,7 +378,7 @@ export function TransportBar() {
         <ChunkyButton
           variant="secondary"
           size={btnSize}
-          onClick={() => seek(trim.in)}
+          onClick={() => seek(seekStartS)}
           aria-label="Jump to in point"
         >
           <SkipBackIcon />
@@ -366,7 +424,7 @@ export function TransportBar() {
         <ChunkyButton
           variant="secondary"
           size={btnSize}
-          onClick={() => seek(trim.out)}
+          onClick={() => seek(seekEndS)}
           aria-label="Jump to out point"
         >
           <SkipFwdIcon />

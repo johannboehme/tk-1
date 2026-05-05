@@ -510,4 +510,125 @@ describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => 
       expect(ramped).toBe(false);
     });
   });
+
+  describe("arrangement-segment walker", () => {
+    it("hops to the NEXT segment in arrangement order, not the first master-time match", async () => {
+      // Arrangement: chunk-A → chunk-B → chunk-A again (same master range
+      // [10,15] used twice). Without the authoritative segment-index in
+      // the walker, the second hop's lookup would snap back to occurrence
+      // #0 and we'd loop forever.
+      const segs = [
+        { in: 10, out: 15 },
+        { in: 50, out: 55 },
+        { in: 10, out: 15 }, // duplicate of segment 0
+      ];
+      const { mA, mB } = await setup(60);
+      useEditorStore.getState().setArrangementSegments(segs);
+      // Park playhead inside segment 0 just before its end so the
+      // crossfade arms on the next tick.
+      useEditorStore.getState().seek(10, { segmentIdxHint: 0 });
+      await act(async () => {
+        await flushAll();
+      });
+      await act(async () => {
+        useEditorStore.getState().setPlaying(true);
+        await flushAll();
+      });
+      // Drive master-time near the end of segment 0 so the walker arms.
+      await act(async () => {
+        mA.setCurrentTime(14.97);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      // Idle (B) should be parked at next segment's in (= 50).
+      expect(mB.getCurrentTime()).toBeCloseTo(50, 1);
+    });
+
+    it("user-seek with segmentIdxHint binds the walker to the requested occurrence", async () => {
+      const segs = [
+        { in: 10, out: 15 },
+        { in: 10, out: 15 }, // duplicate
+      ];
+      const { mA, mB } = await setup(20);
+      useEditorStore.getState().setArrangementSegments(segs);
+      // Click on the duplicate occurrence (idx 1) at master 12.
+      useEditorStore.getState().seek(12, { segmentIdxHint: 1 });
+      await act(async () => {
+        await flushAll();
+      });
+      await act(async () => {
+        useEditorStore.getState().setPlaying(true);
+        await flushAll();
+      });
+      // Drive near the end of segment 1 (= last segment). Walker should
+      // schedule a pause-at-end (no further segment to hop into) — and
+      // crucially NOT arm a crossfade hop because there's no nextSeg.
+      await act(async () => {
+        mA.setCurrentTime(14.97);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      // Idle was never re-parked at master 10 again — the walker treats
+      // segment idx 1 as final.
+      expect(mB.playSpy).not.toHaveBeenCalled();
+    });
+
+    it(
+      "end of last segment does NOT swap roles (the loop-back bug). " +
+        "The active element keeps playing past `out` until the timeout " +
+        "fires — never the idle element parked at an earlier master-time.",
+      async () => {
+        // Arrangement of 2 segs where seg 1's `in` shares master with seg 0.
+        // After hop seg 0 → seg 1, the now-idle is parked at seg 1.in.
+        // Without this regression test, the walker fake-armed at end of
+        // seg 1 and the swap kicked the idle back onto PROGRAM, snapping
+        // master-time backwards by one chunk-length.
+        const segs = [
+          { in: 30, out: 40 }, // seg 0 master
+          { in: 30, out: 40 }, // seg 1 master (duplicate of seg 0)
+        ];
+        const { mA, mB } = await setup(60);
+        useEditorStore.getState().setArrangementSegments(segs);
+        useEditorStore.getState().seek(30, { segmentIdxHint: 0 });
+        await act(async () => {
+          await flushAll();
+        });
+        await act(async () => {
+          useEditorStore.getState().setPlaying(true);
+          await flushAll();
+        });
+        // Drive through seg 0's end so the walker arms a real crossfade.
+        await act(async () => {
+          mA.setCurrentTime(39.97);
+          await new Promise((r) =>
+            requestAnimationFrame(() => r(undefined)),
+          );
+          await new Promise((r) =>
+            requestAnimationFrame(() => r(undefined)),
+          );
+        });
+        // Crossfade fires — verify idle (= mB) was used: it should have
+        // been play()'d during arm and parked at seg 1.in (=30).
+        expect(mB.playSpy).toHaveBeenCalled();
+        // Now pretend the swap completed and we're playing seg 1 via mB.
+        // Drive mB through seg 1's end. The fake-arm bug would set
+        // state.armed which fires the swap block on the next tick, kick
+        // mA (parked at master 30) onto active, and the walker would
+        // observe master 30 — but mA was paused, so master-time would
+        // freeze there until the pause timer fires.
+        const mAStartCalls = mA.playSpy.mock.calls.length;
+        await act(async () => {
+          mB.setCurrentTime(39.97);
+          await new Promise((r) =>
+            requestAnimationFrame(() => r(undefined)),
+          );
+          await new Promise((r) =>
+            requestAnimationFrame(() => r(undefined)),
+          );
+        });
+        // mA must NOT be re-played as a new active during the end-pause
+        // window. (One play() during arm of seg 0→1 is allowed; that's
+        // mAStartCalls.) After we're in seg 1, mA stays paused.
+        expect(mA.playSpy.mock.calls.length).toBe(mAStartCalls);
+      },
+    );
+  });
 });

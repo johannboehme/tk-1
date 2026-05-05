@@ -692,6 +692,108 @@ function refineTempoFromBeats(beats: number[], seed: Tempo): Tempo {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Phase-only refit at a fixed period.
+//
+// Triage's "Conform" action needs to re-detect the bar-grid phase of one
+// chunk while keeping the song-global BPM untouched. The full analyzeAudio
+// pipeline jointly refits period+phase from detected beats, which would
+// override the global decision. Here we hold the period and fit only the
+// phase: residual mean of (beats[k] − k · fixedPeriod).
+//
+// Inputs:
+//   - pcm: mono Float32Array
+//   - sampleRate: Hz
+//   - fixedBpm: the global BPM to hold as the period
+//   - beatsPerBar: time-signature numerator (currently unused — kept for
+//     symmetry with the chunk model and future per-bar refinements)
+//
+// Returns null when the chunk is too short for meaningful analysis or when
+// fewer than 2 beats are detected (no slope to anchor).
+// ────────────────────────────────────────────────────────────────────────────
+
+export interface FixedBpmAnalysis {
+  /** Master-time-relative seconds: where the bar-grid anchor lies in the
+   *  PCM slice's coordinate frame. Add the slice's master-time offset to
+   *  get a master-time anchor. */
+  phaseS: number;
+  /** All detected beat times (PCM-relative seconds). */
+  beats: number[];
+  /** 0..1 — proxy for how cleanly the residuals clustered around the
+   *  fixed period. 1 = beats sit exactly on `phase + k·period`; lower
+   *  means the audio's tempo disagrees with `fixedBpm`. */
+  confidence: number;
+}
+
+export function analyzeAudioFixedBpm(
+  pcm: Float32Array,
+  sampleRate: number,
+  fixedBpm: number,
+  _beatsPerBar: number,
+  opts: AnalyzeOptions = {},
+): FixedBpmAnalysis | null {
+  if (!fixedBpm || fixedBpm <= 0 || !Number.isFinite(fixedBpm)) return null;
+  const fps = opts.framesPerSec ?? TARGET_FRAMES_PER_SEC;
+  const hopSize = Math.max(1, Math.round(sampleRate / fps));
+  const framesPerSec = sampleRate / hopSize;
+  const totalFrames = Math.max(0, Math.floor((pcm.length - N_FFT) / hopSize) + 1);
+  if (totalFrames < 4) return null;
+
+  const halfWinS = N_FFT / (2 * sampleRate);
+  const frameToSec = (i: number): number => i / framesPerSec + halfWinS;
+
+  const mag = stftMagnitude(pcm, N_FFT, hopSize, totalFrames);
+  const onsetStrength = spectralFlux(mag);
+
+  // DP beat-tracking with the fixed period. We don't run autocorrelation
+  // — the global BPM is the period seed, full stop.
+  const seedTempo: Tempo = { bpm: fixedBpm, confidence: 1, phase: 0 };
+  const beatFrames = trackBeatFrames(onsetStrength, framesPerSec, seedTempo, 0);
+
+  // Fallback path — too few beats for a meaningful LS-fit (very short
+  // chunk, sparse hits, percussive-only material). Use the first
+  // detected onset as the phase anchor: better than refusing to
+  // re-fit at all, since the user has explicitly asked for a re-grid.
+  // Confidence reflects that we couldn't verify the period.
+  if (beatFrames.length < 2) {
+    const onsetFrames = pickOnsetFrames(onsetStrength, framesPerSec);
+    if (onsetFrames.length === 0) return null;
+    const phaseS = frameToSec(onsetFrames[0]);
+    return { phaseS, beats: [phaseS], confidence: 0.2 };
+  }
+
+  const beats = beatFrames.map((f) => frameToSec(refineBeatFrame(onsetStrength, f)));
+
+  const period = 60 / fixedBpm;
+
+  // Phase = mean of residuals (beats[k] − k · period). Robust under
+  // missed/extra beats only insofar as the residuals stay clustered;
+  // the test for that is the residual std-dev → confidence below.
+  let phaseSum = 0;
+  for (let k = 0; k < beats.length; k++) phaseSum += beats[k] - k * period;
+  const phase = phaseSum / beats.length;
+
+  // Confidence: the residuals (after subtracting the modular grid) should
+  // cluster tightly around 0. We compute std-dev of the residuals modulo
+  // period (folded into [-period/2, +period/2]) and map to a 0..1
+  // confidence — tighter cluster = higher confidence. A perfect grid
+  // gives std=0 → confidence=1; uniform-random residuals give
+  // std≈period/sqrt(12) → confidence≈0.
+  let varAcc = 0;
+  for (let k = 0; k < beats.length; k++) {
+    const resid = beats[k] - k * period - phase;
+    // Fold into [-period/2, +period/2] so adjacent grid lines don't
+    // inflate the variance via wrap-around.
+    const folded = ((resid + period / 2) % period + period) % period - period / 2;
+    varAcc += folded * folded;
+  }
+  const std = Math.sqrt(varAcc / beats.length);
+  const stdMax = period / Math.sqrt(12); // ≈ uniform-random baseline
+  const confidence = Math.max(0, Math.min(1, 1 - std / stdMax));
+
+  return { phaseS: phase, beats, confidence };
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Empty-shape helper
 // ────────────────────────────────────────────────────────────────────────────
 

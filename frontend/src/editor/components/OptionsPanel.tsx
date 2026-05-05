@@ -22,6 +22,7 @@ import {
   type ImageClip,
   type VideoClip,
 } from "../types";
+import { isPillDirty } from "../arrangement-pills";
 import { ChunkyButton } from "./ChunkyButton";
 import { Knob } from "./Knob";
 import { MonoReadout } from "./MonoReadout";
@@ -88,6 +89,8 @@ function ClipOptions({ clip }: ClipOptionsProps) {
   return (
     <div className="flex flex-col gap-5">
       <ClipHeader clip={clip} camIdx={camIdx} />
+
+      <SelectedPillSection clipId={clip.id} />
 
       <section className="flex flex-col gap-2">
         <div className="label flex items-center gap-1.5">
@@ -158,6 +161,54 @@ function ClipOptions({ clip }: ClipOptionsProps) {
         Reset transform
       </ChunkyButton>
     </div>
+  );
+}
+
+/**
+ * Per-pill controls. Visible only when the user has a pill selected on
+ * the cam currently shown by this panel — which is the common case
+ * since pill-click sets both `selectedPillId` AND `selectedClipId`.
+ *
+ * The section reads the pill's current arr/source bounds against its
+ * stored originals; the RESET button is enabled iff at least one of the
+ * four fields has been moved off its baseline. RESET pushes a history
+ * snapshot so the gesture can be undone the same way as a drag.
+ *
+ * The cam-track nudge (= "shift every pill of this cam in lockstep")
+ * lives in the SyncTuner panel's Nudge row already, where the user is
+ * adjusting cam-master alignment anyway.
+ */
+function SelectedPillSection({ clipId }: { clipId: string }) {
+  const selectedPillId = useEditorStore((s) => s.selectedPillId);
+  const pill = useEditorStore((s) =>
+    s.pills.find((p) => p.id === selectedPillId) ?? null,
+  );
+  const resetPill = useEditorStore((s) => s.resetPill);
+  if (!pill || pill.camId !== clipId) return null;
+  const dirty = isPillDirty(pill);
+  return (
+    <section className="flex flex-col gap-2 rounded-md border border-rule px-3 py-2 bg-paper-deep">
+      <div className="label">Selected pill</div>
+      <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px] tabular font-mono">
+        <span className="text-ink-3">arr</span>
+        <span className="text-ink">
+          {pill.arrStartS.toFixed(3)}s — {pill.arrEndS.toFixed(3)}s
+        </span>
+        <span className="text-ink-3">source</span>
+        <span className="text-ink">
+          {pill.sourceInS.toFixed(3)}s — {pill.sourceOutS.toFixed(3)}s
+        </span>
+      </div>
+      <ChunkyButton
+        variant={dirty ? "primary" : "ghost"}
+        size="sm"
+        disabled={!dirty}
+        onClick={() => resetPill(pill.id)}
+        title="Restore the pill to its auto-generated arr-time + source-trim defaults"
+      >
+        Reset pill
+      </ChunkyButton>
+    </section>
   );
 }
 

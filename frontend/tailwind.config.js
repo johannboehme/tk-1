@@ -83,6 +83,26 @@ export default {
       letterSpacing: {
         label: "0.16em",
       },
+      keyframes: {
+        "cockpit-scan": {
+          "0%": { left: "0%", opacity: "0" },
+          "15%": { opacity: "0.9" },
+          "85%": { opacity: "0.9" },
+          "100%": { left: "100%", opacity: "0" },
+        },
+        "frame-pulse": {
+          "0%, 100%": {
+            filter: "drop-shadow(0 0 4px rgba(255,87,34,0.45))",
+          },
+          "50%": {
+            filter: "drop-shadow(0 0 10px rgba(255,87,34,0.75))",
+          },
+        },
+      },
+      animation: {
+        "cockpit-scan": "cockpit-scan 4s linear infinite",
+        "frame-pulse": "frame-pulse 1.6s ease-in-out infinite",
+      },
     },
   },
   plugins: [],

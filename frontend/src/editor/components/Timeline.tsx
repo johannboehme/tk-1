@@ -20,7 +20,17 @@ import {
   useState,
 } from "react";
 import { useEditorStore } from "../store";
-import { clipRangeS, isVideoClip, type Clip } from "../types";
+import { clipRangeS, isVideoClip, type Clip, type Pill } from "../types";
+import {
+  arrToMaster,
+  masterToArr,
+  mastersToArrAll,
+  segmentArrStarts,
+  segmentIndexAtArr,
+  sliceByArrSegments,
+  totalArrDuration,
+} from "../arrangement-time";
+import { isPillDirty } from "../arrangement-pills";
 import { LaneHeader, type CamStatus } from "./timeline/LaneHeader";
 import { AddMediaButton } from "./AddMediaButton";
 import { ProgramStrip } from "./timeline/ProgramStrip";
@@ -30,7 +40,6 @@ import { BeatRuler } from "./timeline/BeatRuler";
 import { BpmReadout } from "./BpmReadout";
 import { SnapModeButtons } from "./SnapModeButtons";
 import { snapTime, type SnapCtx, type SnapMode } from "../snap";
-import { DEFAULT_MATCH_CONFIDENCE_THRESHOLD } from "../match-snap";
 import {
   effectiveBeatPhaseS,
   effectiveBeatsPerBar,
@@ -72,63 +81,67 @@ type DragKind =
   | { kind: "trim-out" }
   | { kind: "loop"; offset: number }
   | {
-      /** Resize an image clip's right edge → grows durationS. */
-      kind: "image-resize-end";
-      camId: string;
-      grabT: number;
-      origDurationS: number;
-      origStartOffsetS: number;
+      /** Drag a pill body — shifts its arr-time placement while the
+       *  duration + source-trim stay put. `grabArrT` is the arr-time
+       *  the pointer was on at drag-start so the pill follows the
+       *  cursor 1:1. */
+      kind: "pill-move";
+      pillId: string;
+      grabArrT: number;
+      origArrStartS: number;
     }
   | {
-      /** Resize an image clip's left edge → shifts startOffsetS while
-       *  keeping the right edge in place. */
-      kind: "image-resize-start";
+      /** MATCH snap-mode pill-body drag. The whole cam track moves —
+       *  every pill of `camId` shifts by the same arr-delta so the
+       *  user can align the entire take against a candidate's
+       *  master-time tick (visible as the match-marker). */
+      kind: "cam-track-move";
       camId: string;
-      grabT: number;
-      origDurationS: number;
-      origStartOffsetS: number;
+      grabArrT: number;
+      origStartsByPillId: Record<string, number>;
     }
   | {
-      /** Trim a video clip's right edge — narrows trimOutS within
-       *  [trimInS+0.05, sourceDurationS]. */
-      kind: "video-trim-out";
-      camId: string;
-      origStartS: number;
-      origTrimInS: number;
-      origTrimOutS: number;
-      sourceDurationS: number;
+      /** Drag a pill's LEFT edge — narrows the arr-window from the
+       *  left and advances `sourceInS` by the same amount, so the cam
+       *  still plays in sync with the visible window. */
+      kind: "pill-trim-in";
+      pillId: string;
+      origArrStartS: number;
+      origArrEndS: number;
+      origSourceInS: number;
     }
   | {
-      /** Trim a video clip's left edge — narrows trimInS within
-       *  [0, trimOutS-0.05]. */
-      kind: "video-trim-in";
-      camId: string;
-      origStartS: number;
-      origTrimInS: number;
-      origTrimOutS: number;
-      sourceDurationS: number;
-    }
-  | {
-      kind: "clip-move";
-      camId: string;
-      grabT: number;
-      origStartOffsetS: number;
-      /** syncOverrideMs at drag-start. Drag mutates this (not
-       *  startOffsetS) so the cam's audio/video alignment actually
-       *  shifts against the master audio — startOffsetS is purely
-       *  visual and would silently desync the cam's audio. */
-      origSyncOverrideMs: number;
-      /** Visible master-timeline startS at drag-start. Used to compute
-       *  the pointer's intended new startS independently of any
-       *  candidate-switch that may happen mid-drag — without it, the
-       *  algoSync delta cascades and the user "jumps" past middle
-       *  candidates. */
-      origStartS: number;
+      /** Drag a pill's RIGHT edge — narrows the arr-window from the
+       *  right and retreats `sourceOutS` by the same amount. */
+      kind: "pill-trim-out";
+      pillId: string;
+      origArrStartS: number;
+      origArrEndS: number;
+      origSourceOutS: number;
     }
   | { kind: "scrollbar"; offsetX: number };
 
 const HANDLE_HIT = 14;
 const TARGET_TILE_W = 64;
+/** Edge-to-edge magnetic-snap reach during a pill drag, in CSS pixels.
+ *  Same on every zoom level — the time-domain threshold is derived per
+ *  drag event from the live `pxPerSec`. */
+const PILL_SNAP_EDGE_PX = 6;
+/** Zoom-out cap (= the whole timeline visible, can't go further). */
+const MIN_ZOOM = 1;
+/** Zoom-in cap. 1024 lets the user resolve down to ~ms-level detail
+ *  on a 7-min long-form arrangement (~415s ÷ 1024 ≈ 0.4s visible).
+ *  The hard upper bound is governed by tick-density in the BeatRuler
+ *  + JS float precision in the px-per-sec math, both of which are
+ *  comfortable at 1024×. */
+const MAX_ZOOM = 1024;
+/** Minimum arr-window length the trim handlers will collapse a pill
+ *  to. Anything thinner is the user mid-drag, not a usable chunk. */
+const PILL_MIN_WINDOW_S = 0.05;
+
+function clamp(x: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, x));
+}
 /** Default lane-header column width on desktop. The narrow-viewport
  *  variant (`HEADER_W_COMPACT`) is used on phone-sized screens — see
  *  LaneHeader.tsx for the matching compact body. */
@@ -169,25 +182,11 @@ export function Timeline({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [canvasWidth, setCanvasWidth] = useState(800);
   const dragRef = useRef<DragKind | null>(null);
-  /** Set during a clip-move drag so the PROGRAM strip can show match
-   *  markers only while the user is actually re-aligning a cam. */
-  const [activeClipMoveDragId, setActiveClipMoveDragId] = useState<
-    string | null
-  >(null);
-  /** Snapshot of the timeline-range at drag-start. Frozen for the
-   *  duration of a clip-move so the canvas doesn't rescale under the
-   *  user's cursor — without this freeze, dragging right extends the
-   *  range, the pixel-per-second shrinks, and the pill seems to
-   *  asymptote to the canvas edge instead of following the pointer. */
-  const frozenTimelineRangeRef = useRef<{
-    startS: number;
-    endS: number;
-    span: number;
-  } | null>(null);
 
   // Store reads — narrow selectors to keep re-renders cheap.
   const jobMeta = useEditorStore((s) => s.jobMeta);
   const trim = useEditorStore((s) => s.trim);
+  const arrangementSegments = useEditorStore((s) => s.arrangementSegments);
   const setTrim = useEditorStore((s) => s.setTrim);
   const loop = useEditorStore((s) => s.playback.loop);
   const setLoop = useEditorStore((s) => s.setLoop);
@@ -200,12 +199,19 @@ export function Timeline({
   const cuts = useEditorStore((s) => s.cuts);
   const selectedClipId = useEditorStore((s) => s.selectedClipId);
   const setSelectedClipId = useEditorStore((s) => s.setSelectedClipId);
-  const setClipStartOffset = useEditorStore((s) => s.setClipStartOffset);
-  const setImageClipDuration = useEditorStore((s) => s.setImageClipDuration);
-  const setVideoClipTrim = useEditorStore((s) => s.setVideoClipTrim);
-  const setClipSyncOverride = useEditorStore((s) => s.setClipSyncOverride);
-  const setSelectedCandidateIdx = useEditorStore((s) => s.setSelectedCandidateIdx);
+  const pills = useEditorStore((s) => s.pills);
+  const selectedPillId = useEditorStore((s) => s.selectedPillId);
+  const setSelectedPillId = useEditorStore((s) => s.setSelectedPillId);
+  const setPillArrPlacement = useEditorStore((s) => s.setPillArrPlacement);
+  const setPillLeftEdgeArrStartS = useEditorStore(
+    (s) => s.setPillLeftEdgeArrStartS,
+  );
+  const setPillRightEdgeArrEndS = useEditorStore(
+    (s) => s.setPillRightEdgeArrEndS,
+  );
   const resetClipAlignment = useEditorStore((s) => s.resetClipAlignment);
+  const resetPillsForCam = useEditorStore((s) => s.resetPillsForCam);
+  const resetPill = useEditorStore((s) => s.resetPill);
   const removeCutAt = useEditorStore((s) => s.removeCutAt);
   const clearCuts = useEditorStore((s) => s.clearCuts);
   const clearAllFx = useEditorStore((s) => s.clearAllFx);
@@ -215,7 +221,9 @@ export function Timeline({
   const snapMode = useEditorStore((s) => s.ui.snapMode);
   const lanesLocked = useEditorStore((s) => s.ui.lanesLocked);
   const bpm = useEditorStore((s) => s.jobMeta?.bpm?.value ?? null);
-  const beatPhase = useEditorStore((s) => effectiveBeatPhaseS(s.jobMeta));
+  const beatPhase = useEditorStore((s) =>
+    effectiveBeatPhaseS(s.jobMeta, s.arrangementSegments),
+  );
   const beatsPerBar = useEditorStore((s) => effectiveBeatsPerBar(s.jobMeta));
   const barOffsetBeats = useEditorStore((s) =>
     effectiveBarOffsetBeats(s.jobMeta),
@@ -233,18 +241,47 @@ export function Timeline({
     for (const k in fxHolds) set.add(fxHolds[k].fxId);
     return set;
   }, [fxHolds]);
+
   const takePromoteTimerRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
 
   const duration = jobMeta?.duration || audioDuration || 0;
+  // Arrangement-mode flag: when the editor was opened from a long-form
+  // Arrange handoff, the timeline shows the song (= sum of segments) on
+  // a continuous arr-time X-axis instead of the raw master-audio. The
+  // audio walker still hops in master-time internally; this flag flips
+  // every UI surface that thinks in time-space.
+  const isArrMode = arrangementSegments.length > 0;
+  const arrTotal = useMemo(
+    () => (isArrMode ? totalArrDuration(arrangementSegments) : 0),
+    [isArrMode, arrangementSegments],
+  );
+
+  // master ↔ view (arrangement) conversions. In direct-mode they are
+  // identity. The Timeline keeps store/cuts/fx as master-time internally
+  // and only applies the bijection at the canvas boundary.
+  const masterToView = useCallback(
+    (masterT: number) =>
+      isArrMode ? masterToArr(masterT, arrangementSegments) : masterT,
+    [isArrMode, arrangementSegments],
+  );
+  const viewToMaster = useCallback(
+    (viewT: number) =>
+      isArrMode ? arrToMaster(viewT, arrangementSegments) : viewT,
+    [isArrMode, arrangementSegments],
+  );
+
   // The visible/scroll range covers the union of the master audio AND
   // every cam's master-timeline span (incl. their match-marker positions
-  // so candidate ticks at negative master-time stay reachable). During
-  // an active clip-move drag we *freeze* this range to the snapshot
-  // captured at drag-start (`frozenTimelineRangeRef`) — without that
-  // freeze, dragging right would extend the range, shrink pxPerSec, and
-  // the pill would asymptote to the canvas edge instead of following
-  // the pointer.
+  // so candidate ticks at negative master-time stay reachable). In
+  // arrangement-mode the range collapses to [0, total-arr-duration] —
+  // the song is the only thing the user can scrub. During an active
+  // clip-move drag (direct-mode only) we *freeze* this range to the
+  // snapshot captured at drag-start (`frozenTimelineRangeRef`) so the
+  // canvas doesn't rescale under the user's cursor.
   const liveTimelineRange = useMemo(() => {
+    if (isArrMode) {
+      return { startS: 0, endS: arrTotal, span: arrTotal };
+    }
     let lo = 0;
     let hi = duration;
     for (const c of clips) {
@@ -261,10 +298,8 @@ export function Timeline({
       }
     }
     return { startS: lo, endS: hi, span: hi - lo };
-  }, [clips, duration]);
-  const timelineRange = activeClipMoveDragId && frozenTimelineRangeRef.current
-    ? frozenTimelineRangeRef.current
-    : liveTimelineRange;
+  }, [isArrMode, arrTotal, clips, duration]);
+  const timelineRange = liveTimelineRange;
   const timelineStartS = timelineRange.startS;
   const timelineSpan = Math.max(1e-6, timelineRange.span);
   const visibleDur = timelineSpan / zoom;
@@ -280,16 +315,21 @@ export function Timeline({
   // playback or via a programmatic seek), snap scrollX so the playhead
   // reappears at the start of the next "screen". Gated on the playhead
   // having moved this render — otherwise scrolling away while paused
-  // would snap straight back.
+  // would snap straight back. Comparison happens in *view* space so the
+  // arrangement-mode path doesn't re-paint to master-time gaps.
   const lastPlayheadRef = useRef(currentTime);
+  const currentTimeView = masterToView(currentTime);
   useEffect(() => {
     const moved = currentTime !== lastPlayheadRef.current;
     lastPlayheadRef.current = currentTime;
     if (!moved) return;
-    if (currentTime >= viewStart && currentTime <= viewEnd) return;
-    const next = Math.max(0, Math.min(maxScroll, currentTime - timelineStartS));
+    if (currentTimeView >= viewStart && currentTimeView <= viewEnd) return;
+    const next = Math.max(
+      0,
+      Math.min(maxScroll, currentTimeView - timelineStartS),
+    );
     if (Math.abs(next - clampedScroll) > 1e-6) setScrollX(next);
-  }, [currentTime, viewStart, viewEnd, timelineStartS, maxScroll, clampedScroll, setScrollX]);
+  }, [currentTime, currentTimeView, viewStart, viewEnd, timelineStartS, maxScroll, clampedScroll, setScrollX]);
 
   // ---- Layout offsets (canvas y-coordinates per lane) ----
   const videoBands = clips.map((_, i) => ({
@@ -338,8 +378,6 @@ export function Timeline({
     function clearStaleDrag() {
       if (dragRef.current) {
         dragRef.current = null;
-        setActiveClipMoveDragId(null);
-        frozenTimelineRangeRef.current = null;
       }
     }
     window.addEventListener("pointerup", clearStaleDrag);
@@ -350,7 +388,7 @@ export function Timeline({
       window.removeEventListener("pointercancel", clearStaleDrag);
       window.removeEventListener("blur", clearStaleDrag);
     };
-  }, [setActiveClipMoveDragId]);
+  }, []);
 
   // ---- Per-cam thumbnail Image objects ----
   // Video clips: load the frames-strip (multiple stills laid out
@@ -394,14 +432,93 @@ export function Timeline({
   }, [clips, cams]);
 
   // ---- t↔x helpers ----
+  // `tToX` accepts master-time (the editor's canonical clock) and lands on
+  // a canvas pixel via the active view-space (= master in direct-mode,
+  // arrangement in arr-mode). `xToT` is the inverse and always returns
+  // master-time so callers (seek/setTrim/cut-add) stay in the canonical
+  // clock. `arrTToX` is a pure view-space mapping for things that are
+  // already in arr coords (segment splice marks, audio waveform slices).
   const tToX = useCallback(
-    (t: number) => ((t - viewStart) / visibleDur) * canvasWidth,
-    [viewStart, visibleDur, canvasWidth],
+    (masterT: number) =>
+      ((masterToView(masterT) - viewStart) / visibleDur) * canvasWidth,
+    [viewStart, visibleDur, canvasWidth, masterToView],
   );
   const xToT = useCallback(
-    (x: number) => viewStart + (x / canvasWidth) * visibleDur,
+    (x: number) =>
+      viewToMaster(viewStart + (x / canvasWidth) * visibleDur),
+    [viewStart, visibleDur, canvasWidth, viewToMaster],
+  );
+  const arrTToX = useCallback(
+    (viewT: number) => ((viewT - viewStart) / visibleDur) * canvasWidth,
     [viewStart, visibleDur, canvasWidth],
   );
+
+  // Compute the seek-hint that disambiguates duplicate chunks. In arr-mode
+  // a single canvas-x position is uniquely tied to one segment occurrence
+  // (because arr-time is unique), so we take that hint along to the seek
+  // call — without it the walker would scan for the first master-time
+  // match and snap the playhead back to a duplicated earlier occurrence.
+  const seekFromX = useCallback(
+    (x: number, masterT: number) => {
+      if (!isArrMode) {
+        seek(masterT);
+        return;
+      }
+      const arrT = viewStart + (x / canvasWidth) * visibleDur;
+      const idx = segmentIndexAtArr(arrT, arrangementSegments);
+      seek(masterT, idx >= 0 ? { segmentIdxHint: idx } : undefined);
+    },
+    [
+      isArrMode,
+      viewStart,
+      visibleDur,
+      canvasWidth,
+      arrangementSegments,
+      seek,
+    ],
+  );
+
+  // Arrangement-mode strip projections.
+  //
+  // Cuts/FX live in master-time inside the store so they remain anchored
+  // to the source media regardless of how the user reorders the
+  // arrangement. The ProgramStrip + FxStripLayer however render in the
+  // active view-space (= arr-time when segments are present) so we
+  // pre-project here: each occurrence of a chunk that contains a cut
+  // produces a corresponding splice tab on the strip; FX capsules that
+  // straddle a segment boundary split into per-segment slices so the
+  // tape edit reads as the arrangement does.
+  // (Direct-mode passes the originals through unchanged.)
+  const stripCuts = useMemo(() => {
+    if (!isArrMode) return cuts;
+    return cuts.flatMap((cut) =>
+      mastersToArrAll(cut.atTimeS, arrangementSegments).map((arrT) => ({
+        ...cut,
+        atTimeS: arrT,
+      })),
+    );
+  }, [cuts, isArrMode, arrangementSegments]);
+  const stripFx = useMemo(() => {
+    if (!isArrMode) return fx;
+    const out: typeof fx = [];
+    for (const f of fx) {
+      const slices = sliceByArrSegments(f.inS, f.outS, arrangementSegments);
+      if (slices.length === 0) continue;
+      for (let i = 0; i < slices.length; i++) {
+        out.push({
+          ...f,
+          inS: slices[i].arrStartS,
+          outS: slices[i].arrEndS,
+          // Multi-slice fx need unique React keys downstream; the live
+          // recording case is always single-slice so the original id
+          // stays in liveFxIds for the pulser path.
+          id: slices.length === 1 ? f.id : `${f.id}::${i}`,
+        });
+      }
+    }
+    return out;
+  }, [fx, isArrMode, arrangementSegments]);
+  const stripDuration = isArrMode ? arrTotal : duration;
 
   // ---- Active-cam status per lane (drives LED color) ----
   const camStatusByCamId = useMemo(() => {
@@ -447,32 +564,59 @@ export function Timeline({
     ctx.fillStyle = "#E8E1D0"; // paper-deep
     ctx.fillRect(0, 0, canvasWidth, canvasH);
 
-    // Per-video-lane: thumbnails + clip pill.
+    // Per-video-lane: thumbnails + pills. Pills are the editing surface
+    // in every mode — single-take jobs render exactly one pill per cam
+    // (covering the clipRange), arrangement jobs render one per
+    // (cam × arrangement-item).
     for (let i = 0; i < clips.length; i++) {
       const clip = clips[i];
       const band = videoBands[i];
+      const range = clipRangeS(clip);
+      const lanePills = pills
+        .filter((p) => p.camId === clip.id)
+        .slice()
+        .sort((a, b) => a.arrStartS - b.arrStartS);
+      const drift = isVideoClip(clip) ? clip.driftRatio : 1;
+      const slices: ClipPillSlice[] = lanePills.map((p) => {
+        // Source-time range projected back into master-time so the
+        // existing thumb sampler (which maps strip pixels via
+        // clipRange) keeps working without a rewrite.
+        const masterStartS = range.anchorS + p.sourceInS / drift;
+        const masterEndS = range.anchorS + p.sourceOutS / drift;
+        return {
+          masterStartS,
+          masterEndS,
+          xStart: ((p.arrStartS - viewStart) / visibleDur) * canvasWidth,
+          xEnd: ((p.arrEndS - viewStart) / visibleDur) * canvasWidth,
+        };
+      });
+      const pillIds: (string | null)[] = lanePills.map((p) => p.id);
+      const selectedSlice = lanePills.map((p) => p.id === selectedPillId);
+      const dirtySlice = lanePills.map(isPillDirty);
       drawVideoLane({
         ctx,
         clip,
         bandTop: band.top,
         bandH: videoLaneHeight,
         canvasWidth,
-        viewStart,
-        visibleDur,
+        slices,
+        pillIds,
+        selectedPerSlice: selectedSlice,
+        dirtyPerSlice: dirtySlice,
         img: camImagesRef.current.get(clip.id) ?? null,
         aspect: cams[clip.id]?.aspect ?? 16 / 9,
-        selected: clip.id === selectedClipId,
       });
-      // Match-point markers: vertical ticks at each candidate's implied
-      // start position. Highlighted in MATCH mode; subtle otherwise so the
-      // user can see all alternatives the matcher considered.
+      // Match-point candidate ticks — drawn ALWAYS (subtly when not in
+      // MATCH snap-mode, emphasised when MATCH is active) so the user
+      // can read the cam's alignment options at a glance regardless of
+      // the active snap-mode, matching the pre-refactor behaviour.
+      // Image clips early-out inside drawMatchMarkers.
       drawMatchMarkers({
         ctx,
         clip,
         bandTop: band.top,
         bandH: videoLaneHeight,
-        viewStart,
-        visibleDur,
+        tToX,
         canvasWidth,
         emphasized: snapMode === "match",
       });
@@ -499,94 +643,145 @@ export function Timeline({
     ctx.fillStyle = "#DDD4BE"; // paper-panel
     ctx.fillRect(0, audioBand.top, audioRightX, audioLaneHeight);
 
-    // Audio waveform — same logic as before.
+    // Audio waveform.
+    //   Direct-mode: walk peaks linearly across [viewStart, viewEnd] in
+    //     master-time. Same as before.
+    //   Arrangement-mode: walk peaks per segment. The arr-time X axis is
+    //     piece-wise-linear over master-time, so a single linear walk
+    //     would smear discontinuous master regions onto each other. For
+    //     each segment we slice the peaks-range corresponding to its
+    //     master span and project onto the segment's arr window.
     if (peaks.length > 0 && audioDuration > 0) {
       const wfMid = audioBand.top + audioLaneHeight / 2;
       const peaksPerSec = peaks.length / audioDuration;
-      const startIdx = Math.max(0, Math.floor(viewStart * peaksPerSec));
-      const endIdx = Math.min(peaks.length, Math.ceil(viewEnd * peaksPerSec));
       ctx.fillStyle = "#5C544A";
-      let prevX = -1;
-      let colMin = 0;
-      let colMax = 0;
-      for (let i = startIdx; i < endIdx; i++) {
-        const t = i / peaksPerSec;
-        const x = Math.round(tToX(t));
-        const [mn, mx] = peaks[i];
-        if (x !== prevX) {
-          if (prevX >= 0) {
-            const yMax = wfMid - (Math.max(0, colMax) * audioLaneHeight) / 2;
-            const yMin = wfMid + (Math.max(0, -colMin) * audioLaneHeight) / 2;
-            ctx.fillRect(prevX, yMax, 1, Math.max(1, yMin - yMax));
+
+      const drawColumns = (
+        startIdx: number,
+        endIdx: number,
+        peakIdxToX: (i: number) => number,
+      ) => {
+        let prevX = -1;
+        let colMin = 0;
+        let colMax = 0;
+        for (let i = startIdx; i < endIdx; i++) {
+          const x = Math.round(peakIdxToX(i));
+          const [mn, mx] = peaks[i];
+          if (x !== prevX) {
+            if (prevX >= 0) {
+              const yMax = wfMid - (Math.max(0, colMax) * audioLaneHeight) / 2;
+              const yMin = wfMid + (Math.max(0, -colMin) * audioLaneHeight) / 2;
+              ctx.fillRect(prevX, yMax, 1, Math.max(1, yMin - yMax));
+            }
+            prevX = x;
+            colMin = mn;
+            colMax = mx;
+          } else {
+            if (mn < colMin) colMin = mn;
+            if (mx > colMax) colMax = mx;
           }
-          prevX = x;
-          colMin = mn;
-          colMax = mx;
-        } else {
-          if (mn < colMin) colMin = mn;
-          if (mx > colMax) colMax = mx;
+        }
+        if (prevX >= 0) {
+          const yMax = wfMid - (Math.max(0, colMax) * audioLaneHeight) / 2;
+          const yMin = wfMid + (Math.max(0, -colMin) * audioLaneHeight) / 2;
+          ctx.fillRect(prevX, yMax, 1, Math.max(1, yMin - yMax));
+        }
+      };
+
+      if (!isArrMode) {
+        const startIdx = Math.max(0, Math.floor(viewStart * peaksPerSec));
+        const endIdx = Math.min(peaks.length, Math.ceil(viewEnd * peaksPerSec));
+        drawColumns(startIdx, endIdx, (i) => tToX(i / peaksPerSec));
+      } else {
+        const arrStarts = segmentArrStarts(arrangementSegments);
+        for (let segIdx = 0; segIdx < arrangementSegments.length; segIdx++) {
+          const seg = arrangementSegments[segIdx];
+          const segArrIn = arrStarts[segIdx];
+          const segArrOut = segArrIn + Math.max(0, seg.out - seg.in);
+          // Skip segments entirely outside the visible arr window.
+          if (segArrOut < viewStart || segArrIn > viewEnd) continue;
+          const startIdx = Math.max(0, Math.floor(seg.in * peaksPerSec));
+          const endIdx = Math.min(peaks.length, Math.ceil(seg.out * peaksPerSec));
+          drawColumns(startIdx, endIdx, (i) => {
+            const masterT = i / peaksPerSec;
+            const arrT = segArrIn + (masterT - seg.in);
+            return arrTToX(arrT);
+          });
         }
       }
-      if (prevX >= 0) {
-        const yMax = wfMid - (Math.max(0, colMax) * audioLaneHeight) / 2;
-        const yMin = wfMid + (Math.max(0, -colMin) * audioLaneHeight) / 2;
-        ctx.fillRect(prevX, yMax, 1, Math.max(1, yMin - yMax));
+    }
+
+    // Trim dim, loop band, audio-start marker, trim handles —
+    // direct-mode-only chrome. In arrangement-mode the playable region
+    // IS the visible region, so trim/loop are unused and the audio-start
+    // marker is a triage concern. Splice marks at every segment seam
+    // replace the dimming so the user sees where the audio walker hops.
+    if (!isArrMode) {
+      const xIn = tToX(trim.in);
+      const xOut = tToX(trim.out);
+      ctx.fillStyle = "rgba(232,225,208,0.78)";
+      if (xIn > 0) ctx.fillRect(0, audioBand.top, xIn, audioLaneHeight);
+      if (xOut < audioRightX)
+        ctx.fillRect(xOut, audioBand.top, audioRightX - xOut, audioLaneHeight);
+
+      if (loop) {
+        const xs = tToX(loop.start);
+        const xe = tToX(loop.end);
+        ctx.fillStyle = "rgba(255,87,34,0.18)";
+        ctx.fillRect(xs, audioBand.top, Math.max(1, xe - xs), audioLaneHeight);
+        ctx.strokeStyle = "rgba(255,87,34,0.6)";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(
+          xs + 0.5,
+          audioBand.top + 0.5,
+          Math.max(0, xe - xs - 1),
+          audioLaneHeight - 1,
+        );
       }
-    }
 
-    // Trim dim — shading on AUDIO lane only, since trim still refers to the
-    // master-audio render bounds.
-    const xIn = tToX(trim.in);
-    const xOut = tToX(trim.out);
-    ctx.fillStyle = "rgba(232,225,208,0.78)";
-    if (xIn > 0) ctx.fillRect(0, audioBand.top, xIn, audioLaneHeight);
-    if (xOut < audioRightX)
-      ctx.fillRect(xOut, audioBand.top, audioRightX - xOut, audioLaneHeight);
-
-    // Loop band on audio lane.
-    if (loop) {
-      const xs = tToX(loop.start);
-      const xe = tToX(loop.end);
-      ctx.fillStyle = "rgba(255,87,34,0.18)";
-      ctx.fillRect(xs, audioBand.top, Math.max(1, xe - xs), audioLaneHeight);
-      ctx.strokeStyle = "rgba(255,87,34,0.6)";
-      ctx.lineWidth = 1;
-      ctx.strokeRect(
-        xs + 0.5,
-        audioBand.top + 0.5,
-        Math.max(0, xe - xs - 1),
-        audioLaneHeight - 1,
+      drawHandle(ctx, xIn, audioBand.top, audioLaneHeight);
+      drawHandle(
+        ctx,
+        Math.min(xOut, audioRightX),
+        audioBand.top,
+        audioLaneHeight,
       );
-    }
 
-    // Trim handles on the audio lane (top + bottom brackets). Clamped to
-    // the audio's effective right edge so the rightmost handle doesn't
-    // poke under the vertical fader.
-    drawHandle(ctx, xIn, audioBand.top, audioLaneHeight);
-    drawHandle(
-      ctx,
-      Math.min(xOut, audioRightX),
-      audioBand.top,
-      audioLaneHeight,
-    );
-
-    // Audio-start marker (corrected position). Shown when the analyzer
-    // detected a silent intro OR the user nudged the start manually.
-    const rawAudioStartS = jobMeta?.audioStartS ?? 0;
-    const audioNudgeS = jobMeta?.audioStartNudgeS ?? 0;
-    if (rawAudioStartS > 0 || audioNudgeS !== 0) {
-      const xMark = tToX(rawAudioStartS + audioNudgeS);
-      if (xMark >= 0 && xMark <= audioRightX) {
-        ctx.fillStyle = "rgba(255,107,0,0.85)";
-        ctx.fillRect(Math.floor(xMark), audioBand.top, 1, audioLaneHeight);
-        // Small triangle flag at the top so the marker reads even when
-        // the playhead overlaps it.
-        ctx.beginPath();
-        ctx.moveTo(xMark, audioBand.top);
-        ctx.lineTo(xMark + 5, audioBand.top);
-        ctx.lineTo(xMark, audioBand.top + 5);
-        ctx.closePath();
-        ctx.fill();
+      const rawAudioStartS = jobMeta?.audioStartS ?? 0;
+      const audioNudgeS = jobMeta?.audioStartNudgeS ?? 0;
+      if (rawAudioStartS > 0 || audioNudgeS !== 0) {
+        const xMark = tToX(rawAudioStartS + audioNudgeS);
+        if (xMark >= 0 && xMark <= audioRightX) {
+          ctx.fillStyle = "rgba(255,107,0,0.85)";
+          ctx.fillRect(Math.floor(xMark), audioBand.top, 1, audioLaneHeight);
+          ctx.beginPath();
+          ctx.moveTo(xMark, audioBand.top);
+          ctx.lineTo(xMark + 5, audioBand.top);
+          ctx.lineTo(xMark, audioBand.top + 5);
+          ctx.closePath();
+          ctx.fill();
+        }
+      }
+    } else {
+      // Arrangement-mode splice marks — hot ticks across the audio band
+      // at every segment seam in arr-time. The user reads them as the
+      // points where the audio walker crossfades to the next chunk.
+      const arrStarts = segmentArrStarts(arrangementSegments);
+      ctx.fillStyle = "rgba(255,87,34,0.55)";
+      for (let i = 0; i < arrangementSegments.length; i++) {
+        const arrIn = arrStarts[i];
+        const segLen = Math.max(
+          0,
+          arrangementSegments[i].out - arrangementSegments[i].in,
+        );
+        const xIn = arrTToX(arrIn);
+        const xOut = arrTToX(arrIn + segLen);
+        if (xIn >= 0 && xIn <= audioRightX) {
+          ctx.fillRect(xIn, audioBand.top, 1, audioLaneHeight);
+        }
+        if (xOut >= 0 && xOut <= audioRightX) {
+          ctx.fillRect(xOut, audioBand.top, 1, audioLaneHeight);
+        }
       }
     }
 
@@ -604,15 +799,21 @@ export function Timeline({
       );
     }
 
-    // Playhead — spans all lanes.
-    const xp = tToX(currentTime);
+    // Playhead — spans all lanes. Snap to a half-pixel column so the
+    // 1.5-px stroke renders crisply on the SAME canvas-x as the
+    // BeatRuler's `Math.floor(x)` bar tick. Without the snap the
+    // sub-pixel smear of an odd-width stroke makes the playhead read
+    // as 1-2 px right of the bar mark even when the time math is exact.
+    const xpFloat = tToX(currentTime);
+    const xp = Math.floor(xpFloat) + 0.5;
     ctx.strokeStyle = "#FF5722";
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     ctx.moveTo(xp, 0);
     ctx.lineTo(xp, canvasH);
     ctx.stroke();
-    // Playhead grip (top).
+    // Playhead grip (top). Use the same snapped x so the triangle
+    // points exactly at the playhead column.
     ctx.fillStyle = "#FF5722";
     ctx.beginPath();
     ctx.moveTo(xp - 6, 0);
@@ -665,6 +866,10 @@ export function Timeline({
     audioDuration,
     trim.in,
     trim.out,
+    arrangementSegments,
+    isArrMode,
+    arrTotal,
+    arrTToX,
     loop,
     currentTime,
     clips,
@@ -688,24 +893,12 @@ export function Timeline({
   ]);
 
   // ---- Hit-testing & drag ----
-  function findClipAt(x: number, y: number): { clip: Clip; band: { top: number; bottom: number } } | null {
-    for (let i = 0; i < clips.length; i++) {
-      const band = videoBands[i];
-      if (y < band.top || y >= band.bottom) continue;
-      const range = clipRangeS(clips[i]);
-      const x1 = tToX(range.startS);
-      const x2 = tToX(range.endS);
-      if (x >= x1 && x <= x2) return { clip: clips[i], band };
-      return null; // hit the lane but missed the pill → no clip selected
-    }
-    return null;
-  }
 
-  /** Lane-only hit-test: returns the clip whose lane band contains `y`,
-   *  regardless of whether the pointer's `x` lands inside the pill. Used
-   *  to make the WHOLE row a selection target so the user can park the
-   *  playhead with a normal click and still send I/O to that clip. */
-  function findLaneAt(y: number): { clip: Clip; band: { top: number; bottom: number } } | null {
+  /** Single source of truth for "which video lane is `y` over". Other
+   *  hit-tests build on this so every Lane-Y-check looks the same. */
+  function videoLaneAt(
+    y: number,
+  ): { clip: Clip; band: { top: number; bottom: number } } | null {
     for (let i = 0; i < clips.length; i++) {
       const band = videoBands[i];
       if (y >= band.top && y < band.bottom) return { clip: clips[i], band };
@@ -713,38 +906,99 @@ export function Timeline({
     return null;
   }
 
-  /** Edge-handle hit-test for clip resizing. Detects whether the pointer
-   *  is on the LEFT or RIGHT edge of a clip's pill (within HANDLE_HIT px).
-   *  Image clips: both edges are draggable. Video clips: trim handles on
-   *  both edges (constrained within the source's full length). */
-  function findClipResizeEdge(
-    x: number,
-    y: number,
-  ): { clip: Clip; edge: "start" | "end"; band: { top: number; bottom: number } } | null {
-    for (let i = 0; i < clips.length; i++) {
-      const c = clips[i];
-      const band = videoBands[i];
-      if (y < band.top || y >= band.bottom) continue;
-      const range = clipRangeS(c);
-      const xStart = tToX(range.startS);
-      const xEnd = tToX(range.endS);
-      // End edge first — when start and end are very close together (a
-      // freshly-trimmed sliver) the user is more likely aiming at the
-      // visible right edge.
-      if (Math.abs(x - xEnd) <= HANDLE_HIT) return { clip: c, edge: "end", band };
-      if (Math.abs(x - xStart) <= HANDLE_HIT) return { clip: c, edge: "start", band };
+  function findClipAt(x: number, y: number): { clip: Clip; band: { top: number; bottom: number } } | null {
+    const lane = videoLaneAt(y);
+    if (!lane) return null;
+    const range = clipRangeS(lane.clip);
+    // Walk the projected slices — direct-mode is one passthrough slice,
+    // arrangement-mode is one per intersected segment. The pointer hits
+    // the clip iff it lands inside any slice's pixel range.
+    const slices = sliceByArrSegments(
+      range.startS,
+      range.endS,
+      isArrMode ? arrangementSegments : [],
+    );
+    for (const s of slices) {
+      const x1 = ((s.arrStartS - viewStart) / visibleDur) * canvasWidth;
+      const x2 = ((s.arrEndS - viewStart) / visibleDur) * canvasWidth;
+      if (x >= x1 && x <= x2) return { clip: lane.clip, band: lane.band };
     }
     return null;
   }
 
+  /** Arr-mode pill hit-test. Returns the pill whose lane + pixel range
+   *  contains the pointer, plus a `zone` indicating whether the cursor
+   *  is on the left edge / right edge / body of the pill. Body hits
+   *  start a pill-move drag; edge hits start a trim drag. Returns null
+   *  for direct-mode (no pills) or when the pointer misses every pill. */
+  function findPillAt(
+    x: number,
+    y: number,
+  ): { pillId: string; zone: "left" | "right" | "body" | "reset" } | null {
+    if (!isArrMode) return null;
+    const lane = videoLaneAt(y);
+    if (!lane) return null;
+    const { clip: laneClip, band } = lane;
+    // Pass 1 — strict body hit. Whatever pill the cursor pixel sits
+    // INSIDE wins, full stop. Reset-button + edge-grip zones live
+    // entirely within that pill's `[x1, x2]` band so they never steal
+    // a click meant for a neighbour's body.
+    for (const p of pills) {
+      if (p.camId !== laneClip.id) continue;
+      const x1 = arrTToX(p.arrStartS);
+      const x2 = arrTToX(p.arrEndS);
+      if (x < x1 || x > x2) continue;
+      // Edge-grip width tapers on tiny pills — without this a 12-px
+      // wide chunk would have NO body zone (HANDLE_HIT * 2 ≥ 12).
+      const grip = Math.min(HANDLE_HIT, Math.max(2, (x2 - x1) / 3));
+      if (isPillDirty(p) && x2 - x1 > 32) {
+        const rb = resetButtonRect(x1, x2, band.top);
+        if (x >= rb.x && x <= rb.x + rb.size && y >= rb.y && y <= rb.y + rb.size) {
+          return { pillId: p.id, zone: "reset" };
+        }
+      }
+      if (x - x1 <= grip) return { pillId: p.id, zone: "left" };
+      if (x2 - x <= grip) return { pillId: p.id, zone: "right" };
+      return { pillId: p.id, zone: "body" };
+    }
+    // Pass 2 — gap hit. Cursor sits in a gap between pills (or just past
+    // the last pill); allow a small `HANDLE_HIT` reach so the user can
+    // still grab a trim-edge that lives just outside the pill body.
+    // Closest edge wins so two adjacent pill edges don't race.
+    let bestPillId: string | null = null;
+    let bestZone: "left" | "right" = "left";
+    let bestDist = HANDLE_HIT;
+    for (const p of pills) {
+      if (p.camId !== laneClip.id) continue;
+      const x1 = arrTToX(p.arrStartS);
+      const x2 = arrTToX(p.arrEndS);
+      const dl = Math.abs(x - x1);
+      const dr = Math.abs(x - x2);
+      if (dl < bestDist) { bestDist = dl; bestPillId = p.id; bestZone = "left"; }
+      if (dr < bestDist) { bestDist = dr; bestPillId = p.id; bestZone = "right"; }
+    }
+    if (bestPillId) return { pillId: bestPillId, zone: bestZone };
+    return null; // hit the lane band but no pill / edge in reach
+  }
+
+
+  /** Lane-only hit-test — alias for `videoLaneAt`. Kept under its
+   *  caller-facing name so the empty-lane click handlers stay readable. */
+  const findLaneAt = videoLaneAt;
+
   function classifyAudioHit(x: number): "trim-in" | "trim-out" | "playhead" | "loop" | null {
     const xp = tToX(currentTime);
-    const xIn = tToX(trim.in);
-    const xOut = tToX(trim.out);
-    if (Math.abs(x - xIn) <= HANDLE_HIT) return "trim-in";
-    if (Math.abs(x - xOut) <= HANDLE_HIT) return "trim-out";
+    // Trim + loop are direct-mode-only chrome; arrangement-mode hides
+    // both, so don't surface their hit zones to the cursor either —
+    // otherwise the user would grab an invisible handle.
+    if (!isArrMode) {
+      const xIn = tToX(trim.in);
+      const xOut = tToX(trim.out);
+      if (Math.abs(x - xIn) <= HANDLE_HIT) return "trim-in";
+      if (Math.abs(x - xOut) <= HANDLE_HIT) return "trim-out";
+    }
     if (Math.abs(x - xp) <= HANDLE_HIT) return "playhead";
-    if (loop) {
+    if (!isArrMode && loop) {
       const xs = tToX(loop.start);
       const xe = tToX(loop.end);
       if (x >= xs && x <= xe) return "loop";
@@ -766,8 +1020,21 @@ export function Timeline({
 
   // Wrap a raw timeline-time through the active snap mode. Shift-hold
   // bypasses snapping (standard NLE-style anti-snap modifier).
+  //
+  // Domain note: callers pass MASTER-time (the canonical clock for
+  // seek/cuts/trim). In arrangement-mode the BeatRuler + `beatPhase`
+  // both live in ARR-time — the canvas axis the user actually sees —
+  // so we project the master-time into arr-time, snap it onto the
+  // visible bar grid, then project back. Without this round-trip the
+  // bar grid and the snap targets sit on different axes and snap=1
+  // visibly lands the playhead between bar marks.
   function snapped(t: number, e: { shiftKey: boolean }, candPositions?: number[]): number {
     if (e.shiftKey || snapMode === "off") return t;
+    if (isArrMode) {
+      const arrT = masterToView(t);
+      const snappedArr = snapTime(arrT, snapMode, buildSnapCtx(candPositions));
+      return viewToMaster(snappedArr);
+    }
     return snapTime(t, snapMode, buildSnapCtx(candPositions));
   }
 
@@ -832,14 +1099,17 @@ export function Timeline({
     // seeking while the user is pinching.
     if (activePointersRef.current.size >= 2) {
       dragRef.current = null;
-      setActiveClipMoveDragId(null);
       const centroid = pointersCentroid();
+      // View-space anchor for pinch-zoom (see wheel-zoom comment).
+      // Master-time would diverge from the canvas axis in arr-mode.
+      const centroidViewT =
+        viewStart + (centroid.x / canvasWidth) * visibleDur;
       gestureRef.current = {
         startDist: pointersDistance() || 1,
         startZoom: zoom,
         startScroll: clampedScroll,
         startCentroidX: centroid.x,
-        startTAtCentroid: xToT(centroid.x),
+        startTAtCentroid: centroidViewT,
         lastCentroidX: centroid.x,
       };
       return;
@@ -855,7 +1125,7 @@ export function Timeline({
         // SyncTuner. Selection is decoupled from the seek/drag so the
         // user can still scrub freely while the panel switches mode.
         setSelectedClipId(MASTER_AUDIO_ID);
-        seek(snapped(tRaw, e));
+        seekFromX(x, snapped(tRaw, e));
         dragRef.current = { kind: "playhead" };
       } else if (k === "trim-in") {
         dragRef.current = { kind: "trim-in" };
@@ -869,64 +1139,96 @@ export function Timeline({
       return;
     }
 
-    // Video lane:
-    //   * Locked (default): click anywhere = scrub the playhead (the
-    //     playhead can be dragged through dense clips without getting
-    //     stuck).
-    //   * Unlocked: click on the right edge of an image clip = resize
-    //     drag (durationS); click on a clip pill = drag-move that clip;
-    //     click on empty area = scrub the playhead. Selection always
-    //     happens.
-    if (!lanesLocked) {
-      const edge = findClipResizeEdge(x, y);
-      if (edge) {
-        setSelectedClipId(edge.clip.id);
-        const range = clipRangeS(edge.clip);
-        if (edge.clip.kind === "image") {
-          dragRef.current = {
-            kind: edge.edge === "end" ? "image-resize-end" : "image-resize-start",
-            camId: edge.clip.id,
-            grabT: tRaw,
-            origDurationS: edge.clip.durationS,
-            origStartOffsetS: edge.clip.startOffsetS,
-          };
-        } else if (isVideoClip(edge.clip)) {
-          dragRef.current = {
-            kind: edge.edge === "end" ? "video-trim-out" : "video-trim-in",
-            camId: edge.clip.id,
-            origStartS: range.startS,
-            origTrimInS: edge.clip.trimInS ?? 0,
-            origTrimOutS:
-              edge.clip.trimOutS ?? edge.clip.sourceDurationS,
-            sourceDurationS: edge.clip.sourceDurationS,
-          };
+    // Video lane interaction model (uniform across job kinds — pills
+    // ARE the editing surface):
+    //   * LOCK ON (default): pill-hits SELECT but don't start a drag —
+    //     the SyncTuner + OptionsPanel still need a target, and the
+    //     reset-button still needs to fire. Empty lane / non-pill
+    //     pixels scrub the playhead.
+    //   * LOCK OFF: pill-edge hits start a trim drag, pill-body hits
+    //     start a move drag; empty lane area still scrubs.
+    {
+      const pillHit = findPillAt(x, y);
+      if (pillHit) {
+        const p = pills.find((pp) => pp.id === pillHit.pillId);
+        if (p) {
+          // Floating ↺ reset-button → revert this pill, no drag.
+          // Allowed regardless of lock state — it's a destructive-revert
+          // action, not an edit gesture.
+          if (pillHit.zone === "reset") {
+            resetPill(p.id);
+            return;
+          }
+          // Selection always works — including under LOCK — so the
+          // user can target this pill in the SyncTuner + OptionsPanel
+          // even when drag is intentionally disabled.
+          setSelectedPillId(p.id);
+          setSelectedClipId(p.camId);
+          if (lanesLocked) {
+            // Lock on → no drag setup. Fall back to a normal scrub
+            // click so the playhead still follows the user's pointer.
+            seekFromX(x, snapped(tRaw, e));
+            dragRef.current = { kind: "playhead" };
+            return;
+          }
+          if (pillHit.zone === "left") {
+            dragRef.current = {
+              kind: "pill-trim-in",
+              pillId: p.id,
+              origArrStartS: p.arrStartS,
+              origArrEndS: p.arrEndS,
+              origSourceInS: p.sourceInS,
+            };
+          } else if (pillHit.zone === "right") {
+            dragRef.current = {
+              kind: "pill-trim-out",
+              pillId: p.id,
+              origArrStartS: p.arrStartS,
+              origArrEndS: p.arrEndS,
+              origSourceOutS: p.sourceOutS,
+            };
+          } else {
+            const arrAtGrab =
+              viewStart + (x / canvasWidth) * visibleDur;
+            // MATCH snap-mode promotes the body-drag from a single
+            // pill move to a CAM-TRACK move: every pill of this
+            // camera shifts in lockstep so the user can align the
+            // whole take against a candidate-implied anchor.
+            if (snapMode === "match") {
+              const origStartsByPillId: Record<string, number> = {};
+              for (const sib of pills) {
+                if (sib.camId === p.camId) {
+                  origStartsByPillId[sib.id] = sib.arrStartS;
+                }
+              }
+              dragRef.current = {
+                kind: "cam-track-move",
+                camId: p.camId,
+                grabArrT: arrAtGrab,
+                origStartsByPillId,
+              };
+            } else {
+              dragRef.current = {
+                kind: "pill-move",
+                pillId: p.id,
+                grabArrT: arrAtGrab,
+                origArrStartS: p.arrStartS,
+              };
+            }
+          }
+          return;
         }
-        return;
       }
     }
+    // No pill grab — fall through. Empty-lane click scrubs playhead +
+    // selects the cam (whichever lane the pointer's y landed in). When
+    // LOCK is on every video-lane click ends here regardless of pill
+    // proximity, which is the "drag through dense lanes" path.
     const hit = findClipAt(x, y);
     if (hit) {
       setSelectedClipId(hit.clip.id);
-      if (!lanesLocked) {
-        const r = clipRangeS(hit.clip);
-        dragRef.current = {
-          kind: "clip-move",
-          camId: hit.clip.id,
-          grabT: tRaw,
-          origStartOffsetS: hit.clip.startOffsetS,
-          // Image clips have no syncOverrideMs; the field is irrelevant
-          // for them but the drag struct keeps a slot to keep the shape stable.
-          origSyncOverrideMs: isVideoClip(hit.clip) ? hit.clip.syncOverrideMs : 0,
-          origStartS: r.startS,
-        };
-        // Freeze the timeline range so pxPerSec stays stable through
-        // the drag.
-        frozenTimelineRangeRef.current = liveTimelineRange;
-        setActiveClipMoveDragId(hit.clip.id);
-      } else {
-        seek(snapped(tRaw, e));
-        dragRef.current = { kind: "playhead" };
-      }
+      seekFromX(x, snapped(tRaw, e));
+      dragRef.current = { kind: "playhead" };
     } else {
       // Empty area inside a video lane → still treat the lane as a
       // selection target so I/O hotkeys (and any per-clip controls) can
@@ -935,7 +1237,11 @@ export function Timeline({
       // lane band.
       const lane = findLaneAt(y);
       setSelectedClipId(lane ? lane.clip.id : null);
-      seek(snapped(tRaw, e));
+      // Click on empty arr-mode lane area also clears the pill selection
+      // — keeps the per-pill toolbar consistent with direct-mode where
+      // empty clicks de-select.
+      if (isArrMode) setSelectedPillId(null);
+      seekFromX(x, snapped(tRaw, e));
       dragRef.current = { kind: "playhead" };
     }
   };
@@ -972,7 +1278,7 @@ export function Timeline({
       // Anchor zoom on the time the centroid was over when the gesture
       // started, then pan so that point follows the centroid (gives a
       // "pin the timeline under your fingers" feel).
-      const newZoom = Math.max(1, Math.min(64, g.startZoom * scale));
+      const newZoom = clamp(g.startZoom * scale, MIN_ZOOM, MAX_ZOOM);
       const newVisible = timelineSpan / newZoom;
       const desiredViewStart = g.startTAtCentroid - (centroid.x / canvasWidth) * newVisible;
       const newScroll = Math.max(
@@ -989,31 +1295,7 @@ export function Timeline({
     const tRaw = Math.max(0, Math.min(duration, xToT(x)));
     const drag = dragRef.current;
     if (drag.kind === "playhead") {
-      seek(snapped(tRaw, e));
-    } else if (drag.kind === "image-resize-end") {
-      // New right edge follows the pointer (snapped to the active grid),
-      // durationS = new-right - startOffsetS.
-      const newRightS = snapped(xToT(x), e);
-      const newDuration = newRightS - drag.origStartOffsetS;
-      setImageClipDuration(drag.camId, newDuration);
-    } else if (drag.kind === "image-resize-start") {
-      // Left edge moves; right edge stays fixed at orig + origDuration.
-      const origRight = drag.origStartOffsetS + drag.origDurationS;
-      const newLeft = Math.min(origRight - 0.1, snapped(xToT(x), e));
-      setClipStartOffset(drag.camId, newLeft);
-      setImageClipDuration(drag.camId, origRight - newLeft);
-    } else if (drag.kind === "video-trim-out") {
-      // New right edge on master timeline → trimOutS = new-right -
-      // (origStartS - origTrimInS) so the un-trimmed startS stays put.
-      const baseStartS = drag.origStartS - drag.origTrimInS;
-      const newRightS = snapped(xToT(x), e);
-      const newTrimOutS = newRightS - baseStartS;
-      setVideoClipTrim(drag.camId, drag.origTrimInS, newTrimOutS);
-    } else if (drag.kind === "video-trim-in") {
-      const baseStartS = drag.origStartS - drag.origTrimInS;
-      const newLeftS = snapped(xToT(x), e);
-      const newTrimInS = newLeftS - baseStartS;
-      setVideoClipTrim(drag.camId, newTrimInS, drag.origTrimOutS);
+      seekFromX(x, snapped(tRaw, e));
     } else if (drag.kind === "trim-in") {
       setTrim({ in: snapped(tRaw, e), out: trim.out });
     } else if (drag.kind === "trim-out") {
@@ -1023,76 +1305,66 @@ export function Timeline({
       const newStartRaw = Math.max(trim.in, Math.min(trim.out - len, tRaw - drag.offset));
       const newStart = snapped(newStartRaw, e);
       setLoop({ start: newStart, end: newStart + len });
-    } else if (drag.kind === "clip-move") {
-      const c = clips.find((cc) => cc.id === drag.camId);
-      if (!c) return;
-      // Pointer's intended new clip-startS, computed from the snapshot
-      // taken at drag-start. Stable through any candidate-switch that
-      // happens mid-drag (which would otherwise jolt algoSyncS and make
-      // middle candidates unreachable).
-      const targetStartS = drag.origStartS + (xToT(x) - drag.grabT);
-
-      // Image clips: drag simply moves the placement offset. No sync
-      // override, no candidate logic — startOffsetS *is* the placement.
-      if (!isVideoClip(c)) {
-        const snappedStart = snapped(targetStartS, e);
-        if (c.startOffsetS !== snappedStart) {
-          setClipStartOffset(drag.camId, snappedStart);
-        }
-        return;
+    } else if (drag.kind === "pill-move") {
+      // Pill body drag — shift arrStartS by the pointer-delta in arr-time.
+      // Source-trim stays put: only the pill's WHEN moves.
+      const arrAtPointer = viewStart + (x / canvasWidth) * visibleDur;
+      let newArrStartS = Math.max(0, drag.origArrStartS + (arrAtPointer - drag.grabArrT));
+      // Edge-to-edge snap to same-cam neighbour pills — whichever edge
+      // (left or right) is closer to a neighbour wins. The store-side
+      // clamp still hard-stops overlap; this just makes the magnetic
+      // feel.
+      const me = pills.find((pp) => pp.id === drag.pillId);
+      if (me) {
+        const len = me.arrEndS - me.arrStartS;
+        const edges = neighbourEdges(pills, me.id, me.camId, "all");
+        const thresholdT = PILL_SNAP_EDGE_PX / Math.max(1, canvasWidth / visibleDur);
+        const snapL = snapToNearest(newArrStartS, edges, thresholdT);
+        const snapR = snapToNearest(newArrStartS + len, edges, thresholdT);
+        const dL = Math.abs(snapL - newArrStartS);
+        const dR = Math.abs(snapR - (newArrStartS + len));
+        newArrStartS = Math.max(0, dL <= dR ? snapL : snapR - len);
       }
-
-      // MATCH mode: always snap to the nearest candidate-implied startS.
-      // No distance threshold — every candidate is a valid lock-target.
-      // Shift bypasses snapping entirely. We use the orig syncOverrideMs
-      // to compute candidate positions, so candidate-switching mid-drag
-      // doesn't shift the math under us.
-      if (snapMode === "match" && !e.shiftKey && c.candidates.length > 0) {
-        type CandPos = { idx: number; startS: number };
-        const positions: CandPos[] = c.candidates
-          .map((cand, idx) => {
-            if (cand.confidence < DEFAULT_MATCH_CONFIDENCE_THRESHOLD) return null;
-            const totalMs = cand.offsetMs + drag.origSyncOverrideMs;
-            return { idx, startS: -totalMs / 1000 };
-          })
-          .filter((p): p is CandPos => p !== null);
-        if (positions.length > 0) {
-          let bestIdx = positions[0].idx;
-          let bestDist = Math.abs(positions[0].startS - targetStartS);
-          for (let i = 1; i < positions.length; i++) {
-            const d = Math.abs(positions[i].startS - targetStartS);
-            if (d < bestDist) {
-              bestDist = d;
-              bestIdx = positions[i].idx;
-            }
-          }
-          if (bestIdx !== c.selectedCandidateIdx) {
-            setSelectedCandidateIdx(drag.camId, bestIdx);
-          }
-          // Keep the user's syncOverrideMs untouched (their fine-tune
-          // applies on top of whichever candidate is chosen). Reset
-          // startOffsetS so the cam sits exactly on the candidate anchor.
-          if (c.syncOverrideMs !== drag.origSyncOverrideMs) {
-            setClipSyncOverride(drag.camId, drag.origSyncOverrideMs);
-          }
-          if (c.startOffsetS !== 0) setClipStartOffset(drag.camId, 0);
-          return;
-        }
+      setPillArrPlacement(drag.pillId, newArrStartS);
+    } else if (drag.kind === "cam-track-move") {
+      // Cam-track move (MATCH snap-mode body drag) — apply the same
+      // arr-delta to every pill of `camId` from its drag-start
+      // snapshot. Each pill keeps its own source-trim; only WHERE on
+      // the song each pill plays moves. Snapshot-based so the math
+      // doesn't cascade as we mutate the store mid-drag.
+      const arrAtPointer = viewStart + (x / canvasWidth) * visibleDur;
+      const deltaArrT = arrAtPointer - drag.grabArrT;
+      for (const [pillId, origStart] of Object.entries(
+        drag.origStartsByPillId,
+      )) {
+        const next = Math.max(0, origStart + deltaArrT);
+        setPillArrPlacement(pillId, next);
       }
-
-      // Non-MATCH (off / grid): mutate syncOverrideMs so the drag is a
-      // *true* sync change. The cam's master-timeline range slides; each
-      // VideoElementPool re-anchors each video.currentTime automatically via the
-      // shared `camSourceTimeS` computation, so the master-audio playhead
-      // doesn't visually jump.
-      const targetSnapped = snapped(targetStartS, e);
-      // startS = -(syncOffsetMs + syncOverrideMs)/1000 + startOffsetS + trimInS
-      // → syncOverrideMs = -1000*(startS - startOffsetS - trimInS) - syncOffsetMs
-      const trimInS = c.trimInS ?? 0;
-      const newSyncOverrideMs =
-        -1000 * (targetSnapped - drag.origStartOffsetS - trimInS) -
-        c.syncOffsetMs;
-      setClipSyncOverride(drag.camId, newSyncOverrideMs);
+    } else if (drag.kind === "pill-trim-in") {
+      // Drag left edge: arr-window narrows from the left + sourceInS
+      // advances by the same delta so the cam still plays in sync
+      // with what's visible inside the pill. Same snap pipeline as
+      // the body-drag — Shift bypasses, Snap modes round to grid /
+      // MATCH candidates, "off" passes through. Plus magnetic snap
+      // onto the previous neighbour's right edge so a trim-in
+      // attaches chunks back-to-back when dragged near the gap.
+      const arrAtPointer = viewStart + (x / canvasWidth) * visibleDur;
+      const me = pills.find((pp) => pp.id === drag.pillId);
+      const thresholdT = PILL_SNAP_EDGE_PX / Math.max(1, canvasWidth / visibleDur);
+      const edgeSnap = me
+        ? snapToNearest(snapped(arrAtPointer, e), neighbourEdges(pills, me.id, me.camId, "ends"), thresholdT)
+        : snapped(arrAtPointer, e);
+      const clamped = clamp(edgeSnap, 0, drag.origArrEndS - PILL_MIN_WINDOW_S);
+      setPillLeftEdgeArrStartS(drag.pillId, clamped);
+    } else if (drag.kind === "pill-trim-out") {
+      const arrAtPointer = viewStart + (x / canvasWidth) * visibleDur;
+      const me = pills.find((pp) => pp.id === drag.pillId);
+      const thresholdT = PILL_SNAP_EDGE_PX / Math.max(1, canvasWidth / visibleDur);
+      const edgeSnap = me
+        ? snapToNearest(snapped(arrAtPointer, e), neighbourEdges(pills, me.id, me.camId, "starts"), thresholdT)
+        : snapped(arrAtPointer, e);
+      const clamped = Math.max(drag.origArrStartS + PILL_MIN_WINDOW_S, edgeSnap);
+      setPillRightEdgeArrEndS(drag.pillId, clamped);
     }
   };
 
@@ -1111,14 +1383,10 @@ export function Timeline({
         // Suppress the lingering single-finger drag — user is winding
         // down a pinch, not starting a scrub.
         dragRef.current = null;
-        setActiveClipMoveDragId(null);
-        frozenTimelineRangeRef.current = null;
       }
       return;
     }
     dragRef.current = null;
-    setActiveClipMoveDragId(null);
-    frozenTimelineRangeRef.current = null;
   };
 
   // Trackpad-aware wheel handling — three exclusive modes:
@@ -1140,17 +1408,22 @@ export function Timeline({
       e.preventDefault();
       const rect = e.currentTarget.getBoundingClientRect();
       const x = e.clientX - rect.left;
-      const tAtCursor = xToT(x);
+      // Anchor in VIEW-space, not master-time. In arr-mode `xToT`
+      // returns master-time (cross-segment), but the zoom math has to
+      // stay inside the linear arr-time axis the canvas is laid out
+      // on — otherwise the next-frame `viewStart` lands somewhere the
+      // scroll-clamp pins to maxScroll. Same fix below for pinch.
+      const viewAtCursor = viewStart + (x / canvasWidth) * visibleDur;
       // Pinch gestures emit small smooth deltas; mouse wheel emits
       // chunky 100+ ones. Scale the factor so the pinch feels natural
       // without making the mouse wheel laggy.
       const intensity = Math.min(1, Math.abs(e.deltaY) / 50);
       const step = 1 + 0.2 * intensity;
       const factor = e.deltaY < 0 ? step : 1 / step;
-      const newZoom = Math.max(1, Math.min(64, zoom * factor));
+      const newZoom = clamp(zoom * factor, MIN_ZOOM, MAX_ZOOM);
       if (newZoom === zoom) return;
       const newVisible = timelineSpan / newZoom;
-      const desiredViewStart = tAtCursor - (x / canvasWidth) * newVisible;
+      const desiredViewStart = viewAtCursor - (x / canvasWidth) * newVisible;
       const newScroll = Math.max(
         0,
         Math.min(timelineSpan - newVisible, desiredViewStart - timelineStartS),
@@ -1228,19 +1501,21 @@ export function Timeline({
       );
     } else {
       // Video lane — over a clip the cursor is `pointer` (clip is selectable
-      // + scrub-draggable). Alt-modifier shows a `move` cursor to hint at
-      // the alternate clip-move drag behavior. Image clips have a resize
-      // affordance on their right edge.
-      if (!lanesLocked && findClipResizeEdge(x, y)) {
-        setHoverCursor("ew-resize");
-        return;
+      // + scrub-draggable). When LOCK is off and the pointer is on a
+      // pill edge, surface a resize cursor; on a pill body, a move
+      // cursor. Empty lane area always reads as the scrub crosshair.
+      if (!lanesLocked) {
+        const pillHover = findPillAt(x, y);
+        if (pillHover) {
+          if (pillHover.zone === "left" || pillHover.zone === "right") {
+            setHoverCursor("ew-resize");
+            return;
+          }
+          setHoverCursor("move");
+          return;
+        }
       }
-      const overClip = findClipAt(x, y);
-      if (overClip) {
-        setHoverCursor(e.altKey ? "move" : "pointer");
-      } else {
-        setHoverCursor("crosshair");
-      }
+      setHoverCursor("crosshair");
     }
   };
 
@@ -1281,12 +1556,12 @@ export function Timeline({
           ]}
         />
         <ActiveMatchReadout
-          camId={activeClipMoveDragId}
+          camId={selectedClipId}
           snapMode={snapMode}
           clips={clips}
         />
-        <div className="sm:ml-auto flex items-center gap-3">
-          <span className="text-[10px] tabular text-ink-3 font-mono">
+        <div className="sm:ml-auto flex items-center gap-2">
+          <span className="text-[10px] tabular text-ink-3 font-mono ml-2">
             {zoomPercent}%
           </span>
           <span className="text-[10px] tabular text-ink-3 font-mono">
@@ -1301,7 +1576,15 @@ export function Timeline({
       </div>
 
       <div className="rounded-md overflow-hidden border border-rule shadow-panel bg-paper-hi-deep">
-        {/* Bar/beat ruler row — bars + beats + subdivisions, click to seek. */}
+        {/* Bar/beat ruler row — always visible. In direct-mode the ruler
+         *  rides on the master-mp3's BPM/phase. In arrangement-mode the
+         *  ruler runs in arr-time and anchors beat 0 on the FIRST
+         *  segment's `audioStartMs` (see selectors/timing.ts), so a
+         *  chunk reordering still puts bar 1 on the first real onset.
+         *  Multi-tempo arrangements (per-chunk BPMs) currently still
+         *  read the global `jobMeta.bpm.value` for the grid step —
+         *  that's an architectural follow-up, not a regression vs
+         *  main. */}
         <div className="flex border-b border-rule">
           <BarsHeader width={HEADER_W} height={26} />
           <div className="flex-1" style={{ width: canvasWidth }}>
@@ -1327,68 +1610,62 @@ export function Timeline({
           </div>
           <div className="flex-1 relative" style={{ width: canvasWidth }}>
             <ProgramStrip
-              cuts={cuts}
+              cuts={stripCuts}
               cams={camLookupsForStrip}
-              duration={duration}
+              duration={stripDuration}
               viewStartS={viewStart}
               viewEndS={viewEnd}
               width={canvasWidth}
-              onRemoveCut={removeCutAt}
+              onRemoveCut={(atTimeS, camId) => {
+                // Strip is in view-space — convert back to master before
+                // mutating the store. removeCutAt resolves the cut by
+                // (master-time, camId), so a single call removes ALL
+                // arr-occurrences of a duplicated chunk's cut at once,
+                // which matches the user's mental model.
+                const masterT = isArrMode ? viewToMaster(atTimeS) : atTimeS;
+                removeCutAt(masterT, camId);
+              }}
               onCutDrag={(fromAtTimeS, camId, rawNewT, ev) => {
                 // Apply the same snap rules as the rest of the timeline:
                 // SHIFT bypasses, MATCH falls through (no candidatePositions
                 // for cut-set), grid modes round to the nearest beat/bar.
-                const snappedT = ev.shiftKey
-                  ? rawNewT
-                  : useEditorStore.getState().snapMasterTime(rawNewT);
-                return useEditorStore
+                const masterFrom = isArrMode
+                  ? viewToMaster(fromAtTimeS)
+                  : fromAtTimeS;
+                const masterTarget = isArrMode
+                  ? viewToMaster(rawNewT)
+                  : rawNewT;
+                const snappedMaster = ev.shiftKey
+                  ? masterTarget
+                  : useEditorStore.getState().snapMasterTime(masterTarget);
+                const landed = useEditorStore
                   .getState()
-                  .moveCut(fromAtTimeS, camId, snappedT);
+                  .moveCut(masterFrom, camId, snappedMaster);
+                return isArrMode ? masterToView(landed) : landed;
               }}
               paintPreview={(() => {
                 if (!holdGesture || !holdGesture.painting) return null;
                 const clip = clips.find((c) => c.id === holdGesture.camId);
                 if (!clip) return null;
                 const idx = clips.findIndex((c) => c.id === clip.id);
+                // Convert master-time hold endpoints into the strip's
+                // active view-space.
+                const fromS = isArrMode
+                  ? masterToView(holdGesture.startS)
+                  : holdGesture.startS;
+                const toS = isArrMode
+                  ? masterToView(currentTime)
+                  : currentTime;
                 return {
-                  fromS: holdGesture.startS,
-                  toS: currentTime,
+                  fromS,
+                  toS,
                   color: clip.color,
                   camLabel: `CAM ${idx + 1}`,
                 };
               })()}
-              matchMarkers={(() => {
-                // Show match markers ONLY while the user is actively
-                // dragging a clip in MATCH mode — they're an interaction
-                // affordance, not a permanent overlay. We render the
-                // markers for that one clip (so candidates from other
-                // cams don't pollute the view).
-                if (snapMode !== "match" || !activeClipMoveDragId) {
-                  return undefined;
-                }
-                const found = clips.find((cc) => cc.id === activeClipMoveDragId);
-                if (!found || !isVideoClip(found)) return undefined;
-                const c = found;
-                if (!c.candidates || c.candidates.length === 0) {
-                  return undefined;
-                }
-                return c.candidates
-                  .filter(
-                    (cand) =>
-                      cand.confidence >= DEFAULT_MATCH_CONFIDENCE_THRESHOLD,
-                  )
-                  .map((cand) => {
-                    const idx = c.candidates.indexOf(cand);
-                    const totalMs = cand.offsetMs + c.syncOverrideMs;
-                    return {
-                      t: -totalMs / 1000,
-                      confidence: cand.confidence,
-                      isPrimary: idx === c.selectedCandidateIdx,
-                    };
-                  });
-              })()}
+              matchMarkers={undefined}
               mode={programStripMode}
-              fx={fx}
+              fx={stripFx}
               liveFxIds={liveFxIds}
               onClearCuts={clearCuts}
               onClearFx={clearAllFx}
@@ -1478,9 +1755,15 @@ export function Timeline({
                   isVideoClip(clip) &&
                   (clip.syncOverrideMs !== 0 ||
                     clip.startOffsetS !== 0 ||
-                    clip.selectedCandidateIdx !== 0)
+                    clip.selectedCandidateIdx !== 0 ||
+                    pills.some(
+                      (p) => p.camId === clip.id && isPillDirty(p),
+                    ))
                 }
-                onReset={() => resetClipAlignment(clip.id)}
+                onReset={() => {
+                  resetClipAlignment(clip.id);
+                  resetPillsForCam(clip.id);
+                }}
                 preparing={preparingCamIds.has(clip.id)}
                 onDelete={() => onDeleteClip?.(clip.id)}
                 height={videoLaneHeight}
@@ -1611,17 +1894,103 @@ export function Timeline({
 
 // ---- helpers ----
 
+/** One sub-pill of a clip — the projection of the clip's master-time
+ *  range onto a single contiguous view-space window. In direct-mode there
+ *  is exactly one such slice per clip; in arrangement-mode there is one
+ *  per intersected segment so the lane reads as N bites of the source
+ *  laid back-to-back along the song timeline. */
+interface ClipPillSlice {
+  /** Pixel range to draw on the canvas. */
+  xStart: number;
+  xEnd: number;
+  /** Master-time range, used to sample thumbnails from the strip. */
+  masterStartS: number;
+  masterEndS: number;
+}
+
+/** Collect the arr-time edges of all same-cam neighbour pills (the
+ *  pill being dragged is excluded). `side` filters which edges count:
+ *  `"starts"` for trim-out (snap to a next pill's left edge),
+ *  `"ends"` for trim-in (snap to a prev pill's right edge), `"all"`
+ *  for a body drag where either edge of the dragged pill can attach
+ *  to either edge of a neighbour. */
+function neighbourEdges(
+  pills: readonly Pill[],
+  myId: string,
+  myCamId: string,
+  side: "all" | "starts" | "ends",
+): number[] {
+  const out: number[] = [];
+  for (const sib of pills) {
+    if (sib.id === myId || sib.camId !== myCamId) continue;
+    if (side !== "ends") out.push(sib.arrStartS);
+    if (side !== "starts") out.push(sib.arrEndS);
+  }
+  return out;
+}
+
+/** Snap `t` to the closest entry in `candidates` within `thresholdT`.
+ *  Returns `t` unchanged when nothing is in reach. Used by all three
+ *  pill-drag edge-snaps; threshold is derived from `PILL_SNAP_EDGE_PX`
+ *  scaled to the live arr-time/px ratio. */
+function snapToNearest(
+  t: number,
+  candidates: readonly number[],
+  thresholdT: number,
+): number {
+  let best = t;
+  let bestDist = thresholdT;
+  for (const c of candidates) {
+    const d = Math.abs(c - t);
+    if (d < bestDist) {
+      bestDist = d;
+      best = c;
+    }
+  }
+  return best;
+}
+
+/** Geometry of the floating ↺ reset button on a dirty pill. Pure
+ *  function — shared between the renderer (drawVideoLane) and the
+ *  hit-test (findPillAt) so the painted glyph and the click area stay
+ *  pixel-aligned. */
+function resetButtonRect(
+  pillX1: number,
+  pillX2: number,
+  bandTop: number,
+): { x: number; y: number; size: number } {
+  const size = 14;
+  const margin = 4;
+  return {
+    x: Math.max(pillX1 + 2, pillX2 - size - margin),
+    y: bandTop + margin,
+    size,
+  };
+}
+
 interface DrawVideoLaneArgs {
   ctx: CanvasRenderingContext2D;
   clip: Clip;
   bandTop: number;
   bandH: number;
   canvasWidth: number;
-  viewStart: number;
-  visibleDur: number;
+  /** Pre-computed pixel + master-time slices. Direct-mode passes a single
+   *  slice covering the whole clipRange; arrangement-mode passes one per
+   *  pill the user has placed for this cam. */
+  slices: ClipPillSlice[];
+  /** Aligned with `slices`. Pill id for arrangement-mode pills (used by
+   *  hit-testing) or null for direct-mode passthrough slices. */
+  pillIds: (string | null)[];
+  /** Aligned with `slices`. True for the slice whose pill matches the
+   *  current `selectedPillId`. Pill-selection is the only canvas
+   *  highlight unit — the cam-level `selectedClipId` drives panel
+   *  routing only and must NOT promote to a lane-wide glow. */
+  selectedPerSlice: boolean[];
+  /** Aligned with `slices`. True when the underlying pill has been
+   *  edited off its baseline; drives the floating ↺ reset-button. */
+  dirtyPerSlice: boolean[];
   img: HTMLImageElement | null;
   aspect: number;
-  selected: boolean;
 }
 
 function drawVideoLane({
@@ -1630,121 +1999,186 @@ function drawVideoLane({
   bandTop,
   bandH,
   canvasWidth,
-  viewStart,
-  visibleDur,
+  slices,
+  pillIds: _pillIds,
+  selectedPerSlice,
+  dirtyPerSlice,
   img,
   aspect,
-  selected,
 }: DrawVideoLaneArgs) {
   // Lane background — paper-deep, same as canvas BG, so video lanes feel
   // continuous and the audio lane reads as the contrasting band below.
   ctx.fillStyle = "#E8E1D0"; // paper-deep
   ctx.fillRect(0, bandTop, canvasWidth, bandH);
 
-  // Clip range on the master timeline.
+  // Clip range on the master timeline — used for thumb sampling so the
+  // strip-image-x mapping stays identical to the direct-mode pre-refactor
+  // baseline (frame-strip covers the visible source span linearly).
   const range = clipRangeS(clip);
-  const xStart = ((range.startS - viewStart) / visibleDur) * canvasWidth;
-  const xEnd = ((range.endS - viewStart) / visibleDur) * canvasWidth;
-  if (xEnd <= 0 || xStart >= canvasWidth) return;
-  const pillX = Math.max(0, xStart);
-  const pillW = Math.min(canvasWidth, xEnd) - pillX;
-  if (pillW <= 0) return;
+  const visibleSpanS = Math.max(1e-6, range.endS - range.startS);
 
-  // Thumbnails — only inside the clip's pill region. Image clips show a
-  // single object-fit:cover preview; video clips show the tiled
-  // frame-strip sampled along the clip's source-time.
-  if (img && img.width > 0 && img.height > 0) {
-    const inset = 4;
-    const drawTop = bandTop + inset;
-    const drawH = bandH - inset * 2;
-    ctx.save();
-    roundRectPath(ctx, pillX, bandTop + 2, pillW, bandH - 4, 6);
-    ctx.clip();
+  for (let sliceIdx = 0; sliceIdx < slices.length; sliceIdx++) {
+    const slice = slices[sliceIdx];
+    const sliceSelected = selectedPerSlice[sliceIdx];
+    if (slice.xEnd <= 0 || slice.xStart >= canvasWidth) continue;
+    const pillX = Math.max(0, slice.xStart);
+    const pillW = Math.min(canvasWidth, slice.xEnd) - pillX;
+    if (pillW <= 0) continue;
 
-    if (clip.kind === "image") {
-      // object-fit: cover — fill the pill, crop the image to fit
-      // the lane height. Repeat horizontally if the pill is wider
-      // than one display copy so a long-duration still doesn't end
-      // up with awkward empty regions.
-      const dispW = drawH * (img.width / img.height);
-      if (dispW > 0) {
-        for (let x = pillX; x < pillX + pillW; x += dispW) {
-          const w = Math.min(dispW, pillX + pillW - x);
+    // Thumbnails — only inside this slice's pill region. Image clips show
+    // a single object-fit:cover preview; video clips show the tiled
+    // frame-strip sampled along the slice's master-time range.
+    if (img && img.width > 0 && img.height > 0) {
+      const inset = 4;
+      const drawTop = bandTop + inset;
+      const drawH = bandH - inset * 2;
+      ctx.save();
+      roundRectPath(ctx, pillX, bandTop + 2, pillW, bandH - 4, 6);
+      ctx.clip();
+
+      if (clip.kind === "image") {
+        // object-fit: cover — fill the pill, crop the image to fit
+        // the lane height. Repeat horizontally if the pill is wider
+        // than one display copy so a long-duration still doesn't end
+        // up with awkward empty regions.
+        const dispW = drawH * (img.width / img.height);
+        if (dispW > 0) {
+          for (let x = pillX; x < pillX + pillW; x += dispW) {
+            const w = Math.min(dispW, pillX + pillW - x);
+            ctx.drawImage(
+              img,
+              0,
+              0,
+              (w / dispW) * img.width,
+              img.height,
+              x,
+              drawTop,
+              w,
+              drawH,
+            );
+          }
+        }
+      } else {
+        const sourceTileW = img.height * aspect;
+        const tilesShown = Math.max(2, Math.round(pillW / TARGET_TILE_W));
+        const tileWDest = pillW / tilesShown;
+        for (let i = 0; i < tilesShown; i++) {
+          const tFrac = (i + 0.5) / tilesShown; // sample mid-tile
+          const tInClip =
+            slice.masterStartS +
+            tFrac * (slice.masterEndS - slice.masterStartS);
+          const sourceFrac = (tInClip - range.startS) / visibleSpanS;
+          const sx = Math.max(
+            0,
+            Math.min(
+              img.width - sourceTileW,
+              sourceFrac * img.width - sourceTileW / 2,
+            ),
+          );
           ctx.drawImage(
             img,
+            sx,
             0,
-            0,
-            (w / dispW) * img.width,
+            sourceTileW,
             img.height,
-            x,
+            pillX + i * tileWDest,
             drawTop,
-            w,
+            tileWDest,
             drawH,
           );
         }
       }
-    } else {
-      const sourceTileW = img.height * aspect;
-      const tilesShown = Math.max(2, Math.round(pillW / TARGET_TILE_W));
-      const tileWDest = pillW / tilesShown;
-      for (let i = 0; i < tilesShown; i++) {
-        const tFrac = (i + 0.5) / tilesShown; // sample mid-tile
-        const tInClip = range.startS + tFrac * (range.endS - range.startS);
-        const sourceFrac = (tInClip - range.startS) / (range.endS - range.startS);
-        const sx = Math.max(0, Math.min(img.width - sourceTileW, sourceFrac * img.width - sourceTileW / 2));
-        ctx.drawImage(
-          img,
-          sx,
-          0,
-          sourceTileW,
-          img.height,
-          pillX + i * tileWDest,
-          drawTop,
-          tileWDest,
-          drawH,
-        );
-      }
+      ctx.restore();
+    }
+
+    // Pill border + cam-color tint overlay (subtle so thumbs stay visible).
+    ctx.save();
+    roundRectPath(
+      ctx,
+      pillX + 0.5,
+      bandTop + 2.5,
+      Math.max(0, pillW - 1),
+      bandH - 5,
+      6,
+    );
+    ctx.fillStyle = hexToRgba(clip.color, 0.1);
+    ctx.fill();
+    ctx.lineWidth = sliceSelected ? 3 : 1;
+    ctx.strokeStyle = sliceSelected ? clip.color : hexToRgba(clip.color, 0.6);
+    ctx.stroke();
+    if (sliceSelected) {
+      // Outer glow — strong, full-alpha cam color so the active pill
+      // is unmistakable against unselected siblings on the same lane.
+      ctx.shadowColor = clip.color;
+      ctx.shadowBlur = 12;
+      ctx.stroke();
+      ctx.stroke();
     }
     ctx.restore();
-  }
 
-  // Pill border + cam-color tint overlay (very subtle so thumbs stay visible).
-  ctx.save();
-  roundRectPath(ctx, pillX + 0.5, bandTop + 2.5, Math.max(0, pillW - 1), bandH - 5, 6);
-  ctx.fillStyle = hexToRgba(clip.color, 0.1);
-  ctx.fill();
-  ctx.lineWidth = selected ? 2 : 1;
-  ctx.strokeStyle = selected ? clip.color : hexToRgba(clip.color, 0.6);
-  ctx.stroke();
-  if (selected) {
-    // Inner glow.
-    ctx.shadowColor = hexToRgba(clip.color, 0.5);
-    ctx.shadowBlur = 6;
-    ctx.stroke();
-  }
-  ctx.restore();
+    // Top color stripe — strong cam-color tab so the lane is identifiable
+    // even when the pill is compressed. Selected pills get a thicker
+    // stripe so the active chunk stands out from its same-cam siblings
+    // even where the body glow gets clipped at the lane edge.
+    ctx.fillStyle = clip.color;
+    ctx.fillRect(pillX, bandTop, pillW, sliceSelected ? 5 : 3);
 
-  // Top color stripe — strong cam-color tab so the lane is identifiable
-  // even when the pill is compressed.
-  ctx.fillStyle = clip.color;
-  ctx.fillRect(pillX, bandTop, pillW, 3);
+    // Resize grips on both edges. Image and video clips both resize in
+    // direct-mode (image: durationS / startOffsetS; video: trim in/out).
+    // Arrangement-mode hides them by passing `selected:false` only when
+    // appropriate — the grips themselves are cheap.
+    if (pillW > 18) {
+      ctx.save();
+      ctx.fillStyle = "rgba(26,24,22,0.55)";
+      const drawGrip = (cx: number) => {
+        const gy = bandTop + bandH * 0.5 - 6;
+        for (let i = 0; i < 3; i++) {
+          ctx.fillRect(cx + i * 2 - 2, gy, 1, 12);
+        }
+      };
+      if (slice.xStart >= 0) drawGrip(Math.max(0, slice.xStart) + 4);
+      if (slice.xEnd <= canvasWidth)
+        drawGrip(Math.min(canvasWidth - 1, slice.xEnd) - 4);
+      ctx.restore();
+    }
 
-  // Resize grips on both edges — three short vertical bars tucked
-  // just inside the pill so the user sees the affordance without
-  // needing to hover for the cursor change. Image and video clips
-  // both resize (image: durationS / startOffsetS; video: trim in/out).
-  if (pillW > 18) {
-    ctx.save();
-    ctx.fillStyle = "rgba(26,24,22,0.55)";
-    const drawGrip = (cx: number) => {
-      const gy = bandTop + bandH * 0.5 - 6;
-      for (let i = 0; i < 3; i++) {
-        ctx.fillRect(cx + i * 2 - 2, gy, 1, 12);
-      }
-    };
-    if (xStart >= 0) drawGrip(Math.max(0, xStart) + 4);
-    if (xEnd <= canvasWidth) drawGrip(Math.min(canvasWidth - 1, xEnd) - 4);
-    ctx.restore();
+    // Floating ↺ reset button — visible on dirty pills (= moved/trimmed
+    // off baseline) when the pill is wide enough to host a 14 px button
+    // without crowding the trim grip. Click is wired in findPillAt
+    // → onPointerDown via `zone === "reset"`.
+    if (dirtyPerSlice[sliceIdx] && pillW > 32) {
+      const rb = resetButtonRect(slice.xStart, slice.xEnd, bandTop);
+      ctx.save();
+      // Paper-bg with sepia rule — matches the lane palette.
+      ctx.fillStyle = "#F2EBD8";
+      ctx.strokeStyle = "rgba(26,24,22,0.45)";
+      ctx.lineWidth = 1;
+      roundRectPath(ctx, rb.x, rb.y, rb.size, rb.size, 3);
+      ctx.fill();
+      ctx.stroke();
+      // ↺ glyph — drawn as an arc with an arrow tip so it reads as
+      // "revert" without depending on a font glyph that may not be
+      // available cross-platform.
+      ctx.strokeStyle = "#1A1816"; // ink
+      ctx.lineWidth = 1.4;
+      ctx.lineCap = "round";
+      const cx = rb.x + rb.size / 2;
+      const cy = rb.y + rb.size / 2;
+      const r = rb.size * 0.32;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, Math.PI * 0.25, Math.PI * 1.85);
+      ctx.stroke();
+      // Arrow head at the open end of the arc (top-right).
+      const ax = cx + r * Math.cos(Math.PI * 0.25);
+      const ay = cy + r * Math.sin(Math.PI * 0.25);
+      ctx.beginPath();
+      ctx.moveTo(ax, ay);
+      ctx.lineTo(ax - 3, ay - 1);
+      ctx.moveTo(ax, ay);
+      ctx.lineTo(ax + 1, ay + 3);
+      ctx.stroke();
+      ctx.restore();
+    }
   }
 }
 
@@ -1889,29 +2323,30 @@ function hexToRgba(hex: string, alpha: number): string {
   return `rgba(${r},${g},${b},${alpha})`;
 }
 
+
 interface DrawMatchMarkersArgs {
   ctx: CanvasRenderingContext2D;
   clip: Clip;
   bandTop: number;
   bandH: number;
-  viewStart: number;
-  visibleDur: number;
+  tToX: (masterT: number) => number;
   canvasWidth: number;
   emphasized: boolean;
 }
 
-/** Render small ticks at each candidate-implied start position. The
- *  active candidate is rendered as a chunky filled triangle, alternates
- *  as thinner ticks fading out with confidence. In MATCH mode the alts
- *  brighten so the user can aim at them while dragging. Image clips have
- *  no candidates → early-out. */
+/** Render small ticks at each candidate-implied cam-master-anchor. The
+ *  active candidate (= clip.selectedCandidateIdx) is rendered as a
+ *  chunky filled triangle, alternates as thinner ticks fading out with
+ *  confidence. Visible when MATCH snap-mode is on (or a MATCH drag is
+ *  in progress), so the user can read the cam's alignment options at
+ *  a glance and snap a track-nudge drag onto a candidate. Image clips
+ *  have no candidates → early-out. */
 function drawMatchMarkers({
   ctx,
   clip,
   bandTop,
   bandH,
-  viewStart,
-  visibleDur,
+  tToX,
   canvasWidth,
   emphasized,
 }: DrawMatchMarkersArgs) {
@@ -1920,13 +2355,13 @@ function drawMatchMarkers({
   ctx.save();
   for (let i = 0; i < clip.candidates.length; i++) {
     const c = clip.candidates[i];
+    // The candidate's master-time anchor: the spot on the master
+    // timeline where the cam's source-time 0 would sit if this
+    // candidate's offset were the active one. Adding the user's
+    // current syncOverrideMs lets the markers track the live nudge.
     const totalMs = c.offsetMs + clip.syncOverrideMs;
-    // Match position is fixed in master-timeline space: the absolute spot
-    // where master audio correlates with cam audio. Do NOT add startOffsetS
-    // — that would make markers slide with the lane drag and lose their
-    // meaning (the user couldn't snap a dragged lane onto its match point).
     const startS = -totalMs / 1000;
-    const x = ((startS - viewStart) / visibleDur) * canvasWidth;
+    const x = tToX(startS);
     if (x < -8 || x > canvasWidth + 8) continue;
     const isPrimary = i === clip.selectedCandidateIdx;
     const conf = Math.max(0, Math.min(1, c.confidence));
@@ -1937,7 +2372,6 @@ function drawMatchMarkers({
     ctx.fillStyle = `rgba(255,87,34,${opacity})`; // hot
     ctx.fillRect(Math.floor(x), bandTop + 2, tickW, tickH);
     if (isPrimary) {
-      // Filled inverted triangle on top to mark the active alignment.
       ctx.beginPath();
       ctx.moveTo(x - 4, bandTop);
       ctx.lineTo(x + 4, bandTop);

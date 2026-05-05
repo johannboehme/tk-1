@@ -9,6 +9,7 @@ import {
   jobsDb,
   type LocalJob,
 } from "../local/jobs";
+import { useRenderOp } from "../local/ops-store";
 
 const STAGE_LABELS: Record<string, string> = {
   "render-prep": "Preparing",
@@ -49,6 +50,7 @@ export default function RenderScreen() {
   // the last 8 and pick the trend over that window.
   const samplesRef = useRef<Array<{ t: number; pct: number }>>([]);
   const [eta, setEta] = useState<number | null>(null);
+  const op = useRenderOp(id);
 
   useEffect(() => {
     if (!id) return;
@@ -71,9 +73,9 @@ export default function RenderScreen() {
   // Update ETA whenever progress changes. We only sample during the
   // encoding phase — the prep stages are too fast to be meaningful.
   useEffect(() => {
-    if (!job || job.progress.stage !== "encoding") return;
+    if (!op || op.stage !== "encoding") return;
     const elapsed = Date.now() - startedAtRef.current;
-    const pct = job.progress.pct;
+    const pct = op.pct;
     if (pct < 26) return; // skip the initial step from 25 → first frame
     const samples = samplesRef.current;
     samples.push({ t: elapsed, pct });
@@ -86,17 +88,15 @@ export default function RenderScreen() {
     const msPerPct = (last.t - first.t) / dPct;
     const remaining = (90 - last.pct) * msPerPct;
     setEta(remaining / 1000);
-  }, [job?.progress.pct, job?.progress.stage, job]);
+  }, [op?.pct, op?.stage, op]);
 
   // Auto-navigate when the render finishes. We give the success path a
   // brief moment so the user sees "Done" before the page swaps.
   useEffect(() => {
-    if (!job) return;
-    if (job.status === "rendered") {
-      const t = window.setTimeout(() => navigate(`/job/${id}`), 600);
-      return () => window.clearTimeout(t);
-    }
-  }, [job?.status, id, navigate, job]);
+    if (!op?.done) return;
+    const t = window.setTimeout(() => navigate(`/job/${id}`), 600);
+    return () => window.clearTimeout(t);
+  }, [op?.done, id, navigate]);
 
   async function onCancel() {
     if (!id || cancelling) return;
@@ -108,13 +108,13 @@ export default function RenderScreen() {
     }
   }
 
-  const pct = job?.progress.pct ?? 0;
-  const stage = job?.progress.stage ?? "render-prep";
-  const framesDone = job?.progress.framesDone;
-  const framesTotal = job?.progress.framesTotal;
-  const isFailed = job?.status === "failed";
-  const isDone = job?.status === "rendered";
-  const isCancelled = isFailed && job?.error === "cancelled";
+  const pct = op?.pct ?? 0;
+  const stage = op?.stage ?? "render-prep";
+  const framesDone = op?.framesDone;
+  const framesTotal = op?.framesTotal;
+  const isCancelled = op?.error === "cancelled";
+  const isFailed = Boolean(op?.error) && !isCancelled;
+  const isDone = op?.done === true;
 
   const headline = useMemo(() => {
     if (isDone) return "Render done";
@@ -178,14 +178,14 @@ export default function RenderScreen() {
           </section>
         )}
 
-        {isFailed && (
+        {(isFailed || isCancelled) && (
           <section className="border-l-2 border-danger pl-3 py-2 font-mono text-sm text-danger">
-            {isCancelled ? "Render was cancelled." : (job?.error ?? "Unknown error.")}
+            {isCancelled ? "Render was cancelled." : (op?.error ?? "Unknown error.")}
           </section>
         )}
 
         <div className="flex flex-wrap gap-3">
-          {!isDone && !isFailed && (
+          {!isDone && !isFailed && !isCancelled && (
             <ChunkyButton
               variant="ghost"
               size="lg"
@@ -195,7 +195,7 @@ export default function RenderScreen() {
               {cancelling ? "Cancelling…" : "Cancel render"}
             </ChunkyButton>
           )}
-          {isFailed && (
+          {(isFailed || isCancelled) && (
             <ChunkyButton
               variant="secondary"
               size="lg"

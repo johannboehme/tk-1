@@ -290,3 +290,191 @@ export async function encodeAacFromPcm(
 ): Promise<AudioEncodeResult> {
   return encodeAudioFromPcm(pcm, { ...opts, codec: "aac" });
 }
+
+export interface StreamEncodeAudioOptions {
+  numberOfChannels: number;
+  sampleRate: number;
+  bitrateBps?: number;
+  frameSize?: number;
+  codec?: AudioEncodeCodec;
+  /** Called for each encoded chunk as it's produced. The encoder does
+   *  NOT retain chunks internally — push them straight into a muxer.
+   *  `description` is provided once the first chunk's metadata arrives;
+   *  subsequent calls pass the same value. */
+  onChunk: (chunk: EncodedAudioChunkRecord, description?: Uint8Array) => void;
+}
+
+export interface StreamEncodeAudioResult {
+  /** Codec string (e.g. "mp4a.40.2" for AAC). */
+  codec: string;
+  /** Container codec key consumed by mp4-muxer. */
+  muxerCodec: "aac" | "opus";
+  sampleRate: number;
+  numberOfChannels: number;
+  description: Uint8Array;
+}
+
+/**
+ * Stream-encode interleaved PCM into the chosen codec, applying segment
+ * trims inline. Each encoded chunk is pushed through `onChunk` — the
+ * encoder does NOT accumulate chunks, so RAM stays constant regardless
+ * of audio length.
+ *
+ * Segments are applied at sample granularity: the kept ranges are
+ * concatenated into a single output stream with monotone timestamps
+ * (= same semantics as `applySegments` + a regular encode, but no
+ * intermediate trimmed PCM array allocated).
+ *
+ * No fallback: the requested codec must be supported. The legacy
+ * `encodeAudioFromPcm` keeps its try-then-fallback for callers that
+ * need it.
+ */
+export async function streamEncodeAudioWithSegments(
+  pcm: Float32Array,
+  segments: { in: number; out: number }[],
+  opts: StreamEncodeAudioOptions,
+): Promise<StreamEncodeAudioResult> {
+  const codec = opts.codec ?? "aac";
+  const codecString = CODEC_STRING[codec];
+  const numberOfChannels = opts.numberOfChannels;
+  const sampleRate = opts.sampleRate;
+  const bitrateBps = opts.bitrateBps ?? 192_000;
+  const frameSize = opts.frameSize ?? (codec === "opus" ? 960 : 1024);
+
+  if (
+    !(await isAudioCodecSupported(codec, sampleRate, numberOfChannels, bitrateBps))
+  ) {
+    throw new Error(
+      `AudioEncoder.isConfigSupported returned false for ` +
+        `${codecString} ${sampleRate}Hz/${numberOfChannels}ch.`,
+    );
+  }
+
+  let description: Uint8Array | undefined;
+  let captured: Error | null = null;
+  let chunkCount = 0;
+
+  const encoder = new AudioEncoder({
+    output: (chunk, metadata) => {
+      if (description === undefined && metadata?.decoderConfig?.description) {
+        const desc = metadata.decoderConfig.description as
+          | ArrayBuffer
+          | ArrayBufferView;
+        if (desc instanceof ArrayBuffer) {
+          description = new Uint8Array(desc);
+        } else {
+          const view = desc as ArrayBufferView;
+          description = new Uint8Array(
+            view.buffer as ArrayBuffer,
+            view.byteOffset,
+            view.byteLength,
+          );
+        }
+      }
+      const data = new Uint8Array(chunk.byteLength);
+      chunk.copyTo(data);
+      opts.onChunk(
+        {
+          type: chunk.type as "key" | "delta",
+          timestampUs: chunk.timestamp,
+          durationUs: chunk.duration ?? 0,
+          data,
+        },
+        description,
+      );
+      chunkCount++;
+    },
+    error: (e) => {
+      captured = e instanceof Error ? e : new Error(String(e));
+    },
+  });
+
+  try {
+    encoder.configure({
+      codec: codecString,
+      sampleRate,
+      numberOfChannels,
+      bitrate: bitrateBps,
+    });
+  } catch (e) {
+    encoder.close();
+    throw new Error(
+      `AudioEncoder.configure(${codecString}) threw: ${(e as Error).message}`,
+    );
+  }
+
+  // Walk segments inline. Output timestamp is the cumulative output
+  // sample index — segments are concatenated so the second segment's
+  // first sample lands right after the first segment's last sample.
+  const totalSrcFrames = Math.floor(pcm.length / numberOfChannels);
+  const segs =
+    segments.length > 0
+      ? segments
+      : [{ in: 0, out: totalSrcFrames / sampleRate }];
+  let outputFrameIdx = 0;
+  try {
+    for (const seg of segs) {
+      const segStartFrame = Math.max(0, Math.floor(seg.in * sampleRate));
+      const segEndFrame = Math.min(totalSrcFrames, Math.floor(seg.out * sampleRate));
+      let cursor = segStartFrame;
+      while (cursor < segEndFrame) {
+        const frameEnd = Math.min(cursor + frameSize, segEndFrame);
+        const frameLen = frameEnd - cursor;
+        // Per-AudioData buffer is bounded: frameSize * channels * 4 bytes
+        // ≈ 8 KB at 1024 frames stereo. Constant, regardless of audio
+        // length — the goal of streaming.
+        const data = new Float32Array(frameLen * numberOfChannels);
+        data.set(
+          pcm.subarray(
+            cursor * numberOfChannels,
+            frameEnd * numberOfChannels,
+          ),
+        );
+        const audioData = new AudioData({
+          format: "f32",
+          sampleRate,
+          numberOfFrames: frameLen,
+          numberOfChannels,
+          timestamp: Math.round((outputFrameIdx / sampleRate) * 1_000_000),
+          data,
+        });
+        encoder.encode(audioData);
+        audioData.close();
+        outputFrameIdx += frameLen;
+        cursor = frameEnd;
+      }
+    }
+    await encoder.flush();
+  } catch (e) {
+    encoder.close();
+    throw new Error(
+      `AudioEncoder.flush(${codecString}) threw: ${(e as Error).message}`,
+    );
+  }
+  encoder.close();
+
+  if (captured) {
+    throw new Error(
+      `AudioEncoder ${codecString} failed mid-stream: ${(captured as Error).message}`,
+    );
+  }
+  if (chunkCount === 0) {
+    throw new Error(
+      `AudioEncoder ${codecString} produced 0 chunks for ${pcm.length} PCM ` +
+        `samples (sr=${sampleRate}, ch=${numberOfChannels}).`,
+    );
+  }
+  if (!description) {
+    throw new Error(
+      `AudioEncoder ${codecString} produced no decoder description.`,
+    );
+  }
+
+  return {
+    codec: codecString,
+    muxerCodec: codec,
+    sampleRate,
+    numberOfChannels,
+    description,
+  };
+}

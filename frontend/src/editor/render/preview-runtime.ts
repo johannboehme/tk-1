@@ -556,6 +556,8 @@ function defaultReadSnapshot(): EditorStoreSnapshot {
     selectedFxKind: s.selectedFxKind,
     fxDefaults: s.fxDefaults,
     fxEnvelopes: s.fxEnvelopes,
+    pills: s.pills,
+    arrangementSegments: s.arrangementSegments,
   };
 }
 

@@ -30,6 +30,7 @@ import {
 type MuxTarget = ArrayBufferTarget | FileSystemWritableFileStreamTarget;
 import {
   encodeAudioFromPcm,
+  streamEncodeAudioWithSegments,
   type AudioEncodeCodec,
 } from "../codec/webcodecs/audio-encode";
 import { demuxVideoTrack } from "../codec/webcodecs/demux";
@@ -47,6 +48,7 @@ import type { BackendCapabilities } from "../../editor/render/factory";
 import { CamFrameStream } from "./cam-frame-stream";
 import { makeTestPatternCanvas } from "./test-pattern";
 import { activeCamAt } from "../../editor/cuts";
+import { activeCamAtArr as activeCamAtArrLocal } from "../../editor/arrangement-pills";
 import type { Cut } from "../../storage/jobs-db";
 import type { PunchFx } from "../../editor/fx/types";
 import type { TextOverlay, EnergyCurves } from "./ass-builder";
@@ -355,7 +357,15 @@ export async function editRender(input: EditRenderInput): Promise<EditRenderResu
       });
     },
     error: (e) => {
-      pendingError = e instanceof Error ? e : new Error(String(e));
+      // The native VideoDecoder error message is just "Decoding error".
+      // Wrap it with the codec + dims so the user has at least a
+      // breadcrumb when render fails partway through.
+      const orig = e instanceof Error ? e.message : String(e);
+      pendingError = new Error(
+        `Render decode failed (codec ${video.info.codec}, ` +
+          `${video.info.width}×${video.info.height}, ` +
+          `${framesEmitted} frames emitted): ${orig}`,
+      );
     },
   });
   decoder.configure({
@@ -533,6 +543,18 @@ export interface MultiCamRenderInput
    * minus segment trims.
    */
   masterDurationS?: number;
+  /**
+   * Long-form arrangement-mode pills. When present (and `segments` is
+   * non-empty), the renderer composes video by walking pills in arr-time
+   * order instead of using the cams' contiguous master ranges directly.
+   * Each pill defines (camId, sourceIn/Out in cam-time, arr-time
+   * placement on the song); the active pill at song-time `tArr` is
+   * chosen via `activeCamAtArr` (mirroring the editor preview).
+   *
+   * Direct-mode jobs leave this empty and fall back to the legacy
+   * `activeCamAt` resolver against `camRanges`.
+   */
+  pills?: import("../../editor/types").Pill[];
 }
 
 /**
@@ -650,7 +672,7 @@ export async function editRenderMulti(
   // like correct alignment in the preview ended up several seconds out
   // in the export.
   input.onProgress?.({ stage: "audio-decode", framesDone: 0, framesTotal: 0 });
-  let audio: { pcm: Float32Array; sampleRate: number; channels: number };
+  let audio: { pcm: Float32Array; sampleRate: number; channels: number } | null;
   if (input.audioPcm) {
     audio = input.audioPcm;
   } else if (input.audioFile) {
@@ -658,21 +680,9 @@ export async function editRenderMulti(
   } else {
     throw new Error("editRenderMulti: either audioFile or audioPcm is required");
   }
-  let pcm: Float32Array | null = audio.pcm;
-  pcm = applySegments(pcm, audio.channels, audio.sampleRate, input.segments);
-
-  input.onProgress?.({ stage: "audio-encode", framesDone: 0, framesTotal: 0 });
   const audioCodec: AudioEncodeCodec = input.audioCodec ?? "aac";
-  const encodedAudio = await encodeAudioFromPcm(pcm, {
-    numberOfChannels: audio.channels,
-    sampleRate: audio.sampleRate,
-    bitrateBps: input.audioBitrateBps ?? 192_000,
-    codec: audioCodec,
-  });
-  if (!encodedAudio.description) {
-    throw new Error("Audio encoder produced no description");
-  }
-  pcm = null;
+  const audioSampleRate = audio.sampleRate;
+  const audioChannels = audio.channels;
 
   // Cam ranges on the master timeline + a test-pattern source for gaps.
   // Per-clip trim (video cams only) narrows the available window; image
@@ -719,12 +729,99 @@ export async function editRenderMulti(
   );
   await compositor.ensureSubtitleEngine();
 
+  // Construct the muxer EARLY so both the audio and video encoders can
+  // stream chunks straight in instead of buffering them in RAM until
+  // finish(). For a 30-min 4K + stereo 48k render the previous batch
+  // path accumulated multi-GB of encoded bytes (incl. ~1.4 GB audio
+  // PCM); streaming keeps RAM constant in render duration.
+  const target: MuxTarget = input.output
+    ? new FileSystemWritableFileStreamTarget(input.output)
+    : new ArrayBufferTarget();
+  const muxerVideoCodecKey: "avc" | "hevc" = videoCodec === "h265" ? "hevc" : "avc";
+  const muxer = new Muxer({
+    target,
+    video: {
+      codec: muxerVideoCodecKey,
+      width: outputWidth,
+      height: outputHeight,
+      frameRate: fps,
+    },
+    audio: {
+      codec: audioCodec,
+      numberOfChannels: audioChannels,
+      sampleRate: audioSampleRate,
+    },
+    fastStart: input.output ? false : "in-memory",
+    firstTimestampBehavior: "offset",
+  });
+
+  // Stream-encode audio: walks segments inline, emits encoded chunks,
+  // each pushed straight into the muxer. No intermediate trimmed-PCM
+  // buffer; no chunks accumulator. After this returns the input PCM
+  // can be released to GC.
+  input.onProgress?.({ stage: "audio-encode", framesDone: 0, framesTotal: 0 });
+  const audioCodecString = audioCodec === "opus" ? "opus" : "mp4a.40.2";
+  let audioMeta: Parameters<Muxer<MuxTarget>["addAudioChunkRaw"]>[4] | undefined;
+  await streamEncodeAudioWithSegments(audio.pcm, input.segments, {
+    numberOfChannels: audioChannels,
+    sampleRate: audioSampleRate,
+    bitrateBps: input.audioBitrateBps ?? 192_000,
+    codec: audioCodec,
+    onChunk: (chunk, description) => {
+      if (!audioMeta && description) {
+        audioMeta = {
+          decoderConfig: {
+            codec: audioCodecString,
+            sampleRate: audioSampleRate,
+            numberOfChannels: audioChannels,
+            description,
+          },
+        } as unknown as Parameters<Muxer<MuxTarget>["addAudioChunkRaw"]>[4];
+      }
+      muxer.addAudioChunkRaw(
+        chunk.data,
+        chunk.type,
+        chunk.timestampUs,
+        chunk.durationUs,
+        audioMeta,
+      );
+    },
+  });
+  // Drop our reference so the worker's PCM buffer is GC-eligible. (For
+  // a 30-min stereo 48k input this is ~700 MB — no point keeping it
+  // around through the video render.)
+  audio = null;
+
+  // Streaming video encoder: each emitted chunk goes straight into the
+  // muxer. The encoder no longer accumulates anything in `chunks`.
+  let videoMeta: Parameters<Muxer<MuxTarget>["addVideoChunkRaw"]>[4] | undefined;
+  let videoChunksWritten = 0;
   const encoder = new StreamingVideoEncoder({
     width: outputWidth,
     height: outputHeight,
     frameRate: fps,
     videoCodec,
     bitrateBps: input.videoBitrateBps ?? 4_000_000,
+    onChunk: (chunk, description) => {
+      if (!videoMeta && description) {
+        videoMeta = {
+          decoderConfig: {
+            codec: encoder.codec,
+            codedWidth: outputWidth,
+            codedHeight: outputHeight,
+            description,
+          },
+        } as unknown as Parameters<Muxer<MuxTarget>["addVideoChunkRaw"]>[4];
+      }
+      muxer.addVideoChunkRaw(
+        chunk.data,
+        chunk.type,
+        chunk.timestampUs,
+        chunk.durationUs,
+        videoMeta,
+      );
+      videoChunksWritten++;
+    },
   });
 
   // Output segments (trim regions on the master timeline).
@@ -736,99 +833,260 @@ export async function editRenderMulti(
   const totalFrames = Math.max(1, Math.round(totalKept * fps));
   const frameDurationUs = Math.round(1_000_000 / fps);
 
+  // Arrangement-mode pill table. When present, the renderer dispatches
+  // each frame's active cam through `activeCamAtArr` so per-pill trim
+  // and arr-placement (the user's edits in the editor's pill toolbar)
+  // are honoured. Direct-mode jobs leave this empty and fall back to
+  // the legacy `activeCamAt` resolver against `camRanges`.
+  const pillsForRender = input.pills ?? [];
+  const pillMode = pillsForRender.length > 0 && input.segments.length > 0;
+
   let framesEmitted = 0;
+  let pendingError: Error | null = null;
+  // Pipeline parallelisation: the main loop awaits frameAtOrBefore (the
+  // decoder runs ahead inside CamFrameStream), then queues compositor +
+  // encoder work onto a Promise chain. While the chain processes frame N
+  // (compositor await + encoder push), the main loop can already pull
+  // frame N+1. Decoder, compositor, encoder run nebenläufig.
+  let outputQueue: Promise<void> = Promise.resolve();
+  let chainInFlight = 0;
   try {
+    // Per-segment arr-time cursor — accumulated so each frame's `tArr`
+    // matches the editor's masterToArr projection, which is what pills
+    // are anchored against.
+    let arrCursorPerSeg = 0;
     for (const seg of intervals) {
       const segStartFrame = framesEmitted;
       const segFrames = Math.max(0, Math.round((seg.out - seg.in) * fps));
       for (let i = 0; i < segFrames; i++) {
+        if (pendingError) throw pendingError;
         const tMaster = seg.in + i / fps;
-        const camId = activeCamAt(input.cuts, tMaster, camRanges);
-        let source: CanvasImageSource;
-        let srcW: number;
-        let srcH: number;
-        let srcRot: 0 | 90 | 180 | 270 = 0;
-        let userTransform: {
-          rotation?: number;
-          flipX?: boolean;
-          flipY?: boolean;
-          viewportTransform?: import("../../editor/types").ViewportTransform;
-        } = {};
+        const tArr = arrCursorPerSeg + i / fps;
+        // Active cam: pill-aware in arrangement-mode, legacy clip-range
+        // in direct-mode. Pills also yield the active pill so we can
+        // pull source-time directly from its sourceIn/Out window.
+        let camId: string | null;
+        let activePill: import("../../editor/types").Pill | null = null;
+        if (pillMode) {
+          const active = activeCamAtArrLocal(
+            input.cuts,
+            tArr,
+            pillsForRender,
+            input.segments,
+          );
+          camId = active?.camId ?? null;
+          activePill = active?.pill ?? null;
+        } else {
+          camId = activeCamAt(input.cuts, tMaster, camRanges);
+        }
+        // Resolve the source for this frame. For video cams we own the
+        // returned VideoFrame (cloned from the stream-owned one) and
+        // must close it after the chain composites it. Static sources
+        // (image cams, test pattern) are not owned.
+        type Src =
+          | {
+              kind: "frame";
+              frame: VideoFrame;
+              w: number;
+              h: number;
+              rot: 0 | 90 | 180 | 270;
+              transform: {
+                rotation?: number;
+                flipX?: boolean;
+                flipY?: boolean;
+                viewportTransform?: import("../../editor/types").ViewportTransform;
+              };
+            }
+          | {
+              kind: "static";
+              img: CanvasImageSource;
+              w: number;
+              h: number;
+              rot: 0 | 90 | 180 | 270;
+              transform: {
+                rotation?: number;
+                flipX?: boolean;
+                flipY?: boolean;
+                viewportTransform?: import("../../editor/types").ViewportTransform;
+              };
+            };
+        let src: Src;
         if (camId) {
           const cam = demuxResults.find((d) => d.cam.id === camId)!;
           if (cam.kind === "image") {
             // Image cam: same bitmap for every frame in range. No
             // source-time math, no drift — the bitmap *is* the frame.
-            source = cam.bitmap;
-            srcW = cam.info.width;
-            srcH = cam.info.height;
-            userTransform = {
-              rotation: cam.cam.rotation,
-              flipX: cam.cam.flipX,
-              flipY: cam.cam.flipY,
-              viewportTransform: cam.cam.viewportTransform,
-            };
-          } else {
-            const sourceTimeUs = camSourceTimeUs(tMaster, {
-              masterStartS: cam.cam.masterStartS,
-              driftRatio: cam.cam.driftRatio ?? 1,
-            });
-            const frame = await cam.stream.frameAtOrBefore(sourceTimeUs);
-            if (frame) {
-              source = frame as unknown as CanvasImageSource;
-              srcW = cam.info.width;
-              srcH = cam.info.height;
-              srcRot = cam.info.rotationDeg;
-              userTransform = {
+            src = {
+              kind: "static",
+              img: cam.bitmap,
+              w: cam.info.width,
+              h: cam.info.height,
+              rot: 0,
+              transform: {
                 rotation: cam.cam.rotation,
                 flipX: cam.cam.flipX,
                 flipY: cam.cam.flipY,
                 viewportTransform: cam.cam.viewportTransform,
+              },
+            };
+          } else {
+            // Source-time selection.
+            //   Pill-mode: read straight from the active pill's
+            //   sourceIn/Out window — moving / trimming a pill in the
+            //   editor must change which frame the renderer fetches.
+            //   Direct-mode: master-to-cam-source via the cam's anchor
+            //   + drift, identical to the legacy path.
+            const rawSourceTimeS = activePill
+              ? activePill.sourceInS + (tArr - activePill.arrStartS)
+              : null;
+            // Clamp to the cam's actual source-time range. A pill whose
+            // sourceIn/Out window points just past the end of the
+            // video (within rounding error) would otherwise hand the
+            // VideoDecoder a timestamp it can't satisfy, surfacing as
+            // a context-free "Decoding error". Clamp to one frame
+            // before the end so the decoder always lands on a valid
+            // sample.
+            const sourceMaxS = Math.max(
+              0,
+              cam.cam.sourceDurationS - 1 / fps,
+            );
+            const sourceTimeS =
+              rawSourceTimeS != null
+                ? Math.max(0, Math.min(sourceMaxS, rawSourceTimeS))
+                : null;
+            const sourceTimeUs =
+              sourceTimeS != null
+                ? Math.round(sourceTimeS * 1_000_000)
+                : camSourceTimeUs(tMaster, {
+                    masterStartS: cam.cam.masterStartS,
+                    driftRatio: cam.cam.driftRatio ?? 1,
+                  });
+            let streamFrame: VideoFrame | null = null;
+            try {
+              streamFrame = await cam.stream.frameAtOrBefore(sourceTimeUs);
+            } catch (err) {
+              // The native VideoDecoder error message is just
+              // "Decoding error" — useless for debugging. Re-throw
+              // with the cam id, source-time, and frame number so
+              // the user has a chance of understanding which input
+              // is bad.
+              const orig = err instanceof Error ? err.message : String(err);
+              throw new Error(
+                `Render decode failed on cam '${cam.cam.id}' at source-time ` +
+                  `${(sourceTimeUs / 1_000_000).toFixed(3)}s ` +
+                  `(arr ${tArr.toFixed(3)}s, master ${tMaster.toFixed(3)}s, ` +
+                  `frame ${framesEmitted}): ${orig}`,
+              );
+            }
+            if (streamFrame) {
+              // Clone the stream-owned frame so it stays alive past the
+              // next frameAtOrBefore call. WebCodecs' VideoFrame
+              // constructor is a cheap reference-clone (shared buffer,
+              // refcounted) — not a pixel copy.
+              const owned = new VideoFrame(streamFrame, {
+                timestamp: streamFrame.timestamp,
+              });
+              src = {
+                kind: "frame",
+                frame: owned,
+                w: cam.info.width,
+                h: cam.info.height,
+                rot: cam.info.rotationDeg,
+                transform: {
+                  rotation: cam.cam.rotation,
+                  flipX: cam.cam.flipX,
+                  flipY: cam.cam.flipY,
+                  viewportTransform: cam.cam.viewportTransform,
+                },
               };
             } else {
-              source = testPattern;
-              srcW = outputWidth;
-              srcH = outputHeight;
+              src = {
+                kind: "static",
+                img: testPattern,
+                w: outputWidth,
+                h: outputHeight,
+                rot: 0,
+                transform: {},
+              };
             }
           }
         } else {
-          source = testPattern;
-          srcW = outputWidth;
-          srcH = outputHeight;
+          src = {
+            kind: "static",
+            img: testPattern,
+            w: outputWidth,
+            h: outputHeight,
+            rot: 0,
+            transform: {},
+          };
         }
         const outTimestampUs = framesEmitted * frameDurationUs;
-        const composed = await compositor.compositeImage(
-          source,
-          srcW,
-          srcH,
-          outTimestampUs,
-          frameDurationUs,
-          srcRot,
-          userTransform,
-          // FX must be looked up at master time (tMaster), not the
-          // segment-relative output timestamp — segments shift output
-          // time so FX queries with output time miss every FX.
-          tMaster,
-        );
-        encoder.pushFrame(composed, {
-          keyFrame: framesEmitted === segStartFrame,
-        });
-        composed.close();
+        const isFirstInSeg = framesEmitted === segStartFrame;
+        const myFrameNum = framesEmitted;
+        const captured = { src, outTs: outTimestampUs, isFirstInSeg, tMaster };
         framesEmitted++;
-        if (framesEmitted % 30 === 0 || framesEmitted === totalFrames) {
-          input.onProgress?.({
-            stage: "video-encode",
-            framesDone: framesEmitted,
-            framesTotal: totalFrames,
-          });
-        }
-        // Yield to let the encoder flush; without this Chrome occasionally
-        // stalls when the compositor pushes faster than the encoder accepts.
-        if ((framesEmitted & 0x07) === 0) {
-          await new Promise((r) => setTimeout(r, 0));
+        chainInFlight++;
+        outputQueue = outputQueue.then(async () => {
+          try {
+            if (pendingError) return;
+            const composed = await compositor.compositeImage(
+              captured.src.kind === "frame"
+                ? (captured.src.frame as unknown as CanvasImageSource)
+                : captured.src.img,
+              captured.src.w,
+              captured.src.h,
+              captured.outTs,
+              frameDurationUs,
+              captured.src.rot,
+              captured.src.transform,
+              // FX must be looked up at master time (tMaster), not the
+              // segment-relative output timestamp — segments shift
+              // output time so FX queries with output time miss every
+              // FX.
+              captured.tMaster,
+            );
+            encoder.pushFrame(composed, { keyFrame: captured.isFirstInSeg });
+            composed.close();
+            const done = myFrameNum + 1;
+            if (done % 30 === 0 || done === totalFrames) {
+              input.onProgress?.({
+                stage: "video-encode",
+                framesDone: done,
+                framesTotal: totalFrames,
+              });
+            }
+          } catch (e) {
+            pendingError = e instanceof Error ? e : new Error(String(e));
+          } finally {
+            if (captured.src.kind === "frame") {
+              try {
+                captured.src.frame.close();
+              } catch {
+                /* already closed */
+              }
+            }
+            chainInFlight--;
+          }
+        });
+        // Hard backpressure on encoder + composite chain. Without this
+        // the main loop would queue chains faster than the GPU
+        // compositor + encoder can drain them — at 4K each in-flight
+        // VideoFrame is ~12 MB, so a few seconds of overflow runs into
+        // multi-GB territory and crashes the tab. Encoder threshold (16)
+        // matches the single-cam path. Chain-depth threshold (4) bounds
+        // queued composite work — compositor takes ~10-30 ms per 4K
+        // frame so 4 means the main loop can run ~50-100 ms ahead of
+        // the GPU.
+        while (encoder.encodeQueueSize > 16 || chainInFlight > 4) {
+          if (pendingError) throw pendingError;
+          await new Promise((r) => setTimeout(r, 1));
         }
       }
+      arrCursorPerSeg += seg.out - seg.in;
     }
+    // Drain pending compositor + encoder work before advancing to flush.
+    await outputQueue;
+    if (pendingError) throw pendingError;
 
     // The encoder still has pending frames to flush — on a 90 s clip
     // that's 1-3 s of opaque waiting. Surface it as its own stage so the
@@ -838,6 +1096,10 @@ export async function editRenderMulti(
       framesDone: framesEmitted,
       framesTotal: totalFrames,
     });
+    // encoder.finish() flushes pending frames; the streaming `onChunk`
+    // callback has already pushed every chunk into the muxer by then.
+    // The returned value is mostly a metadata bundle; chunks is empty
+    // in streaming mode.
     const encodedVideo = await encoder.finish();
     if (!encodedVideo.description) {
       throw new Error("Video encoder produced no description");
@@ -845,76 +1107,8 @@ export async function editRenderMulti(
 
     input.onProgress?.({
       stage: "muxing",
-      framesDone: framesEmitted,
-      framesTotal: totalFrames,
-    });
-
-    const target: MuxTarget = input.output
-      ? new FileSystemWritableFileStreamTarget(input.output)
-      : new ArrayBufferTarget();
-
-    const muxer = new Muxer({
-      target,
-      video: {
-        codec: encodedVideo.muxerCodec,
-        width: outputWidth,
-        height: outputHeight,
-        frameRate: fps,
-      },
-      audio: {
-        codec: encodedAudio.muxerCodec,
-        numberOfChannels: encodedAudio.numberOfChannels,
-        sampleRate: encodedAudio.sampleRate,
-      },
-      fastStart: input.output ? false : "in-memory",
-      firstTimestampBehavior: "offset",
-    });
-
-    const videoMeta = {
-      decoderConfig: {
-        codec: encodedVideo.codec,
-        codedWidth: encodedVideo.width,
-        codedHeight: encodedVideo.height,
-        description: encodedVideo.description,
-      },
-    } as unknown as Parameters<Muxer<MuxTarget>["addVideoChunkRaw"]>[4];
-    // Push chunks in batches so the progress event fires periodically
-    // while the muxer streams to FileSystemWritableFileStream — without
-    // this, longer renders sit silent for several seconds while the file
-    // is written.
-    const totalChunks = encodedVideo.chunks.length + encodedAudio.chunks.length;
-    let chunksWritten = 0;
-    const reportMuxProgress = () => {
-      input.onProgress?.({
-        stage: "muxing",
-        framesDone: chunksWritten,
-        framesTotal: totalChunks,
-      });
-    };
-    for (const c of encodedVideo.chunks) {
-      muxer.addVideoChunkRaw(c.data, c.type, c.timestampUs, c.durationUs, videoMeta);
-      chunksWritten++;
-      if ((chunksWritten & 0x3f) === 0) reportMuxProgress();
-    }
-
-    const audioMeta = {
-      decoderConfig: {
-        codec: encodedAudio.codec,
-        sampleRate: encodedAudio.sampleRate,
-        numberOfChannels: encodedAudio.numberOfChannels,
-        description: encodedAudio.description,
-      },
-    } as unknown as Parameters<Muxer<MuxTarget>["addAudioChunkRaw"]>[4];
-    for (const c of encodedAudio.chunks) {
-      muxer.addAudioChunkRaw(c.data, c.type, c.timestampUs, c.durationUs, audioMeta);
-      chunksWritten++;
-      if ((chunksWritten & 0x3f) === 0) reportMuxProgress();
-    }
-
-    input.onProgress?.({
-      stage: "finalizing",
-      framesDone: chunksWritten,
-      framesTotal: totalChunks,
+      framesDone: videoChunksWritten,
+      framesTotal: framesEmitted,
     });
     muxer.finalize();
 
@@ -932,8 +1126,8 @@ export async function editRenderMulti(
       height: outputHeight,
       videoCodec: encodedVideo.codec,
       audioBackend: "webcodecs",
-      audioSampleRate: encodedAudio.sampleRate,
-      audioChannelCount: encodedAudio.numberOfChannels,
+      audioSampleRate: audioSampleRate,
+      audioChannelCount: audioChannels,
       byteLength,
     };
   } finally {

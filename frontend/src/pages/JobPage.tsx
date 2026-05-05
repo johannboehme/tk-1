@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { useNavigate, useParams } from "react-router-dom";
 import { ChunkyButton } from "../editor/components/ChunkyButton";
@@ -13,7 +13,10 @@ import {
   runQuickRender,
   type LocalJob,
 } from "../local/jobs";
-import { isVideoAsset, type VideoAsset } from "../storage/jobs-db";
+import { jobRoutePath, nextRouteForJob } from "../local/jobs-routing";
+import { useSyncOp } from "../local/ops-store";
+import { isVideoAsset } from "../storage/jobs-db";
+import { SyncPatchPanel } from "../components/sync/SyncPatchPanel";
 
 export default function JobPage() {
   const { id = "" } = useParams<{ id: string }>();
@@ -21,6 +24,17 @@ export default function JobPage() {
   const [job, setJob] = useState<LocalJob | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+  const syncOp = useSyncOp(id);
+
+  // Derived state — phase comes from data + ops, never a status enum.
+  const hasSyncData = useMemo(() => {
+    const cams = job?.videos ?? [];
+    if (cams.length === 0) return false;
+    return cams.every((c) => !isVideoAsset(c) || Boolean(c.sync));
+  }, [job?.videos]);
+  const isSyncing = Boolean(syncOp) && !syncOp?.error;
+  const syncFailed = Boolean(syncOp?.error);
+  const hasOutput = Boolean(job?.lastRender);
 
   useEffect(() => {
     if (!id) return;
@@ -42,7 +56,7 @@ export default function JobPage() {
 
   // Build a download URL when an output appears.
   useEffect(() => {
-    if (!job?.hasOutput) return;
+    if (!job?.lastRender) return;
     let url: string | null = null;
     let cancelled = false;
     resolveJobAssetUrl(job.id, "output").then((u) => {
@@ -58,7 +72,7 @@ export default function JobPage() {
       if (url) URL.revokeObjectURL(url);
       setDownloadUrl(null);
     };
-  }, [job?.hasOutput, job?.id]);
+  }, [job?.lastRender, job?.id]);
 
   async function onQuickRender() {
     if (!job) return;
@@ -88,12 +102,18 @@ export default function JobPage() {
     );
   }
 
-  const isDone = job.status === "rendered" || job.status === "synced";
-  const isFailed = job.status === "failed";
-  // A failed job that already has a sync result is recoverable: the
-  // sync data lets the user re-enter the editor or kick off another
-  // render attempt without redoing the upload + analysis.
-  const canRetry = isFailed && Boolean(job.sync);
+  // "Ready to use" = sync result is on the job. Either freshly
+  // produced (op finished, hasSyncData) or rehydrated from history.
+  const isDone = hasSyncData && !isSyncing;
+  // A failed sync op with `videos[].sync` already filled is recoverable
+  // — the sync data lets the user re-enter the editor or kick off
+  // another render attempt without redoing the upload + analysis.
+  const canRetry = syncFailed && hasSyncData;
+  // Quick render is the "drop video + audio → aligned MP4" shortcut —
+  // skips the editor entirely. Doesn't fit the long-form workflow
+  // (chunks need to be triaged, arranged, then composed in the editor),
+  // so we hide it for that path.
+  const showQuickRender = job.mode !== "longform";
 
   return (
     <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6 sm:py-10">
@@ -103,7 +123,9 @@ export default function JobPage() {
             JOB · {job.id.slice(0, 8)}
           </span>
           <RuleStrip count={32} className="text-rule flex-1 max-w-[200px]" />
-          <StatusBadge status={job.status} />
+          <StatusBadge
+            label={statusLabel({ isSyncing, syncFailed, hasSyncData, hasOutput })}
+          />
         </div>
         <h1 className="font-display font-semibold text-3xl sm:text-4xl text-ink truncate">
           {job.title || job.id}
@@ -113,7 +135,7 @@ export default function JobPage() {
 
       <section className="mb-6">
         <AnimatePresence mode="wait" initial={false}>
-          {(job.status === "queued" || job.status === "syncing") ? (
+          {isSyncing ? (
             <motion.div
               key="progress"
               initial={{ opacity: 0, y: 6 }}
@@ -136,21 +158,33 @@ export default function JobPage() {
         </AnimatePresence>
       </section>
 
-      {isFailed && job.error && <Banner kind="error" text={job.error} />}
+      {syncFailed && syncOp?.error && (
+        <Banner kind="error" text={syncOp.error} />
+      )}
       {err && <Banner kind="error" text={err} />}
 
       {(isDone || canRetry) && (
         <div className="flex flex-wrap gap-3 border-t border-rule pt-5">
-          <ChunkyButton variant="primary" size="lg" onClick={onQuickRender}>
-            {canRetry ? "Retry quick render" : "Quick render"}
-          </ChunkyButton>
-          <ChunkyButton
-            variant="secondary"
-            size="lg"
-            onClick={() => navigate(`/job/${job.id}/edit`)}
-          >
-            Open editor
-          </ChunkyButton>
+          {showQuickRender && (
+            <ChunkyButton variant="primary" size="lg" onClick={onQuickRender}>
+              {canRetry ? "Retry quick render" : "Quick render"}
+            </ChunkyButton>
+          )}
+          {job.mode === "longform" ? (
+            <LongformStageButtons
+              job={job}
+              isPrimary={!showQuickRender}
+              onNavigate={(route) => navigate(jobRoutePath(job.id, route))}
+            />
+          ) : (
+            <ChunkyButton
+              variant={showQuickRender ? "secondary" : "primary"}
+              size="lg"
+              onClick={() => navigate(jobRoutePath(job.id, nextRouteForJob(job)))}
+            >
+              {nextRouteLabel(nextRouteForJob(job))}
+            </ChunkyButton>
+          )}
           {downloadUrl && (
             <a
               href={downloadUrl}
@@ -167,8 +201,8 @@ export default function JobPage() {
         </div>
       )}
 
-      {/* Sync also failed — only recovery is to delete and retry the upload. */}
-      {isFailed && !job.sync && (
+      {/* Sync failed without producing any data — only recovery is to delete and retry. */}
+      {syncFailed && !hasSyncData && (
         <div className="flex flex-wrap gap-3 border-t border-rule pt-5">
           <ChunkyButton variant="ghost" size="lg" onClick={onDelete}>
             Delete and start over
@@ -179,12 +213,92 @@ export default function JobPage() {
   );
 }
 
-function StatusBadge({ status }: { status: string }) {
+function nextRouteLabel(route: ReturnType<typeof nextRouteForJob>): string {
+  switch (route) {
+    case "triage":
+      return "Continue → Triage";
+    case "arrange":
+      return "Continue → Arrange";
+    case "edit":
+    default:
+      return "Open editor";
+  }
+}
+
+/**
+ * Long-form jobs walk Triage → Arrange → Editor. Once a job has
+ * graduated past a phase the user typically still wants to be able to
+ * jump back into it (re-curate chunks, tweak the arrangement) without
+ * losing the editor state. We surface all reachable phases as buttons,
+ * highlighting the most-recent one as primary so a single click on
+ * "open" still lands them where they were.
+ */
+function LongformStageButtons({
+  job,
+  isPrimary,
+  onNavigate,
+}: {
+  job: LocalJob;
+  isPrimary: boolean;
+  onNavigate: (route: "triage" | "arrange" | "edit") => void;
+}) {
+  const arrangementDefined = job.arrangement !== undefined;
+  const arrangementHasItems = (job.arrangement?.length ?? 0) > 0;
+  // The "default" stage = the furthest one the user can land in.
+  // Highlighting that one as primary keeps the muscle memory of the
+  // single Continue button while still exposing the others.
+  const defaultStage = nextRouteForJob(job);
+
+  type Stage = { route: "triage" | "arrange" | "edit"; label: string; reachable: boolean };
+  const stages: Stage[] = [
+    { route: "triage", label: "Triage", reachable: true },
+    { route: "arrange", label: "Arrange", reachable: arrangementDefined },
+    { route: "edit", label: "Editor", reachable: arrangementHasItems },
+  ];
+
+  return (
+    <>
+      {stages
+        .filter((s) => s.reachable)
+        .map((s) => (
+          <ChunkyButton
+            key={s.route}
+            variant={
+              s.route === defaultStage
+                ? isPrimary
+                  ? "primary"
+                  : "secondary"
+                : "ghost"
+            }
+            size="lg"
+            onClick={() => onNavigate(s.route)}
+          >
+            {s.label}
+          </ChunkyButton>
+        ))}
+    </>
+  );
+}
+
+function StatusBadge({ label }: { label: string }) {
   return (
     <span className="font-mono text-[10px] tracking-label uppercase text-ink-2 bg-paper-hi border border-rule rounded-full px-2 py-0.5">
-      {status}
+      {label}
     </span>
   );
+}
+
+function statusLabel(args: {
+  isSyncing: boolean;
+  syncFailed: boolean;
+  hasSyncData: boolean;
+  hasOutput: boolean;
+}): string {
+  if (args.isSyncing) return "syncing";
+  if (args.syncFailed) return "failed";
+  if (args.hasOutput) return "rendered";
+  if (args.hasSyncData) return "synced";
+  return "needs sync";
 }
 
 /**
@@ -198,219 +312,6 @@ function JobSubtitle({ job }: { job: LocalJob }) {
     <p className="font-mono text-xs text-ink-2 truncate">
       {camCount} cam{camCount === 1 ? "" : "s"} · {job.audioFilename}
     </p>
-  );
-}
-
-/**
- * Sync Patch Panel — uniform per-cam patchbay, regardless of cam count.
- *
- * One row per cam, hardware look that matches the timeline's Lane-Headers:
- * cam-color stripe + cam name + filename + OFFSET + DRIFT + a 3-LED
- * confidence bar matching the Tally aesthetic. Reads each cam's sync from
- * `job.videos[i].sync` directly — single source of truth, no mirror layer.
- */
-function SyncPatchPanel({ job }: { job: LocalJob }) {
-  // Image cams have no sync result — they're not part of this panel.
-  const videos: VideoAsset[] = (job.videos ?? []).filter(isVideoAsset);
-
-  if (videos.length === 0) {
-    return (
-      <div className="rounded-md border border-rule px-4 py-6 text-center font-mono text-xs text-ink-3">
-        No cams yet.
-      </div>
-    );
-  }
-
-  return (
-    <div className="rounded-md border border-rule overflow-hidden bg-paper-hi shadow-panel">
-      <div className="bg-paper-panel border-b border-rule px-3 py-2 flex items-center gap-2">
-        <span className="font-display tracking-label uppercase text-[10px] text-ink-2">
-          {videos.length === 1 ? "Sync" : `Sync · ${videos.length} cams`}
-        </span>
-        <RuleStrip count={20} className="text-rule flex-1 max-w-[180px]" />
-      </div>
-      {/* Desktop / wider tablets: 5-column grid. */}
-      <div className="hidden sm:grid sm:grid-cols-[auto_1fr_auto_auto_auto] gap-x-4">
-        <HeaderCell>CAM</HeaderCell>
-        <HeaderCell>SOURCE</HeaderCell>
-        <HeaderCell align="right">OFFSET</HeaderCell>
-        <HeaderCell align="right">DRIFT</HeaderCell>
-        <HeaderCell align="right">CONF</HeaderCell>
-        {videos.map((cam, i) => (
-          <SyncRow
-            key={cam.id}
-            cam={cam}
-            index={i}
-            last={i === videos.length - 1}
-          />
-        ))}
-      </div>
-      {/* Narrow phones: stacked card per cam — labels render inline so the
-       *  numeric columns can't overflow. */}
-      <div className="sm:hidden">
-        {videos.map((cam, i) => (
-          <SyncCard
-            key={cam.id}
-            cam={cam}
-            index={i}
-            last={i === videos.length - 1}
-          />
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function HeaderCell({
-  children,
-  align = "left",
-}: {
-  children: React.ReactNode;
-  align?: "left" | "right";
-}) {
-  return (
-    <div
-      className={[
-        "px-3 py-2 font-display tracking-label uppercase text-[10px] text-ink-3 border-b border-rule bg-paper-panel/60",
-        align === "right" ? "text-right" : "text-left",
-      ].join(" ")}
-    >
-      {children}
-    </div>
-  );
-}
-
-function SyncRow({
-  cam,
-  index,
-  last,
-}: {
-  cam: VideoAsset;
-  index: number;
-  last: boolean;
-}) {
-  const sync = cam.sync;
-  const border = last ? "" : "border-b border-rule/50";
-  return (
-    <>
-      {/* CAM cell — color stripe + name */}
-      <div className={`px-3 py-3 ${border} flex items-center gap-2`}>
-        <span
-          className="w-1.5 h-7 rounded-sm shrink-0"
-          style={{
-            background: cam.color,
-            boxShadow: `0 0 4px ${cam.color}55`,
-          }}
-        />
-        <span className="font-display font-semibold text-xs tracking-label uppercase">
-          Cam {index + 1}
-        </span>
-      </div>
-      {/* SOURCE cell — filename */}
-      <div
-        className={`px-3 py-3 ${border} font-mono text-xs text-ink-2 truncate self-center min-w-0`}
-        title={cam.filename}
-      >
-        {cam.filename}
-      </div>
-      {/* OFFSET */}
-      <div className={`px-3 py-3 ${border} text-right font-mono tabular text-ink self-center`}>
-        {sync ? `${sync.offsetMs.toFixed(1)} ms` : "—"}
-      </div>
-      {/* DRIFT */}
-      <div className={`px-3 py-3 ${border} text-right font-mono tabular text-ink self-center`}>
-        {sync ? `${((sync.driftRatio - 1) * 100).toFixed(3)}%` : "—"}
-      </div>
-      {/* CONFIDENCE — three-LED bar like a hardware tally */}
-      <div className={`px-3 py-3 ${border} text-right self-center`}>
-        {sync ? (
-          <ConfidenceLeds value={sync.confidence} />
-        ) : (
-          <span className="font-mono text-ink-3">—</span>
-        )}
-      </div>
-    </>
-  );
-}
-
-/**
- * Mobile-only stacked card per cam. Renders the same data as SyncRow but
- * label-value pairs flow vertically so OFFSET/DRIFT/CONF can never push
- * the row past the viewport on a narrow phone.
- */
-function SyncCard({
-  cam,
-  index,
-  last,
-}: {
-  cam: VideoAsset;
-  index: number;
-  last: boolean;
-}) {
-  const sync = cam.sync;
-  const border = last ? "" : "border-b border-rule/50";
-  return (
-    <div className={`px-3 py-3 ${border}`}>
-      <div className="flex items-center gap-2 mb-1.5">
-        <span
-          className="w-1.5 h-7 rounded-sm shrink-0"
-          style={{
-            background: cam.color,
-            boxShadow: `0 0 4px ${cam.color}55`,
-          }}
-        />
-        <span className="font-display font-semibold text-xs tracking-label uppercase shrink-0">
-          Cam {index + 1}
-        </span>
-        <span
-          className="font-mono text-xs text-ink-2 truncate min-w-0"
-          title={cam.filename}
-        >
-          {cam.filename}
-        </span>
-      </div>
-      <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-[11px] pl-3.5">
-        <span className="font-display tracking-label uppercase text-ink-3">Offset</span>
-        <span className="font-mono tabular text-ink text-right">
-          {sync ? `${sync.offsetMs.toFixed(1)} ms` : "—"}
-        </span>
-        <span className="font-display tracking-label uppercase text-ink-3">Drift</span>
-        <span className="font-mono tabular text-ink text-right">
-          {sync ? `${((sync.driftRatio - 1) * 100).toFixed(3)}%` : "—"}
-        </span>
-        <span className="font-display tracking-label uppercase text-ink-3">Conf</span>
-        <span className="text-right">
-          {sync ? <ConfidenceLeds value={sync.confidence} /> : <span className="font-mono text-ink-3">—</span>}
-        </span>
-      </div>
-    </div>
-  );
-}
-
-/** 3-LED confidence indicator. Matches the analog Tally aesthetic of the
- * Lane-Headers in the timeline. */
-function ConfidenceLeds({ value }: { value: number }) {
-  const pct = Math.round(value * 100);
-  // High >= 70, Mid 30..70, Low < 30
-  const lit = value >= 0.7 ? 3 : value >= 0.3 ? 2 : 1;
-  const color = lit === 3 ? "#34D399" : lit === 2 ? "#FFB020" : "#FF3326";
-  return (
-    <span className="inline-flex items-center gap-1.5">
-      <span className="inline-flex gap-[3px]">
-        {[0, 1, 2].map((i) => (
-          <span
-            key={i}
-            className="block w-[6px] h-[6px] rounded-full"
-            style={{
-              background: i < lit ? color : "#3A352E",
-              boxShadow: i < lit ? `0 0 4px ${color}` : "none",
-              opacity: i < lit ? 1 : 0.35,
-            }}
-          />
-        ))}
-      </span>
-      <span className="font-mono tabular text-ink text-xs">{pct}%</span>
-    </span>
   );
 }
 

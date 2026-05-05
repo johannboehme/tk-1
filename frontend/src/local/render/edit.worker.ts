@@ -20,7 +20,6 @@
  */
 
 import {
-  editRender,
   editRenderMulti,
   type EditRenderProgress,
   type Segment,
@@ -73,14 +72,16 @@ export interface CamWorkerInput {
 }
 
 export interface EditWorkerInput {
-  /** Legacy single-cam path. Used when `cams` is omitted (or has length 1
-   *  and `cuts` is empty — the renderer fast-paths to the simpler pipeline).
-   *  Either an OPFS path or a `FileSystemFileHandle`. */
-  videoSource?: import("../asset-source").AssetSource;
-  /** Multi-cam path. When present and (cams.length > 1 || cuts.length > 0)
-   *  the worker dispatches to `editRenderMulti`. */
-  cams?: CamWorkerInput[];
+  /** One or more cams to render. Unified path — direct (no pills),
+   *  multi-cam-with-cuts, and pill-mode arrangements all go through
+   *  `editRenderMulti`. A single-cam direct render is just `cams` with
+   *  one entry, no cuts, no pills. */
+  cams: CamWorkerInput[];
   cuts?: Cut[];
+  /** Long-form arrangement-mode pills. Honoured when present alongside
+   *  non-empty `segments`; the renderer composes video off the pill
+   *  table instead of the cams' contiguous master ranges. */
+  pills?: import("../../editor/types").Pill[];
   /** Master-timeline duration; defaults to longest cam's end. */
   masterDurationS?: number;
 
@@ -171,81 +172,52 @@ ctx.addEventListener("message", async (e: MessageEvent<EditWorkerMessage>) => {
       ctx.postMessage(evt);
     };
 
-    const useMultiCam =
-      input.cams !== undefined &&
-      (input.cams.length > 1 || (input.cuts ?? []).length > 0);
-
-    if (useMultiCam) {
-      const cams = input.cams!;
-      const camFiles = await Promise.all(
-        cams.map(async (c) => ({
-          ...c,
-          file: await loadAsset(c.source),
-        })),
-      );
-      await editRenderMulti({
-        cams: camFiles.map((c) => ({
-          id: c.id,
-          file: c.file,
-          masterStartS: c.masterStartS,
-          sourceDurationS: c.sourceDurationS,
-          driftRatio: c.driftRatio ?? 1,
-          kind: c.kind ?? "video",
-          trimInS: c.trimInS,
-          trimOutS: c.trimOutS,
-          rotation: c.rotation,
-          flipX: c.flipX,
-          flipY: c.flipY,
-          viewportTransform: c.viewportTransform,
-        })),
-        cuts: input.cuts ?? [],
-        masterDurationS: input.masterDurationS,
-        audioPcm: input.audioPcm,
-        segments: input.segments,
-        overlays: input.overlays,
-        energy: input.energy,
-        visualizers,
-        fx: input.fx,
-        offsetMs: input.offsetMs,
-        driftRatio: input.driftRatio,
-        outputFps: input.outputFps,
-        outputWidth: input.outputWidth,
-        outputHeight: input.outputHeight,
-        videoCodec: input.videoCodec,
-        audioCodec: input.audioCodec,
-        videoBitrateBps: input.videoBitrateBps,
-        audioBitrateBps: input.audioBitrateBps,
-        output: writable,
-        onProgress,
-        capabilities,
-      });
-    } else {
-      // Single-cam fast path. Either `videoSource` (legacy) or the only
-      // entry in `cams` provides the source.
-      const src = input.videoSource ?? input.cams?.[0]?.source;
-      if (!src) throw new Error("editWorker: no video source provided");
-      const videoFile = await loadAsset(src);
-      await editRender({
-        videoFile,
-        audioPcm: input.audioPcm,
-        segments: input.segments,
-        overlays: input.overlays,
-        energy: input.energy,
-        visualizers,
-        fx: input.fx,
-        offsetMs: input.offsetMs,
-        driftRatio: input.driftRatio,
-        outputWidth: input.outputWidth,
-        outputHeight: input.outputHeight,
-        videoCodec: input.videoCodec,
-        audioCodec: input.audioCodec,
-        videoBitrateBps: input.videoBitrateBps,
-        audioBitrateBps: input.audioBitrateBps,
-        output: writable,
-        onProgress,
-        capabilities,
-      });
+    if (!input.cams || input.cams.length === 0) {
+      throw new Error("editWorker: no cams provided");
     }
+    const camFiles = await Promise.all(
+      input.cams.map(async (c) => ({
+        ...c,
+        file: await loadAsset(c.source),
+      })),
+    );
+    await editRenderMulti({
+      cams: camFiles.map((c) => ({
+        id: c.id,
+        file: c.file,
+        masterStartS: c.masterStartS,
+        sourceDurationS: c.sourceDurationS,
+        driftRatio: c.driftRatio ?? 1,
+        kind: c.kind ?? "video",
+        trimInS: c.trimInS,
+        trimOutS: c.trimOutS,
+        rotation: c.rotation,
+        flipX: c.flipX,
+        flipY: c.flipY,
+        viewportTransform: c.viewportTransform,
+      })),
+      cuts: input.cuts ?? [],
+      pills: input.pills,
+      masterDurationS: input.masterDurationS,
+      audioPcm: input.audioPcm,
+      segments: input.segments,
+      overlays: input.overlays,
+      energy: input.energy,
+      visualizers,
+      fx: input.fx,
+      offsetMs: input.offsetMs,
+      driftRatio: input.driftRatio,
+      outputFps: input.outputFps,
+      outputWidth: input.outputWidth,
+      outputHeight: input.outputHeight,
+      videoCodec: input.videoCodec,
+      audioCodec: input.audioCodec,
+      videoBitrateBps: input.videoBitrateBps,
+      audioBitrateBps: input.audioBitrateBps,
+      output: writable,
+      onProgress,
+      capabilities,
+    });
 
     await writable.close();
     writable = null;

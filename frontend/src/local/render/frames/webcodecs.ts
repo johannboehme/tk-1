@@ -32,6 +32,11 @@ export interface WebcodecsFrameStripOptions {
   quality?: number;
   /** Called with [0..1] as tiles fill in. Cheap to call repeatedly. */
   onProgress?: (frac: number) => void;
+  /** Display rotation to bake into the strip. When non-zero, tiles
+   *  come out in display orientation (e.g. portrait phone recordings
+   *  produce upright tiles). Tile dimensions are computed from the
+   *  post-rotation aspect. Default 0 — codec orientation. */
+  rotationDeg?: 0 | 90 | 180 | 270;
 }
 
 export async function extractFrameStripWebcodecs(
@@ -43,11 +48,17 @@ export async function extractFrameStripWebcodecs(
     throw new Error("Frame extraction: source has no video track");
   }
   const { info, sampleTable, loadSample } = demuxed;
+  const rotationDeg = opts.rotationDeg ?? 0;
+  const swap = rotationDeg === 90 || rotationDeg === 270;
 
   const plan = planTileStrip({
     durationS: info.durationS,
-    sourceWidth: info.width,
-    sourceHeight: info.height,
+    // Plan tile dims from the DISPLAY aspect, not the codec aspect.
+    // Portrait phone recordings (codec landscape, display portrait)
+    // produce narrow upright tiles — the resulting strip stays
+    // visually correct without any consumer-side rotation.
+    sourceWidth: swap ? info.height : info.width,
+    sourceHeight: swap ? info.width : info.height,
     tileHeight: opts.tileHeight,
     maxTiles: opts.maxTiles,
   });
@@ -173,13 +184,35 @@ export async function extractFrameStripWebcodecs(
       }
 
       const dx = t * plan.tileWidth;
-      ctx.drawImage(
-        frame as unknown as CanvasImageSource,
-        dx,
-        0,
-        plan.tileWidth,
-        plan.tileHeight,
-      );
+      if (rotationDeg === 0) {
+        ctx.drawImage(
+          frame as unknown as CanvasImageSource,
+          dx,
+          0,
+          plan.tileWidth,
+          plan.tileHeight,
+        );
+      } else {
+        // Rotate around the tile centre. After the transform we draw
+        // the codec frame at the (pre-rotation) display dims of the
+        // tile — `swap` covers 90°/270° where width and height
+        // swap, leaving 180° drawn at the tile dims directly.
+        const cx = dx + plan.tileWidth / 2;
+        const cy = plan.tileHeight / 2;
+        const drawW = swap ? plan.tileHeight : plan.tileWidth;
+        const drawH = swap ? plan.tileWidth : plan.tileHeight;
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate((rotationDeg * Math.PI) / 180);
+        ctx.drawImage(
+          frame as unknown as CanvasImageSource,
+          -drawW / 2,
+          -drawH / 2,
+          drawW,
+          drawH,
+        );
+        ctx.restore();
+      }
       drawnCount++;
       opts.onProgress?.(drawnCount / tileSampleIdx.length);
     }

@@ -2,8 +2,12 @@
  * IndexedDB-Wrapper für lokale Job-Metadaten.
  *
  * Mediadaten (Video, Audio, Render-Output) leben in OPFS (siehe ./opfs.ts).
- * Hier liegen nur strukturierte Daten: Status, Sync-Result, Edit-Spec,
- * Progress, Timing.
+ * Hier liegen nur strukturierte Daten: Sync-Result, Edit-Spec, Timing.
+ *
+ * Lifecycle-Bits (was läuft gerade — Sync, Render, Fehler) leben NICHT
+ * hier, sondern in `local/ops-store.ts`. Die Phase eines Projekts ergibt
+ * sich rein aus den persistierten Daten (videos[].sync, chunks,
+ * arrangement, pills, lastRender).
  */
 
 import { openDB, type IDBPDatabase } from "idb";
@@ -58,8 +62,29 @@ export interface VideoAsset {
   width?: number;
   height?: number;
   fps?: number;
+  /** Display rotation in degrees clockwise that needs to be applied to
+   *  the codec-level pixel buffer for correct on-screen orientation.
+   *  Decoded from the source MP4's `tkhd` matrix at sync time and
+   *  persisted so consumers (chunk-thumbnail extractor, future
+   *  renderers) don't have to re-demux just for the rotation flag.
+   *  Optional / undefined for legacy rows synced before this field
+   *  existed — those callers can fall back to a `<video>.videoWidth /
+   *  videoHeight` vs `width / height` swap-heuristic. */
+  intrinsicRotationDeg?: 0 | 90 | 180 | 270;
   /** OPFS-Pfad zur extrahierten Thumbnail-Strip-Datei (frames.webp). */
   framesPath?: string;
+  /** What pixel orientation the strip at `framesPath` carries.
+   *
+   *  - `"display"` — strip tiles are already display-oriented (rotation
+   *    baked in at extraction time). Tier-2 thumbnail consumers can
+   *    blit them straight to canvas. NEW.
+   *  - `"codec"` (or undefined for legacy rows) — strip tiles store
+   *    raw codec frames (no rotation). Consumers must apply
+   *    `intrinsicRotationDeg` themselves at slice time.
+   *
+   *  This is per-cam because we may incrementally re-extract one cam's
+   *  strip without forcing a re-extract of the others. */
+  framesOrientation?: "codec" | "display";
   // ---- Editor-state, persisted via auto-save ----
   /** User-nudge (ms) on top of sync.offsetMs. */
   syncOverrideMs?: number;
@@ -131,6 +156,28 @@ export function isVideoAsset(a: MediaAsset): a is VideoAsset {
 }
 
 /**
+ * Display-oriented dimensions for a cam — codec dims swapped when the
+ * intrinsic rotation is 90/270 (portrait phone recordings).
+ *
+ * Use this for any consumer that operates on the actual on-screen
+ * frame: `<video>.videoWidth/Height` matches these values, the
+ * baked-in (framesOrientation: "display") strip's tile aspect matches
+ * these, and the edit compositor's output canvas should follow them.
+ *
+ * Returns null when the cam never had width/height probed (legacy
+ * rows synced before width/height were captured).
+ */
+export function displayDimsOf(
+  cam: VideoAsset,
+): { width: number; height: number } | null {
+  if (cam.width === undefined || cam.height === undefined) return null;
+  const swap = cam.intrinsicRotationDeg === 90 || cam.intrinsicRotationDeg === 270;
+  return swap
+    ? { width: cam.height, height: cam.width }
+    : { width: cam.width, height: cam.height };
+}
+
+/**
  * Multi-Cam-Cut: ab `atTimeS` wird auf `camId` umgeschaltet.
  *
  * Cuts sind nach `atTimeS` aufsteigend geordnet. Active-Cam an einem
@@ -141,22 +188,105 @@ export interface Cut {
   camId: string;
 }
 
-export interface JobProgress {
-  pct: number;
-  stage: string;
-  detail?: string;
-  etaS?: number;
-  framesDone?: number;
-  framesTotal?: number;
+/**
+ * Workflow-Pfad nach dem Upload.
+ *  - "direct"   — fertiges Stück + Video(s) → direkt in den Editor.
+ *  - "longform" — Session-Mitschnitt → Triage → Arrange → Editor.
+ *
+ * Optional auf `LocalJob`; fehlende Werte werden als `"direct"` behandelt
+ * (rückwärtskompatibel mit allen Pre-Triage-Jobs).
+ */
+export type JobMode = "direct" | "longform";
+
+/** Stille-Detector-Parameter. Live anpassbar in der Triage-UI. */
+export interface SilenceConfig {
+  /** Threshold in dBFS (negativ; z.B. -50). Audio ≤ dieser Lautstärke
+   *  zählt als Stille. */
+  thresholdDb: number;
+  /** Mindestpausenlänge (ms) — kürzere Pausen werden ignoriert (vermeidet
+   *  Mikro-Splits zwischen Drum-Hits). */
+  minPauseMs: number;
 }
 
-export type JobStatus =
-  | "queued"
-  | "syncing"
-  | "synced"
-  | "rendering"
-  | "rendered"
-  | "failed";
+/**
+ * Ein erkanntes Audio-Stück im Long-Form-Master. Wird in der Triage-Phase
+ * vom Detection-Worker erzeugt und kann pro Chunk vom User akzeptiert,
+ * verworfen, getrimmt oder im BPM angepasst werden.
+ *
+ * Stable IDs überleben eine erneute Detection (re-running threshold/min-
+ * pause behält bestehende Chunk-IDs für noch existierende Bereiche bei).
+ */
+export interface Chunk {
+  id: string;
+  /** Master-Audio-Zeit in ms. */
+  startMs: number;
+  endMs: number;
+  /** Vom Detection-Worker pro Chunk erkanntes BPM, falls verfügbar.
+   *  Long-form-Sessions bestehen aus unabhängigen musikalischen
+   *  Fragmenten — daher detect pro Chunk und aggregiere zum
+   *  Song-globalen `job.bpm` (Mode der per-Chunk-Werte). */
+  detectedBpm?: number;
+  /** User-Override für Half/Double-Time. -1 → ÷2, 0 → unverändert,
+   *  1 → ×2. Wird auf `detectedBpm` angewendet, ergibt `effectiveBpm`. */
+  bpmOctaveShift: -1 | 0 | 1;
+  /** Tatsächlich für Bar-Berechnung verwendetes BPM. Default = detectedBpm
+   *  * 2^bpmOctaveShift; default = job.bpm wenn der User keinen
+   *  per-Chunk-Override gesetzt hat. */
+  effectiveBpm: number;
+  /** Bar-grid phase anchor (master-audio time, ms). Marks a single point
+   *  the chunk's bar grid is anchored on; the rendered grid is then
+   *  `audioStartMs + N * msPerBar`. Misnamed for legacy reasons — does
+   *  NOT necessarily mark where audio starts. The detector seeds it from
+   *  the first onset; `splitChunkAt` projects it onto the new range as
+   *  a bar boundary of the original grid; `conformChunk` re-fits it
+   *  from the chunk's current audio range. Chunks are not aligned to
+   *  each other — each carries its own anchor. Default = startMs when
+   *  no onset was detected. */
+  audioStartMs?: number;
+  /** Snapshot of (startMs, endMs, audioStartMs) taken just before the
+   *  most recent `conformChunk` call — undefined when the chunk has
+   *  never been conformed (or has been reverted/edited since). Powers
+   *  the "Original" button next to Conform: revert to this state and
+   *  clear the snapshot. Cleared on split/join/extend/reset to avoid
+   *  surfacing a stale undo target. */
+  preConformSnapshot?: {
+    startMs: number;
+    endMs: number;
+    audioStartMs?: number;
+  };
+  /** Berechnete Bar-Anzahl (Dauer / Sekunden-pro-Bar). Optional — UI
+   *  kann das auf der Fly berechnen falls nicht persistiert. */
+  bars?: number;
+  /** Time-Signature-Numerator (default 4). */
+  beatsPerBar: number;
+  /** Im Arrangement enthalten? Cherry-Pick passiert in Triage. */
+  accepted: boolean;
+  /** Snap-Modus für In/Out-Drag. */
+  trimMode: "auto" | "bar" | "free";
+  /** Optional: User-getrimmte Boundaries, falls abweichend von der
+   *  ursprünglichen Detection. */
+  trimStartMs?: number;
+  trimEndMs?: number;
+  /** Snapshot der Detection-Boundaries (oder bei manuellen Chunks
+   *  ihrer initialen Werte). Treibt den "Reset"-Button im Inspector,
+   *  der den Chunk wieder auf seinen Ausgangszustand zurücksetzen
+   *  darf. Optional: legacy-Chunks ohne dieses Feld können nicht
+   *  zurückgesetzt werden — Reset-Button ist dann disabled. */
+  originalStartMs?: number;
+  originalEndMs?: number;
+  originalAudioStartMs?: number;
+}
+
+/**
+ * Eintrag in der Arrange-Phase: referenziert einen Chunk (per ID) und
+ * gibt ihm seinen Platz in der finalen Reihenfolge. Ein Chunk kann
+ * mehrfach im Arrangement vorkommen (Duplicate-Funktion); jede Instanz
+ * hat ihre eigene `ArrangementItem.id` für Stable-Editor-Edits.
+ */
+export interface ArrangementItem {
+  id: string;
+  chunkId: string;
+}
 
 export interface LocalJob {
   id: string;
@@ -171,10 +301,6 @@ export interface LocalJob {
    *  Either an OPFS path or a `FileSystemFileHandle` to the user's
    *  original audio file. */
   audioSource?: AssetSource;
-
-  status: JobStatus;
-  progress: JobProgress;
-  error?: string;
 
   /** V1-Feld: Sync-Result für das (eine) Video. Ab V2 lebt das pro Video in
    * `videos[i].sync`. Wird zur Backward-Compat hier gespiegelt. */
@@ -194,12 +320,15 @@ export interface LocalJob {
    * Coupling zu vermeiden. */
   editSpec?: unknown;
 
-  hasOutput: boolean;
-  outputBytes?: number;
+  /** Last successful render. Persistent "this job has produced an output
+   *  video" pointer. Cleared (overwritten) on each new successful render.
+   *  Output bytes live at `jobs/{id}/output.mp4` in OPFS. */
+  lastRender?: {
+    completedAt: number;
+    outputBytes: number;
+  };
 
   createdAt: number;
-  startedAt?: number;
-  finishedAt?: number;
 
   // ---- V2 (Multi-Video) ----
 
@@ -262,6 +391,61 @@ export interface LocalJob {
    *  storage layer to the editor's `ExportSpec` type — the editor
    *  validates / ignores fields it doesn't recognise. */
   exportSpec?: unknown;
+
+  // ---- Long-Form Triage Workflow ----
+
+  /** Workflow-Pfad. Fehlt bei Pre-Triage-Jobs → wird als `"direct"`
+   *  behandelt. Beim Upload gesetzt; ändert sich danach nicht mehr. */
+  mode?: JobMode;
+
+  /** Letzte vom User justierten Detection-Parameter. Werden in der
+   *  Triage-UI live mutiert; persistiert damit ein Reload an derselben
+   *  Stelle weitermacht. Nur sinnvoll für `mode === "longform"`. */
+  silenceConfig?: SilenceConfig;
+
+  /** Session-weite BPM-Erzwingung. Wenn gesetzt, gilt dieser Wert für
+   *  alle Chunks ohne eigenen Octave-Shift. */
+  sessionBpmOverride?: number;
+
+  /** Erkannte (und vom User kuratierte) Audio-Chunks. Nur für
+   *  Long-Form-Jobs; bei Direct bleibt das undefined. */
+  chunks?: Chunk[];
+
+  /** Geordnete Sequenz von Chunks (mit möglichen Duplikaten) für die
+   *  Editor-Pre-Population. Wird in der Arrange-Phase gefüllt. */
+  arrangement?: ArrangementItem[];
+
+  /** Editor-side pill list — first-class slots of cam material on the
+   *  song timeline. Auto-generated from `arrangement × cams × chunks`
+   *  on first editor mount; persisted here so user edits (move / trim)
+   *  survive across mounts / refreshes. Pills with ids whose underlying
+   *  arrangement-item disappears are reconciled out at load time. */
+  pills?: PillRecord[];
+
+  /** Cached RMS-envelope of the master audio at 10 Hz, computed during
+   *  sync. Lets Triage render the waveform overview without
+   *  re-decoding the multi-GB PCM up front. ~144 KB per hour of
+   *  audio — comfortable in IDB. Float32Array round-trips through
+   *  structured-clone natively. Optional / undefined for jobs synced
+   *  before this field existed (or direct-mode jobs). */
+  triageEnvelope?: Float32Array;
+}
+
+/** Persisted shape of `Pill` (from editor/types). Mirrored here to keep
+ *  the storage layer free of editor-module imports. Same field semantics
+ *  as the runtime type. */
+export interface PillRecord {
+  id: string;
+  camId: string;
+  arrStartS: number;
+  arrEndS: number;
+  sourceInS: number;
+  sourceOutS: number;
+  originalArrStartS: number;
+  originalArrEndS: number;
+  originalSourceInS: number;
+  originalSourceOutS: number;
+  fromArrangementItemId?: string;
 }
 
 /** Storage shape for a single Punch-in FX. Mirrors `PunchFx` from the
@@ -294,9 +478,19 @@ export interface PunchFxRecord {
 }
 
 const DB_NAME = "videoaudiosync";
-const DB_VERSION = 3;
+const DB_VERSION = 8;
 const STORE = "jobs";
 const ANALYSIS_STORE = "audio-analysis";
+/** Per-chunk thumbnail JPEG bytes, keyed by `${jobId}::${camId}::${chunkId}`.
+ *  Filled lazily by the Arrange page so reloads don't re-decode the
+ *  underlying video. Bounded soft-cap: callers can prune via
+ *  `pruneChunkThumbnailsForJob` when a job is deleted. */
+const CHUNK_THUMBS_STORE = "chunk-thumbnails";
+/** Per-chunk mel-spectrogram bytes (u8 grayscale), keyed by
+ *  `${jobId}::${chunkId}`. Computed once when the user first opens
+ *  Arrange for a job and cached so re-mounts don't re-decode the
+ *  master audio. */
+const CHUNK_MELS_STORE = "chunk-mel-specs";
 
 let dbPromise: Promise<IDBPDatabase> | null = null;
 
@@ -327,6 +521,85 @@ function db(): Promise<IDBPDatabase> {
         // Editor-Open eine frische Analyse.
         if (oldVersion < 3 && !database.objectStoreNames.contains(ANALYSIS_STORE)) {
           database.createObjectStore(ANALYSIS_STORE, { keyPath: "jobId" });
+        }
+
+        // V3 → V4: chunk-thumbnail cache so the Arrange page doesn't
+        // re-decode the same per-chunk thumbnails on every reload.
+        if (oldVersion < 4 && !database.objectStoreNames.contains(CHUNK_THUMBS_STORE)) {
+          const s = database.createObjectStore(CHUNK_THUMBS_STORE, {
+            keyPath: "key",
+          });
+          s.createIndex("by-jobId", "jobId");
+        }
+
+        // V4 → V5: chunk-thumbnail extraction logic learned to apply
+        // intrinsic MP4 rotation. Old cached blobs were extracted
+        // without the rotation transform — wipe them so the next
+        // page-mount re-extracts via the corrected pipeline.
+        // Auto-heal — no user-facing migration UI needed.
+        if (oldVersion === 4 && database.objectStoreNames.contains(CHUNK_THUMBS_STORE)) {
+          const s = tx.objectStore(CHUNK_THUMBS_STORE);
+          await s.clear();
+        }
+
+        // V5 → V6: per-chunk mel-spectrogram cache for the Arrange-page
+        // glance display. No data migration — fresh store, lazily
+        // filled on first Arrange mount per job.
+        if (oldVersion < 6 && !database.objectStoreNames.contains(CHUNK_MELS_STORE)) {
+          const s = database.createObjectStore(CHUNK_MELS_STORE, {
+            keyPath: "key",
+          });
+          s.createIndex("by-jobId", "jobId");
+        }
+
+        // V6 → V7: chunk-thumbnail extraction switched from "200 px wide
+        // upscaled JPEG" to "native tile resolution + tier-3 fallback
+        // for tiles too small to upscale". Old cached thumbs are blocky
+        // (especially for portrait clips) — wipe them so the next page
+        // mount re-extracts via the corrected pipeline.
+        if (oldVersion === 6 && database.objectStoreNames.contains(CHUNK_THUMBS_STORE)) {
+          const s = tx.objectStore(CHUNK_THUMBS_STORE);
+          await s.clear();
+        }
+
+        // V7 → V8: removed the persisted lifecycle fields (status,
+        // progress, error, hasOutput, outputBytes, startedAt, finishedAt)
+        // from LocalJob in favour of the in-memory ops-store. Strip the
+        // legacy fields off existing rows so a TypeScript-aware reader
+        // never sees them again, and synthesize `lastRender` for rows
+        // that previously had `hasOutput === true` so the user doesn't
+        // lose the "I have a finished video" indicator.
+        if (oldVersion < 8 && database.objectStoreNames.contains(STORE)) {
+          const store = tx.objectStore(STORE);
+          let cursor = await store.openCursor();
+          while (cursor) {
+            const row = cursor.value as Record<string, unknown>;
+            const hasOutput = row.hasOutput === true;
+            const outputBytes =
+              typeof row.outputBytes === "number"
+                ? row.outputBytes
+                : 0;
+            const finishedAt =
+              typeof row.finishedAt === "number"
+                ? row.finishedAt
+                : Date.now();
+            const cleaned: Record<string, unknown> = { ...row };
+            delete cleaned.status;
+            delete cleaned.progress;
+            delete cleaned.error;
+            delete cleaned.hasOutput;
+            delete cleaned.outputBytes;
+            delete cleaned.startedAt;
+            delete cleaned.finishedAt;
+            if (hasOutput && !cleaned.lastRender) {
+              cleaned.lastRender = {
+                completedAt: finishedAt,
+                outputBytes,
+              };
+            }
+            await cursor.update(cleaned);
+            cursor = await cursor.continue();
+          }
         }
       },
     });
@@ -372,6 +645,8 @@ async function deleteJob(id: string): Promise<void> {
   if (d.objectStoreNames.contains(ANALYSIS_STORE)) {
     await d.delete(ANALYSIS_STORE, id);
   }
+  await deleteChunkThumbnailsForJob(id);
+  await deleteChunkMelSpecsForJob(id);
 }
 
 async function wipeAll(): Promise<void> {
@@ -379,6 +654,12 @@ async function wipeAll(): Promise<void> {
   await d.clear(STORE);
   if (d.objectStoreNames.contains(ANALYSIS_STORE)) {
     await d.clear(ANALYSIS_STORE);
+  }
+  if (d.objectStoreNames.contains(CHUNK_THUMBS_STORE)) {
+    await d.clear(CHUNK_THUMBS_STORE);
+  }
+  if (d.objectStoreNames.contains(CHUNK_MELS_STORE)) {
+    await d.clear(CHUNK_MELS_STORE);
   }
 }
 
@@ -408,6 +689,132 @@ async function deleteAudioAnalysis(jobId: string): Promise<void> {
   }
 }
 
+interface ChunkThumbnailRecord {
+  /** `${jobId}::${camId}::${chunkId}` — primary key. */
+  key: string;
+  jobId: string;
+  /** image/jpeg bytes. */
+  blob: Blob;
+}
+
+function chunkThumbKey(jobId: string, camId: string, chunkId: string): string {
+  return `${jobId}::${camId}::${chunkId}`;
+}
+
+async function getChunkThumbnail(
+  jobId: string,
+  camId: string,
+  chunkId: string,
+): Promise<Blob | undefined> {
+  const d = await db();
+  if (!d.objectStoreNames.contains(CHUNK_THUMBS_STORE)) return undefined;
+  const rec = (await d.get(
+    CHUNK_THUMBS_STORE,
+    chunkThumbKey(jobId, camId, chunkId),
+  )) as ChunkThumbnailRecord | undefined;
+  return rec?.blob;
+}
+
+async function saveChunkThumbnail(
+  jobId: string,
+  camId: string,
+  chunkId: string,
+  blob: Blob,
+): Promise<void> {
+  const d = await db();
+  if (!d.objectStoreNames.contains(CHUNK_THUMBS_STORE)) return;
+  const rec: ChunkThumbnailRecord = {
+    key: chunkThumbKey(jobId, camId, chunkId),
+    jobId,
+    blob,
+  };
+  await d.put(CHUNK_THUMBS_STORE, rec);
+}
+
+/** Drop every cached thumbnail for a job (e.g. when the job itself is
+ *  deleted). Iterates the by-jobId index. */
+async function deleteChunkThumbnailsForJob(jobId: string): Promise<void> {
+  const d = await db();
+  if (!d.objectStoreNames.contains(CHUNK_THUMBS_STORE)) return;
+  const tx = d.transaction(CHUNK_THUMBS_STORE, "readwrite");
+  const idx = tx.store.index("by-jobId");
+  let cursor = await idx.openCursor(IDBKeyRange.only(jobId));
+  while (cursor) {
+    await cursor.delete();
+    cursor = await cursor.continue();
+  }
+  await tx.done;
+}
+
+interface ChunkMelRecord {
+  /** `${jobId}::${chunkId}` */
+  key: string;
+  jobId: string;
+  /** Frame-major u8 mel-spec data, length = `nMels * nFrames`. */
+  data: Uint8Array;
+  nMels: number;
+  nFrames: number;
+  /** Original chunk duration in seconds — lets the renderer pick a
+   *  pixel width independent of the mel frame count. */
+  durationS: number;
+  /** 12-bin chroma profile. Optional for back-compat with v6 records
+   *  that were saved before key-detection landed. Class 0 = C. */
+  chroma?: Float32Array;
+}
+
+function chunkMelKey(jobId: string, chunkId: string): string {
+  return `${jobId}::${chunkId}`;
+}
+
+async function getChunkMelSpec(
+  jobId: string,
+  chunkId: string,
+): Promise<ChunkMelRecord | undefined> {
+  const d = await db();
+  if (!d.objectStoreNames.contains(CHUNK_MELS_STORE)) return undefined;
+  return (await d.get(CHUNK_MELS_STORE, chunkMelKey(jobId, chunkId))) as
+    | ChunkMelRecord
+    | undefined;
+}
+
+async function saveChunkMelSpec(
+  jobId: string,
+  chunkId: string,
+  data: Uint8Array,
+  nMels: number,
+  nFrames: number,
+  durationS: number,
+  chroma?: Float32Array,
+): Promise<void> {
+  const d = await db();
+  if (!d.objectStoreNames.contains(CHUNK_MELS_STORE)) return;
+  const rec: ChunkMelRecord = {
+    key: chunkMelKey(jobId, chunkId),
+    jobId,
+    data,
+    nMels,
+    nFrames,
+    durationS,
+    chroma,
+  };
+  await d.put(CHUNK_MELS_STORE, rec);
+}
+
+async function deleteChunkMelSpecsForJob(jobId: string): Promise<void> {
+  const d = await db();
+  if (!d.objectStoreNames.contains(CHUNK_MELS_STORE)) return;
+  const tx = d.transaction(CHUNK_MELS_STORE, "readwrite");
+  const idx = tx.store.index("by-jobId");
+  let cursor = await idx.openCursor(IDBKeyRange.only(jobId));
+  while (cursor) {
+    await cursor.delete();
+    cursor = await cursor.continue();
+  }
+  await tx.done;
+}
+
+export type { ChunkMelRecord };
+
 export const jobsDb = {
   saveJob,
   getJob,
@@ -418,6 +825,12 @@ export const jobsDb = {
   getAudioAnalysis,
   saveAudioAnalysis,
   deleteAudioAnalysis,
+  getChunkThumbnail,
+  saveChunkThumbnail,
+  deleteChunkThumbnailsForJob,
+  getChunkMelSpec,
+  saveChunkMelSpec,
+  deleteChunkMelSpecsForJob,
 };
 
 export type JobsDb = typeof jobsDb;

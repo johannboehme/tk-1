@@ -5,11 +5,11 @@ import {
   initCapabilities,
   meetsMinRequirements,
 } from "./local/capabilities";
-import { markInterruptedJobsOnLoad } from "./local/lifecycle";
 import { HelpOverlay } from "./editor/components/HelpOverlay";
 import { RecMark } from "./editor/components/RuleStrip";
 import { Footer } from "./components/Footer";
 import { Datenschutz } from "./pages/Datenschutz";
+import Arrange from "./pages/Arrange";
 import Editor from "./pages/Editor";
 import { JobPermissionRoute } from "./components/JobPermissionRoute";
 import History from "./pages/History";
@@ -18,6 +18,7 @@ import JobPage from "./pages/JobPage";
 import RenderScreen from "./pages/RenderScreen";
 import { Settings } from "./pages/Settings";
 import { BrowserTooOld } from "./pages/BrowserTooOld";
+import Triage from "./pages/Triage";
 import Upload from "./pages/Upload";
 
 export default function App() {
@@ -26,7 +27,9 @@ export default function App() {
   // (the editor and the render screen).
   const isFullBleed =
     /^\/job\/[^/]+\/edit/.test(location.pathname) ||
-    /^\/job\/[^/]+\/render$/.test(location.pathname);
+    /^\/job\/[^/]+\/render$/.test(location.pathname) ||
+    /^\/job\/[^/]+\/triage$/.test(location.pathname) ||
+    /^\/job\/[^/]+\/arrange$/.test(location.pathname);
   // `caps` starts with the sync probe (webgpu=false) and gets the
   // async-probed `webgpu` merged in once `initCapabilities()` resolves.
   // Both Settings (display) and any render-backend consumer that reads
@@ -37,24 +40,19 @@ export default function App() {
   // Hold off rendering anything browser-API-dependent until we've confirmed
   // we're not running in jsdom-with-coercion (some unit tests stub
   // navigator etc.). For real browsers this is a one-tick check.
-  // We also clean up jobs left in `syncing`/`rendering` from a previous
-  // page session — they were necessarily interrupted (the work was driven
-  // by a now-dead tab) so surfacing that beats letting them hang in limbo.
-  // And we await the WebGPU adapter probe so the Render-Backend factory
+  // We also await the WebGPU adapter probe so the Render-Backend factory
   // gets a reliable `caps.webgpu` from the very first mount.
   const [ready, setReady] = useState(false);
   useEffect(() => {
     let cancelled = false;
-    Promise.all([
-      markInterruptedJobsOnLoad().catch(() => undefined),
-      initCapabilities()
-        .then((merged) => {
-          if (!cancelled) setCaps(merged);
-        })
-        .catch(() => undefined),
-    ]).finally(() => {
-      if (!cancelled) setReady(true);
-    });
+    initCapabilities()
+      .then((merged) => {
+        if (!cancelled) setCaps(merged);
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (!cancelled) setReady(true);
+      });
     return () => {
       cancelled = true;
     };
@@ -79,6 +77,8 @@ export default function App() {
         <Route path="/" element={<Upload />} />
         <Route path="/jobs" element={<History />} />
         <Route path="/job/:id" element={<JobPermissionRoute><JobPage /></JobPermissionRoute>} />
+        <Route path="/job/:id/triage" element={<JobPermissionRoute><Triage /></JobPermissionRoute>} />
+        <Route path="/job/:id/arrange" element={<JobPermissionRoute><Arrange /></JobPermissionRoute>} />
         <Route path="/job/:id/edit" element={<JobPermissionRoute><Editor /></JobPermissionRoute>} />
         <Route path="/job/:id/render" element={<JobPermissionRoute><RenderScreen /></JobPermissionRoute>} />
         <Route path="/settings" element={<Settings caps={caps} />} />

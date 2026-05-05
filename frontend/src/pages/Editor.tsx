@@ -30,7 +30,8 @@ import {
   type LocalJob,
   type EditSpecLocal,
 } from "../local/jobs";
-import { isVideoAsset, type MediaAsset } from "../storage/jobs-db";
+import { isVideoAsset, type MediaAsset, type VideoAsset } from "../storage/jobs-db";
+import { arrangementToSegments } from "../local/arrange/chunks-to-segments";
 import { decodeAudioToMonoPcm } from "../local/codec";
 import { computeWaveformPeaks } from "../local/waveform-peaks";
 import { exportSpecToRenderOpts } from "../editor/exportPresets";
@@ -689,6 +690,15 @@ export default function Editor() {
                 }
               : null));
 
+      // Long-form jobs land here with a populated `arrangement[]` —
+      // translate it into a flat segment list so the editor's audio
+      // master walks the user's chunk sequence and `buildEditSpec`
+      // emits a multi-segment EditSpec the renderer slices natively.
+      const arrangementSegments =
+        j.mode === "longform" && Array.isArray(j.arrangement) && j.arrangement.length > 0
+          ? arrangementToSegments(j.arrangement, j.chunks ?? [])
+          : [];
+
       loadJob(
         {
           id: j.id,
@@ -717,8 +727,32 @@ export default function Editor() {
           cuts: j.cuts ?? [],
           fx: j.fx ?? [],
           audioVolume: j.audioVolume,
+          arrangementSegments,
+          // First-class pills: passed to loadJob so reconcileArrangementPills
+          // can splice user-edited pills (move / trim) on top of the
+          // freshly-generated default. `storedPills` is read from the
+          // LocalJob so a refresh / re-open keeps the user's edits.
+          arrangement:
+            j.mode === "longform" ? (j.arrangement ?? []) : undefined,
+          chunks: j.mode === "longform" ? (j.chunks ?? []) : undefined,
+          storedPills: j.pills ?? [],
         },
       );
+      // E2E hook (dev only) — Playwright reads `arrangementSegments[]`
+      // length via `window.__editorTestHooks` so the screenshot script
+      // can verify the long-form handoff without re-importing the
+      // zustand module (Vite hands back distinct instances for
+      // dynamic vs. static imports). Stripped from production builds.
+      if (import.meta.env.DEV) {
+        (
+          window as unknown as {
+            __editorTestHooks?: { segments: number; trim: { in: number; out: number } };
+          }
+        ).__editorTestHooks = {
+          segments: useEditorStore.getState().arrangementSegments.length,
+          trim: useEditorStore.getState().trim,
+        };
+      }
 
       // Restore persisted UI state (snap-mode, lanesLocked) and trim. Must
       // happen AFTER loadJob, since loadJob resets ui to defaults.
@@ -747,6 +781,32 @@ export default function Editor() {
         const tin = Math.max(0, Math.min(j.trim.in, audioMax));
         const tout = Math.max(tin, Math.min(j.trim.out, audioMax));
         useEditorStore.getState().setTrim({ in: tin, out: tout });
+      } else if (arrangementSegments.length > 0) {
+        // Long-form first-load: derive trim from the span across ALL
+        // segments so skip-to-end / zoom-to-fit cover every active
+        // region. Arrangement order can place a duplicated early
+        // chunk after later ones, so we MUST take min/max — not
+        // first.in / last.out — to get a sensible window.
+        let lo = Infinity;
+        let hi = -Infinity;
+        for (const seg of arrangementSegments) {
+          if (seg.in < lo) lo = seg.in;
+          if (seg.out > hi) hi = seg.out;
+        }
+        if (lo < hi) {
+          useEditorStore.getState().setTrim({ in: lo, out: hi });
+        }
+      }
+      // Long-form: park the playhead at the first segment's in-point so
+      // the user pressing Space starts on real material instead of
+      // tripping the audio walker's "in-gap → hard seek" branch (audible
+      // as a momentary scratchy attack at master-time 0). The hint binds
+      // the audio walker to segment 0 so duplicate-chunk arrangements
+      // start at the right occurrence.
+      if (arrangementSegments.length > 0) {
+        useEditorStore
+          .getState()
+          .seek(arrangementSegments[0].in, { segmentIdxHint: 0 });
       }
     })().catch((e) => {
       if (!cancelled) setErr(e instanceof Error ? e.message : "Could not load job");
@@ -924,6 +984,11 @@ export default function Editor() {
       outputFilename: spec.export?.filename,
       clipOverrides,
       cuts,
+      // Forward arrangement-mode pills so the renderer composes the
+      // song from the same per-cam slots the user shaped in the
+      // editor's Timeline. Empty in direct-mode → renderer falls back
+      // to its legacy clip-range walk.
+      pills: liveState.pills,
       audioVolume: liveState.audioVolume,
     };
     // Fire-and-forget: the render screen owns the lifecycle from here.
@@ -1007,8 +1072,27 @@ export default function Editor() {
               cams={Object.fromEntries(
                 Object.entries(assets.cams).map(([camId, ca]) => {
                   const cam = job.videos?.find((v) => v.id === camId);
-                  const aspect =
-                    cam?.width && cam?.height ? cam.width / cam.height : 16 / 9;
+                  // Tile aspect must match the strip's pixel layout.
+                  // Legacy strips (`framesOrientation === "codec"` or
+                  // undefined): tiles are codec-oriented, so use codec
+                  // dims. New strips ("display"): tiles are upright,
+                  // so swap codec dims when the cam carries a 90/270
+                  // intrinsic rotation.
+                  const usingDisplayStrip =
+                    isVideoAsset(cam ?? ({} as never)) &&
+                    (cam as VideoAsset).framesOrientation === "display";
+                  const dims = (() => {
+                    if (!cam || cam.width == null || cam.height == null) return null;
+                    if (!usingDisplayStrip) return { w: cam.width, h: cam.height };
+                    const swap =
+                      isVideoAsset(cam) &&
+                      (cam.intrinsicRotationDeg === 90 ||
+                        cam.intrinsicRotationDeg === 270);
+                    return swap
+                      ? { w: cam.height, h: cam.width }
+                      : { w: cam.width, h: cam.height };
+                  })();
+                  const aspect = dims ? dims.w / dims.h : 16 / 9;
                   // Image clips: pass the asset URL through so the lane
                   // renders the actual image as a preview instead of an
                   // empty pill.

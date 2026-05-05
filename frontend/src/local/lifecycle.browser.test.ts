@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import {
-  markInterruptedJobsOnLoad,
   installRenderUnloadGuard,
   removeRenderUnloadGuard,
   activeRenderJobsForTest,
@@ -16,67 +15,10 @@ function makeJob(overrides: Partial<LocalJob> = {}): LocalJob {
     title: null,
     videoFilename: "v.mp4",
     audioFilename: "a.wav",
-    status: "queued",
-    progress: { pct: 0, stage: "queued" },
-    hasOutput: false,
     createdAt: Date.now(),
     ...overrides,
   };
 }
-
-describe("markInterruptedJobsOnLoad", () => {
-  beforeEach(async () => {
-    await jobsDb.wipeAll();
-  });
-
-  it("marks syncing/rendering jobs as failed and leaves the rest alone", async () => {
-    await jobsDb.saveJob(makeJob({ id: "syncing-1", status: "syncing" }));
-    await jobsDb.saveJob(makeJob({ id: "rendering-1", status: "rendering" }));
-    await jobsDb.saveJob(makeJob({ id: "synced-1", status: "synced" }));
-    await jobsDb.saveJob(makeJob({ id: "rendered-1", status: "rendered" }));
-    await jobsDb.saveJob(makeJob({ id: "failed-1", status: "failed", error: "old" }));
-
-    const touched = await markInterruptedJobsOnLoad();
-    expect(touched).toBe(2);
-
-    const a = await jobsDb.getJob("syncing-1");
-    expect(a!.status).toBe("failed");
-    expect(a!.error).toMatch(/Interrupted/);
-    const b = await jobsDb.getJob("rendering-1");
-    expect(b!.status).toBe("failed");
-
-    expect((await jobsDb.getJob("synced-1"))!.status).toBe("synced");
-    expect((await jobsDb.getJob("rendered-1"))!.status).toBe("rendered");
-    expect((await jobsDb.getJob("failed-1"))!.error).toBe("old");
-  });
-
-  it("is idempotent — running twice does not flip already-failed jobs again", async () => {
-    await jobsDb.saveJob(makeJob({ id: "syncing-1", status: "syncing" }));
-    await markInterruptedJobsOnLoad();
-    const second = await markInterruptedJobsOnLoad();
-    expect(second).toBe(0);
-  });
-
-  it("emits jobEvents so any open page refreshes immediately", async () => {
-    const { jobEvents } = await import("./jobs-events");
-    await jobsDb.saveJob(makeJob({ id: "stuck-render", status: "rendering" }));
-
-    const observed: Array<{ jobId: string; status: string }> = [];
-    const handler = (e: Event) => {
-      const detail = (e as CustomEvent<{ jobId: string; job: { status: string } }>).detail;
-      observed.push({ jobId: detail.jobId, status: detail.job.status });
-    };
-    jobEvents.addEventListener("update", handler);
-
-    try {
-      await markInterruptedJobsOnLoad();
-    } finally {
-      jobEvents.removeEventListener("update", handler);
-    }
-
-    expect(observed).toContainEqual({ jobId: "stuck-render", status: "failed" });
-  });
-});
 
 describe("install/removeRenderUnloadGuard", () => {
   it("tracks active jobs in a shared set", () => {
@@ -111,13 +53,23 @@ describe("pruneIfQuotaTight", () => {
     expect(pruned).toBe(0);
   });
 
-  it("when forced (high watermark surpassed via stub) deletes oldest finished jobs first and skips protected ids", async () => {
-    // Set up: three rendered jobs of varying age + an active synced job.
+  it("when forced (high watermark surpassed via stub) deletes oldest rendered jobs first and skips protected ids", async () => {
+    // Set up: three jobs with `lastRender` of varying age + one without.
     const now = Date.now();
-    await jobsDb.saveJob(makeJob({ id: "old-1", status: "rendered", createdAt: now - 1000_000 }));
-    await jobsDb.saveJob(makeJob({ id: "mid-1", status: "rendered", createdAt: now - 500_000 }));
-    await jobsDb.saveJob(makeJob({ id: "new-1", status: "rendered", createdAt: now - 100_000 }));
-    await jobsDb.saveJob(makeJob({ id: "active", status: "synced", createdAt: now }));
+    const lastRender = (completedAt: number) => ({
+      completedAt,
+      outputBytes: 1024,
+    });
+    await jobsDb.saveJob(
+      makeJob({ id: "old-1", lastRender: lastRender(now - 1000_000), createdAt: now - 1000_000 }),
+    );
+    await jobsDb.saveJob(
+      makeJob({ id: "mid-1", lastRender: lastRender(now - 500_000), createdAt: now - 500_000 }),
+    );
+    await jobsDb.saveJob(
+      makeJob({ id: "new-1", lastRender: lastRender(now - 100_000), createdAt: now - 100_000 }),
+    );
+    await jobsDb.saveJob(makeJob({ id: "active", createdAt: now }));
 
     // Stub navigator.storage.estimate to lie that we're full.
     const origEstimate = navigator.storage.estimate.bind(navigator.storage);
@@ -139,6 +91,29 @@ describe("pruneIfQuotaTight", () => {
       expect(await jobsDb.getJob("mid-1")).toBeDefined();
       expect(await jobsDb.getJob("new-1")).toBeDefined();
       expect(await jobsDb.getJob("active")).toBeDefined();
+    } finally {
+      (navigator.storage as { estimate: typeof origEstimate }).estimate = origEstimate;
+    }
+  });
+
+  it("never prunes a job without lastRender, even if it's old", async () => {
+    const now = Date.now();
+    await jobsDb.saveJob(makeJob({ id: "ancient-no-output", createdAt: now - 9_000_000 }));
+
+    const origEstimate = navigator.storage.estimate.bind(navigator.storage);
+    let queriedTimes = 0;
+    (navigator.storage as { estimate: () => Promise<{ quota: number; usage: number }> }).estimate =
+      async () => {
+        queriedTimes++;
+        return queriedTimes === 1
+          ? { quota: 100, usage: 90 }
+          : { quota: 100, usage: 50 };
+      };
+
+    try {
+      const pruned = await pruneIfQuotaTight();
+      expect(pruned).toBe(0);
+      expect(await jobsDb.getJob("ancient-no-output")).toBeDefined();
     } finally {
       (navigator.storage as { estimate: typeof origEstimate }).estimate = origEstimate;
     }

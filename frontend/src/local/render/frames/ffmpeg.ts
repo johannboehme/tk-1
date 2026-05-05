@@ -23,16 +23,23 @@ export interface FfmpegFrameStripOptions {
    *  expose mid-pipe progress over a tractable API, so we don't try to fake
    *  one — the caller can map this onto its own progress range. */
   onProgress?: (frac: number) => void;
+  /** Display rotation to bake into the strip (matches WebCodecs path).
+   *  Implemented via ffmpeg's `transpose` filter; tile dims are
+   *  computed from the post-rotation aspect. Default 0. */
+  rotationDeg?: 0 | 90 | 180 | 270;
 }
 
 export async function extractFrameStripFfmpeg(
   source: Blob | ArrayBuffer,
   opts: FfmpegFrameStripOptions,
 ): Promise<FrameStripResult> {
+  const rotationDeg = opts.rotationDeg ?? 0;
+  const swap = rotationDeg === 90 || rotationDeg === 270;
   const plan = planTileStrip({
     durationS: opts.durationS,
-    sourceWidth: opts.sourceWidth,
-    sourceHeight: opts.sourceHeight,
+    // Plan from display dims so tiles come out display-oriented.
+    sourceWidth: swap ? opts.sourceHeight : opts.sourceWidth,
+    sourceHeight: swap ? opts.sourceWidth : opts.sourceHeight,
     tileHeight: opts.tileHeight,
     maxTiles: opts.maxTiles,
   });
@@ -62,8 +69,20 @@ export async function extractFrameStripFfmpeg(
       : new Uint8Array(await source.arrayBuffer());
   await ffmpeg.writeFile(inputName, data);
 
+  // ffmpeg's transpose filter:
+  //   transpose=1 → 90° clockwise
+  //   transpose=2 → 90° counter-clockwise (= 270° CW)
+  //   transpose=1,transpose=1 → 180°
+  // We chain rotation BEFORE the scale so the scale targets the
+  // already-rotated frame's aspect.
+  let rotateChain = "";
+  if (rotationDeg === 90) rotateChain = "transpose=1,";
+  else if (rotationDeg === 180) rotateChain = "transpose=1,transpose=1,";
+  else if (rotationDeg === 270) rotateChain = "transpose=2,";
+
   const filter =
     `fps=1/${step.toFixed(6)},` +
+    rotateChain +
     `scale=${plan.tileWidth}:${plan.tileHeight}:flags=lanczos,` +
     `tile=${plan.timestampsS.length}x1`;
 

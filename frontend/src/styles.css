@@ -30,6 +30,14 @@ body,
   font-feature-settings: "tnum" 1;
 }
 
+/* Phosphor-amber LCD text shared across Cockpit cells. Warmer color +
+ * dual glow approximates a real LCD lit by side-illumination. */
+.phosphor-text {
+  color: #FF8A4F;
+  text-shadow: 0 0 6px rgba(255, 138, 79, 0.7), 0 0 12px rgba(255, 87, 34, 0.3);
+  font-weight: 600;
+}
+
 /* TE-style label: uppercase, tracked, small */
 .label {
   font-family:

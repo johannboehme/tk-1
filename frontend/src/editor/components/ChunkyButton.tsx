@@ -14,7 +14,8 @@ interface Props extends ButtonProps {
   variant?: Variant;
   size?: Size;
   pressed?: boolean;
-  children: ReactNode;
+  /** Optional: an icon-only button can omit children entirely. */
+  children?: ReactNode;
   iconLeft?: ReactNode;
   iconRight?: ReactNode;
   fullWidth?: boolean;
@@ -81,7 +82,9 @@ export function ChunkyButton({
       {...rest}
     >
       {iconLeft}
-      <span className="leading-none">{children}</span>
+      {children !== undefined && children !== null && children !== "" ? (
+        <span className="leading-none">{children}</span>
+      ) : null}
       {iconRight}
     </motion.button>
   );
