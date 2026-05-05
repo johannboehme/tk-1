@@ -443,18 +443,36 @@ describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => 
         useEditorStore.getState().shiftLoop(1); // [0,2] → [2,4]
         await flushAll();
       });
-      // pendingWrapAt should now be 2 (old loop.end). Approach it
-      // from below — the lead-window arms even though loop.end is 4.
+      // The whole point of pendingWrapAt is the playhead does NOT jump
+      // immediately. After the shift, playhead at 0.5 sits outside the
+      // new loop [2,4], but the deferred wrap is queued at OLD loop.end =
+      // 2 — so the active element should keep playing through unchanged
+      // until master-time reaches that mark.
       ctx.gains.forEach((g) =>
         (g.gain.linearRampToValueAtTime as ReturnType<typeof vi.fn>).mockClear(),
       );
+      await act(async () => {
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      const rampedEarly = ctx.gains.some(
+        (g) =>
+          (g.gain.linearRampToValueAtTime as ReturnType<typeof vi.fn>).mock
+            .calls.length > 0,
+      );
+      expect(rampedEarly).toBe(false);
+
+      // Approach pendingWrapAt — the lead-window arms even though
+      // loop.end is 4.
       await act(async () => {
         mA.setCurrentTime(1.97);
         await new Promise((r) => requestAnimationFrame(() => r(undefined)));
         await new Promise((r) => requestAnimationFrame(() => r(undefined)));
       });
       const ramped = ctx.gains.some(
-        (g) => (g.gain.linearRampToValueAtTime as ReturnType<typeof vi.fn>).mock.calls.length > 0,
+        (g) =>
+          (g.gain.linearRampToValueAtTime as ReturnType<typeof vi.fn>).mock
+            .calls.length > 0,
       );
       expect(ramped).toBe(true);
     });

@@ -190,6 +190,7 @@ export function Timeline({
   const setTrim = useEditorStore((s) => s.setTrim);
   const loop = useEditorStore((s) => s.playback.loop);
   const setLoop = useEditorStore((s) => s.setLoop);
+  const moveLoop = useEditorStore((s) => s.moveLoop);
   const seek = useEditorStore((s) => s.seek);
   const zoom = useEditorStore((s) => s.ui.zoom);
   const scrollX = useEditorStore((s) => s.ui.scrollX);
@@ -1328,7 +1329,11 @@ export function Timeline({
         e.shiftKey || snapMode === "off"
           ? newStartRaw
           : snapTime(newStartRaw, snapMode, buildSnapCtx());
-      setLoop({ start: newStart, end: newStart + len });
+      // OP-1 tape feel: don't yank the playhead while dragging — the
+      // store defers the wrap to the OLD loop.end. The active element
+      // keeps playing through that point and wraps to the new loop's
+      // start when it gets there.
+      moveLoop({ start: newStart, end: newStart + len });
     } else if (drag.kind === "pill-move") {
       // Pill body drag — shift arrStartS by the pointer-delta in arr-time.
       // Source-trim stays put: only the pill's WHEN moves.

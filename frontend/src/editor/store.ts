@@ -461,6 +461,11 @@ interface EditorState {
    *  the audio scheduler wraps at the natural play-out point. No-op if no
    *  loop is set or the shifted loop falls entirely outside trim. */
   shiftLoop(direction: 1 | -1): void;
+  /** Tape-drag: relocate the loop region without interrupting playback.
+   *  Same OP-1 deferred-wrap semantics as `shiftLoop`, but for absolute
+   *  placements (a Timeline drag, not a directional shift). `setLoop`
+   *  remains the "full replacement" entry point and clears pendingWrapAt. */
+  moveLoop(loop: LoopRegion | null): void;
   /** Clear the deferred wrap point (called by useAudioMaster after the
    *  scheduler has reseeked into the new loop region). */
   clearPendingWrap(): void;
@@ -1347,15 +1352,55 @@ export const useEditorStore = create<EditorState>()(
       const clamped = clampLoopToBounds(newLoop, s.arrangementSegments, s.trim);
       if (!clamped) return;
 
-      const t = s.playback.currentTime;
       // Defer the wrap to the OLD loop end whenever the playhead is OUTSIDE
-      // the new loop region. Forward-shift while playing: t is in the old
-      // loop, before the new loop's start → wrap at old loop.end. Backward-
-      // shift while playing: t is past the new loop's end → still wrap at
-      // old loop.end (the playhead reaches it as it advances forward).
-      const insideNew = t >= clamped.start && t < clamped.end;
+      // the new loop region. Loop bounds + pendingWrapAt all live in arr-
+      // time on the composed timeline (= master in direct-mode), so the
+      // playhead's master-time is projected into arr-time before the
+      // inside/outside test.
+      const t_master = s.playback.currentTime;
+      const t_view =
+        s.arrangementSegments.length > 0
+          ? masterToArr(t_master, s.arrangementSegments)
+          : t_master;
+      const insideNew = t_view >= clamped.start && t_view < clamped.end;
       const pendingWrapAt = insideNew ? null : loop.end;
 
+      set({
+        playback: { ...s.playback, loop: clamped, pendingWrapAt },
+      });
+    },
+    moveLoop(loop) {
+      // OP-1 tape-drag: incrementally relocates an existing loop region.
+      // Differs from `setLoop` (full replacement, clears pendingWrapAt)
+      // in that it preserves continuity — the active element keeps
+      // playing through the OLD loop until its end, then wraps to the
+      // NEW loop.start. `setLoop(null)` and "first set" cases route
+      // through `setLoop`, since there's nothing to defer to.
+      if (!loop) {
+        get().setLoop(null);
+        return;
+      }
+      const s = get();
+      const old = s.playback.loop;
+      if (!old) {
+        get().setLoop(loop);
+        return;
+      }
+      const clamped = clampLoopToBounds(loop, s.arrangementSegments, s.trim);
+      if (!clamped) return;
+      const t_master = s.playback.currentTime;
+      const t_view =
+        s.arrangementSegments.length > 0
+          ? masterToArr(t_master, s.arrangementSegments)
+          : t_master;
+      const insideNew = t_view >= clamped.start && t_view < clamped.end;
+      // Preserve any existing pendingWrapAt — multiple drags before the
+      // first wrap fires should keep the earliest old-end as the trigger
+      // (otherwise the trigger keeps chasing the latest drag's old-end
+      // and the wrap may never fire).
+      const pendingWrapAt = insideNew
+        ? null
+        : (s.playback.pendingWrapAt ?? old.end);
       set({
         playback: { ...s.playback, loop: clamped, pendingWrapAt },
       });
