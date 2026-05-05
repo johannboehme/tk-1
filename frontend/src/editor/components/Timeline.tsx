@@ -189,7 +189,6 @@ export function Timeline({
   const arrangementSegments = useEditorStore((s) => s.arrangementSegments);
   const setTrim = useEditorStore((s) => s.setTrim);
   const loop = useEditorStore((s) => s.playback.loop);
-  const setLoop = useEditorStore((s) => s.setLoop);
   const moveLoop = useEditorStore((s) => s.moveLoop);
   const seek = useEditorStore((s) => s.seek);
   const zoom = useEditorStore((s) => s.ui.zoom);
