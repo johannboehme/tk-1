@@ -915,10 +915,16 @@ export async function editRenderMulti(
             framesTotal: totalFrames,
           });
         }
-        // Yield to let the encoder flush; without this Chrome occasionally
-        // stalls when the compositor pushes faster than the encoder accepts.
-        if ((framesEmitted & 0x07) === 0) {
-          await new Promise((r) => setTimeout(r, 0));
+        // Hard backpressure on the encoder. Without this the per-frame
+        // loop pushes raw VideoFrames into the WebCodecs encoder
+        // faster than the encoder can drain them — at 4K each VideoFrame
+        // is ~12 MB, so a few seconds of overflow runs into multi-GB
+        // territory and crashes the tab. Same threshold the single-cam
+        // path uses; matches HW encoder pipeline depth (~4 frames) with
+        // headroom. The 1 ms sleep yields the event loop so the
+        // encoder's output callback can fire and frames drain.
+        while (encoder.encodeQueueSize > 16) {
+          await new Promise((r) => setTimeout(r, 1));
         }
       }
       arrCursorPerSeg += seg.out - seg.in;
