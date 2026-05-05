@@ -143,7 +143,7 @@ describe("reconcilePills", () => {
   ];
 
   it("preserves user-edited arr/source on stored pills, refreshes originals", () => {
-    const userEdited: Pill[] = [
+    const userEditedPills: Pill[] = [
       {
         id: "c::a0",
         camId: "c",
@@ -156,9 +156,10 @@ describe("reconcilePills", () => {
         originalSourceInS: 99,
         originalSourceOutS: 99,
         fromArrangementItemId: "a0",
+        userEdited: true,
       },
     ];
-    const reconciled = reconcilePills(arr, chunks, cams, userEdited);
+    const reconciled = reconcilePills(arr, chunks, cams, userEditedPills);
     expect(reconciled.length).toBe(2);
     // First pill: user-edited values stay.
     expect(reconciled[0].arrStartS).toBe(0.5);
@@ -171,6 +172,34 @@ describe("reconcilePills", () => {
     // Second pill: freshly generated.
     expect(reconciled[1].id).toBe("c::a1");
     expect(reconciled[1].arrStartS).toBe(2);
+  });
+
+  it("regenerates pills without the userEdited flag (legacy / sync-stale)", () => {
+    // Mode-agnostic rule: stored arr/source override fresh ONLY when the
+    // user-edited flag is true. Pre-flag pills (or pills written before
+    // sync resolved) are auto-derived and must follow the current
+    // baseline.
+    const stored: Pill[] = [
+      {
+        id: "c::a0",
+        camId: "c",
+        // Pre-sync stored values that no longer match clipRangeS.
+        arrStartS: 99,
+        arrEndS: 99,
+        sourceInS: 99,
+        sourceOutS: 99,
+        originalArrStartS: 0,
+        originalArrEndS: 2,
+        originalSourceInS: 0,
+        originalSourceOutS: 2,
+        fromArrangementItemId: "a0",
+        // No userEdited flag → treated as auto-generated.
+      },
+    ];
+    const reconciled = reconcilePills(arr, chunks, cams, stored);
+    // Fresh values win.
+    expect(reconciled[0].arrStartS).toBe(0);
+    expect(reconciled[0].arrEndS).toBe(2);
   });
 
   it("regenerates an unedited stored pill when sync changes its baseline", () => {

@@ -206,32 +206,22 @@ export function reconcilePills(
   storedPills: readonly Pill[],
 ): Pill[] {
   const fresh = generatePills(arrangement, chunks, clips);
-  // Direct-mode (no arrangement): pills are pure derivations of clipRangeS
-  // — there's no per-(cam × item) layout for the user to rearrange. Always
-  // use fresh values so sync resolution, trim edits, and any other clip-
-  // level mutation flow straight through to the pill. A previously stored
-  // pill from a moment when sync hadn't resolved (arrStartS=0) would
-  // otherwise stick around forever, displaced from where clipRangeS+the
-  // cuts strip want it. Pill move/trim in direct-mode persists via
-  // clip-level fields (setClipStartOffset / setVideoClipTrim), not via
-  // the pill itself, so this isn't a regression for user edits.
-  if (arrangement.length === 0 || chunks.length === 0) return fresh;
   if (storedPills.length === 0) return fresh;
   const storedById = new Map(storedPills.map((p) => [p.id, p]));
   return fresh.map((freshP) => {
     const stored = storedById.get(freshP.id);
-    if (!stored) return freshP;
-    // Heuristic for never-edited stored pills: stored arr/source match
-    // their own stored originals (within eps). When true, regenerate so
-    // sync/baseline shifts flow through. When false, the pill carries
-    // user edits and we preserve them; originals refresh to the current
-    // auto-baseline so RESET targets the right place.
-    const wasUnedited =
-      Math.abs(stored.arrStartS - stored.originalArrStartS) < DIRTY_EPS_S &&
-      Math.abs(stored.arrEndS - stored.originalArrEndS) < DIRTY_EPS_S &&
-      Math.abs(stored.sourceInS - stored.originalSourceInS) < DIRTY_EPS_S &&
-      Math.abs(stored.sourceOutS - stored.originalSourceOutS) < DIRTY_EPS_S;
-    if (wasUnedited) return freshP;
+    // Mode-agnostic rule: stored values override fresh ONLY when the
+    // user explicitly edited this pill (`userEdited === true`). Without
+    // that flag, the pill is auto-derived from clips + sync + chunks —
+    // any baseline shift (sync resolving, trim change, audio nudge) must
+    // flow through to the pill, which means using fresh values.
+    //
+    // Pre-flag pills (no `userEdited`) are conservatively treated as
+    // auto-generated. This drops any user edits made before the flag
+    // was added, but those were already broken across reloads in many
+    // cases (the previous heuristic mis-flagged unedited pills as edited
+    // whenever a previous reconcile cycle had refreshed the originals).
+    if (!stored || !stored.userEdited) return freshP;
     return {
       ...stored,
       originalArrStartS: freshP.originalArrStartS,

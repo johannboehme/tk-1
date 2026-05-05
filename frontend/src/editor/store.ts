@@ -923,6 +923,7 @@ function restorePillBaseline(p: Pill): Pill {
     arrEndS: p.originalArrEndS,
     sourceInS: p.originalSourceInS,
     sourceOutS: p.originalSourceOutS,
+    userEdited: false,
   };
 }
 
@@ -1658,6 +1659,7 @@ export const useEditorStore = create<EditorState>()(
           ...p,
           arrStartS: safe,
           arrEndS: safe + len,
+          userEdited: true,
         })),
       });
     },
@@ -1676,6 +1678,7 @@ export const useEditorStore = create<EditorState>()(
           ...p,
           arrStartS: newStart,
           sourceInS: newSourceIn,
+          userEdited: true,
         })),
       });
     },
@@ -1694,6 +1697,7 @@ export const useEditorStore = create<EditorState>()(
           ...p,
           arrEndS: newEnd,
           sourceOutS: newSourceOut,
+          userEdited: true,
         })),
       });
     },
@@ -1712,9 +1716,10 @@ export const useEditorStore = create<EditorState>()(
     },
     nudgePillSourceMs(id, deltaMs) {
       set({
-        pills: mutatePill(get().pills, id, (p) =>
-          shiftPillSource(p, deltaMs / 1000),
-        ),
+        pills: mutatePill(get().pills, id, (p) => ({
+          ...shiftPillSource(p, deltaMs / 1000),
+          userEdited: true,
+        })),
       });
     },
     setPillSourceOffsetMs(id, offsetMs) {
@@ -1727,6 +1732,7 @@ export const useEditorStore = create<EditorState>()(
             p.originalSourceInS + offsetS + 0.05,
             p.originalSourceOutS + offsetS,
           ),
+          userEdited: true,
         })),
       });
     },
@@ -1735,7 +1741,12 @@ export const useEditorStore = create<EditorState>()(
       set({
         pills: mutatePill(get().pills, id, (p) => {
           const newStart = Math.max(0, p.arrStartS + deltaS);
-          return { ...p, arrStartS: newStart, arrEndS: newStart + (p.arrEndS - p.arrStartS) };
+          return {
+            ...p,
+            arrStartS: newStart,
+            arrEndS: newStart + (p.arrEndS - p.arrStartS),
+            userEdited: true,
+          };
         }),
       });
     },

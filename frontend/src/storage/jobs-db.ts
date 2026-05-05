@@ -446,6 +446,11 @@ export interface PillRecord {
   originalSourceInS: number;
   originalSourceOutS: number;
   fromArrangementItemId?: string;
+  /** Set true when the user has moved or trimmed the pill. Reconcile
+   *  preserves stored values only when this is true; otherwise the
+   *  pill is regenerated from the current auto-baseline. Optional for
+   *  backward-compat — pre-flag pills are treated as auto. */
+  userEdited?: boolean;
 }
 
 /** Storage shape for a single Punch-in FX. Mirrors `PunchFx` from the
