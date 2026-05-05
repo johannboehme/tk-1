@@ -39,7 +39,6 @@ import { BeatRuler } from "./timeline/BeatRuler";
 import { BpmReadout } from "./BpmReadout";
 import { SnapModeButtons } from "./SnapModeButtons";
 import { snapTime, type SnapCtx, type SnapMode } from "../snap";
-import { DEFAULT_MATCH_CONFIDENCE_THRESHOLD } from "../match-snap";
 import {
   effectiveBeatPhaseS,
   effectiveBeatsPerBar,
@@ -81,16 +80,19 @@ type DragKind =
   | { kind: "trim-out" }
   | { kind: "loop"; offset: number }
   | {
-      /** Drag the body of an arrangement pill — shifts arrStartS while
-       *  preserving duration. `grabArrT` is the arr-time the pointer was
-       *  on at drag-start so the pill follows the cursor 1:1. */
+      /** Drag a pill body — shifts its arr-time placement while the
+       *  duration + source-trim stay put. `grabArrT` is the arr-time
+       *  the pointer was on at drag-start so the pill follows the
+       *  cursor 1:1. */
       kind: "pill-move";
       pillId: string;
       grabArrT: number;
       origArrStartS: number;
     }
   | {
-      /** Drag a pill's left edge (= retrim source-in + shift arr-start). */
+      /** Drag a pill's LEFT edge — narrows the arr-window from the
+       *  left and advances `sourceInS` by the same amount, so the cam
+       *  still plays in sync with the visible window. */
       kind: "pill-trim-in";
       pillId: string;
       origArrStartS: number;
@@ -98,66 +100,13 @@ type DragKind =
       origSourceInS: number;
     }
   | {
-      /** Drag a pill's right edge (= retrim source-out + shift arr-end). */
+      /** Drag a pill's RIGHT edge — narrows the arr-window from the
+       *  right and retreats `sourceOutS` by the same amount. */
       kind: "pill-trim-out";
       pillId: string;
       origArrStartS: number;
       origArrEndS: number;
       origSourceOutS: number;
-    }
-  | {
-      /** Resize an image clip's right edge → grows durationS. */
-      kind: "image-resize-end";
-      camId: string;
-      grabT: number;
-      origDurationS: number;
-      origStartOffsetS: number;
-    }
-  | {
-      /** Resize an image clip's left edge → shifts startOffsetS while
-       *  keeping the right edge in place. */
-      kind: "image-resize-start";
-      camId: string;
-      grabT: number;
-      origDurationS: number;
-      origStartOffsetS: number;
-    }
-  | {
-      /** Trim a video clip's right edge — narrows trimOutS within
-       *  [trimInS+0.05, sourceDurationS]. */
-      kind: "video-trim-out";
-      camId: string;
-      origStartS: number;
-      origTrimInS: number;
-      origTrimOutS: number;
-      sourceDurationS: number;
-    }
-  | {
-      /** Trim a video clip's left edge — narrows trimInS within
-       *  [0, trimOutS-0.05]. */
-      kind: "video-trim-in";
-      camId: string;
-      origStartS: number;
-      origTrimInS: number;
-      origTrimOutS: number;
-      sourceDurationS: number;
-    }
-  | {
-      kind: "clip-move";
-      camId: string;
-      grabT: number;
-      origStartOffsetS: number;
-      /** syncOverrideMs at drag-start. Drag mutates this (not
-       *  startOffsetS) so the cam's audio/video alignment actually
-       *  shifts against the master audio — startOffsetS is purely
-       *  visual and would silently desync the cam's audio. */
-      origSyncOverrideMs: number;
-      /** Visible master-timeline startS at drag-start. Used to compute
-       *  the pointer's intended new startS independently of any
-       *  candidate-switch that may happen mid-drag — without it, the
-       *  algoSync delta cascades and the user "jumps" past middle
-       *  candidates. */
-      origStartS: number;
     }
   | { kind: "scrollbar"; offsetX: number };
 
@@ -203,21 +152,6 @@ export function Timeline({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [canvasWidth, setCanvasWidth] = useState(800);
   const dragRef = useRef<DragKind | null>(null);
-  /** Set during a clip-move drag so the PROGRAM strip can show match
-   *  markers only while the user is actually re-aligning a cam. */
-  const [activeClipMoveDragId, setActiveClipMoveDragId] = useState<
-    string | null
-  >(null);
-  /** Snapshot of the timeline-range at drag-start. Frozen for the
-   *  duration of a clip-move so the canvas doesn't rescale under the
-   *  user's cursor — without this freeze, dragging right extends the
-   *  range, the pixel-per-second shrinks, and the pill seems to
-   *  asymptote to the canvas edge instead of following the pointer. */
-  const frozenTimelineRangeRef = useRef<{
-    startS: number;
-    endS: number;
-    span: number;
-  } | null>(null);
 
   // Store reads — narrow selectors to keep re-renders cheap.
   const jobMeta = useEditorStore((s) => s.jobMeta);
@@ -245,11 +179,7 @@ export function Timeline({
   const setPillRightEdgeArrEndS = useEditorStore(
     (s) => s.setPillRightEdgeArrEndS,
   );
-  const setClipStartOffset = useEditorStore((s) => s.setClipStartOffset);
-  const setImageClipDuration = useEditorStore((s) => s.setImageClipDuration);
-  const setVideoClipTrim = useEditorStore((s) => s.setVideoClipTrim);
-  const setClipSyncOverride = useEditorStore((s) => s.setClipSyncOverride);
-  const setSelectedCandidateIdx = useEditorStore((s) => s.setSelectedCandidateIdx);
+  const commitPillEdit = useEditorStore((s) => s.commitPillEdit);
   const resetClipAlignment = useEditorStore((s) => s.resetClipAlignment);
   const removeCutAt = useEditorStore((s) => s.removeCutAt);
   const clearCuts = useEditorStore((s) => s.clearCuts);
@@ -336,9 +266,7 @@ export function Timeline({
     }
     return { startS: lo, endS: hi, span: hi - lo };
   }, [isArrMode, arrTotal, clips, duration]);
-  const timelineRange = activeClipMoveDragId && frozenTimelineRangeRef.current
-    ? frozenTimelineRangeRef.current
-    : liveTimelineRange;
+  const timelineRange = liveTimelineRange;
   const timelineStartS = timelineRange.startS;
   const timelineSpan = Math.max(1e-6, timelineRange.span);
   const visibleDur = timelineSpan / zoom;
@@ -417,8 +345,6 @@ export function Timeline({
     function clearStaleDrag() {
       if (dragRef.current) {
         dragRef.current = null;
-        setActiveClipMoveDragId(null);
-        frozenTimelineRangeRef.current = null;
       }
     }
     window.addEventListener("pointerup", clearStaleDrag);
@@ -429,7 +355,7 @@ export function Timeline({
       window.removeEventListener("pointercancel", clearStaleDrag);
       window.removeEventListener("blur", clearStaleDrag);
     };
-  }, [setActiveClipMoveDragId]);
+  }, []);
 
   // ---- Per-cam thumbnail Image objects ----
   // Video clips: load the frames-strip (multiple stills laid out
@@ -605,53 +531,34 @@ export function Timeline({
     ctx.fillStyle = "#E8E1D0"; // paper-deep
     ctx.fillRect(0, 0, canvasWidth, canvasH);
 
-    // Per-video-lane: thumbnails + clip pill.
+    // Per-video-lane: thumbnails + pills. Pills are the editing surface
+    // in every mode — single-take jobs render exactly one pill per cam
+    // (covering the clipRange), arrangement jobs render one per
+    // (cam × arrangement-item).
     for (let i = 0; i < clips.length; i++) {
       const clip = clips[i];
       const band = videoBands[i];
       const range = clipRangeS(clip);
-      let slices: ClipPillSlice[];
-      let pillIds: (string | null)[];
-      let selectedSlice: boolean[];
-      if (isArrMode) {
-        // Arrangement-mode: pills are first-class store entities. Each
-        // pill has its own arr-time placement + cam-source range; the
-        // lane renders them as individually-selectable + draggable
-        // rectangles. Sort by arr-start for deterministic z-ordering.
-        const lanePills = pills
-          .filter((p) => p.camId === clip.id)
-          .slice()
-          .sort((a, b) => a.arrStartS - b.arrStartS);
-        const drift = isVideoClip(clip) ? clip.driftRatio : 1;
-        slices = lanePills.map((p) => {
-          // Source-time range: the pill's stored sourceIn/Out is in
-          // cam-source-time. The thumb sampler in drawVideoLane wants
-          // master-time (sx mapped via clipRange). Translate back via
-          // anchorS.
-          const masterStartS = range.anchorS + p.sourceInS / drift;
-          const masterEndS = range.anchorS + p.sourceOutS / drift;
-          return {
-            masterStartS,
-            masterEndS,
-            xStart: ((p.arrStartS - viewStart) / visibleDur) * canvasWidth,
-            xEnd: ((p.arrEndS - viewStart) / visibleDur) * canvasWidth,
-          };
-        });
-        pillIds = lanePills.map((p) => p.id);
-        selectedSlice = lanePills.map((p) => p.id === selectedPillId);
-      } else {
-        // Direct-mode: one passthrough slice per clip.
-        slices = [
-          {
-            masterStartS: range.startS,
-            masterEndS: range.endS,
-            xStart: ((range.startS - viewStart) / visibleDur) * canvasWidth,
-            xEnd: ((range.endS - viewStart) / visibleDur) * canvasWidth,
-          },
-        ];
-        pillIds = [null];
-        selectedSlice = [clip.id === selectedClipId];
-      }
+      const lanePills = pills
+        .filter((p) => p.camId === clip.id)
+        .slice()
+        .sort((a, b) => a.arrStartS - b.arrStartS);
+      const drift = isVideoClip(clip) ? clip.driftRatio : 1;
+      const slices: ClipPillSlice[] = lanePills.map((p) => {
+        // Source-time range projected back into master-time so the
+        // existing thumb sampler (which maps strip pixels via
+        // clipRange) keeps working without a rewrite.
+        const masterStartS = range.anchorS + p.sourceInS / drift;
+        const masterEndS = range.anchorS + p.sourceOutS / drift;
+        return {
+          masterStartS,
+          masterEndS,
+          xStart: ((p.arrStartS - viewStart) / visibleDur) * canvasWidth,
+          xEnd: ((p.arrEndS - viewStart) / visibleDur) * canvasWidth,
+        };
+      });
+      const pillIds: (string | null)[] = lanePills.map((p) => p.id);
+      const selectedSlice = lanePills.map((p) => p.id === selectedPillId);
       drawVideoLane({
         ctx,
         clip,
@@ -665,22 +572,6 @@ export function Timeline({
         aspect: cams[clip.id]?.aspect ?? 16 / 9,
         clipSelected: clip.id === selectedClipId,
       });
-      // Match-point markers: vertical ticks at each candidate's implied
-      // start position. Hidden in arrangement-mode — sync is locked once
-      // the arrangement is committed; surfacing alternative offsets here
-      // would just be visual noise around an immutable choice.
-      if (!isArrMode) {
-        drawMatchMarkers({
-          ctx,
-          clip,
-          bandTop: band.top,
-          bandH: videoLaneHeight,
-          viewStart,
-          visibleDur,
-          canvasWidth,
-          emphasized: snapMode === "match",
-        });
-      }
       // Lane separator line below each video lane (subtle sepia rule).
       ctx.fillStyle = "#D8CFB8";
       ctx.fillRect(0, band.bottom - 1, canvasWidth, 1);
@@ -1015,30 +906,6 @@ export function Timeline({
     return null;
   }
 
-  /** Edge-handle hit-test for clip resizing. Detects whether the pointer
-   *  is on the LEFT or RIGHT edge of a clip's pill (within HANDLE_HIT px).
-   *  Image clips: both edges are draggable. Video clips: trim handles on
-   *  both edges (constrained within the source's full length). */
-  function findClipResizeEdge(
-    x: number,
-    y: number,
-  ): { clip: Clip; edge: "start" | "end"; band: { top: number; bottom: number } } | null {
-    for (let i = 0; i < clips.length; i++) {
-      const c = clips[i];
-      const band = videoBands[i];
-      if (y < band.top || y >= band.bottom) continue;
-      const range = clipRangeS(c);
-      const xStart = tToX(range.startS);
-      const xEnd = tToX(range.endS);
-      // End edge first — when start and end are very close together (a
-      // freshly-trimmed sliver) the user is more likely aiming at the
-      // visible right edge.
-      if (Math.abs(x - xEnd) <= HANDLE_HIT) return { clip: c, edge: "end", band };
-      if (Math.abs(x - xStart) <= HANDLE_HIT) return { clip: c, edge: "start", band };
-    }
-    return null;
-  }
-
   function classifyAudioHit(x: number): "trim-in" | "trim-out" | "playhead" | "loop" | null {
     const xp = tToX(currentTime);
     // Trim + loop are direct-mode-only chrome; arrangement-mode hides
@@ -1139,7 +1006,6 @@ export function Timeline({
     // seeking while the user is pinching.
     if (activePointersRef.current.size >= 2) {
       dragRef.current = null;
-      setActiveClipMoveDragId(null);
       const centroid = pointersCentroid();
       gestureRef.current = {
         startDist: pointersDistance() || 1,
@@ -1176,59 +1042,26 @@ export function Timeline({
       return;
     }
 
-    // Video lane:
-    //   * Locked (default): click anywhere = scrub the playhead (the
-    //     playhead can be dragged through dense clips without getting
-    //     stuck).
-    //   * Unlocked: click on the right edge of an image clip = resize
-    //     drag (durationS); click on a clip pill = drag-move that clip;
-    //     click on empty area = scrub the playhead. Selection always
-    //     happens.
-    //   * Arrangement-mode: clip-move + edge-resize would mutate
-    //     master-time sync/trim, which fights the chunk anchors set in
-    //     triage. We restrict to "click = scrub + select cam" in arr-mode
-    //     regardless of `lanesLocked` — the LOCK affordance is a
-    //     direct-mode tool.
-    if (!lanesLocked && !isArrMode) {
-      const edge = findClipResizeEdge(x, y);
-      if (edge) {
-        setSelectedClipId(edge.clip.id);
-        const range = clipRangeS(edge.clip);
-        if (edge.clip.kind === "image") {
-          dragRef.current = {
-            kind: edge.edge === "end" ? "image-resize-end" : "image-resize-start",
-            camId: edge.clip.id,
-            grabT: tRaw,
-            origDurationS: edge.clip.durationS,
-            origStartOffsetS: edge.clip.startOffsetS,
-          };
-        } else if (isVideoClip(edge.clip)) {
-          dragRef.current = {
-            kind: edge.edge === "end" ? "video-trim-out" : "video-trim-in",
-            camId: edge.clip.id,
-            origStartS: range.startS,
-            origTrimInS: edge.clip.trimInS ?? 0,
-            origTrimOutS:
-              edge.clip.trimOutS ?? edge.clip.sourceDurationS,
-            sourceDurationS: edge.clip.sourceDurationS,
-          };
-        }
-        return;
-      }
-    }
-    // Arrangement-mode: hit-test against pills first. Pills are first-
-    // class on the song timeline — clicking the body selects + starts a
-    // move drag, clicking an edge starts a trim drag. The `lanesLocked`
-    // toggle is a direct-mode tool (it protects the playhead scrub from
-    // accidental clip-syncOverrideMs drags); in arr-mode the user is
-    // editing pills, so the toggle is bypassed entirely. Click on
-    // empty lane area still scrubs the playhead.
-    if (isArrMode) {
+    // Video lane interaction model (uniform across job kinds — pills
+    // ARE the editing surface):
+    //   * LOCK ON (default): everything in a video lane scrubs the
+    //     playhead. Pills stay visible and selectable but no drag is
+    //     initiated. Same `lanesLocked` shield the user toggles to
+    //     scrub freely without accidentally moving content.
+    //   * LOCK OFF: pill-edge hits start a trim drag, pill-body hits
+    //     start a move drag; empty lane area still scrubs.
+    if (!lanesLocked) {
       const pillHit = findPillAt(x, y);
       if (pillHit) {
         const p = pills.find((pp) => pp.id === pillHit.pillId);
         if (p) {
           setSelectedPillId(p.id);
+          setSelectedClipId(p.camId);
+          // Snapshot pre-mutation pills onto the undo stack ONCE per
+          // gesture; the move/trim updates that follow are batched into
+          // the same step so Cmd+Z reverts the whole drag, not one
+          // pixel.
+          commitPillEdit();
           if (pillHit.zone === "left") {
             dragRef.current = {
               kind: "pill-trim-in",
@@ -1246,44 +1079,28 @@ export function Timeline({
               origSourceOutS: p.sourceOutS,
             };
           } else {
+            const arrAtGrab =
+              viewStart + (x / canvasWidth) * visibleDur;
             dragRef.current = {
               kind: "pill-move",
               pillId: p.id,
-              grabArrT: tRaw, // tRaw is xToT(x) which in arr-mode returns master-time; we want arr-time here
+              grabArrT: arrAtGrab,
               origArrStartS: p.arrStartS,
             };
-            // We need arr-time at grab, not master-time. Recompute from x.
-            const arrAtGrab =
-              viewStart + (x / canvasWidth) * visibleDur;
-            (dragRef.current as { grabArrT: number }).grabArrT = arrAtGrab;
           }
           return;
         }
       }
     }
+    // No pill grab — fall through. Empty-lane click scrubs playhead +
+    // selects the cam (whichever lane the pointer's y landed in). When
+    // LOCK is on every video-lane click ends here regardless of pill
+    // proximity, which is the "drag through dense lanes" path.
     const hit = findClipAt(x, y);
     if (hit) {
       setSelectedClipId(hit.clip.id);
-      if (!lanesLocked && !isArrMode) {
-        const r = clipRangeS(hit.clip);
-        dragRef.current = {
-          kind: "clip-move",
-          camId: hit.clip.id,
-          grabT: tRaw,
-          origStartOffsetS: hit.clip.startOffsetS,
-          // Image clips have no syncOverrideMs; the field is irrelevant
-          // for them but the drag struct keeps a slot to keep the shape stable.
-          origSyncOverrideMs: isVideoClip(hit.clip) ? hit.clip.syncOverrideMs : 0,
-          origStartS: r.startS,
-        };
-        // Freeze the timeline range so pxPerSec stays stable through
-        // the drag.
-        frozenTimelineRangeRef.current = liveTimelineRange;
-        setActiveClipMoveDragId(hit.clip.id);
-      } else {
-        seekFromX(x, snapped(tRaw, e));
-        dragRef.current = { kind: "playhead" };
-      }
+      seekFromX(x, snapped(tRaw, e));
+      dragRef.current = { kind: "playhead" };
     } else {
       // Empty area inside a video lane → still treat the lane as a
       // selection target so I/O hotkeys (and any per-clip controls) can
@@ -1351,30 +1168,6 @@ export function Timeline({
     const drag = dragRef.current;
     if (drag.kind === "playhead") {
       seekFromX(x, snapped(tRaw, e));
-    } else if (drag.kind === "image-resize-end") {
-      // New right edge follows the pointer (snapped to the active grid),
-      // durationS = new-right - startOffsetS.
-      const newRightS = snapped(xToT(x), e);
-      const newDuration = newRightS - drag.origStartOffsetS;
-      setImageClipDuration(drag.camId, newDuration);
-    } else if (drag.kind === "image-resize-start") {
-      // Left edge moves; right edge stays fixed at orig + origDuration.
-      const origRight = drag.origStartOffsetS + drag.origDurationS;
-      const newLeft = Math.min(origRight - 0.1, snapped(xToT(x), e));
-      setClipStartOffset(drag.camId, newLeft);
-      setImageClipDuration(drag.camId, origRight - newLeft);
-    } else if (drag.kind === "video-trim-out") {
-      // New right edge on master timeline → trimOutS = new-right -
-      // (origStartS - origTrimInS) so the un-trimmed startS stays put.
-      const baseStartS = drag.origStartS - drag.origTrimInS;
-      const newRightS = snapped(xToT(x), e);
-      const newTrimOutS = newRightS - baseStartS;
-      setVideoClipTrim(drag.camId, drag.origTrimInS, newTrimOutS);
-    } else if (drag.kind === "video-trim-in") {
-      const baseStartS = drag.origStartS - drag.origTrimInS;
-      const newLeftS = snapped(xToT(x), e);
-      const newTrimInS = newLeftS - baseStartS;
-      setVideoClipTrim(drag.camId, newTrimInS, drag.origTrimOutS);
     } else if (drag.kind === "trim-in") {
       setTrim({ in: snapped(tRaw, e), out: trim.out });
     } else if (drag.kind === "trim-out") {
@@ -1384,90 +1177,18 @@ export function Timeline({
       const newStartRaw = Math.max(trim.in, Math.min(trim.out - len, tRaw - drag.offset));
       const newStart = snapped(newStartRaw, e);
       setLoop({ start: newStart, end: newStart + len });
-    } else if (drag.kind === "clip-move") {
-      const c = clips.find((cc) => cc.id === drag.camId);
-      if (!c) return;
-      // Pointer's intended new clip-startS, computed from the snapshot
-      // taken at drag-start. Stable through any candidate-switch that
-      // happens mid-drag (which would otherwise jolt algoSyncS and make
-      // middle candidates unreachable).
-      const targetStartS = drag.origStartS + (xToT(x) - drag.grabT);
-
-      // Image clips: drag simply moves the placement offset. No sync
-      // override, no candidate logic — startOffsetS *is* the placement.
-      if (!isVideoClip(c)) {
-        const snappedStart = snapped(targetStartS, e);
-        if (c.startOffsetS !== snappedStart) {
-          setClipStartOffset(drag.camId, snappedStart);
-        }
-        return;
-      }
-
-      // MATCH mode: always snap to the nearest candidate-implied startS.
-      // No distance threshold — every candidate is a valid lock-target.
-      // Shift bypasses snapping entirely. We use the orig syncOverrideMs
-      // to compute candidate positions, so candidate-switching mid-drag
-      // doesn't shift the math under us.
-      if (snapMode === "match" && !e.shiftKey && c.candidates.length > 0) {
-        type CandPos = { idx: number; startS: number };
-        const positions: CandPos[] = c.candidates
-          .map((cand, idx) => {
-            if (cand.confidence < DEFAULT_MATCH_CONFIDENCE_THRESHOLD) return null;
-            const totalMs = cand.offsetMs + drag.origSyncOverrideMs;
-            return { idx, startS: -totalMs / 1000 };
-          })
-          .filter((p): p is CandPos => p !== null);
-        if (positions.length > 0) {
-          let bestIdx = positions[0].idx;
-          let bestDist = Math.abs(positions[0].startS - targetStartS);
-          for (let i = 1; i < positions.length; i++) {
-            const d = Math.abs(positions[i].startS - targetStartS);
-            if (d < bestDist) {
-              bestDist = d;
-              bestIdx = positions[i].idx;
-            }
-          }
-          if (bestIdx !== c.selectedCandidateIdx) {
-            setSelectedCandidateIdx(drag.camId, bestIdx);
-          }
-          // Keep the user's syncOverrideMs untouched (their fine-tune
-          // applies on top of whichever candidate is chosen). Reset
-          // startOffsetS so the cam sits exactly on the candidate anchor.
-          if (c.syncOverrideMs !== drag.origSyncOverrideMs) {
-            setClipSyncOverride(drag.camId, drag.origSyncOverrideMs);
-          }
-          if (c.startOffsetS !== 0) setClipStartOffset(drag.camId, 0);
-          return;
-        }
-      }
-
-      // Non-MATCH (off / grid): mutate syncOverrideMs so the drag is a
-      // *true* sync change. The cam's master-timeline range slides; each
-      // VideoElementPool re-anchors each video.currentTime automatically via the
-      // shared `camSourceTimeS` computation, so the master-audio playhead
-      // doesn't visually jump.
-      const targetSnapped = snapped(targetStartS, e);
-      // startS = -(syncOffsetMs + syncOverrideMs)/1000 + startOffsetS + trimInS
-      // → syncOverrideMs = -1000*(startS - startOffsetS - trimInS) - syncOffsetMs
-      const trimInS = c.trimInS ?? 0;
-      const newSyncOverrideMs =
-        -1000 * (targetSnapped - drag.origStartOffsetS - trimInS) -
-        c.syncOffsetMs;
-      setClipSyncOverride(drag.camId, newSyncOverrideMs);
     } else if (drag.kind === "pill-move") {
       // Pill body drag — shift arrStartS by the pointer-delta in arr-time.
-      // Source-trim stays — only the pill's WHEN moves on the song.
+      // Source-trim stays put: only the pill's WHEN moves.
       const arrAtPointer = viewStart + (x / canvasWidth) * visibleDur;
       const deltaArrT = arrAtPointer - drag.grabArrT;
       const newArrStartS = Math.max(0, drag.origArrStartS + deltaArrT);
       setPillArrPlacement(drag.pillId, newArrStartS);
     } else if (drag.kind === "pill-trim-in") {
       // Drag left edge: arr-window narrows from the left + sourceInS
-      // advances by the same delta so the cam still plays in sync with
-      // what's visible inside the pill.
+      // advances by the same delta so the cam still plays in sync
+      // with what's visible inside the pill.
       const arrAtPointer = viewStart + (x / canvasWidth) * visibleDur;
-      // Clamp: never overlap the right edge (-min window) or go below
-      // an arr-time of 0.
       const minWindow = 0.05;
       const clamped = Math.max(
         0,
@@ -1497,14 +1218,10 @@ export function Timeline({
         // Suppress the lingering single-finger drag — user is winding
         // down a pinch, not starting a scrub.
         dragRef.current = null;
-        setActiveClipMoveDragId(null);
-        frozenTimelineRangeRef.current = null;
       }
       return;
     }
     dragRef.current = null;
-    setActiveClipMoveDragId(null);
-    frozenTimelineRangeRef.current = null;
   };
 
   // Trackpad-aware wheel handling — three exclusive modes:
@@ -1614,19 +1331,21 @@ export function Timeline({
       );
     } else {
       // Video lane — over a clip the cursor is `pointer` (clip is selectable
-      // + scrub-draggable). Alt-modifier shows a `move` cursor to hint at
-      // the alternate clip-move drag behavior. Image clips have a resize
-      // affordance on their right edge.
-      if (!lanesLocked && findClipResizeEdge(x, y)) {
-        setHoverCursor("ew-resize");
-        return;
+      // + scrub-draggable). When LOCK is off and the pointer is on a
+      // pill edge, surface a resize cursor; on a pill body, a move
+      // cursor. Empty lane area always reads as the scrub crosshair.
+      if (!lanesLocked) {
+        const pillHover = findPillAt(x, y);
+        if (pillHover) {
+          if (pillHover.zone === "left" || pillHover.zone === "right") {
+            setHoverCursor("ew-resize");
+            return;
+          }
+          setHoverCursor("move");
+          return;
+        }
       }
-      const overClip = findClipAt(x, y);
-      if (overClip) {
-        setHoverCursor(e.altKey ? "move" : "pointer");
-      } else {
-        setHoverCursor("crosshair");
-      }
+      setHoverCursor("crosshair");
     }
   };
 
@@ -1667,7 +1386,7 @@ export function Timeline({
           ]}
         />
         <ActiveMatchReadout
-          camId={activeClipMoveDragId}
+          camId={null}
           snapMode={snapMode}
           clips={clips}
         />
@@ -1772,40 +1491,7 @@ export function Timeline({
                   camLabel: `CAM ${idx + 1}`,
                 };
               })()}
-              matchMarkers={(() => {
-                // Show match markers ONLY while the user is actively
-                // dragging a clip in MATCH mode — they're an interaction
-                // affordance, not a permanent overlay. Hidden entirely
-                // in arrangement-mode (sync is locked once the arrangement
-                // is committed).
-                if (
-                  isArrMode ||
-                  snapMode !== "match" ||
-                  !activeClipMoveDragId
-                ) {
-                  return undefined;
-                }
-                const found = clips.find((cc) => cc.id === activeClipMoveDragId);
-                if (!found || !isVideoClip(found)) return undefined;
-                const c = found;
-                if (!c.candidates || c.candidates.length === 0) {
-                  return undefined;
-                }
-                return c.candidates
-                  .filter(
-                    (cand) =>
-                      cand.confidence >= DEFAULT_MATCH_CONFIDENCE_THRESHOLD,
-                  )
-                  .map((cand) => {
-                    const idx = c.candidates.indexOf(cand);
-                    const totalMs = cand.offsetMs + c.syncOverrideMs;
-                    return {
-                      t: -totalMs / 1000,
-                      confidence: cand.confidence,
-                      isPrimary: idx === c.selectedCandidateIdx,
-                    };
-                  });
-              })()}
+              matchMarkers={undefined}
               mode={programStripMode}
               fx={stripFx}
               liveFxIds={liveFxIds}
@@ -2352,66 +2038,6 @@ function hexToRgba(hex: string, alpha: number): string {
   const g = parseInt(c.slice(2, 4), 16);
   const b = parseInt(c.slice(4, 6), 16);
   return `rgba(${r},${g},${b},${alpha})`;
-}
-
-interface DrawMatchMarkersArgs {
-  ctx: CanvasRenderingContext2D;
-  clip: Clip;
-  bandTop: number;
-  bandH: number;
-  viewStart: number;
-  visibleDur: number;
-  canvasWidth: number;
-  emphasized: boolean;
-}
-
-/** Render small ticks at each candidate-implied start position. The
- *  active candidate is rendered as a chunky filled triangle, alternates
- *  as thinner ticks fading out with confidence. In MATCH mode the alts
- *  brighten so the user can aim at them while dragging. Image clips have
- *  no candidates → early-out. */
-function drawMatchMarkers({
-  ctx,
-  clip,
-  bandTop,
-  bandH,
-  viewStart,
-  visibleDur,
-  canvasWidth,
-  emphasized,
-}: DrawMatchMarkersArgs) {
-  if (!isVideoClip(clip)) return;
-  if (!clip.candidates || clip.candidates.length === 0) return;
-  ctx.save();
-  for (let i = 0; i < clip.candidates.length; i++) {
-    const c = clip.candidates[i];
-    const totalMs = c.offsetMs + clip.syncOverrideMs;
-    // Match position is fixed in master-timeline space: the absolute spot
-    // where master audio correlates with cam audio. Do NOT add startOffsetS
-    // — that would make markers slide with the lane drag and lose their
-    // meaning (the user couldn't snap a dragged lane onto its match point).
-    const startS = -totalMs / 1000;
-    const x = ((startS - viewStart) / visibleDur) * canvasWidth;
-    if (x < -8 || x > canvasWidth + 8) continue;
-    const isPrimary = i === clip.selectedCandidateIdx;
-    const conf = Math.max(0, Math.min(1, c.confidence));
-    const baseOpacity = (isPrimary ? 1 : 0.35) * (emphasized ? 1 : 0.55);
-    const opacity = baseOpacity * (0.4 + 0.6 * conf);
-    const tickW = isPrimary ? 3 : 2;
-    const tickH = isPrimary ? bandH - 6 : Math.round(bandH * 0.45);
-    ctx.fillStyle = `rgba(255,87,34,${opacity})`; // hot
-    ctx.fillRect(Math.floor(x), bandTop + 2, tickW, tickH);
-    if (isPrimary) {
-      // Filled inverted triangle on top to mark the active alignment.
-      ctx.beginPath();
-      ctx.moveTo(x - 4, bandTop);
-      ctx.lineTo(x + 4, bandTop);
-      ctx.lineTo(x, bandTop + 6);
-      ctx.closePath();
-      ctx.fill();
-    }
-  }
-  ctx.restore();
 }
 
 /** Big "currently snapped to" readout that lights up only while a

@@ -1,14 +1,20 @@
 /**
- * Pill auto-generation + active-pill resolution.
+ * Pill auto-generation, reconciliation, and active-pill resolution.
  *
- * For each (cam × arrangement-item) pair, intersect the cam's master-time
- * range with the chunk's master-time range. If the intersection has any
- * length, emit one pill anchored to that arrangement-item's slot on the
- * song timeline. The result is the FRESH initial pill list — user edits
- * (move/trim) ride on top via the store and survive arrangement reorders
- * as long as the underlying arrangement-item id stays.
+ * The editor is uniformly pill-based. Every job — long-form arrangement
+ * or single-take — renders through `pills[]`. The generator below
+ * produces one pill per editing slot:
  *
- * Pure helper. No store, no IO, no React.
+ *   - Long-form jobs (arrangement non-empty): one pill per
+ *     (cam × arrangement-item) intersection. Pill ID
+ *     `${camId}::${arrangementItemId}` round-trips user edits across
+ *     editor mounts.
+ *
+ *   - Single-take jobs (arrangement empty): one pill per cam covering
+ *     the cam's full visible master-time range. Pill ID
+ *     `${camId}::__default__`.
+ *
+ * Pure helpers — no store, no IO, no React.
  */
 import type { ArrangementItem, Chunk, Cut } from "../storage/jobs-db";
 import { camSourceTimeS } from "../local/timing/cam-time";
@@ -22,25 +28,72 @@ import {
   type Segment,
 } from "./types";
 
+/** Single-take pill id sentinel. Stable so reconcile keeps user edits
+ *  across editor mounts even when the job has no arrangement. */
+const DEFAULT_ITEM_ID = "__default__";
+
 /**
- * Build the initial pill list for a long-form editor session.
+ * Build the editor's pill list from the persisted job state.
  *
- * Walks the arrangement in playback order accumulating arr-time. For each
- * item-of-arrangement and each cam, intersects the cam's master-time
- * range with the chunk's `[startMs, endMs)`. Image clips have no source
- * time (no decode pipeline), so they get one pill spanning the whole
- * chunk — the renderer will treat their source as a single bitmap.
+ * Dispatches on whether the job carries an arrangement:
+ *   - `arrangement.length > 0` → emit one pill per (cam × item)
+ *     intersection in playback order.
+ *   - empty / missing arrangement → emit one pill per cam, anchored
+ *     at the cam's full master-time range. arr-time == master-time
+ *     in this case (no segment-walker mapping).
  *
- * Pill ID convention: `${camId}::${arrangementItemId}` so user-edited
- * pills (mutated trim/placement) round-trip across editor mounts.
+ * Originals are baked in so the per-pill RESET action restores the
+ * pill to the slot the editor would generate today.
  */
-export function generateArrangementPills(
+export function generatePills(
+  arrangement: readonly ArrangementItem[],
+  chunks: readonly Chunk[],
+  clips: readonly Clip[],
+): Pill[] {
+  if (arrangement.length === 0 || chunks.length === 0) {
+    return generateDefaultPills(clips);
+  }
+  return generateArrangementPills(arrangement, chunks, clips);
+}
+
+function generateDefaultPills(clips: readonly Clip[]): Pill[] {
+  const out: Pill[] = [];
+  for (const clip of clips) {
+    const range = clipRangeS(clip);
+    if (range.endS <= range.startS) continue;
+    if (isImageClip(clip)) {
+      out.push(makePill({
+        camId: clip.id,
+        itemId: DEFAULT_ITEM_ID,
+        arrStartS: range.startS,
+        arrEndS: range.endS,
+        sourceInS: 0,
+        sourceOutS: clip.durationS,
+      }));
+      continue;
+    }
+    if (!isVideoClip(clip)) continue;
+    const sourceInS = clip.trimInS ?? 0;
+    const sourceOutS = clip.trimOutS ?? clip.sourceDurationS;
+    out.push(makePill({
+      camId: clip.id,
+      itemId: DEFAULT_ITEM_ID,
+      arrStartS: range.startS,
+      arrEndS: range.endS,
+      sourceInS,
+      sourceOutS,
+    }));
+  }
+  return out;
+}
+
+function generateArrangementPills(
   arrangement: readonly ArrangementItem[],
   chunks: readonly Chunk[],
   clips: readonly Clip[],
 ): Pill[] {
   const chunkById = new Map(chunks.map((c) => [c.id, c]));
-  const pills: Pill[] = [];
+  const out: Pill[] = [];
   let arrCursor = 0;
   for (const item of arrangement) {
     const chunk = chunkById.get(item.chunkId);
@@ -52,15 +105,14 @@ export function generateArrangementPills(
     for (const clip of clips) {
       if (isImageClip(clip)) {
         // Image cam: no master-time anchor, just spans the chunk's slot.
-        pills.push({
-          id: `${clip.id}::${item.id}`,
+        out.push(makePill({
           camId: clip.id,
+          itemId: item.id,
           arrStartS: arrCursor,
           arrEndS: arrCursor + chunkLenS,
           sourceInS: 0,
           sourceOutS: chunkLenS,
-          fromArrangementItemId: item.id,
-        });
+        }));
         continue;
       }
       if (!isVideoClip(clip)) continue;
@@ -68,8 +120,6 @@ export function generateArrangementPills(
       const interIn = Math.max(clipRange.startS, chunkInS);
       const interOut = Math.min(clipRange.endS, chunkOutS);
       if (interOut <= interIn) continue;
-      // Translate the master-time intersection into the cam's source-time
-      // (= what frame-strip / video element offset to fetch).
       const sourceInS = camSourceTimeS(interIn, {
         masterStartS: clipRange.anchorS,
         driftRatio: clip.driftRatio,
@@ -80,60 +130,91 @@ export function generateArrangementPills(
       });
       const arrSubStart = arrCursor + (interIn - chunkInS);
       const arrSubEnd = arrCursor + (interOut - chunkInS);
-      pills.push({
-        id: `${clip.id}::${item.id}`,
+      out.push(makePill({
         camId: clip.id,
+        itemId: item.id,
         arrStartS: arrSubStart,
         arrEndS: arrSubEnd,
         sourceInS,
         sourceOutS,
-        fromArrangementItemId: item.id,
-      });
+      }));
     }
     arrCursor += chunkLenS;
   }
-  return pills;
+  return out;
+}
+
+function makePill(args: {
+  camId: string;
+  itemId: string;
+  arrStartS: number;
+  arrEndS: number;
+  sourceInS: number;
+  sourceOutS: number;
+}): Pill {
+  return {
+    id: `${args.camId}::${args.itemId}`,
+    camId: args.camId,
+    arrStartS: args.arrStartS,
+    arrEndS: args.arrEndS,
+    sourceInS: args.sourceInS,
+    sourceOutS: args.sourceOutS,
+    originalArrStartS: args.arrStartS,
+    originalArrEndS: args.arrEndS,
+    originalSourceInS: args.sourceInS,
+    originalSourceOutS: args.sourceOutS,
+    fromArrangementItemId: args.itemId,
+  };
 }
 
 /**
- * Reconcile a stored pills list against the current arrangement.
+ * Reconcile a stored pill list against the current arrangement+cam state.
  *
- * On editor re-load we want user pill edits (move / trim) to survive,
- * but new arrangement-items added after the user left need fresh pills.
  * Algorithm:
- *   1. Generate the fresh "default" pill list from the current
- *      arrangement+chunks+cams.
- *   2. For each fresh pill, look up a stored pill with the same id
- *      (stored pills carry `${camId}::${arrangementItemId}`). If found,
- *      keep the stored pill — user edits ride.
- *   3. Stored pills whose id has no fresh counterpart are dropped: the
- *      arrangement-item they came from no longer exists, so the pill
- *      no longer has a home on the song.
+ *   1. Generate the fresh pill list from the current job state.
+ *   2. For each fresh pill, look up a stored pill by id. If found,
+ *      keep the stored arr/source values (= user edits), but refresh
+ *      the originals to the fresh pill's values. That way RESET
+ *      always returns to "what the editor would generate now",
+ *      reflecting any chunk reorder / cam re-sync the user did since
+ *      the pill was first created.
+ *   3. Stored pills whose id has no fresh counterpart are dropped:
+ *      the cam or arrangement-item they came from no longer exists,
+ *      so the pill no longer has a home on the song.
  */
-export function reconcileArrangementPills(
+export function reconcilePills(
   arrangement: readonly ArrangementItem[],
   chunks: readonly Chunk[],
   clips: readonly Clip[],
   storedPills: readonly Pill[],
 ): Pill[] {
-  const fresh = generateArrangementPills(arrangement, chunks, clips);
+  const fresh = generatePills(arrangement, chunks, clips);
   if (storedPills.length === 0) return fresh;
   const storedById = new Map(storedPills.map((p) => [p.id, p]));
-  return fresh.map((p) => storedById.get(p.id) ?? p);
+  return fresh.map((freshP) => {
+    const stored = storedById.get(freshP.id);
+    if (!stored) return freshP;
+    return {
+      ...stored,
+      // Refresh originals to current auto-derived values so RESET
+      // takes the user back to "what the editor would generate now".
+      originalArrStartS: freshP.originalArrStartS,
+      originalArrEndS: freshP.originalArrEndS,
+      originalSourceInS: freshP.originalSourceInS,
+      originalSourceOutS: freshP.originalSourceOutS,
+    };
+  });
 }
+
 
 /**
  * Resolve which cam is on PROGRAM at song-time `arrT`.
  *
- * Rules (mirrors `activeCamAt` from cuts.ts but in arr-time + pill space):
- *   1. Find every pill that covers `arrT` (= cam availability at this
- *      song position).
+ * Rules:
+ *   1. Find every pill that covers `arrT`.
  *   2. Find the latest cut whose master-time maps to an arr-time ≤ arrT
  *      AND whose `camId` has a covering pill. That cam wins.
- *   3. If no cut applies, fall back to the FIRST covering pill (in
- *      `pills[]` order — the loadJob auto-generation emits them in
- *      cam-list order so this matches direct-mode's "first cam wins"
- *      tiebreaker).
+ *   3. If no cut applies, fall back to the FIRST covering pill.
  *   4. If no pill covers `arrT`, return null (= test pattern).
  *
  * Returns the active pill so callers (compositor + Timeline) can pull
@@ -150,9 +231,6 @@ export function activeCamAtArr(
     (p) => arrT >= p.arrStartS && arrT < p.arrEndS,
   );
   if (covering.length === 0) return null;
-  // Cuts are stored in master-time; map each to arr-time via the active
-  // segment list. (For direct-mode `segments` is empty and masterToArr
-  // is identity, so this still works without an arr-mode caller.)
   let chosen: { camId: string; pill: Pill } | null = null;
   let bestArrT = -Infinity;
   for (const cut of cuts) {

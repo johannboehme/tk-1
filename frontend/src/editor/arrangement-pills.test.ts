@@ -1,9 +1,6 @@
 import { describe, expect, it } from "vitest";
-import {
-  generateArrangementPills,
-  reconcileArrangementPills,
-} from "./arrangement-pills";
-import type { Clip } from "./types";
+import { generatePills, reconcilePills } from "./arrangement-pills";
+import type { Clip, Pill } from "./types";
 
 const makeVideoClip = (
   id: string,
@@ -23,10 +20,36 @@ const makeVideoClip = (
   selectedCandidateIdx: 0,
 });
 
-describe("generateArrangementPills", () => {
+describe("generatePills (single-take = no arrangement)", () => {
+  it("emits one pill per cam covering its full master range", () => {
+    const cams: Clip[] = [
+      makeVideoClip("cam-a", 0, 30),
+      makeVideoClip("cam-b", 0, 45),
+    ];
+    const pills = generatePills([], [], cams);
+    expect(pills.length).toBe(2);
+    expect(pills[0]).toMatchObject({
+      id: "cam-a::__default__",
+      camId: "cam-a",
+      arrStartS: 0,
+      arrEndS: 30,
+      sourceInS: 0,
+      sourceOutS: 30,
+      originalArrStartS: 0,
+      originalArrEndS: 30,
+      originalSourceInS: 0,
+      originalSourceOutS: 30,
+      fromArrangementItemId: "__default__",
+    });
+    expect(pills[1].id).toBe("cam-b::__default__");
+    expect(pills[1].arrEndS).toBe(45);
+  });
+});
+
+describe("generatePills (long-form = arrangement)", () => {
   it("emits one pill per (cam × arrangement-item) intersection", () => {
     const cams: Clip[] = [
-      makeVideoClip("cam-a", 0, 100), // anchor 0; covers master 0..100
+      makeVideoClip("cam-a", 0, 100),
       makeVideoClip("cam-b", 0, 100),
     ];
     const chunks = [
@@ -37,40 +60,38 @@ describe("generateArrangementPills", () => {
       { id: "a0", chunkId: "c0" },
       { id: "a1", chunkId: "c1" },
     ];
-    const pills = generateArrangementPills(arr, chunks, cams);
-    expect(pills.length).toBe(4); // 2 cams × 2 chunks
-    // First chunk arr-slot is [0, 2). cam-a maps to source 5..7.
+    const pills = generatePills(arr, chunks, cams);
+    expect(pills.length).toBe(4);
     expect(pills[0]).toMatchObject({
+      id: "cam-a::a0",
       camId: "cam-a",
       arrStartS: 0,
       arrEndS: 2,
       sourceInS: 5,
       sourceOutS: 7,
+      originalArrStartS: 0,
+      originalArrEndS: 2,
+      originalSourceInS: 5,
+      originalSourceOutS: 7,
       fromArrangementItemId: "a0",
     });
-    // Second chunk arr-slot is [2, 7). cam-b maps to source 30..35.
     expect(pills[3]).toMatchObject({
       camId: "cam-b",
       arrStartS: 2,
       arrEndS: 7,
       sourceInS: 30,
       sourceOutS: 35,
-      fromArrangementItemId: "a1",
     });
   });
 
   it("clips a cam to its visible master-time range", () => {
-    // cam covers master 0..10. Chunk is master 8..12. Intersect is 8..10.
     const cams: Clip[] = [makeVideoClip("c", 0, 10)];
     const chunks = [
       { id: "c0", startMs: 8_000, endMs: 12_000, bpmOctaveShift: 0 as const, effectiveBpm: 120, beatsPerBar: 4, accepted: true, trimMode: "auto" as const },
     ];
     const arr = [{ id: "a0", chunkId: "c0" }];
-    const pills = generateArrangementPills(arr, chunks, cams);
+    const pills = generatePills(arr, chunks, cams);
     expect(pills.length).toBe(1);
-    // arr slot is [0, 4) — but the pill only covers [0, 2) because the
-    // cam runs out at master 10.
-    expect(pills[0].arrStartS).toBe(0);
     expect(pills[0].arrEndS).toBe(2);
     expect(pills[0].sourceInS).toBe(8);
     expect(pills[0].sourceOutS).toBe(10);
@@ -85,7 +106,7 @@ describe("generateArrangementPills", () => {
       { id: "a0", chunkId: "c0" },
       { id: "a1", chunkId: "c0" }, // duplicate
     ];
-    const pills = generateArrangementPills(arr, chunks, cams);
+    const pills = generatePills(arr, chunks, cams);
     expect(pills.length).toBe(2);
     expect(pills[0].arrStartS).toBe(0);
     expect(pills[0].arrEndS).toBe(2);
@@ -93,10 +114,6 @@ describe("generateArrangementPills", () => {
     expect(pills[1].arrStartS).toBe(2);
     expect(pills[1].arrEndS).toBe(4);
     expect(pills[1].fromArrangementItemId).toBe("a1");
-    // Both pills point at the same cam-source range — that's the whole
-    // point of duplicates.
-    expect(pills[0].sourceInS).toBe(pills[1].sourceInS);
-    expect(pills[0].sourceOutS).toBe(pills[1].sourceOutS);
   });
 
   it("skips arrangement-items whose chunk no longer exists", () => {
@@ -108,13 +125,13 @@ describe("generateArrangementPills", () => {
       { id: "a0", chunkId: "c0" },
       { id: "a-orphan", chunkId: "GONE" },
     ];
-    const pills = generateArrangementPills(arr, chunks, cams);
+    const pills = generatePills(arr, chunks, cams);
     expect(pills.length).toBe(1);
     expect(pills[0].fromArrangementItemId).toBe("a0");
   });
 });
 
-describe("reconcileArrangementPills", () => {
+describe("reconcilePills", () => {
   const cams: Clip[] = [makeVideoClip("c", 0, 100)];
   const chunks = [
     { id: "c0", startMs: 0, endMs: 2_000, bpmOctaveShift: 0 as const, effectiveBpm: 120, beatsPerBar: 4, accepted: true, trimMode: "auto" as const },
@@ -125,30 +142,39 @@ describe("reconcileArrangementPills", () => {
     { id: "a1", chunkId: "c1" },
   ];
 
-  it("preserves user-edited pills by id and adopts new ones", () => {
-    const userEdited = [
+  it("preserves user-edited arr/source on stored pills, refreshes originals", () => {
+    const userEdited: Pill[] = [
       {
         id: "c::a0",
         camId: "c",
-        arrStartS: 0.5, // user dragged the pill 0.5s right
+        arrStartS: 0.5,
         arrEndS: 2.5,
-        sourceInS: 0.2, // user trimmed front 200 ms off
+        sourceInS: 0.2,
         sourceOutS: 2,
+        originalArrStartS: 99,
+        originalArrEndS: 99,
+        originalSourceInS: 99,
+        originalSourceOutS: 99,
         fromArrangementItemId: "a0",
       },
     ];
-    const reconciled = reconcileArrangementPills(arr, chunks, cams, userEdited);
+    const reconciled = reconcilePills(arr, chunks, cams, userEdited);
     expect(reconciled.length).toBe(2);
-    // First pill: kept with user edits.
+    // First pill: user-edited values stay.
     expect(reconciled[0].arrStartS).toBe(0.5);
     expect(reconciled[0].sourceInS).toBe(0.2);
-    // Second pill: freshly generated (user never touched it).
+    // ...but originals are refreshed to the CURRENT auto-derived values.
+    expect(reconciled[0].originalArrStartS).toBe(0);
+    expect(reconciled[0].originalArrEndS).toBe(2);
+    expect(reconciled[0].originalSourceInS).toBe(0);
+    expect(reconciled[0].originalSourceOutS).toBe(2);
+    // Second pill: freshly generated.
     expect(reconciled[1].id).toBe("c::a1");
     expect(reconciled[1].arrStartS).toBe(2);
   });
 
   it("drops stored pills whose arrangement-item disappeared", () => {
-    const stored = [
+    const stored: Pill[] = [
       {
         id: "c::removed",
         camId: "c",
@@ -156,10 +182,14 @@ describe("reconcileArrangementPills", () => {
         arrEndS: 1,
         sourceInS: 0,
         sourceOutS: 1,
+        originalArrStartS: 0,
+        originalArrEndS: 1,
+        originalSourceInS: 0,
+        originalSourceOutS: 1,
         fromArrangementItemId: "removed",
       },
     ];
-    const reconciled = reconcileArrangementPills(arr, chunks, cams, stored);
+    const reconciled = reconcilePills(arr, chunks, cams, stored);
     expect(reconciled.find((p) => p.id === "c::removed")).toBeUndefined();
   });
 });

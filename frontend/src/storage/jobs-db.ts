@@ -439,6 +439,10 @@ export interface PillRecord {
   arrEndS: number;
   sourceInS: number;
   sourceOutS: number;
+  originalArrStartS: number;
+  originalArrEndS: number;
+  originalSourceInS: number;
+  originalSourceOutS: number;
   fromArrangementItemId?: string;
 }
 
