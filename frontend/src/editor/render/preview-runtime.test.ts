@@ -10,6 +10,7 @@ import {
 import type { Clip, ImageClip, VideoClip } from "../types";
 import type { EditorStoreSnapshot } from "./build-descriptor";
 import { useEditorStore } from "../store";
+import { generatePills } from "../arrangement-pills";
 
 function videoClip(id: string, more: Partial<VideoClip> = {}): VideoClip {
   return {
@@ -45,11 +46,48 @@ function imageClip(id: string, more: Partial<ImageClip> = {}): ImageClip {
 }
 
 function snapshot(over: Partial<EditorStoreSnapshot> = {}): EditorStoreSnapshot {
+  const clips = over.clips ?? [];
+  // Mirror the post-loadJob invariant: every job carries a populated
+  // pills + arrangementSegments shape (synthesized for single-take in
+  // synthesizeJobLoadShape). Tests focused on cam/cut/rotation behavior
+  // care about the active-cam answer, not the segment/pill plumbing —
+  // synthesize defaults from clips so the descriptor builder finds an
+  // active cam.
+  const segments =
+    clips.length > 0
+      ? [
+          {
+            in: 0,
+            out: Math.max(
+              ...clips.map((c) =>
+                c.kind === "image" ? c.durationS : c.sourceDurationS,
+              ),
+              60,
+            ),
+          },
+        ]
+      : [];
+  const arrangement = [{ id: "__default__", chunkId: "__default_chunk__" }];
+  const chunks = [
+    {
+      id: "__default_chunk__",
+      startMs: 0,
+      endMs: (segments[0]?.out ?? 0) * 1000,
+      bpmOctaveShift: 0 as const,
+      effectiveBpm: 0,
+      beatsPerBar: 4,
+      accepted: true,
+      trimMode: "free" as const,
+    },
+  ];
   return {
-    clips: [],
+    clips,
     cuts: [],
     fx: [],
     exportSpec: { preset: "web" },
+    pills:
+      clips.length > 0 ? generatePills(arrangement, chunks, clips) : [],
+    arrangementSegments: segments,
     ...over,
   };
 }

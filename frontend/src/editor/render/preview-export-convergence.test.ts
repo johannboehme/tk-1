@@ -17,6 +17,7 @@ import { describe, it, expect } from "vitest";
 import { buildPreviewFrameDescriptor } from "./build-descriptor";
 import { buildElementFitRect } from "./element-transform";
 import type { Clip, ViewportTransform } from "../types";
+import { generatePills } from "../arrangement-pills";
 
 function video(
   id: string,
@@ -86,12 +87,32 @@ const cases: Array<{
 describe("preview vs export — placement convergence", () => {
   for (const c of cases) {
     it(c.name, () => {
+      const clips = [video("a", c.display.w, c.display.h, c.transform)];
+      // Synthetic single-take shape — same as synthesizeJobLoadShape
+      // produces in production. Without it, the descriptor builder
+      // finds no active cam and returns no layers.
+      const segments = [{ in: 0, out: 60 }];
+      const arrangement = [{ id: "__default__", chunkId: "__default_chunk__" }];
+      const chunks = [
+        {
+          id: "__default_chunk__",
+          startMs: 0,
+          endMs: 60_000,
+          bpmOctaveShift: 0 as const,
+          effectiveBpm: 0,
+          beatsPerBar: 4,
+          accepted: true,
+          trimMode: "free" as const,
+        },
+      ];
       const previewDescriptor = buildPreviewFrameDescriptor(
         {
-          clips: [video("a", c.display.w, c.display.h, c.transform)],
+          clips,
           cuts: [],
           fx: [],
           exportSpec: { preset: "custom", resolution: c.stage },
+          pills: generatePills(arrangement, chunks, clips),
+          arrangementSegments: segments,
         },
         0,
       );

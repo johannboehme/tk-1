@@ -778,12 +778,14 @@ export default function Editor() {
         const tin = Math.max(0, Math.min(j.trim.in, audioMax));
         const tout = Math.max(tin, Math.min(j.trim.out, audioMax));
         useEditorStore.getState().setTrim({ in: tin, out: tout });
-      } else if (arrangementSegments.length > 0) {
-        // Long-form first-load: derive trim from the span across ALL
-        // segments so skip-to-end / zoom-to-fit cover every active
-        // region. Arrangement order can place a duplicated early
-        // chunk after later ones, so we MUST take min/max — not
-        // first.in / last.out — to get a sensible window.
+      } else {
+        // First-load default: derive trim from the master-time span
+        // covered by the arrangement segments so skip-to-end / zoom-to-
+        // fit cover every active region. Arrangement order can place a
+        // duplicated early chunk after later ones, so take min/max
+        // across all segments — not first.in / last.out — to get a
+        // sensible window. Single-take's whole-master segment yields
+        // [0, duration] (= the full audio range).
         let lo = Infinity;
         let hi = -Infinity;
         for (const seg of arrangementSegments) {
@@ -794,13 +796,13 @@ export default function Editor() {
           useEditorStore.getState().setTrim({ in: lo, out: hi });
         }
       }
-      // Long-form: park the playhead at the first segment's in-point so
-      // the user pressing Space starts on real material instead of
-      // tripping the audio walker's "in-gap → hard seek" branch (audible
-      // as a momentary scratchy attack at master-time 0). The hint binds
-      // the audio walker to segment 0 so duplicate-chunk arrangements
-      // start at the right occurrence.
-      if (arrangementSegments.length > 0) {
+      // Park the playhead at the first segment's in-point (= 0 for
+      // single-take) so the user pressing Space starts on real material
+      // instead of tripping the audio walker's "in-gap → hard seek"
+      // branch (audible as a momentary scratchy attack). The
+      // segmentIdxHint binds the walker to segment 0 so duplicate-chunk
+      // arrangements start at the right occurrence.
+      {
         useEditorStore
           .getState()
           .seek(arrangementSegments[0].in, { segmentIdxHint: 0 });
