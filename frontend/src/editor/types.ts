@@ -70,6 +70,13 @@ export interface Pill {
   originalSourceInS: number;
   originalSourceOutS: number;
   fromArrangementItemId?: string;
+  /** True when the user has moved or trimmed this pill — explicit flag
+   *  so reconciliation across reloads doesn't have to guess from value
+   *  comparison. Auto-generated pills (every `generatePills` output) are
+   *  unflagged; pill edit actions in the store flip it on, RESET clears
+   *  it. Reconcile uses this to decide whether stored arr/source values
+   *  override the fresh auto-baseline. */
+  userEdited?: boolean;
 }
 
 /** Half-open arr-time range a pill occupies. */

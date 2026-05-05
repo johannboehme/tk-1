@@ -162,7 +162,11 @@ export function TransportBar() {
     });
     switch (target.kind) {
       case "loop": {
-        const newStart = t;
+        // Loop lives in arr-time on the composed timeline: in direct-mode
+        // arr == master so this is identity; in arr-mode it converts so
+        // the user's I/O hits the same point on the visible tape they see.
+        const t_arr = isArrMode ? masterToArr(t, arrSegments) : t;
+        const newStart = t_arr;
         const newEnd = Math.max(loop!.end, newStart + 1 / fps);
         setLoop({ start: newStart, end: newEnd });
         return;
@@ -194,7 +198,8 @@ export function TransportBar() {
     });
     switch (target.kind) {
       case "loop": {
-        const newEnd = t;
+        const t_arr = isArrMode ? masterToArr(t, arrSegments) : t;
+        const newEnd = t_arr;
         const newStart = Math.min(loop!.start, newEnd - 1 / fps);
         setLoop({ start: newStart, end: newEnd });
         return;
@@ -216,31 +221,21 @@ export function TransportBar() {
   }
 
   function toggleLoop() {
-    // Loop is direct-mode-only: a master-time loop region inside the
-    // arrangement either spans a chunk-gap (silence, broken playback)
-    // or fights the audio walker's segment-hop crossfade. The button
-    // stays visible (so the user knows what they'd lose) but it's a
-    // no-op + a toast — the proper "loop my song" feature would be
-    // arrangement-time-aware and is deferred.
-    if (isArrMode) {
-      useEditorStore
-        .getState()
-        .pushNotice("Loop is disabled while playing an arrangement");
-      return;
-    }
     if (loop) {
       setLoop(null);
       return;
     }
-    // Anchor inside trim — if the playhead sits before/after the trim
-    // region (e.g. fresh editor open with currentTime = 0 while the
-    // audio starts at trim.in = 6.4 s) we'd otherwise propose a region
-    // outside trim, which `setLoop` clamps to null and the L shortcut
-    // appears to do nothing. Clamping here keeps the action a real
-    // toggle from any playhead position.
+    // Anchor on the COMPOSED timeline (the user's tape): in direct-mode
+    // that's master-time, in arr-mode it's arr-time. Either way clamp
+    // to the playable bounds so a fresh-open playhead at t=0 doesn't
+    // propose a region outside the active range — `setLoop` would clamp
+    // it to null and the toggle would appear to do nothing.
     const t = useEditorStore.getState().playback.currentTime;
-    const start = Math.max(trim.in, Math.min(trim.out - 1 / fps, t));
-    const end = Math.min(trim.out, start + 2);
+    const t_arr = isArrMode ? masterToArr(t, arrSegments) : t;
+    const lo = isArrMode ? 0 : trim.in;
+    const hi = isArrMode ? totalArrDuration(arrSegments) : trim.out;
+    const start = Math.max(lo, Math.min(hi - 1 / fps, t_arr));
+    const end = Math.min(hi, start + 2);
     setLoop({ start, end });
   }
 

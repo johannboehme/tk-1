@@ -190,6 +190,7 @@ export function Timeline({
   const setTrim = useEditorStore((s) => s.setTrim);
   const loop = useEditorStore((s) => s.playback.loop);
   const setLoop = useEditorStore((s) => s.setLoop);
+  const moveLoop = useEditorStore((s) => s.moveLoop);
   const seek = useEditorStore((s) => s.seek);
   const zoom = useEditorStore((s) => s.ui.zoom);
   const scrollX = useEditorStore((s) => s.ui.scrollX);
@@ -711,11 +712,12 @@ export function Timeline({
       }
     }
 
-    // Trim dim, loop band, audio-start marker, trim handles —
-    // direct-mode-only chrome. In arrangement-mode the playable region
-    // IS the visible region, so trim/loop are unused and the audio-start
-    // marker is a triage concern. Splice marks at every segment seam
-    // replace the dimming so the user sees where the audio walker hops.
+    // Trim dim and audio-start marker stay direct-mode-only. In arrangement-
+    // mode the playable region IS the visible region, so trim is unused and
+    // the audio-start marker is a triage concern. Splice marks at every
+    // segment seam replace the dimming so the user sees the walker's hops.
+    // The loop band, however, is mode-agnostic: it lives on the composed
+    // timeline (arr-time in arr-mode, master == arr in direct-mode).
     if (!isArrMode) {
       const xIn = tToX(trim.in);
       const xOut = tToX(trim.out);
@@ -723,21 +725,6 @@ export function Timeline({
       if (xIn > 0) ctx.fillRect(0, audioBand.top, xIn, audioLaneHeight);
       if (xOut < audioRightX)
         ctx.fillRect(xOut, audioBand.top, audioRightX - xOut, audioLaneHeight);
-
-      if (loop) {
-        const xs = tToX(loop.start);
-        const xe = tToX(loop.end);
-        ctx.fillStyle = "rgba(255,87,34,0.18)";
-        ctx.fillRect(xs, audioBand.top, Math.max(1, xe - xs), audioLaneHeight);
-        ctx.strokeStyle = "rgba(255,87,34,0.6)";
-        ctx.lineWidth = 1;
-        ctx.strokeRect(
-          xs + 0.5,
-          audioBand.top + 0.5,
-          Math.max(0, xe - xs - 1),
-          audioLaneHeight - 1,
-        );
-      }
 
       drawHandle(ctx, xIn, audioBand.top, audioLaneHeight);
       drawHandle(
@@ -783,6 +770,23 @@ export function Timeline({
           ctx.fillRect(xOut, audioBand.top, 1, audioLaneHeight);
         }
       }
+    }
+
+    // Loop band — mode-agnostic. Loop is stored in arr-time which equals
+    // master-time in direct-mode, so `arrTToX` works in both flows.
+    if (loop) {
+      const xs = arrTToX(loop.start);
+      const xe = arrTToX(loop.end);
+      ctx.fillStyle = "rgba(255,87,34,0.18)";
+      ctx.fillRect(xs, audioBand.top, Math.max(1, xe - xs), audioLaneHeight);
+      ctx.strokeStyle = "rgba(255,87,34,0.6)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(
+        xs + 0.5,
+        audioBand.top + 0.5,
+        Math.max(0, xe - xs - 1),
+        audioLaneHeight - 1,
+      );
     }
 
     ctx.restore();
@@ -998,9 +1002,11 @@ export function Timeline({
       if (Math.abs(x - xOut) <= HANDLE_HIT) return "trim-out";
     }
     if (Math.abs(x - xp) <= HANDLE_HIT) return "playhead";
-    if (!isArrMode && loop) {
-      const xs = tToX(loop.start);
-      const xe = tToX(loop.end);
+    // Loop hit-test is mode-agnostic — loop is stored in arr-time which is
+    // identity in direct-mode, so `arrTToX` works in both flows.
+    if (loop) {
+      const xs = arrTToX(loop.start);
+      const xe = arrTToX(loop.end);
       if (x >= xs && x <= xe) return "loop";
     }
     return null;
@@ -1134,7 +1140,10 @@ export function Timeline({
       } else if (k === "playhead") {
         dragRef.current = { kind: "playhead" };
       } else if (k === "loop" && loop) {
-        dragRef.current = { kind: "loop", offset: tRaw - loop.start };
+        // Loop is on the composed timeline; capture grab offset in arr-time
+        // so dragging stays consistent across direct and arrangement modes.
+        const arrAtPointer = viewStart + (x / canvasWidth) * visibleDur;
+        dragRef.current = { kind: "loop", offset: arrAtPointer - loop.start };
       }
       return;
     }
@@ -1301,10 +1310,30 @@ export function Timeline({
     } else if (drag.kind === "trim-out") {
       setTrim({ in: trim.in, out: snapped(tRaw, e) });
     } else if (drag.kind === "loop" && loop) {
+      // Loop drag operates in arr-time (= master in direct-mode, composed
+      // tape in arr-mode). Clamp to the playable bounds of whichever clock
+      // we're in. Snap operates in the same arr-time domain — `buildSnapCtx`
+      // anchors phase on the active view-clock, so calling `snapTime`
+      // directly avoids the master⇄arr round-trip in `snapped()`.
       const len = loop.end - loop.start;
-      const newStartRaw = Math.max(trim.in, Math.min(trim.out - len, tRaw - drag.offset));
-      const newStart = snapped(newStartRaw, e);
-      setLoop({ start: newStart, end: newStart + len });
+      const arrAtPointer = viewStart + (x / canvasWidth) * visibleDur;
+      const lo = isArrMode ? 0 : trim.in;
+      const hi = isArrMode
+        ? totalArrDuration(arrangementSegments)
+        : trim.out;
+      const newStartRaw = Math.max(
+        lo,
+        Math.min(hi - len, arrAtPointer - drag.offset),
+      );
+      const newStart =
+        e.shiftKey || snapMode === "off"
+          ? newStartRaw
+          : snapTime(newStartRaw, snapMode, buildSnapCtx());
+      // OP-1 tape feel: don't yank the playhead while dragging — the
+      // store defers the wrap to the OLD loop.end. The active element
+      // keeps playing through that point and wraps to the new loop's
+      // start when it gets there.
+      moveLoop({ start: newStart, end: newStart + len });
     } else if (drag.kind === "pill-move") {
       // Pill body drag — shift arrStartS by the pointer-delta in arr-time.
       // Source-trim stays put: only the pill's WHEN moves.
@@ -1522,15 +1551,31 @@ export function Timeline({
   const zoomPercent = useMemo(() => Math.round(zoom * 100), [zoom]);
 
   // Build CamLookups for the PROGRAM strip.
-  const camLookupsForStrip = useMemo(
-    () =>
-      clips.map((c) => ({
+  // ProgramStrip is drawn in `stripDuration` units — master-time in direct-
+  // mode, arr-time when an arrangement is loaded. The cam ranges fed into
+  // `buildProgram` MUST be in the same domain as the strip's sampling
+  // axis or the cuts strip diverges from the cam-lane (and from the
+  // compositor, which uses `activeCamAtArr` with pills). Direct-mode is
+  // identity, so `clipRangeS` works as-is. In arr-mode, pills already
+  // hold per-cam arr-time ranges (one entry per chunk×clip intersection,
+  // or one per single-take cam), so use them as the lookup directly —
+  // multiple entries with the same `id` are fine, `activeCamAt` returns
+  // a cam id whenever ANY range contains the sample.
+  const camLookupsForStrip = useMemo(() => {
+    if (!isArrMode) {
+      return clips.map((c) => ({
         id: c.id,
         color: c.color,
         range: clipRangeS(c),
-      })),
-    [clips],
-  );
+      }));
+    }
+    const colorById = new Map(clips.map((c) => [c.id, c.color]));
+    return pills.map((p) => ({
+      id: p.camId,
+      color: colorById.get(p.camId) ?? "#888888",
+      range: { startS: p.arrStartS, endS: p.arrEndS },
+    }));
+  }, [clips, isArrMode, pills]);
 
   return (
     <div ref={wrapRef} className="w-full select-none">

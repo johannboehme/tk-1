@@ -143,7 +143,7 @@ describe("reconcilePills", () => {
   ];
 
   it("preserves user-edited arr/source on stored pills, refreshes originals", () => {
-    const userEdited: Pill[] = [
+    const userEditedPills: Pill[] = [
       {
         id: "c::a0",
         camId: "c",
@@ -156,9 +156,10 @@ describe("reconcilePills", () => {
         originalSourceInS: 99,
         originalSourceOutS: 99,
         fromArrangementItemId: "a0",
+        userEdited: true,
       },
     ];
-    const reconciled = reconcilePills(arr, chunks, cams, userEdited);
+    const reconciled = reconcilePills(arr, chunks, cams, userEditedPills);
     expect(reconciled.length).toBe(2);
     // First pill: user-edited values stay.
     expect(reconciled[0].arrStartS).toBe(0.5);
@@ -171,6 +172,91 @@ describe("reconcilePills", () => {
     // Second pill: freshly generated.
     expect(reconciled[1].id).toBe("c::a1");
     expect(reconciled[1].arrStartS).toBe(2);
+  });
+
+  it("regenerates pills without the userEdited flag (legacy / sync-stale)", () => {
+    // Mode-agnostic rule: stored arr/source override fresh ONLY when the
+    // user-edited flag is true. Pre-flag pills (or pills written before
+    // sync resolved) are auto-derived and must follow the current
+    // baseline.
+    const stored: Pill[] = [
+      {
+        id: "c::a0",
+        camId: "c",
+        // Pre-sync stored values that no longer match clipRangeS.
+        arrStartS: 99,
+        arrEndS: 99,
+        sourceInS: 99,
+        sourceOutS: 99,
+        originalArrStartS: 0,
+        originalArrEndS: 2,
+        originalSourceInS: 0,
+        originalSourceOutS: 2,
+        fromArrangementItemId: "a0",
+        // No userEdited flag → treated as auto-generated.
+      },
+    ];
+    const reconciled = reconcilePills(arr, chunks, cams, stored);
+    // Fresh values win.
+    expect(reconciled[0].arrStartS).toBe(0);
+    expect(reconciled[0].arrEndS).toBe(2);
+  });
+
+  it("regenerates an unedited stored pill when sync changes its baseline", () => {
+    // Pre-existing bug: a single-take pill saved before sync completed
+    // (arrStartS=0, originalArrStartS=0). Sync resolves later to a non-zero
+    // offset → fresh generation puts the pill at e.g. arr=2.896. Reconcile
+    // would otherwise keep stored.arrStartS=0 and only refresh originals,
+    // so the pill renders at 0 while the cuts strip / clipRangeS expect
+    // 2.896. Direct-mode bypasses the stored pill entirely.
+    const cam: Clip[] = [makeVideoClip("c", -2896, 100)];
+    const stored: Pill[] = [
+      {
+        id: "c::__default__",
+        camId: "c",
+        arrStartS: 0,
+        arrEndS: 100,
+        sourceInS: 0,
+        sourceOutS: 100,
+        originalArrStartS: 0,
+        originalArrEndS: 100,
+        originalSourceInS: 0,
+        originalSourceOutS: 100,
+        fromArrangementItemId: "__default__",
+      },
+    ];
+    const reconciled = reconcilePills([], [], cam, stored);
+    expect(reconciled.length).toBe(1);
+    expect(reconciled[0].arrStartS).toBeCloseTo(2.896, 3);
+    expect(reconciled[0].arrEndS).toBeCloseTo(2.896 + 100, 3);
+  });
+
+  it("ignores polluted stored pills in direct-mode (originals diverged from arr by previous reconcile)", () => {
+    // Reload race: a previous reconcile cycle refreshed `originalArrStartS`
+    // to the post-sync fresh value (2.896) but left `arrStartS=0`. Then the
+    // pill got persisted in that polluted state. The unedited-heuristic
+    // can no longer recognize it because arr ≠ original. Direct-mode
+    // sidesteps this entirely: pill is always regenerated.
+    const cam: Clip[] = [makeVideoClip("c", -2896, 100)];
+    const stored: Pill[] = [
+      {
+        id: "c::__default__",
+        camId: "c",
+        arrStartS: 0,
+        arrEndS: 100,
+        sourceInS: 0,
+        sourceOutS: 100,
+        // Originals diverged from arr by a previous reconcile run.
+        originalArrStartS: 2.896,
+        originalArrEndS: 2.896 + 100,
+        originalSourceInS: 0,
+        originalSourceOutS: 100,
+        fromArrangementItemId: "__default__",
+      },
+    ];
+    const reconciled = reconcilePills([], [], cam, stored);
+    expect(reconciled.length).toBe(1);
+    expect(reconciled[0].arrStartS).toBeCloseTo(2.896, 3);
   });
 
   it("drops stored pills whose arrangement-item disappeared", () => {

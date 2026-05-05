@@ -38,7 +38,8 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useEditorStore } from "./store";
-import { shouldArmCrossfade, loopWrapTime } from "./OffsetScheduler";
+import { nextLoopWrapMasterT } from "./arrangement-loop";
+import { segmentArrStarts, segmentIndexAtArr } from "./arrangement-time";
 import { attachLoopGlitchProbe, isProbeEnabled } from "./audio-glitch-probe";
 
 export interface AudioMasterHandle {
@@ -442,14 +443,6 @@ export function useAudioMaster(
       const active = state.active === "A" ? refA : refB;
       const idle = state.active === "A" ? refB : refA;
       const t = active.currentTime;
-
-      // Auto-pause at master end.
-      if (t >= dur) {
-        store.setCurrentTime(dur);
-        store.setPlaying(false);
-        rafRef.current = null;
-        return;
-      }
       store.setCurrentTime(t);
 
       // Has an armed crossfade fired already? Detect by
@@ -511,13 +504,12 @@ export function useAudioMaster(
         return;
       }
 
-      // ─── Arrangement-segment walker ───────────────────────────────────
-      // When the editor was opened from a long-form Arrange handoff, the
-      // store carries a list of `arrangementSegments` (in master-time).
-      // Playback should walk them in order, gapless-hopping at each
-      // segment boundary instead of streaming straight through the
-      // master audio. Direct-mode jobs leave this empty and the legacy
-      // loop logic below runs as before.
+      // ─── Composed-timeline walker (single path for direct + arrangement) ──
+      // Long-form jobs carry real `arrangementSegments` (master-time slices
+      // of the source recording). Direct-mode jobs synthesize a single
+      // segment covering the full master audio — arr-time then equals
+      // master-time and every helper is identity, so the user's loop
+      // markers map straight through.
       //
       // The walker uses an AUTHORITATIVE state.currentSegmentIdx instead
       // of re-deriving from master-time on every tick — duplicate chunks
@@ -525,8 +517,13 @@ export function useAudioMaster(
       // share master-time bounds, so a "scan-for-first-match" lookup
       // would lock the playback into the first occurrence forever. The
       // index advances on each crossfade hop and re-binds on user-seek.
-      const segs = store.arrangementSegments;
-      if (segs.length > 0) {
+      const segs =
+        store.arrangementSegments.length > 0
+          ? store.arrangementSegments
+          : Number.isFinite(dur) && dur > 0
+            ? [{ in: 0, out: dur }]
+            : null;
+      if (segs && segs.length > 0) {
         let curIdx = state.currentSegmentIdx ?? -1;
         // Validate the cached index — if master-time has drifted out of
         // its window (e.g. browser nudged currentTime past the end while
@@ -578,11 +575,201 @@ export function useAudioMaster(
         const curSeg = segs[curIdx];
         const nextSeg = segs[curIdx + 1] ?? null;
         const distToEnd = curSeg.out - t;
+
+        // ── Loop-wrap arming (composed-timeline / OP-1 tape mode) ──
+        // The user marks loop in/out on the arr-time tape. We project
+        // those markers down to master-time wrap geometry per tick; the
+        // wrap fires inside ONE specific segment occurrence (dedup-safe
+        // for arrangements where the same chunk appears twice).
+        //
+        // The wrap takes priority over hop-arming when it fires inside
+        // the current segment: the segment-hop would otherwise schedule
+        // first and the loop wrap target would never be reached.
+        const loop = store.playback.loop;
+        const loopWrap = nextLoopWrapMasterT(loop, segs);
+        const wrapHere =
+          loopWrap !== null && loopWrap.wrapInSegIdx === curIdx;
+        const pendingWrapAt = store.playback.pendingWrapAt;
+        if (loop && state.armed === null) {
+          // arr-time of the playhead WITHIN this specific segment
+          // occurrence. segmentArrStarts handles duplicates correctly —
+          // we anchor to curIdx, not to a master-time scan.
+          const arrStarts = segmentArrStarts(segs);
+          const arrT = arrStarts[curIdx] + (t - curSeg.in);
+
+          // OP-1 deferred shift: when `pendingWrapAt` is set the loop
+          // bounds are ignored entirely — the active element keeps
+          // playing through whatever territory it's in until arr-time
+          // reaches the deferred wrap point (typically the OLD loop's
+          // end), at which moment we wrap to the new loop.start. Without
+          // this branch the "outside loop → immediate wrap" rule below
+          // would yank the playhead back the moment the user shifted
+          // the loop, defeating the whole point of the deferred shift.
+          if (pendingWrapAt != null && loopWrap) {
+            const pendingSegIdx = segmentIndexAtArr(pendingWrapAt, segs);
+            // Half-open: arr exactly at totalArr returns -1 — clamp to
+            // last segment so the wrap can still fire.
+            const armSegIdx =
+              pendingSegIdx === -1 ? segs.length - 1 : pendingSegIdx;
+            if (armSegIdx === curIdx) {
+              const masterTAtPending =
+                curSeg.in + (pendingWrapAt - arrStarts[curIdx]);
+              const distMaster = masterTAtPending - t;
+              if (distMaster <= LEAD_TIME_S) {
+                const fireAtCtxTime =
+                  graph.ctx.currentTime + Math.max(0, distMaster);
+                try {
+                  if (
+                    Math.abs(idle.currentTime - loopWrap.wrapTargetMasterT) >
+                    0.01
+                  ) {
+                    idle.currentTime = clampSeek(
+                      loopWrap.wrapTargetMasterT,
+                      idle.duration,
+                    );
+                  }
+                } catch {
+                  /* ignore */
+                }
+                if (idle.paused) idle.play().catch(() => undefined);
+                const activeGain =
+                  state.active === "A" ? graph.gainA : graph.gainB;
+                const idleGain =
+                  state.active === "A" ? graph.gainB : graph.gainA;
+                activeGain.gain.cancelScheduledValues(graph.ctx.currentTime);
+                idleGain.gain.cancelScheduledValues(graph.ctx.currentTime);
+                activeGain.gain.setValueAtTime(1, fireAtCtxTime);
+                activeGain.gain.linearRampToValueAtTime(
+                  0,
+                  fireAtCtxTime + CROSSFADE_S,
+                );
+                idleGain.gain.setValueAtTime(0, fireAtCtxTime);
+                idleGain.gain.linearRampToValueAtTime(
+                  1,
+                  fireAtCtxTime + CROSSFADE_S,
+                );
+                state.armed = {
+                  fireAtCtxTime,
+                  fromSide: state.active,
+                  wrapTarget: loopWrap.wrapTargetMasterT,
+                  nextSegmentIdx: loopWrap.targetSegIdx,
+                };
+                rafRef.current = requestAnimationFrame(tick);
+                return;
+              }
+            }
+            // pendingWrapAt is in a future segment OR not yet within
+            // lead-window: skip the regular loop-arming below (else the
+            // immediate-wrap branch would trigger and defeat the deferred
+            // shift) but fall through to segment-hop arming so we can
+            // walk into the segment that contains pendingWrapAt.
+          }
+
+          // Skip the immediate / lead-window arming when pendingWrapAt
+          // is queued — only the OP-1 branch above is allowed to fire,
+          // and only the segment-hop block below should still run.
+          const insideLoop = arrT >= loop.start && arrT < loop.end;
+          if (pendingWrapAt == null && !insideLoop && loopWrap) {
+            // User scrubbed outside the loop region (before-start or
+            // past-end) — wrap immediately. Crossfade with zero distance.
+            const fireAtCtxTime = graph.ctx.currentTime;
+            try {
+              if (
+                Math.abs(idle.currentTime - loopWrap.wrapTargetMasterT) > 0.01
+              ) {
+                idle.currentTime = clampSeek(
+                  loopWrap.wrapTargetMasterT,
+                  idle.duration,
+                );
+              }
+            } catch {
+              /* ignore */
+            }
+            if (idle.paused) idle.play().catch(() => undefined);
+            const activeGain =
+              state.active === "A" ? graph.gainA : graph.gainB;
+            const idleGain = state.active === "A" ? graph.gainB : graph.gainA;
+            activeGain.gain.cancelScheduledValues(graph.ctx.currentTime);
+            idleGain.gain.cancelScheduledValues(graph.ctx.currentTime);
+            activeGain.gain.setValueAtTime(1, fireAtCtxTime);
+            activeGain.gain.linearRampToValueAtTime(
+              0,
+              fireAtCtxTime + CROSSFADE_S,
+            );
+            idleGain.gain.setValueAtTime(0, fireAtCtxTime);
+            idleGain.gain.linearRampToValueAtTime(
+              1,
+              fireAtCtxTime + CROSSFADE_S,
+            );
+            state.armed = {
+              fireAtCtxTime,
+              fromSide: state.active,
+              wrapTarget: loopWrap.wrapTargetMasterT,
+              nextSegmentIdx: loopWrap.targetSegIdx,
+            };
+            rafRef.current = requestAnimationFrame(tick);
+            return;
+          }
+
+          if (pendingWrapAt == null && wrapHere && loopWrap) {
+            const distToWrap = loopWrap.wrapAtMasterT - t;
+            if (distToWrap <= LEAD_TIME_S) {
+              // Within lead window (or briefly past on RAF stall) — arm.
+              const fireAtCtxTime =
+                graph.ctx.currentTime + Math.max(0, distToWrap);
+              try {
+                if (
+                  Math.abs(idle.currentTime - loopWrap.wrapTargetMasterT) >
+                  0.01
+                ) {
+                  idle.currentTime = clampSeek(
+                    loopWrap.wrapTargetMasterT,
+                    idle.duration,
+                  );
+                }
+              } catch {
+                /* ignore */
+              }
+              if (idle.paused) idle.play().catch(() => undefined);
+              const activeGain =
+                state.active === "A" ? graph.gainA : graph.gainB;
+              const idleGain =
+                state.active === "A" ? graph.gainB : graph.gainA;
+              activeGain.gain.cancelScheduledValues(graph.ctx.currentTime);
+              idleGain.gain.cancelScheduledValues(graph.ctx.currentTime);
+              activeGain.gain.setValueAtTime(1, fireAtCtxTime);
+              activeGain.gain.linearRampToValueAtTime(
+                0,
+                fireAtCtxTime + CROSSFADE_S,
+              );
+              idleGain.gain.setValueAtTime(0, fireAtCtxTime);
+              idleGain.gain.linearRampToValueAtTime(
+                1,
+                fireAtCtxTime + CROSSFADE_S,
+              );
+              state.armed = {
+                fireAtCtxTime,
+                fromSide: state.active,
+                wrapTarget: loopWrap.wrapTargetMasterT,
+                nextSegmentIdx: loopWrap.targetSegIdx,
+              };
+              rafRef.current = requestAnimationFrame(tick);
+              return;
+            }
+          }
+        }
+
+        // Hop-arming guard: skip the segment hop only when the loop wrap
+        // is going to fire INSIDE this segment first. The pendingWrapAt
+        // (deferred shift) doesn't follow `loopWrap`'s geometry — it has
+        // its own arming branch above and shouldn't suppress hops.
+        const wrapBlocksHop = pendingWrapAt == null && wrapHere;
         if (
           state.armed === null &&
           distToEnd > 0 &&
           distToEnd <= LEAD_TIME_S &&
-          nextSeg
+          nextSeg &&
+          !wrapBlocksHop
         ) {
           // Approaching a segment boundary with another chunk to hop
           // into — arm a sample-accurate gain crossfade. The idle is
@@ -635,62 +822,12 @@ export function useAudioMaster(
             useEditorStore.getState().setPlaying(false);
           }, Math.max(0, distToEnd * 1000));
         }
-        // Skip the legacy loop arming below — segment-walk owns the
-        // crossfade scheduling for arrangement playback.
         rafRef.current = requestAnimationFrame(tick);
         return;
       }
 
-      // Should we arm a crossfade now? Pure helper makes the rule
-      // testable in isolation.
-      const lp = store.playback.loop;
-      const pendingWrapAt = store.playback.pendingWrapAt;
-      if (
-        lp &&
-        shouldArmCrossfade({
-          masterT: t,
-          loop: lp,
-          pendingWrapAt,
-          leadTimeS: LEAD_TIME_S,
-          alreadyArmed: state.armed != null,
-        })
-      ) {
-        const wrapT = loopWrapTime(lp, pendingWrapAt) ?? lp.end;
-        // Distance to wrap in master-time. AudioContext-time advances
-        // at the same rate as master-time (no playbackRate mod), so
-        // the offset translates 1:1.
-        const distToWrap = Math.max(0, wrapT - t);
-        const fireAtCtxTime = graph.ctx.currentTime + distToWrap;
-
-        // Park idle element at loop.start and start it playing so its
-        // decoder is producing samples by the time the gain ramp hits.
-        try {
-          if (Math.abs(idle.currentTime - lp.start) > 0.01) {
-            idle.currentTime = clampSeek(lp.start, idle.duration);
-          }
-        } catch {
-          /* ignore */
-        }
-        if (idle.paused) {
-          idle.play().catch(() => undefined);
-        }
-
-        // Schedule the gain ramps. setValueAtTime "anchors" the ramp's
-        // start value at fireAtCtxTime — without this anchor, the ramp
-        // begins from now, which would slowly fade during the lead
-        // window instead of at the wrap point.
-        const activeGain = state.active === "A" ? graph.gainA : graph.gainB;
-        const idleGain = state.active === "A" ? graph.gainB : graph.gainA;
-        activeGain.gain.cancelScheduledValues(graph.ctx.currentTime);
-        idleGain.gain.cancelScheduledValues(graph.ctx.currentTime);
-        activeGain.gain.setValueAtTime(1, fireAtCtxTime);
-        activeGain.gain.linearRampToValueAtTime(0, fireAtCtxTime + CROSSFADE_S);
-        idleGain.gain.setValueAtTime(0, fireAtCtxTime);
-        idleGain.gain.linearRampToValueAtTime(1, fireAtCtxTime + CROSSFADE_S);
-
-        state.armed = { fireAtCtxTime, fromSide: state.active };
-      }
-
+      // No segments + no finite duration: nothing to play. Yield until
+      // the audio loads (`isReady` flips and the effect re-runs).
       rafRef.current = requestAnimationFrame(tick);
     }
 

@@ -210,11 +210,20 @@ export function reconcilePills(
   const storedById = new Map(storedPills.map((p) => [p.id, p]));
   return fresh.map((freshP) => {
     const stored = storedById.get(freshP.id);
-    if (!stored) return freshP;
+    // Mode-agnostic rule: stored values override fresh ONLY when the
+    // user explicitly edited this pill (`userEdited === true`). Without
+    // that flag, the pill is auto-derived from clips + sync + chunks —
+    // any baseline shift (sync resolving, trim change, audio nudge) must
+    // flow through to the pill, which means using fresh values.
+    //
+    // Pre-flag pills (no `userEdited`) are conservatively treated as
+    // auto-generated. This drops any user edits made before the flag
+    // was added, but those were already broken across reloads in many
+    // cases (the previous heuristic mis-flagged unedited pills as edited
+    // whenever a previous reconcile cycle had refreshed the originals).
+    if (!stored || !stored.userEdited) return freshP;
     return {
       ...stored,
-      // Refresh originals to current auto-derived values so RESET
-      // takes the user back to "what the editor would generate now".
       originalArrStartS: freshP.originalArrStartS,
       originalArrEndS: freshP.originalArrEndS,
       originalSourceInS: freshP.originalSourceInS,

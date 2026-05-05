@@ -443,18 +443,36 @@ describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => 
         useEditorStore.getState().shiftLoop(1); // [0,2] → [2,4]
         await flushAll();
       });
-      // pendingWrapAt should now be 2 (old loop.end). Approach it
-      // from below — the lead-window arms even though loop.end is 4.
+      // The whole point of pendingWrapAt is the playhead does NOT jump
+      // immediately. After the shift, playhead at 0.5 sits outside the
+      // new loop [2,4], but the deferred wrap is queued at OLD loop.end =
+      // 2 — so the active element should keep playing through unchanged
+      // until master-time reaches that mark.
       ctx.gains.forEach((g) =>
         (g.gain.linearRampToValueAtTime as ReturnType<typeof vi.fn>).mockClear(),
       );
+      await act(async () => {
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      const rampedEarly = ctx.gains.some(
+        (g) =>
+          (g.gain.linearRampToValueAtTime as ReturnType<typeof vi.fn>).mock
+            .calls.length > 0,
+      );
+      expect(rampedEarly).toBe(false);
+
+      // Approach pendingWrapAt — the lead-window arms even though
+      // loop.end is 4.
       await act(async () => {
         mA.setCurrentTime(1.97);
         await new Promise((r) => requestAnimationFrame(() => r(undefined)));
         await new Promise((r) => requestAnimationFrame(() => r(undefined)));
       });
       const ramped = ctx.gains.some(
-        (g) => (g.gain.linearRampToValueAtTime as ReturnType<typeof vi.fn>).mock.calls.length > 0,
+        (g) =>
+          (g.gain.linearRampToValueAtTime as ReturnType<typeof vi.fn>).mock
+            .calls.length > 0,
       );
       expect(ramped).toBe(true);
     });
@@ -630,5 +648,154 @@ describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => 
         expect(mA.playSpy.mock.calls.length).toBe(mAStartCalls);
       },
     );
+  });
+
+  describe("loop wrap inside arrangement walker", () => {
+    // The Phase 2 contract: the segment walker treats `playback.loop` as
+    // in/out markers on the composed (arr-time) timeline. The user sees
+    // a tape, the walker projects that tape's loop down to master-time
+    // wrap geometry and arms a crossfade — same machinery as direct-mode
+    // looping, just with arr-time → master-time projection.
+
+    it("loop entirely inside one segment — wraps within the segment master-time", async () => {
+      const segs = [
+        { in: 10, out: 20 }, // arr [0..10]
+        { in: 30, out: 40 }, // arr [10..20]
+      ];
+      const { mA, mB } = await setup(60);
+      useEditorStore.getState().setArrangementSegments(segs);
+      useEditorStore.getState().seek(10, { segmentIdxHint: 0 });
+      // arr-time loop {2, 5}; both in seg 0 → master {12, 15}.
+      await act(async () => {
+        useEditorStore.getState().setLoop({ start: 2, end: 5 });
+        await flushAll();
+      });
+      await act(async () => {
+        useEditorStore.getState().setPlaying(true);
+        await flushAll();
+      });
+      // Drive near master 15 (= loop.end projected). Walker arms wrap.
+      await act(async () => {
+        mA.setCurrentTime(14.97);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      // Idle parked at wrap target = master 12 (= loop.start in seg 0).
+      expect(mB.getCurrentTime()).toBeCloseTo(12, 1);
+      expect(mB.playSpy).toHaveBeenCalled();
+    });
+
+    it("loop spanning a segment boundary — wrap target lands in earlier segment", async () => {
+      const segs = [
+        { in: 10, out: 15 }, // arr [0..5]
+        { in: 30, out: 35 }, // arr [5..10]
+      ];
+      const { mA, mB } = await setup(60);
+      useEditorStore.getState().setArrangementSegments(segs);
+      useEditorStore.getState().seek(10, { segmentIdxHint: 0 });
+      // arr-time loop {2, 8}: start in seg 0 (master 12), end in seg 1 (master 33).
+      await act(async () => {
+        useEditorStore.getState().setLoop({ start: 2, end: 8 });
+        await flushAll();
+      });
+      await act(async () => {
+        useEditorStore.getState().setPlaying(true);
+        await flushAll();
+      });
+      // Phase 1: drive seg 0 to its end so the walker hops to seg 1.
+      // Wrap is in seg 1, so seg 0's hop-arming should still fire.
+      await act(async () => {
+        mA.setCurrentTime(14.97);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      // Idle (B) parked at seg 1.in = 30 (the hop target), NOT loop.start.
+      expect(mB.getCurrentTime()).toBeCloseTo(30, 1);
+    });
+
+    it("loop end at last-segment.out — wraps instead of pausing", async () => {
+      const segs = [
+        { in: 10, out: 15 }, // arr [0..5]
+        { in: 30, out: 35 }, // arr [5..10]
+      ];
+      const { mA, mB } = await setup(60);
+      useEditorStore.getState().setArrangementSegments(segs);
+      // Park inside the last segment.
+      useEditorStore.getState().seek(30, { segmentIdxHint: 1 });
+      // Loop arr {0, 10} — end exactly at totalArr, clamps to last segment.
+      await act(async () => {
+        useEditorStore.getState().setLoop({ start: 0, end: 10 });
+        await flushAll();
+      });
+      await act(async () => {
+        useEditorStore.getState().setPlaying(true);
+        await flushAll();
+      });
+      mB.playSpy.mockClear();
+      await act(async () => {
+        mA.setCurrentTime(34.97);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      // Idle parked at wrap target = arrToMaster(0) = seg 0 master 10.
+      expect(mB.getCurrentTime()).toBeCloseTo(10, 1);
+      // Wrap was armed (idle play()ed); pause-at-end did NOT take over.
+      expect(mB.playSpy).toHaveBeenCalled();
+      expect(useEditorStore.getState().playback.isPlaying).toBe(true);
+    });
+
+    it("duplicate chunks — wrap fires only at user-marked output position", async () => {
+      // Same master range used twice. Arr-time loop {1, 5} maps to:
+      //   arr=1 → seg 0 master 6 (wrap target)
+      //   arr=5 → seg 1 master 7 (wrap point — 5 - 3 = 2 into seg 1)
+      // The wrap MUST NOT fire while still in seg 0 even though seg 0's
+      // master crosses 7 too.
+      const segs = [
+        { in: 5, out: 8 }, // arr [0..3]
+        { in: 5, out: 8 }, // arr [3..6]
+      ];
+      const { mA, mB } = await setup(20);
+      useEditorStore.getState().setArrangementSegments(segs);
+      useEditorStore.getState().seek(5, { segmentIdxHint: 0 });
+      await act(async () => {
+        useEditorStore.getState().setLoop({ start: 1, end: 5 });
+        await flushAll();
+      });
+      await act(async () => {
+        useEditorStore.getState().setPlaying(true);
+        await flushAll();
+      });
+      // While in seg 0, drive master past 7 (the wrap-point's master).
+      // The walker must NOT arm a wrap here — the user's wrap is in seg 1.
+      // What it SHOULD do is hop to seg 1 at master=8, since that's the
+      // segment boundary.
+      await act(async () => {
+        mA.setCurrentTime(7.97);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      // Idle parked at seg 1 in = 5 (hop), NOT at wrap target (= 6).
+      expect(mB.getCurrentTime()).toBeCloseTo(5, 1);
+    });
+
+    it("no loop set — walker behaves exactly as before (regression guard)", async () => {
+      const segs = [
+        { in: 10, out: 15 },
+        { in: 30, out: 35 },
+      ];
+      const { mA, mB } = await setup(60);
+      useEditorStore.getState().setArrangementSegments(segs);
+      useEditorStore.getState().seek(10, { segmentIdxHint: 0 });
+      await act(async () => {
+        useEditorStore.getState().setPlaying(true);
+        await flushAll();
+      });
+      await act(async () => {
+        mA.setCurrentTime(14.97);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      // Hops to seg 1.in normally — loop logic must be a no-op when no loop.
+      expect(mB.getCurrentTime()).toBeCloseTo(30, 1);
+    });
   });
 });
