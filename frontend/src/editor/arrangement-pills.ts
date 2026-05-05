@@ -206,18 +206,26 @@ export function reconcilePills(
   storedPills: readonly Pill[],
 ): Pill[] {
   const fresh = generatePills(arrangement, chunks, clips);
+  // Direct-mode (no arrangement): pills are pure derivations of clipRangeS
+  // — there's no per-(cam × item) layout for the user to rearrange. Always
+  // use fresh values so sync resolution, trim edits, and any other clip-
+  // level mutation flow straight through to the pill. A previously stored
+  // pill from a moment when sync hadn't resolved (arrStartS=0) would
+  // otherwise stick around forever, displaced from where clipRangeS+the
+  // cuts strip want it. Pill move/trim in direct-mode persists via
+  // clip-level fields (setClipStartOffset / setVideoClipTrim), not via
+  // the pill itself, so this isn't a regression for user edits.
+  if (arrangement.length === 0 || chunks.length === 0) return fresh;
   if (storedPills.length === 0) return fresh;
   const storedById = new Map(storedPills.map((p) => [p.id, p]));
   return fresh.map((freshP) => {
     const stored = storedById.get(freshP.id);
     if (!stored) return freshP;
-    // If the stored pill matches its own stored originals (within eps),
-    // it was never user-edited — sync changes or other clip-derived
-    // shifts that move the auto-baseline should flow through. Keeping
-    // the stored arr/source values would otherwise leave the pill
-    // "stuck" at the old baseline (e.g. arrStartS=0 from a save that
-    // happened before sync resolved a non-zero offset), which the user
-    // reads as a phantom edit.
+    // Heuristic for never-edited stored pills: stored arr/source match
+    // their own stored originals (within eps). When true, regenerate so
+    // sync/baseline shifts flow through. When false, the pill carries
+    // user edits and we preserve them; originals refresh to the current
+    // auto-baseline so RESET targets the right place.
     const wasUnedited =
       Math.abs(stored.arrStartS - stored.originalArrStartS) < DIRTY_EPS_S &&
       Math.abs(stored.arrEndS - stored.originalArrEndS) < DIRTY_EPS_S &&
@@ -226,8 +234,6 @@ export function reconcilePills(
     if (wasUnedited) return freshP;
     return {
       ...stored,
-      // Refresh originals to current auto-derived values so RESET
-      // takes the user back to "what the editor would generate now".
       originalArrStartS: freshP.originalArrStartS,
       originalArrEndS: freshP.originalArrEndS,
       originalSourceInS: freshP.originalSourceInS,
