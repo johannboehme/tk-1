@@ -30,6 +30,7 @@ import {
 type MuxTarget = ArrayBufferTarget | FileSystemWritableFileStreamTarget;
 import {
   encodeAudioFromPcm,
+  streamEncodeAudioWithSegments,
   type AudioEncodeCodec,
 } from "../codec/webcodecs/audio-encode";
 import { demuxVideoTrack } from "../codec/webcodecs/demux";
@@ -671,7 +672,7 @@ export async function editRenderMulti(
   // like correct alignment in the preview ended up several seconds out
   // in the export.
   input.onProgress?.({ stage: "audio-decode", framesDone: 0, framesTotal: 0 });
-  let audio: { pcm: Float32Array; sampleRate: number; channels: number };
+  let audio: { pcm: Float32Array; sampleRate: number; channels: number } | null;
   if (input.audioPcm) {
     audio = input.audioPcm;
   } else if (input.audioFile) {
@@ -679,21 +680,9 @@ export async function editRenderMulti(
   } else {
     throw new Error("editRenderMulti: either audioFile or audioPcm is required");
   }
-  let pcm: Float32Array | null = audio.pcm;
-  pcm = applySegments(pcm, audio.channels, audio.sampleRate, input.segments);
-
-  input.onProgress?.({ stage: "audio-encode", framesDone: 0, framesTotal: 0 });
   const audioCodec: AudioEncodeCodec = input.audioCodec ?? "aac";
-  const encodedAudio = await encodeAudioFromPcm(pcm, {
-    numberOfChannels: audio.channels,
-    sampleRate: audio.sampleRate,
-    bitrateBps: input.audioBitrateBps ?? 192_000,
-    codec: audioCodec,
-  });
-  if (!encodedAudio.description) {
-    throw new Error("Audio encoder produced no description");
-  }
-  pcm = null;
+  const audioSampleRate = audio.sampleRate;
+  const audioChannels = audio.channels;
 
   // Cam ranges on the master timeline + a test-pattern source for gaps.
   // Per-clip trim (video cams only) narrows the available window; image
@@ -740,10 +729,11 @@ export async function editRenderMulti(
   );
   await compositor.ensureSubtitleEngine();
 
-  // Construct the muxer EARLY so the video encoder can stream chunks
-  // straight in instead of buffering them in RAM until finish(). For a
-  // 30-min 4K render the previous batch path accumulated multi-GB of
-  // encoded bytes — streaming keeps RAM constant in render duration.
+  // Construct the muxer EARLY so both the audio and video encoders can
+  // stream chunks straight in instead of buffering them in RAM until
+  // finish(). For a 30-min 4K + stereo 48k render the previous batch
+  // path accumulated multi-GB of encoded bytes (incl. ~1.4 GB audio
+  // PCM); streaming keeps RAM constant in render duration.
   const target: MuxTarget = input.output
     ? new FileSystemWritableFileStreamTarget(input.output)
     : new ArrayBufferTarget();
@@ -757,28 +747,50 @@ export async function editRenderMulti(
       frameRate: fps,
     },
     audio: {
-      codec: encodedAudio.muxerCodec,
-      numberOfChannels: encodedAudio.numberOfChannels,
-      sampleRate: encodedAudio.sampleRate,
+      codec: audioCodec,
+      numberOfChannels: audioChannels,
+      sampleRate: audioSampleRate,
     },
     fastStart: input.output ? false : "in-memory",
     firstTimestampBehavior: "offset",
   });
 
-  // Audio is fully encoded ahead of video — push all of its chunks now.
-  // (mp4-muxer interleaves on timestamps, so order between audio and
-  // video pushes is irrelevant.)
-  const audioMeta = {
-    decoderConfig: {
-      codec: encodedAudio.codec,
-      sampleRate: encodedAudio.sampleRate,
-      numberOfChannels: encodedAudio.numberOfChannels,
-      description: encodedAudio.description,
+  // Stream-encode audio: walks segments inline, emits encoded chunks,
+  // each pushed straight into the muxer. No intermediate trimmed-PCM
+  // buffer; no chunks accumulator. After this returns the input PCM
+  // can be released to GC.
+  input.onProgress?.({ stage: "audio-encode", framesDone: 0, framesTotal: 0 });
+  const audioCodecString = audioCodec === "opus" ? "opus" : "mp4a.40.2";
+  let audioMeta: Parameters<Muxer<MuxTarget>["addAudioChunkRaw"]>[4] | undefined;
+  await streamEncodeAudioWithSegments(audio.pcm, input.segments, {
+    numberOfChannels: audioChannels,
+    sampleRate: audioSampleRate,
+    bitrateBps: input.audioBitrateBps ?? 192_000,
+    codec: audioCodec,
+    onChunk: (chunk, description) => {
+      if (!audioMeta && description) {
+        audioMeta = {
+          decoderConfig: {
+            codec: audioCodecString,
+            sampleRate: audioSampleRate,
+            numberOfChannels: audioChannels,
+            description,
+          },
+        } as unknown as Parameters<Muxer<MuxTarget>["addAudioChunkRaw"]>[4];
+      }
+      muxer.addAudioChunkRaw(
+        chunk.data,
+        chunk.type,
+        chunk.timestampUs,
+        chunk.durationUs,
+        audioMeta,
+      );
     },
-  } as unknown as Parameters<Muxer<MuxTarget>["addAudioChunkRaw"]>[4];
-  for (const c of encodedAudio.chunks) {
-    muxer.addAudioChunkRaw(c.data, c.type, c.timestampUs, c.durationUs, audioMeta);
-  }
+  });
+  // Drop our reference so the worker's PCM buffer is GC-eligible. (For
+  // a 30-min stereo 48k input this is ~700 MB — no point keeping it
+  // around through the video render.)
+  audio = null;
 
   // Streaming video encoder: each emitted chunk goes straight into the
   // muxer. The encoder no longer accumulates anything in `chunks`.
@@ -1114,8 +1126,8 @@ export async function editRenderMulti(
       height: outputHeight,
       videoCodec: encodedVideo.codec,
       audioBackend: "webcodecs",
-      audioSampleRate: encodedAudio.sampleRate,
-      audioChannelCount: encodedAudio.numberOfChannels,
+      audioSampleRate: audioSampleRate,
+      audioChannelCount: audioChannels,
       byteLength,
     };
   } finally {
