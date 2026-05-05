@@ -173,6 +173,40 @@ describe("reconcilePills", () => {
     expect(reconciled[1].arrStartS).toBe(2);
   });
 
+  it("regenerates an unedited stored pill when sync changes its baseline", () => {
+    // Pre-existing bug: a single-take pill saved before sync completed
+    // (arrStartS=0, originalArrStartS=0). Sync resolves later to a non-zero
+    // offset → fresh generation puts the pill at e.g. arr=2.896. Reconcile
+    // would otherwise keep stored.arrStartS=0 and only refresh originals,
+    // so the pill renders at 0 while the cuts strip / clipRangeS expect
+    // 2.896. If the user hasn't edited the pill (stored matches its own
+    // originals), we trust the fresh auto-derived values.
+    const cam: Clip[] = [makeVideoClip("c", -2896, 100)];
+    const stored: Pill[] = [
+      {
+        id: "c::__default__",
+        camId: "c",
+        // Generated when sync was still 0 → at the master origin.
+        arrStartS: 0,
+        arrEndS: 100,
+        sourceInS: 0,
+        sourceOutS: 100,
+        // Originals match stored — pill is auto-derived, never user-edited.
+        originalArrStartS: 0,
+        originalArrEndS: 100,
+        originalSourceInS: 0,
+        originalSourceOutS: 100,
+        fromArrangementItemId: "__default__",
+      },
+    ];
+    // No arrangement → falls through to generateDefaultPills which uses
+    // the current clipRangeS — that's the value we expect to win.
+    const reconciled = reconcilePills([], [], cam, stored);
+    expect(reconciled.length).toBe(1);
+    expect(reconciled[0].arrStartS).toBeCloseTo(2.896, 3);
+    expect(reconciled[0].arrEndS).toBeCloseTo(2.896 + 100, 3);
+  });
+
   it("drops stored pills whose arrangement-item disappeared", () => {
     const stored: Pill[] = [
       {

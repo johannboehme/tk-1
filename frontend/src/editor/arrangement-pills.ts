@@ -211,6 +211,19 @@ export function reconcilePills(
   return fresh.map((freshP) => {
     const stored = storedById.get(freshP.id);
     if (!stored) return freshP;
+    // If the stored pill matches its own stored originals (within eps),
+    // it was never user-edited — sync changes or other clip-derived
+    // shifts that move the auto-baseline should flow through. Keeping
+    // the stored arr/source values would otherwise leave the pill
+    // "stuck" at the old baseline (e.g. arrStartS=0 from a save that
+    // happened before sync resolved a non-zero offset), which the user
+    // reads as a phantom edit.
+    const wasUnedited =
+      Math.abs(stored.arrStartS - stored.originalArrStartS) < DIRTY_EPS_S &&
+      Math.abs(stored.arrEndS - stored.originalArrEndS) < DIRTY_EPS_S &&
+      Math.abs(stored.sourceInS - stored.originalSourceInS) < DIRTY_EPS_S &&
+      Math.abs(stored.sourceOutS - stored.originalSourceOutS) < DIRTY_EPS_S;
+    if (wasUnedited) return freshP;
     return {
       ...stored,
       // Refresh originals to current auto-derived values so RESET
