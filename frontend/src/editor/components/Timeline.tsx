@@ -245,60 +245,35 @@ export function Timeline({
   const takePromoteTimerRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
 
   const duration = jobMeta?.duration || audioDuration || 0;
-  // Arrangement-mode flag: when the editor was opened from a long-form
-  // Arrange handoff, the timeline shows the song (= sum of segments) on
-  // a continuous arr-time X-axis instead of the raw master-audio. The
-  // audio walker still hops in master-time internally; this flag flips
-  // every UI surface that thinks in time-space.
-  const isArrMode = arrangementSegments.length > 0;
+  // Composed-timeline total. arrangementSegments is invariantly non-empty
+  // post-loadJob (single-take = one synthetic [0, duration] segment,
+  // long-form = the user's chunk arrangement). All time projections
+  // below run through it; for single-take they're Identity.
   const arrTotal = useMemo(
-    () => (isArrMode ? totalArrDuration(arrangementSegments) : 0),
-    [isArrMode, arrangementSegments],
+    () => totalArrDuration(arrangementSegments),
+    [arrangementSegments],
   );
 
-  // master ↔ view (arrangement) conversions. In direct-mode they are
-  // identity. The Timeline keeps store/cuts/fx as master-time internally
-  // and only applies the bijection at the canvas boundary.
+  // master ↔ view (arrangement) conversions. The Timeline keeps store /
+  // cuts / fx as master-time internally and applies the bijection at the
+  // canvas boundary. Identity for single-take's whole-master segment.
   const masterToView = useCallback(
-    (masterT: number) =>
-      isArrMode ? masterToArr(masterT, arrangementSegments) : masterT,
-    [isArrMode, arrangementSegments],
+    (masterT: number) => masterToArr(masterT, arrangementSegments),
+    [arrangementSegments],
   );
   const viewToMaster = useCallback(
-    (viewT: number) =>
-      isArrMode ? arrToMaster(viewT, arrangementSegments) : viewT,
-    [isArrMode, arrangementSegments],
+    (viewT: number) => arrToMaster(viewT, arrangementSegments),
+    [arrangementSegments],
   );
 
-  // The visible/scroll range covers the union of the master audio AND
-  // every cam's master-timeline span (incl. their match-marker positions
-  // so candidate ticks at negative master-time stay reachable). In
-  // arrangement-mode the range collapses to [0, total-arr-duration] —
-  // the song is the only thing the user can scrub. During an active
-  // clip-move drag (direct-mode only) we *freeze* this range to the
-  // snapshot captured at drag-start (`frozenTimelineRangeRef`) so the
-  // canvas doesn't rescale under the user's cursor.
-  const liveTimelineRange = useMemo(() => {
-    if (isArrMode) {
-      return { startS: 0, endS: arrTotal, span: arrTotal };
-    }
-    let lo = 0;
-    let hi = duration;
-    for (const c of clips) {
-      const r = clipRangeS(c);
-      if (r.startS < lo) lo = r.startS;
-      if (r.endS > hi) hi = r.endS;
-      // Candidate-marker positions only apply to video clips.
-      if (isVideoClip(c)) {
-        for (const cand of c.candidates) {
-          const t = -(cand.offsetMs + c.syncOverrideMs) / 1000;
-          if (t < lo) lo = t;
-          if (t > hi) hi = t;
-        }
-      }
-    }
-    return { startS: lo, endS: hi, span: hi - lo };
-  }, [isArrMode, arrTotal, clips, duration]);
+  // Visible/scroll range = the composed timeline. The X-axis runs
+  // continuously over the song; clip anchors and candidate markers
+  // outside the song range are not addressable from the timeline (the
+  // master playhead can only land on a playable arr-time position).
+  const liveTimelineRange = useMemo(
+    () => ({ startS: 0, endS: arrTotal, span: arrTotal }),
+    [arrTotal],
+  );
   const timelineRange = liveTimelineRange;
   const timelineStartS = timelineRange.startS;
   const timelineSpan = Math.max(1e-6, timelineRange.span);
@@ -460,16 +435,11 @@ export function Timeline({
   // match and snap the playhead back to a duplicated earlier occurrence.
   const seekFromX = useCallback(
     (x: number, masterT: number) => {
-      if (!isArrMode) {
-        seek(masterT);
-        return;
-      }
       const arrT = viewStart + (x / canvasWidth) * visibleDur;
       const idx = segmentIndexAtArr(arrT, arrangementSegments);
       seek(masterT, idx >= 0 ? { segmentIdxHint: idx } : undefined);
     },
     [
-      isArrMode,
       viewStart,
       visibleDur,
       canvasWidth,
@@ -478,28 +448,25 @@ export function Timeline({
     ],
   );
 
-  // Arrangement-mode strip projections.
-  //
-  // Cuts/FX live in master-time inside the store so they remain anchored
-  // to the source media regardless of how the user reorders the
-  // arrangement. The ProgramStrip + FxStripLayer however render in the
-  // active view-space (= arr-time when segments are present) so we
-  // pre-project here: each occurrence of a chunk that contains a cut
-  // produces a corresponding splice tab on the strip; FX capsules that
-  // straddle a segment boundary split into per-segment slices so the
-  // tape edit reads as the arrangement does.
-  // (Direct-mode passes the originals through unchanged.)
-  const stripCuts = useMemo(() => {
-    if (!isArrMode) return cuts;
-    return cuts.flatMap((cut) =>
-      mastersToArrAll(cut.atTimeS, arrangementSegments).map((arrT) => ({
-        ...cut,
-        atTimeS: arrT,
-      })),
-    );
-  }, [cuts, isArrMode, arrangementSegments]);
+  // Strip projections — cuts/fx live in master-time inside the store so
+  // they remain anchored to the source media regardless of how the user
+  // reorders the arrangement. The ProgramStrip + FxStripLayer render in
+  // arr-time, so we pre-project here: each occurrence of a chunk that
+  // contains a cut produces a corresponding splice tab on the strip; FX
+  // capsules that straddle a segment boundary split into per-segment
+  // slices. For single-take's whole-master segment both projections are
+  // Identity (one occurrence per cut, one slice per fx).
+  const stripCuts = useMemo(
+    () =>
+      cuts.flatMap((cut) =>
+        mastersToArrAll(cut.atTimeS, arrangementSegments).map((arrT) => ({
+          ...cut,
+          atTimeS: arrT,
+        })),
+      ),
+    [cuts, arrangementSegments],
+  );
   const stripFx = useMemo(() => {
-    if (!isArrMode) return fx;
     const out: typeof fx = [];
     for (const f of fx) {
       const slices = sliceByArrSegments(f.inS, f.outS, arrangementSegments);
@@ -517,8 +484,8 @@ export function Timeline({
       }
     }
     return out;
-  }, [fx, isArrMode, arrangementSegments]);
-  const stripDuration = isArrMode ? arrTotal : duration;
+  }, [fx, arrangementSegments]);
+  const stripDuration = arrTotal;
 
   // ---- Active-cam status per lane (drives LED color) ----
   const camStatusByCamId = useMemo(() => {
@@ -688,70 +655,98 @@ export function Timeline({
         }
       };
 
-      if (!isArrMode) {
-        const startIdx = Math.max(0, Math.floor(viewStart * peaksPerSec));
-        const endIdx = Math.min(peaks.length, Math.ceil(viewEnd * peaksPerSec));
-        drawColumns(startIdx, endIdx, (i) => tToX(i / peaksPerSec));
-      } else {
-        const arrStarts = segmentArrStarts(arrangementSegments);
-        for (let segIdx = 0; segIdx < arrangementSegments.length; segIdx++) {
-          const seg = arrangementSegments[segIdx];
-          const segArrIn = arrStarts[segIdx];
-          const segArrOut = segArrIn + Math.max(0, seg.out - seg.in);
-          // Skip segments entirely outside the visible arr window.
-          if (segArrOut < viewStart || segArrIn > viewEnd) continue;
-          const startIdx = Math.max(0, Math.floor(seg.in * peaksPerSec));
-          const endIdx = Math.min(peaks.length, Math.ceil(seg.out * peaksPerSec));
-          drawColumns(startIdx, endIdx, (i) => {
-            const masterT = i / peaksPerSec;
-            const arrT = segArrIn + (masterT - seg.in);
-            return arrTToX(arrT);
-          });
-        }
+      // Waveform draw: walk segments and project each peak's master-time
+      // into arr-time. Single-take's whole-master segment yields a single
+      // pass with arrT == masterT (the per-segment guard skips no peaks).
+      const arrStarts = segmentArrStarts(arrangementSegments);
+      for (let segIdx = 0; segIdx < arrangementSegments.length; segIdx++) {
+        const seg = arrangementSegments[segIdx];
+        const segArrIn = arrStarts[segIdx];
+        const segArrOut = segArrIn + Math.max(0, seg.out - seg.in);
+        if (segArrOut < viewStart || segArrIn > viewEnd) continue;
+        const startIdx = Math.max(0, Math.floor(seg.in * peaksPerSec));
+        const endIdx = Math.min(peaks.length, Math.ceil(seg.out * peaksPerSec));
+        drawColumns(startIdx, endIdx, (i) => {
+          const masterT = i / peaksPerSec;
+          const arrT = segArrIn + (masterT - seg.in);
+          return arrTToX(arrT);
+        });
       }
     }
 
-    // Trim dim and audio-start marker stay direct-mode-only. In arrangement-
-    // mode the playable region IS the visible region, so trim is unused and
-    // the audio-start marker is a triage concern. Splice marks at every
-    // segment seam replace the dimming so the user sees the walker's hops.
-    // The loop band, however, is mode-agnostic: it lives on the composed
-    // timeline (arr-time in arr-mode, master == arr in direct-mode).
-    if (!isArrMode) {
-      const xIn = tToX(trim.in);
-      const xOut = tToX(trim.out);
+    // Trim-dim, trim-handles, and audio-start marker — universal across
+    // single-take and long-form. Trim sits in master-time; project each
+    // marker through `mastersToArrAll` so it lands at every arr-time
+    // occurrence (a chunk repeated in long-form yields multiple ticks).
+    {
+      const trimInArrPositions = mastersToArrAll(trim.in, arrangementSegments);
+      const trimOutArrPositions = mastersToArrAll(trim.out, arrangementSegments);
+      // Dim the un-trimmed arr-time region: everything before the
+      // *earliest* trim.in occurrence and after the *latest* trim.out
+      // occurrence sits outside the export window.
+      const arrTotalLocal = totalArrDuration(arrangementSegments);
+      const earliestIn = trimInArrPositions.length
+        ? Math.min(...trimInArrPositions)
+        : 0;
+      const latestOut = trimOutArrPositions.length
+        ? Math.max(...trimOutArrPositions)
+        : arrTotalLocal;
+      const xInBound = arrTToX(earliestIn);
+      const xOutBound = arrTToX(latestOut);
       ctx.fillStyle = "rgba(232,225,208,0.78)";
-      if (xIn > 0) ctx.fillRect(0, audioBand.top, xIn, audioLaneHeight);
-      if (xOut < audioRightX)
-        ctx.fillRect(xOut, audioBand.top, audioRightX - xOut, audioLaneHeight);
-
-      drawHandle(ctx, xIn, audioBand.top, audioLaneHeight);
+      if (xInBound > 0) {
+        ctx.fillRect(0, audioBand.top, xInBound, audioLaneHeight);
+      }
+      if (xOutBound < audioRightX) {
+        ctx.fillRect(
+          xOutBound,
+          audioBand.top,
+          audioRightX - xOutBound,
+          audioLaneHeight,
+        );
+      }
+      // Trim-handles at the bound positions only — long-form duplicates
+      // don't get extra handles (a single drag controls the master-time
+      // value, all occurrences move together).
+      drawHandle(ctx, xInBound, audioBand.top, audioLaneHeight);
       drawHandle(
         ctx,
-        Math.min(xOut, audioRightX),
+        Math.min(xOutBound, audioRightX),
         audioBand.top,
         audioLaneHeight,
       );
 
+      // Audio-start marker — orange tick at every arr-time occurrence
+      // of `audioStartS + audioStartNudgeS`. Single-take's identity
+      // projection produces one tick.
       const rawAudioStartS = jobMeta?.audioStartS ?? 0;
       const audioNudgeS = jobMeta?.audioStartNudgeS ?? 0;
       if (rawAudioStartS > 0 || audioNudgeS !== 0) {
-        const xMark = tToX(rawAudioStartS + audioNudgeS);
-        if (xMark >= 0 && xMark <= audioRightX) {
-          ctx.fillStyle = "rgba(255,107,0,0.85)";
-          ctx.fillRect(Math.floor(xMark), audioBand.top, 1, audioLaneHeight);
-          ctx.beginPath();
-          ctx.moveTo(xMark, audioBand.top);
-          ctx.lineTo(xMark + 5, audioBand.top);
-          ctx.lineTo(xMark, audioBand.top + 5);
-          ctx.closePath();
-          ctx.fill();
+        const masterAudioStart = rawAudioStartS + audioNudgeS;
+        const arrPositions = mastersToArrAll(
+          masterAudioStart,
+          arrangementSegments,
+        );
+        ctx.fillStyle = "rgba(255,107,0,0.85)";
+        for (const arrT of arrPositions) {
+          const xMark = arrTToX(arrT);
+          if (xMark >= 0 && xMark <= audioRightX) {
+            ctx.fillRect(Math.floor(xMark), audioBand.top, 1, audioLaneHeight);
+            ctx.beginPath();
+            ctx.moveTo(xMark, audioBand.top);
+            ctx.lineTo(xMark + 5, audioBand.top);
+            ctx.lineTo(xMark, audioBand.top + 5);
+            ctx.closePath();
+            ctx.fill();
+          }
         }
       }
-    } else {
-      // Arrangement-mode splice marks — hot ticks across the audio band
-      // at every segment seam in arr-time. The user reads them as the
-      // points where the audio walker crossfades to the next chunk.
+    }
+
+    // Splice marks — hot ticks at every chunk-seam in arr-time. For
+    // single-take's single segment there are no seams to mark (start/end
+    // coincide with the canvas boundary), so this is a no-op.
+    if (arrangementSegments.length > 1) {
       const arrStarts = segmentArrStarts(arrangementSegments);
       ctx.fillStyle = "rgba(255,87,34,0.55)";
       for (let i = 0; i < arrangementSegments.length; i++) {
@@ -870,7 +865,6 @@ export function Timeline({
     trim.in,
     trim.out,
     arrangementSegments,
-    isArrMode,
     arrTotal,
     arrTToX,
     loop,
@@ -919,7 +913,7 @@ export function Timeline({
     const slices = sliceByArrSegments(
       range.startS,
       range.endS,
-      isArrMode ? arrangementSegments : [],
+      arrangementSegments,
     );
     for (const s of slices) {
       const x1 = ((s.arrStartS - viewStart) / visibleDur) * canvasWidth;
@@ -929,16 +923,15 @@ export function Timeline({
     return null;
   }
 
-  /** Arr-mode pill hit-test. Returns the pill whose lane + pixel range
-   *  contains the pointer, plus a `zone` indicating whether the cursor
-   *  is on the left edge / right edge / body of the pill. Body hits
-   *  start a pill-move drag; edge hits start a trim drag. Returns null
-   *  for direct-mode (no pills) or when the pointer misses every pill. */
+  /** Pill hit-test. Returns the pill whose lane + pixel range contains
+   *  the pointer, plus a `zone` indicating whether the cursor is on the
+   *  left edge / right edge / body of the pill. Body hits start a
+   *  pill-move drag; edge hits start a trim drag. Returns null when the
+   *  pointer misses every pill in the lane. */
   function findPillAt(
     x: number,
     y: number,
   ): { pillId: string; zone: "left" | "right" | "body" | "reset" } | null {
-    if (!isArrMode) return null;
     const lane = videoLaneAt(y);
     if (!lane) return null;
     const { clip: laneClip, band } = lane;
@@ -991,18 +984,21 @@ export function Timeline({
 
   function classifyAudioHit(x: number): "trim-in" | "trim-out" | "playhead" | "loop" | null {
     const xp = tToX(currentTime);
-    // Trim + loop are direct-mode-only chrome; arrangement-mode hides
-    // both, so don't surface their hit zones to the cursor either —
-    // otherwise the user would grab an invisible handle.
-    if (!isArrMode) {
-      const xIn = tToX(trim.in);
-      const xOut = tToX(trim.out);
+    // Trim handles live at the *earliest* trim.in occurrence and the
+    // *latest* trim.out occurrence in arr-time — same anchors the
+    // drawing path uses. mastersToArrAll yields one position for
+    // single-take's identity projection, multiple for chunk repeats.
+    const trimInArr = mastersToArrAll(trim.in, arrangementSegments);
+    const trimOutArr = mastersToArrAll(trim.out, arrangementSegments);
+    if (trimInArr.length > 0) {
+      const xIn = arrTToX(Math.min(...trimInArr));
       if (Math.abs(x - xIn) <= HANDLE_HIT) return "trim-in";
+    }
+    if (trimOutArr.length > 0) {
+      const xOut = arrTToX(Math.max(...trimOutArr));
       if (Math.abs(x - xOut) <= HANDLE_HIT) return "trim-out";
     }
     if (Math.abs(x - xp) <= HANDLE_HIT) return "playhead";
-    // Loop hit-test is mode-agnostic — loop is stored in arr-time which is
-    // identity in direct-mode, so `arrTToX` works in both flows.
     if (loop) {
       const xs = arrTToX(loop.start);
       const xe = arrTToX(loop.end);
@@ -1027,20 +1023,15 @@ export function Timeline({
   // bypasses snapping (standard NLE-style anti-snap modifier).
   //
   // Domain note: callers pass MASTER-time (the canonical clock for
-  // seek/cuts/trim). In arrangement-mode the BeatRuler + `beatPhase`
-  // both live in ARR-time — the canvas axis the user actually sees —
-  // so we project the master-time into arr-time, snap it onto the
-  // visible bar grid, then project back. Without this round-trip the
-  // bar grid and the snap targets sit on different axes and snap=1
-  // visibly lands the playhead between bar marks.
+  // seek/cuts/trim); the BeatRuler + `beatPhase` live in ARR-time
+  // (the canvas axis the user actually sees), so we project master →
+  // arr, snap, then project back. Identity for single-take's
+  // whole-master segment.
   function snapped(t: number, e: { shiftKey: boolean }, candPositions?: number[]): number {
     if (e.shiftKey || snapMode === "off") return t;
-    if (isArrMode) {
-      const arrT = masterToView(t);
-      const snappedArr = snapTime(arrT, snapMode, buildSnapCtx(candPositions));
-      return viewToMaster(snappedArr);
-    }
-    return snapTime(t, snapMode, buildSnapCtx(candPositions));
+    const arrT = masterToView(t);
+    const snappedArr = snapTime(arrT, snapMode, buildSnapCtx(candPositions));
+    return viewToMaster(snappedArr);
   }
 
   // ─── Multi-touch pinch-zoom + 2-finger pan ─────────────────────────
@@ -1245,10 +1236,9 @@ export function Timeline({
       // lane band.
       const lane = findLaneAt(y);
       setSelectedClipId(lane ? lane.clip.id : null);
-      // Click on empty arr-mode lane area also clears the pill selection
-      // — keeps the per-pill toolbar consistent with direct-mode where
-      // empty clicks de-select.
-      if (isArrMode) setSelectedPillId(null);
+      // Click on empty lane area clears the pill selection so the
+      // per-pill toolbar matches the empty-click "deselect" idiom.
+      setSelectedPillId(null);
       seekFromX(x, snapped(tRaw, e));
       dragRef.current = { kind: "playhead" };
     }
@@ -1309,20 +1299,24 @@ export function Timeline({
     } else if (drag.kind === "trim-out") {
       setTrim({ in: trim.in, out: snapped(tRaw, e) });
     } else if (drag.kind === "loop" && loop) {
-      // Loop drag operates in arr-time (= master in direct-mode, composed
-      // tape in arr-mode). Clamp to the playable bounds of whichever clock
-      // we're in. Snap operates in the same arr-time domain — `buildSnapCtx`
-      // anchors phase on the active view-clock, so calling `snapTime`
-      // directly avoids the master⇄arr round-trip in `snapped()`.
+      // Loop drag operates in arr-time (the composed tape). Clamp to the
+      // master-trim window projected through `arrangementSegments` so
+      // the loop can't escape the export region — same trim-universal
+      // contract clampLoopToBounds enforces on the store side.
       const len = loop.end - loop.start;
       const arrAtPointer = viewStart + (x / canvasWidth) * visibleDur;
-      const lo = isArrMode ? 0 : trim.in;
-      const hi = isArrMode
-        ? totalArrDuration(arrangementSegments)
-        : trim.out;
+      const arrTotalLocal = totalArrDuration(arrangementSegments);
+      const trimInArr = Math.max(
+        0,
+        Math.min(arrTotalLocal, masterToArr(trim.in, arrangementSegments)),
+      );
+      const trimOutArr = Math.max(
+        trimInArr,
+        Math.min(arrTotalLocal, masterToArr(trim.out, arrangementSegments)),
+      );
       const newStartRaw = Math.max(
-        lo,
-        Math.min(hi - len, arrAtPointer - drag.offset),
+        trimInArr,
+        Math.min(trimOutArr - len, arrAtPointer - drag.offset),
       );
       const newStart =
         e.shiftKey || snapMode === "off"
@@ -1561,20 +1555,13 @@ export function Timeline({
   // multiple entries with the same `id` are fine, `activeCamAt` returns
   // a cam id whenever ANY range contains the sample.
   const camLookupsForStrip = useMemo(() => {
-    if (!isArrMode) {
-      return clips.map((c) => ({
-        id: c.id,
-        color: c.color,
-        range: clipRangeS(c),
-      }));
-    }
     const colorById = new Map(clips.map((c) => [c.id, c.color]));
     return pills.map((p) => ({
       id: p.camId,
       color: colorById.get(p.camId) ?? "#888888",
       range: { startS: p.arrStartS, endS: p.arrEndS },
     }));
-  }, [clips, isArrMode, pills]);
+  }, [clips, pills]);
 
   return (
     <div ref={wrapRef} className="w-full select-none">
@@ -1661,45 +1648,35 @@ export function Timeline({
               viewEndS={viewEnd}
               width={canvasWidth}
               onRemoveCut={(atTimeS, camId) => {
-                // Strip is in view-space — convert back to master before
+                // Strip runs in arr-time; convert back to master before
                 // mutating the store. removeCutAt resolves the cut by
                 // (master-time, camId), so a single call removes ALL
                 // arr-occurrences of a duplicated chunk's cut at once,
                 // which matches the user's mental model.
-                const masterT = isArrMode ? viewToMaster(atTimeS) : atTimeS;
-                removeCutAt(masterT, camId);
+                removeCutAt(viewToMaster(atTimeS), camId);
               }}
               onCutDrag={(fromAtTimeS, camId, rawNewT, ev) => {
-                // Apply the same snap rules as the rest of the timeline:
-                // SHIFT bypasses, MATCH falls through (no candidatePositions
+                // Same snap rules as the rest of the timeline: SHIFT
+                // bypasses, MATCH falls through (no candidatePositions
                 // for cut-set), grid modes round to the nearest beat/bar.
-                const masterFrom = isArrMode
-                  ? viewToMaster(fromAtTimeS)
-                  : fromAtTimeS;
-                const masterTarget = isArrMode
-                  ? viewToMaster(rawNewT)
-                  : rawNewT;
+                const masterFrom = viewToMaster(fromAtTimeS);
+                const masterTarget = viewToMaster(rawNewT);
                 const snappedMaster = ev.shiftKey
                   ? masterTarget
                   : useEditorStore.getState().snapMasterTime(masterTarget);
                 const landed = useEditorStore
                   .getState()
                   .moveCut(masterFrom, camId, snappedMaster);
-                return isArrMode ? masterToView(landed) : landed;
+                return masterToView(landed);
               }}
               paintPreview={(() => {
                 if (!holdGesture || !holdGesture.painting) return null;
                 const clip = clips.find((c) => c.id === holdGesture.camId);
                 if (!clip) return null;
                 const idx = clips.findIndex((c) => c.id === clip.id);
-                // Convert master-time hold endpoints into the strip's
-                // active view-space.
-                const fromS = isArrMode
-                  ? masterToView(holdGesture.startS)
-                  : holdGesture.startS;
-                const toS = isArrMode
-                  ? masterToView(currentTime)
-                  : currentTime;
+                // Project the master-time hold endpoints into arr-time.
+                const fromS = masterToView(holdGesture.startS);
+                const toS = masterToView(currentTime);
                 return {
                   fromS,
                   toS,
