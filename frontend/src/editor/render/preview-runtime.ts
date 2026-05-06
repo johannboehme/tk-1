@@ -279,14 +279,16 @@ export class PreviewRuntime {
       playback.timelineT,
     );
 
-    // Pool sync: drive every cam from the descriptor's per-layer
-    // `sourceTimeS` (the active pill's source-window applied at the
-    // current `tTimeline`). Cams without a layer entry are paused — no
-    // pill is on PROGRAM for them this tick. This is THE fix for the
-    // "duplicate pill plays the wrong source frame" bug: the pool no
-    // longer derives source-time from the cam-anchor (which can't tell
-    // duplicate pills apart) but takes the pre-resolved value.
-    const targets = collectPoolTargets(descriptor.layers);
+    // Pool sync: drive every cam from its OWN covering pill's pill-aware
+    // `sourceTimeS`. We don't restrict to the descriptor's active layer
+    // (the cuts-resolved cam) — every cam whose pill covers `timelineT`
+    // stays hot. Without this the inactive cams get paused tick-after-
+    // tick; the next time the cuts resolve to one of them the pool has
+    // to re-seek the decoder, and Chrome's first-frame-after-seek
+    // sometimes ships an upside-down texture (every pill flickers as
+    // its cam wakes up). Keeping all decoders hot mirrors the pre-
+    // refactor behaviour while still using pill-trim for source-time.
+    const targets = collectPoolTargets(snapshot.pills, playback.timelineT);
     this.pool.syncAll(targets, playback.isPlaying);
 
     if (skip) {
@@ -575,23 +577,40 @@ export class PreviewRuntime {
 
 // ---- helpers ----
 
-/** Build per-cam pool sync targets from a freshly-built descriptor.
- *  Each video layer carries a pre-resolved `sourceTimeS` (the active
- *  pill's source-window applied at the current `tTimeline`); the pool
- *  uses that as `<video>.currentTime` instead of a cam-anchor scan. */
+/** Build per-cam pool sync targets from the pill list at `tTimeline`.
+ *  For every cam whose pill covers the playhead, derive a pill-aware
+ *  source-time so the decoder lands on the right frame even for
+ *  duplicate-source pills with distinct trim windows. Cams without a
+ *  covering pill at this instant are correctly absent — the pool pauses
+ *  them.
+ *
+ *  The pre-refactor pool sourced sourceTimeS from the descriptor's
+ *  active layer, which silently paused every NON-active cam every
+ *  tick. When a cut later switched to one of those cams, Chrome had to
+ *  spin the decoder back up — and the first frame after a fresh
+ *  play()/seek occasionally arrives upside-down on WebGPU's
+ *  copyExternalImageToTexture path, presenting as a visible flip flicker
+ *  at every pill start. Keeping every covering cam hot makes the
+ *  cut-switch a no-op for the decoder; the upload picks up an
+ *  already-running stream. */
 function collectPoolTargets(
-  layers: ReadonlyArray<{
-    layerId: string;
-    source: { kind: string; sourceTimeS?: number };
-  }>,
+  pills: readonly import("../types").Pill[] | undefined,
+  tTimeline: number,
 ): Map<string, PoolSyncTarget> {
   const out = new Map<string, PoolSyncTarget>();
-  for (const layer of layers) {
-    if (layer.source.kind !== "video") continue;
-    const t = layer.source.sourceTimeS;
-    if (typeof t === "number" && Number.isFinite(t)) {
-      out.set(layer.layerId, { sourceT: t });
-    }
+  if (!pills) return out;
+  // First-pill-wins per cam: pills are sorted by arr-time, the first
+  // covering one for a given cam is the one in playback order.
+  for (const p of pills) {
+    if (out.has(p.camId)) continue;
+    if (tTimeline < p.arrStartS || tTimeline >= p.arrEndS) continue;
+    const arrSpan = p.arrEndS - p.arrStartS;
+    const sourceT =
+      arrSpan > 0
+        ? p.sourceInS +
+          ((tTimeline - p.arrStartS) * (p.sourceOutS - p.sourceInS)) / arrSpan
+        : p.sourceInS;
+    out.set(p.camId, { sourceT });
   }
   return out;
 }
