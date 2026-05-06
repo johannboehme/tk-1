@@ -769,6 +769,79 @@ describe("useEditorStore", () => {
       expect(c.syncOffsetMs).toBe(750);
     });
 
+    test("setSelectedCandidateIdx shifts the cam's pill source-times by the offsetMs delta", () => {
+      // Pills are authoritative for source-time post-pill-refactor —
+      // changing syncOffsetMs alone is invisible unless we mirror the
+      // delta into pills. Without the shift the same arr-position
+      // would keep playing the OLD candidate's frames.
+      useEditorStore.getState().loadJob(baseJobMeta, {
+        clips: [
+          {
+            id: "cam-1",
+            filename: "a.mp4",
+            color: "#fff",
+            sourceDurationS: 10,
+            syncOffsetMs: 250,
+            candidates: cands,
+          },
+        ],
+        // Synthetic single-take arrangement (mirrors what
+        // synthesizeJobLoadShape produces in production), needed so
+        // reconcilePills generates fresh pills that the storedPill
+        // can latch onto.
+        arrangementSegments: [{ in: 0, out: 60 }],
+        arrangement: [{ id: "__default__", chunkId: "__default_chunk__" }],
+        chunks: [
+          {
+            id: "__default_chunk__",
+            startMs: 0,
+            endMs: 60_000,
+            bpmOctaveShift: 0,
+            effectiveBpm: 0,
+            beatsPerBar: 4,
+            accepted: true,
+            trimMode: "free",
+          },
+        ],
+        // Pre-existing user-edited pill at sourceIn=2, sourceOut=5.
+        storedPills: [
+          {
+            id: "cam-1::__default__",
+            camId: "cam-1",
+            arrStartS: 0,
+            arrEndS: 3,
+            sourceInS: 2,
+            sourceOutS: 5,
+            originalArrStartS: 0,
+            originalArrEndS: 3,
+            originalSourceInS: 2,
+            originalSourceOutS: 5,
+            fromArrangementItemId: "__default__",
+            userEdited: true,
+          },
+        ],
+      });
+      // Switch to candidate idx=1 (offsetMs 750, delta from 250 = +500ms)
+      // → pills should shift source-times by +0.5s.
+      // Capture pre-snap originals (refreshed by reconcilePills from
+      // the current clip-state during loadJob — not the storedPill's
+      // values).
+      const before = useEditorStore.getState().pills[0];
+      const origInBefore = before.originalSourceInS;
+      const origOutBefore = before.originalSourceOutS;
+      // Switch to candidate idx=1 (offsetMs 750, delta from 250 = +500ms)
+      // → pills should shift source-times by +0.5s.
+      useEditorStore.getState().setSelectedCandidateIdx("cam-1", 1);
+      const p = useEditorStore.getState().pills[0];
+      expect(p.sourceInS).toBeCloseTo(2.5, 6);
+      expect(p.sourceOutS).toBeCloseTo(5.5, 6);
+      // Originals also shift so a per-pill RESET targets the post-snap
+      // baseline (= where the cam now belongs after the candidate
+      // switch).
+      expect(p.originalSourceInS).toBeCloseTo(origInBefore + 0.5, 6);
+      expect(p.originalSourceOutS).toBeCloseTo(origOutBefore + 0.5, 6);
+    });
+
     test("loadJob without candidates leaves array empty and idx=0", () => {
       useEditorStore.getState().loadJob(baseJobMeta, {
         clips: [

@@ -41,6 +41,10 @@ import { BpmReadout } from "./BpmReadout";
 import { SnapModeButtons } from "./SnapModeButtons";
 import { snapTime, type SnapCtx, type SnapMode } from "../snap";
 import {
+  buildClipMatchPositions,
+  candidateIdxNearestStart,
+} from "../match-snap";
+import {
   effectiveBeatPhaseS,
   effectiveBeatsPerBar,
   effectiveBarOffsetBeats,
@@ -94,11 +98,19 @@ type DragKind =
       /** MATCH snap-mode pill-body drag. The whole cam track moves —
        *  every pill of `camId` shifts by the same arr-delta so the
        *  user can align the entire take against a candidate's
-       *  master-time tick (visible as the match-marker). */
+       *  master-time tick (visible as the match-marker). When MATCH
+       *  is active, the drag locks to the nearest candidate-implied
+       *  master-startS instead of free-dragging. */
       kind: "cam-track-move";
       camId: string;
       grabArrT: number;
       origStartsByPillId: Record<string, number>;
+      /** Cam's master-startS at drag-start (= -(syncOffsetMs +
+       *  syncOverrideMs)/1000). Stable through any candidate-switch
+       *  that happens mid-drag — without this freeze the candidate
+       *  positions would shift under the user's pointer and middle
+       *  candidates become unreachable. */
+      origMasterStartS: number;
     }
   | {
       /** Drag a pill's LEFT edge — narrows the arr-window from the
@@ -212,6 +224,9 @@ export function Timeline({
   const resetClipAlignment = useEditorStore((s) => s.resetClipAlignment);
   const resetPillsForCam = useEditorStore((s) => s.resetPillsForCam);
   const resetPill = useEditorStore((s) => s.resetPill);
+  const setSelectedCandidateIdx = useEditorStore(
+    (s) => s.setSelectedCandidateIdx,
+  );
   const removeCutAt = useEditorStore((s) => s.removeCutAt);
   const clearCuts = useEditorStore((s) => s.clearCuts);
   const clearAllFx = useEditorStore((s) => s.clearAllFx);
@@ -1233,11 +1248,17 @@ export function Timeline({
                   origStartsByPillId[sib.id] = sib.arrStartS;
                 }
               }
+              const camClip = clips.find((c) => c.id === p.camId);
+              const origMasterStartS =
+                camClip && isVideoClip(camClip)
+                  ? -(camClip.syncOffsetMs + camClip.syncOverrideMs) / 1000
+                  : 0;
               dragRef.current = {
                 kind: "cam-track-move",
                 camId: p.camId,
                 grabArrT: arrAtGrab,
                 origStartsByPillId,
+                origMasterStartS,
               };
             } else {
               dragRef.current = {
@@ -1390,13 +1411,43 @@ export function Timeline({
       }
       setPillArrPlacement(drag.pillId, newArrStartS);
     } else if (drag.kind === "cam-track-move") {
-      // Cam-track move (MATCH snap-mode body drag) — apply the same
-      // arr-delta to every pill of `camId` from its drag-start
-      // snapshot. Each pill keeps its own source-trim; only WHERE on
-      // the song each pill plays moves. Snapshot-based so the math
-      // doesn't cascade as we mutate the store mid-drag.
+      // Cam-track move — MATCH snap-mode body drag. The drag locks to
+      // the nearest candidate-implied master-startS: setSelectedCandidateIdx
+      // shifts the cam's syncOffsetMs to the candidate's value, and
+      // (post-pill-refactor) atomically slides every pill of this cam's
+      // source-time mapping by the same delta so the snap is visible in
+      // the rendered output. Shift bypasses to free-drag.
       const arrAtPointer = viewStart + (x / canvasWidth) * visibleDur;
       const deltaArrT = arrAtPointer - drag.grabArrT;
+      const camClip = clips.find((c) => c.id === drag.camId);
+      if (
+        snapMode === "match" &&
+        !e.shiftKey &&
+        camClip &&
+        isVideoClip(camClip) &&
+        camClip.candidates.length > 0
+      ) {
+        // Drag-target master-startS, computed from the snapshot taken
+        // at drag-start so candidate-positions stay stable across mid-
+        // drag candidate switches (otherwise the math cascades and
+        // middle candidates become unreachable).
+        const targetStartS = drag.origMasterStartS + deltaArrT;
+        const positions = buildClipMatchPositions(camClip);
+        const nearestIdx = candidateIdxNearestStart(
+          positions,
+          targetStartS,
+          Infinity,
+        );
+        if (nearestIdx !== null && nearestIdx !== camClip.selectedCandidateIdx) {
+          setSelectedCandidateIdx(drag.camId, nearestIdx);
+        }
+        return;
+      }
+      // Non-MATCH (or shift-bypass): free-drag — apply the arr-delta to
+      // every pill of `camId` from its drag-start snapshot. Snapshot-
+      // based so the math doesn't cascade as we mutate the store mid-
+      // drag. Pills keep their own source-trim; only WHERE on the song
+      // each pill plays moves.
       for (const [pillId, origStart] of Object.entries(
         drag.origStartsByPillId,
       )) {

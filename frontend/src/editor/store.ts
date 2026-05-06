@@ -1582,6 +1582,9 @@ export const useEditorStore = create<EditorState>()(
       set({ jobMeta: { ...meta, barOffsetBeats: off } });
     },
     setSelectedCandidateIdx(camId, idx) {
+      const prev = get().clips.find((c) => c.id === camId);
+      if (!prev || !isVideoClip(prev)) return;
+      const prevOffsetMs = prev.syncOffsetMs;
       set({
         clips: mutateClip(get().clips, camId, (c) => {
           if (!isVideoClip(c)) return c; // image clips have no candidates
@@ -1590,6 +1593,29 @@ export const useEditorStore = create<EditorState>()(
           return { ...c, selectedCandidateIdx: clamped, syncOffsetMs: newOffset };
         }),
       });
+      // The candidate-switch shifts the cam's master-anchor — every
+      // pill of this cam needs its source-time mapping shifted by the
+      // same delta so the same arr-position plays the right source
+      // frames at the new alignment. Without this, pills (which are
+      // authoritative for source-time post-pill-refactor) keep playing
+      // the OLD candidate's frames and the snap is invisible. Mirrors
+      // what `setClipSyncOverride` does for syncOverrideMs nudges.
+      const next = get().clips.find((c) => c.id === camId);
+      if (!next || !isVideoClip(next)) return;
+      const deltaMs = next.syncOffsetMs - prevOffsetMs;
+      if (Math.abs(deltaMs) > 1e-6) {
+        const deltaS = deltaMs / 1000;
+        set({
+          pills: mutatePillsForCam(get().pills, camId, (p) => ({
+            ...shiftPillSource(p, deltaS),
+            originalSourceInS: Math.max(0, p.originalSourceInS + deltaS),
+            originalSourceOutS: Math.max(
+              p.originalSourceInS + 0.05,
+              p.originalSourceOutS + deltaS,
+            ),
+          })),
+        });
+      }
     },
 
     setSelectedClipId(id) {
