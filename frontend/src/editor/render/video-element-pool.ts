@@ -30,8 +30,6 @@
  * RAF owns N cams instead of one effect-binding per cam.
  */
 import type { VideoClip } from "../types";
-import { clipRangeS } from "../types";
-import { camSourceTimeS } from "../../local/timing/cam-time";
 
 export interface VideoCam {
   clip: VideoClip;
@@ -49,17 +47,26 @@ export interface VideoElementPoolOptions {
   createElement?(): HTMLVideoElement;
 }
 
-/** Per-cam slot — the `<video>` plus its derived sync constants
- *  (anchor / drift / source duration), captured once at mount time
- *  so per-tick sync is a tight closure-free function. */
+/** Per-cam slot — the `<video>` plus its source-duration for
+ *  range-checks. Source-time targets come from the per-frame
+ *  descriptor (the active pill's `sourceIn/Out` window applied at
+ *  the current `tTimeline`); the pool is target-driven, not
+ *  cam-anchor-driven, so duplicate-source pills with distinct
+ *  trim windows seek the `<video>` to the right frame. */
 interface Slot {
   clipId: string;
   el: HTMLVideoElement;
-  anchorS: number;
-  driftRatio: number;
   sourceDurS: number;
   warmed: boolean;
   cleanups: Array<() => void>;
+}
+
+/** Per-tick sync target per cam. `sourceT` is seconds INSIDE the cam's
+ *  media — already accounting for pill-trim, drift, anchor. The pool
+ *  doesn't recompute that; whoever built the descriptor (pill-aware)
+ *  did. */
+export interface PoolSyncTarget {
+  sourceT: number;
 }
 
 const READY_HAVE_CURRENT_DATA = 2;
@@ -105,27 +112,33 @@ export class VideoElementPool {
     return this.slots.get(clipId)?.el ?? null;
   }
 
-  /** Whether `masterT` lands inside the cam's source-time range. False
-   *  for unknown ids. The runtime uses this to gate the last-good-frame
-   *  fallback: out-of-range cams should stay black (correct empty
-   *  state), in-range cams that are mid-seek should hold the cached
-   *  frame to hide the decode-latency flash. */
-  isInRange(clipId: string, masterT: number): boolean {
+  /** Whether the supplied `sourceT` lands inside the cam's source-time
+   *  range. The runtime uses this to gate the last-good-frame fallback:
+   *  out-of-range cams should stay black (correct empty state), in-range
+   *  cams that are mid-seek should hold the cached frame to hide the
+   *  decode-latency flash. */
+  isSourceInRange(clipId: string, sourceT: number): boolean {
     const slot = this.slots.get(clipId);
     if (!slot) return false;
-    const sourceT = camSourceTimeS(masterT, {
-      masterStartS: slot.anchorS,
-      driftRatio: slot.driftRatio,
-    });
     return sourceT >= 0 && sourceT < slot.sourceDurS;
   }
 
-  /** Re-syncs every cam in the pool against the master clock. Called
-   *  by the runtime once per RAF tick. Cheap — no allocations, the
-   *  hot path is one float compare per cam. */
-  syncAll(masterT: number, isPlaying: boolean): void {
+  /** Re-syncs every cam in the pool against per-cam sync targets. The
+   *  runtime supplies `targets` from the current frame descriptor, where
+   *  each entry is the active pill's `sourceIn/Out` evaluated at the
+   *  current `tTimeline`. Cams with no entry are paused (no active pill =
+   *  not on PROGRAM this tick). */
+  syncAll(
+    targets: ReadonlyMap<string, PoolSyncTarget>,
+    isPlaying: boolean,
+  ): void {
     for (const slot of this.slots.values()) {
-      syncSlot(slot, masterT, isPlaying);
+      const t = targets.get(slot.clipId);
+      if (!t) {
+        if (!slot.el.paused) slot.el.pause();
+        continue;
+      }
+      syncSlot(slot, t.sourceT, isPlaying);
     }
   }
 
@@ -145,11 +158,9 @@ export class VideoElementPool {
     for (const cam of cams) {
       const existing = this.slots.get(cam.clip.id);
       if (existing) {
-        // Update sync constants if the clip's drift/sync changed but
-        // the id didn't — common after the user nudges a cam.
-        const range = clipRangeS(cam.clip);
-        existing.anchorS = range.anchorS;
-        existing.driftRatio = cam.clip.driftRatio;
+        // Update source-duration if the clip's metadata changed (lazy
+        // metadata report) — anchor + drift are not tracked here anymore;
+        // the per-frame descriptor handles cam-anchor / drift / pill-trim.
         existing.sourceDurS = cam.clip.sourceDurationS;
         continue;
       }
@@ -171,7 +182,6 @@ export class VideoElementPool {
   // ---- internals ----
 
   private addSlot(cam: VideoCam): void {
-    const range = clipRangeS(cam.clip);
     const el = this.createElement();
     el.muted = true;
     el.playsInline = true;
@@ -188,8 +198,6 @@ export class VideoElementPool {
     const slot: Slot = {
       clipId: cam.clip.id,
       el,
-      anchorS: range.anchorS,
-      driftRatio: cam.clip.driftRatio,
       sourceDurS: cam.clip.sourceDurationS,
       warmed: false,
       cleanups: [],
@@ -236,11 +244,7 @@ export class VideoElementPool {
   }
 }
 
-function syncSlot(slot: Slot, masterT: number, isPlaying: boolean): void {
-  const sourceT = camSourceTimeS(masterT, {
-    masterStartS: slot.anchorS,
-    driftRatio: slot.driftRatio,
-  });
+function syncSlot(slot: Slot, sourceT: number, isPlaying: boolean): void {
   const inRange = sourceT >= 0 && sourceT < slot.sourceDurS;
   const v = slot.el;
   if (!inRange) {

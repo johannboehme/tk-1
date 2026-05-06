@@ -20,6 +20,7 @@ import {
 } from "./build-descriptor";
 import {
   VideoElementPool,
+  type PoolSyncTarget,
   type VideoCam,
   type VideoElementPoolOptions,
 } from "./video-element-pool";
@@ -55,8 +56,16 @@ export interface PreviewRuntimeOptions {
   cancelRaf?: (id: number) => void;
   /** Test-injection — read EditorStoreSnapshot. Defaults to useEditorStore. */
   readSnapshot?: () => EditorStoreSnapshot;
-  /** Test-injection — read playback (currentTime + isPlaying). */
-  readPlayback?: () => { currentTime: number; isPlaying: boolean };
+  /** Test-injection — read playback (currentTime + isPlaying + timelineT).
+   *  `currentTime` is master-time (drives the audio decoder seek inside
+   *  the pool); `timelineT` is the walker's authoritative timeline-position
+   *  (drives every consumer that resolves "what should be on screen RIGHT
+   *  HERE on the song"). */
+  readPlayback?: () => {
+    currentTime: number;
+    timelineT: number;
+    isPlaying: boolean;
+  };
   /** Test-injection — load an image bitmap from a URL. */
   loadBitmap?: (url: string) => Promise<ImageBitmap>;
   /** Test-injection — snapshot a live `<video>` element into an
@@ -254,28 +263,42 @@ export class PreviewRuntime {
     if (!this.backend || !this.pool) return;
     const tickStart = this.opts.now();
     const playback = this.opts.readPlayback();
-    // Pool sync stays in the hot path even on skipped frames — it's
-    // cheap (one float compare per cam) and keeps cam decoders aligned
-    // for when the next non-skipped frame draws.
-    this.pool.syncAll(playback.currentTime, playback.isPlaying);
 
     // Frame-budget watchdog: if the previous tick blew the budget, drop
     // this tick's draw. One-shot. Audio is on a separate thread so it
     // doesn't care about preview frame drops; the user's stated
     // priority (audio sacred, video can compensate) is exactly what
-    // this implements.
-    if (this.skipNextDraw) {
+    // this implements. Pool sync still runs below (descriptor build is
+    // cheap; the dropped work is the GPU draw).
+    const skip = this.skipNextDraw;
+
+    const snapshot = this.opts.readSnapshot();
+    const descriptor = buildPreviewFrameDescriptor(
+      snapshot,
+      playback.currentTime,
+      playback.timelineT,
+    );
+
+    // Pool sync: drive every cam from the descriptor's per-layer
+    // `sourceTimeS` (the active pill's source-window applied at the
+    // current `tTimeline`). Cams without a layer entry are paused — no
+    // pill is on PROGRAM for them this tick. This is THE fix for the
+    // "duplicate pill plays the wrong source frame" bug: the pool no
+    // longer derives source-time from the cam-anchor (which can't tell
+    // duplicate pills apart) but takes the pre-resolved value.
+    const targets = collectPoolTargets(descriptor.layers);
+    this.pool.syncAll(targets, playback.isPlaying);
+
+    if (skip) {
       this.skipNextDraw = false;
       this.recordTickLatency(this.opts.now() - tickStart);
       return;
     }
 
-    const snapshot = this.opts.readSnapshot();
-    const descriptor = buildPreviewFrameDescriptor(snapshot, playback.currentTime);
     const sources = this.buildSourcesMap(
       descriptor.layers,
       snapshot.clips,
-      playback.currentTime,
+      targets,
     );
 
     // Close any pending fx-first-render perf mark on the first frame
@@ -319,7 +342,7 @@ export class PreviewRuntime {
     this.backend.drawFrame(descriptor, sources);
     const drawMs = this.opts.now() - t0;
 
-    this.maybeRefreshSnapshots(descriptor.layers, playback.currentTime);
+    this.maybeRefreshSnapshots(descriptor.layers, targets);
 
     // Feed the adaptive scaler. Only react when the backend itself is
     // straining — visualizers/overlays/store reads are out of scope.
@@ -390,7 +413,7 @@ export class PreviewRuntime {
   private buildSourcesMap(
     layers: ReadonlyArray<{ layerId: string; source: { kind: string } }>,
     clips: readonly Clip[],
-    masterT: number,
+    targets: ReadonlyMap<string, PoolSyncTarget>,
   ): SourcesMap {
     const out = new Map<string, LayerSource>();
     for (const layer of layers) {
@@ -402,7 +425,11 @@ export class PreviewRuntime {
         // <video> can't deliver a fresh frame this tick (mid-seek or
         // pre-decode), and (c) we have a snapshot to substitute. Misses
         // any of these → standard video source.
-        const inRange = this.pool?.isInRange(layer.layerId, masterT) ?? true;
+        const target = targets.get(layer.layerId);
+        const inRange =
+          target != null
+            ? (this.pool?.isSourceInRange(layer.layerId, target.sourceT) ?? true)
+            : false;
         const ready =
           !el.seeking && el.readyState >= READY_HAVE_CURRENT_DATA;
         const cached = this.lastGoodFrames.get(layer.layerId);
@@ -435,7 +462,7 @@ export class PreviewRuntime {
    *  `buildSourcesMap` substitutes during seeks/wraps. */
   private maybeRefreshSnapshots(
     layers: ReadonlyArray<{ layerId: string; source: { kind: string } }>,
-    masterT: number,
+    targets: ReadonlyMap<string, PoolSyncTarget>,
   ): void {
     if (!this.pool) return;
     let now: number | null = null;
@@ -450,7 +477,10 @@ export class PreviewRuntime {
       const el = this.pool.getElement(layer.layerId);
       if (!el) continue;
       if (el.seeking || el.readyState < READY_HAVE_CURRENT_DATA) continue;
-      if (!this.pool.isInRange(layer.layerId, masterT)) continue;
+      const target = targets.get(layer.layerId);
+      if (!target || !this.pool.isSourceInRange(layer.layerId, target.sourceT)) {
+        continue;
+      }
 
       this.snapshotInFlight.add(layer.layerId);
       const layerId = layer.layerId;
@@ -543,6 +573,29 @@ export class PreviewRuntime {
   }
 }
 
+// ---- helpers ----
+
+/** Build per-cam pool sync targets from a freshly-built descriptor.
+ *  Each video layer carries a pre-resolved `sourceTimeS` (the active
+ *  pill's source-window applied at the current `tTimeline`); the pool
+ *  uses that as `<video>.currentTime` instead of a cam-anchor scan. */
+function collectPoolTargets(
+  layers: ReadonlyArray<{
+    layerId: string;
+    source: { kind: string; sourceTimeS?: number };
+  }>,
+): Map<string, PoolSyncTarget> {
+  const out = new Map<string, PoolSyncTarget>();
+  for (const layer of layers) {
+    if (layer.source.kind !== "video") continue;
+    const t = layer.source.sourceTimeS;
+    if (typeof t === "number" && Number.isFinite(t)) {
+      out.set(layer.layerId, { sourceT: t });
+    }
+  }
+  return out;
+}
+
 // ---- defaults ----
 
 function defaultReadSnapshot(): EditorStoreSnapshot {
@@ -561,9 +614,17 @@ function defaultReadSnapshot(): EditorStoreSnapshot {
   };
 }
 
-function defaultReadPlayback(): { currentTime: number; isPlaying: boolean } {
+function defaultReadPlayback(): {
+  currentTime: number;
+  timelineT: number;
+  isPlaying: boolean;
+} {
   const s = useEditorStore.getState();
-  return { currentTime: s.playback.currentTime, isPlaying: s.playback.isPlaying };
+  return {
+    currentTime: s.playback.currentTime,
+    timelineT: s.playback.timelineT,
+    isPlaying: s.playback.isPlaying,
+  };
 }
 
 async function defaultLoadBitmap(url: string): Promise<ImageBitmap> {

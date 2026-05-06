@@ -81,10 +81,23 @@ export interface EditorStoreSnapshot {
  * `videoWidth/Height` already swapped). So `rotationDeg` here is the
  * USER rotation only. The export builder (Schritt 8) takes a different
  * code path that adds the intrinsic on top.
+ *
+ * Time arguments:
+ *   - `tMaster` is the master-audio source-time. FX queries still anchor
+ *     here because `PunchFx.inS/outS` are master-time in the V1 schema.
+ *     A subsequent commit moves FX to timeline-time and drops the dual
+ *     argument.
+ *   - `tTimeline` is the walker's authoritative timeline-position. Pill
+ *     resolution AND source-time computation use this directly: when the
+ *     same chunk repeats in the song, master-time alone can't tell the
+ *     occurrences apart, so the renderer picks a deterministic-but-wrong
+ *     pill. Threading `tTimeline` through preserves the pill identity the
+ *     walker already knows.
  */
 export function buildPreviewFrameDescriptor(
   snapshot: EditorStoreSnapshot,
   tMaster: number,
+  tTimeline?: number,
 ): FrameDescriptor {
   const output = computeOutputSnapped(snapshot.clips, snapshot.exportSpec.resolution);
   const fxOut = buildFx(snapshot, tMaster);
@@ -93,15 +106,14 @@ export function buildPreviewFrameDescriptor(
     return { tMaster, output: null, layers: [], fx: fxOut };
   }
 
-  // Active-cam resolution: the pill+cuts table is the single source of
-  // truth. Pills are populated for every job (single-take = synthetic
-  // single arrangement-item, long-form = the user's arrangement) so the
-  // resolver runs identically in both. Source-time comes from the
-  // active pill's stored `sourceIn/Out`, picking up user trim/move
-  // edits without a re-extraction round-trip.
+  // Active-cam resolution: pill resolution lives in timeline-time. When
+  // the caller didn't pass `tTimeline` (test stubs, legacy callers) we
+  // fall back to projecting `tMaster` — correct for non-duplicate jobs,
+  // wrong for chunks repeated in the song (picks the FIRST occurrence,
+  // shows pill 1 where pill 3 should be). New runtime always supplies it.
   const segments = snapshot.arrangementSegments ?? [];
   const pills = snapshot.pills ?? [];
-  const tArr = masterToArr(tMaster, segments);
+  const tArr = tTimeline ?? masterToArr(tMaster, segments);
   const active = activeCamAtArr(snapshot.cuts, tArr, pills, segments);
   let layers: FrameLayer[] = [];
   if (active) {
