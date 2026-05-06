@@ -1756,7 +1756,7 @@ export function Timeline({
                 // cuts are timeline-anchored, snap is axis-agnostic.
                 const target = ev.shiftKey
                   ? rawNewT
-                  : useEditorStore.getState().snapMasterTime(rawNewT);
+                  : useEditorStore.getState().snapTimelineTime(rawNewT);
                 return useEditorStore
                   .getState()
                   .moveCut(fromAtTimeS, camId, target);
@@ -1836,7 +1836,7 @@ export function Timeline({
                   // Single-active-hold guard: ignore if another TAKE is
                   // already engaged (button or keyboard).
                   if (s.holdGesture) return;
-                  const startS = s.snapMasterTime(s.playback.timelineT);
+                  const startS = s.snapTimelineTime(s.playback.timelineT);
                   s.beginHoldGesture(clip.id, startS);
                   s.addCut({ atTimeS: startS, camId: clip.id });
                   const existing = takePromoteTimerRef.current.get(clip.id);
@@ -1858,7 +1858,7 @@ export function Timeline({
                   // otherwise a stale onTakeFinish (after a cancelHold
                   // via Esc) shouldn't re-apply anything.
                   if (!hold || hold.camId !== clip.id) return;
-                  const endS = s2.snapMasterTime(s2.playback.timelineT);
+                  const endS = s2.snapTimelineTime(s2.playback.timelineT);
                   if (hold.painting) {
                     s2.applyHoldRelease(
                       clip.id,

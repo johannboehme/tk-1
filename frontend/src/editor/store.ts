@@ -615,6 +615,12 @@ interface EditorState {
    *  cut-set call site (TAKE-button, hotkey, REC) so cuts respect the
    *  same grid as drag-snapping. Returns `t` unchanged in mode "off". */
   snapMasterTime(t: number): number;
+  /** Apply the active snap mode to a timeline-time value. The grid
+   *  anchor (beatPhase) is projected from master-time into timeline-
+   *  time so the snapped value lands on the same bar marker the
+   *  BeatRuler draws. Use this for FX / Cut recording, where the
+   *  capsule lives on the song axis. */
+  snapTimelineTime(t: number): number;
 
   /** Show a transient toast. Reuses the same store slot — multiple pushes
    *  in quick succession overwrite each other. The toast component owns
@@ -2315,6 +2321,25 @@ export const useEditorStore = create<EditorState>()(
         barOffsetBeats: effectiveBarOffsetBeats(s.jobMeta),
       });
     },
+    snapTimelineTime(t) {
+      const s = get();
+      const mode = s.ui.snapMode;
+      if (mode === "off" || mode === "match") return t;
+      // beatPhase is the master-time of beat 0. For the snap result to
+      // land on the bar marker the BeatRuler renders, the anchor must
+      // be projected into the same axis as `t`. `masterToArr` is the
+      // bijection the BeatRuler itself uses.
+      const beatPhase = masterToArr(
+        effectiveBeatPhaseS(s.jobMeta),
+        s.arrangementSegments,
+      );
+      return snapTime(t, mode, {
+        bpm: s.jobMeta?.bpm?.value ?? null,
+        beatPhase,
+        beatsPerBar: effectiveBeatsPerBar(s.jobMeta),
+        barOffsetBeats: effectiveBarOffsetBeats(s.jobMeta),
+      });
+    },
 
     pushNotice(message) {
       const cur = get().notice;
@@ -2545,7 +2570,7 @@ export const useEditorStore = create<EditorState>()(
         // currentTime again — the latter may have advanced past our last
         // observation, and during tests there's often no playback at all.
         const releaseS = Math.max(fx.inS, fx.outS - FX_HOLD_OVERSHOOT_S);
-        const snappedRelease = get().snapMasterTime(releaseS);
+        const snappedRelease = get().snapTimelineTime(releaseS);
         // Synth-voice release: the region must extend BEYOND the user's
         // release moment by `envelope.releaseS` seconds so the release
         // phase actually has time to fade. Without the tail, `outS` lands

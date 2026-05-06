@@ -219,7 +219,7 @@ export default function Editor() {
       // hotkey + the cam-switch this triggers. No-op when perf disabled.
       trackKeypressToPaint(e.key);
       trackCamSwitchToPaint(clip.id);
-      const startS = s.snapMasterTime(s.playback.timelineT);
+      const startS = s.snapTimelineTime(s.playback.timelineT);
       // beginHoldGesture must happen BEFORE addCut, so the snapshot
       // captures cuts as they were *before* the immediate tap-cut lands.
       s.beginHoldGesture(clip.id, startS);
@@ -237,7 +237,7 @@ export default function Editor() {
       const s = useEditorStore.getState();
       const hold = s.holdGesture;
       if (!hold) return;
-      const endS = s.snapMasterTime(s.playback.timelineT);
+      const endS = s.snapTimelineTime(s.playback.timelineT);
       if (hold.painting) {
         // Paint-mode commit: drop everything in (start, end], add the
         // trailing resume-cut (handled by applyHoldRelease).
@@ -479,13 +479,13 @@ export default function Editor() {
           return;
         }
         if (existingSlot != null) s.endFxHold(existingSlot);
-        const t = s.snapMasterTime(s.playback.timelineT);
+        const t = s.snapTimelineTime(s.playback.timelineT);
         s.beginFxHold(slotKey, kind, t);
         ensureTick();
         return;
       }
 
-      const t = s.snapMasterTime(s.playback.timelineT);
+      const t = s.snapTimelineTime(s.playback.timelineT);
       s.beginFxHold(slotKey, kind, t);
       ensureTick();
     }

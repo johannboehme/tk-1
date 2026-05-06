@@ -437,13 +437,13 @@ function FxPad({ pad }: { pad: PadDef }) {
         // Different pad → drop the prior preview before latching new.
         endFxHold(existingSlot);
       }
-      const t = s.snapMasterTime(s.playback.timelineT);
+      const t = s.snapTimelineTime(s.playback.timelineT);
       beginFxHold(pad.slotKey, pad.kind, t);
       return;
     }
 
     // Playback running → record-mode (press-and-hold).
-    const t = s.snapMasterTime(s.playback.timelineT);
+    const t = s.snapTimelineTime(s.playback.timelineT);
     beginFxHold(pad.slotKey, pad.kind, t);
   }
   function handleUp() {
