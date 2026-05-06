@@ -173,13 +173,14 @@ export class Compositor {
       viewportTransform?: ViewportTransform;
     } = {},
     /**
-     * Master-timeline time in seconds for FX lookup. **Must be passed
-     * by callers that use segments**, because `timestampUs` is the
+     * Timeline-time in seconds for FX lookup. **Must be passed by
+     * callers that use segments**, because `timestampUs` is the
      * output-relative timestamp (starts at 0 each segment) — looking
-     * up FX with that ignores the master-time offset and the FX never
-     * "fire" in the export. When omitted, falls back to
-     * `timestampUs / 1e6` (correct only for whole-video renders where
-     * output time == master time). */
+     * up FX with that ignores the song-position offset and the FX
+     * never fire in the export. When omitted, falls back to
+     * `timestampUs / 1e6` (only correct for whole-video renders).
+     * Historically named `tMasterS` for compat — semantics flipped to
+     * timeline-time when FX moved off the master axis. */
     tMasterS?: number,
   ): Promise<VideoFrame> {
     const intrinsic = rotationDeg % 360;
