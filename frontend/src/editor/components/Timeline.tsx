@@ -1034,8 +1034,22 @@ export function Timeline({
     if (e.shiftKey || snapMode === "off") return t;
     const arrT = masterToView(t);
     const arrPhase = masterToArr(beatPhase, arrangementSegments);
-    const snappedArr = snapTime(arrT, snapMode, buildSnapCtx(arrPhase, candPositions));
-    return viewToMaster(snappedArr);
+    const snappedT = snapTime(arrT, snapMode, buildSnapCtx(arrPhase, candPositions));
+    return viewToMaster(snappedT);
+  }
+
+  /** Same snap mechanics, but the input `t` is already arr-time. Pill
+   *  drags work directly on the canvas axis, so they shouldn't go
+   *  through `snapped()` (which would treat their arr-time input as
+   *  master-time and double-project it). */
+  function snappedArr(
+    arrT: number,
+    e: { shiftKey: boolean },
+    candPositions?: number[],
+  ): number {
+    if (e.shiftKey || snapMode === "off") return arrT;
+    const arrPhase = masterToArr(beatPhase, arrangementSegments);
+    return snapTime(arrT, snapMode, buildSnapCtx(arrPhase, candPositions));
   }
 
   // ─── Multi-touch pinch-zoom + 2-finger pan ─────────────────────────
@@ -1340,10 +1354,14 @@ export function Timeline({
       // Source-trim stays put: only the pill's WHEN moves.
       const arrAtPointer = viewStart + (x / canvasWidth) * visibleDur;
       let newArrStartS = Math.max(0, drag.origArrStartS + (arrAtPointer - drag.grabArrT));
-      // Edge-to-edge snap to same-cam neighbour pills — whichever edge
-      // (left or right) is closer to a neighbour wins. The store-side
-      // clamp still hard-stops overlap; this just makes the magnetic
-      // feel.
+      // Grid snap (Shift bypasses; OFF / MATCH pass through unchanged —
+      // MATCH triggers cam-track-move below, not this kind).
+      newArrStartS = Math.max(0, snappedArr(newArrStartS, e));
+      // Edge-to-edge magnetic snap to same-cam neighbour pills — whichever
+      // edge (left or right) ends up closer to a neighbour wins. Still
+      // applies on top of grid-snap so pills stitch back-to-back when
+      // dragged near the gap. The store-side clamp hard-stops overlap;
+      // this just makes the magnetic feel.
       const me = pills.find((pp) => pp.id === drag.pillId);
       if (me) {
         const len = me.arrEndS - me.arrStartS;
@@ -1381,18 +1399,23 @@ export function Timeline({
       const arrAtPointer = viewStart + (x / canvasWidth) * visibleDur;
       const me = pills.find((pp) => pp.id === drag.pillId);
       const thresholdT = PILL_SNAP_EDGE_PX / Math.max(1, canvasWidth / visibleDur);
+      // arrAtPointer is already arr-time; snappedArr takes arr-time
+      // directly. Going through `snapped()` would project it as
+      // master-time — Identity in single-take, broken in long-form.
+      const gridSnapped = snappedArr(arrAtPointer, e);
       const edgeSnap = me
-        ? snapToNearest(snapped(arrAtPointer, e), neighbourEdges(pills, me.id, me.camId, "ends"), thresholdT)
-        : snapped(arrAtPointer, e);
+        ? snapToNearest(gridSnapped, neighbourEdges(pills, me.id, me.camId, "ends"), thresholdT)
+        : gridSnapped;
       const clamped = clamp(edgeSnap, 0, drag.origArrEndS - PILL_MIN_WINDOW_S);
       setPillLeftEdgeArrStartS(drag.pillId, clamped);
     } else if (drag.kind === "pill-trim-out") {
       const arrAtPointer = viewStart + (x / canvasWidth) * visibleDur;
       const me = pills.find((pp) => pp.id === drag.pillId);
       const thresholdT = PILL_SNAP_EDGE_PX / Math.max(1, canvasWidth / visibleDur);
+      const gridSnapped = snappedArr(arrAtPointer, e);
       const edgeSnap = me
-        ? snapToNearest(snapped(arrAtPointer, e), neighbourEdges(pills, me.id, me.camId, "starts"), thresholdT)
-        : snapped(arrAtPointer, e);
+        ? snapToNearest(gridSnapped, neighbourEdges(pills, me.id, me.camId, "starts"), thresholdT)
+        : gridSnapped;
       const clamped = Math.max(drag.origArrStartS + PILL_MIN_WINDOW_S, edgeSnap);
       setPillRightEdgeArrEndS(drag.pillId, clamped);
     }
