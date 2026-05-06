@@ -1742,35 +1742,38 @@ export function Timeline({
               viewEndS={viewEnd}
               width={canvasWidth}
               onRemoveCut={(atTimeS, camId) => {
-                // Strip runs in arr-time; convert back to master before
-                // mutating the store. removeCutAt resolves the cut by
-                // (master-time, camId), so a single call removes ALL
-                // arr-occurrences of a duplicated chunk's cut at once,
-                // which matches the user's mental model.
-                removeCutAt(viewToMaster(atTimeS), camId);
+                // Strip and store both run in timeline-time after the
+                // cut/fx axis flip — pass the strip's `atTimeS`
+                // through verbatim. Pre-refactor this projected through
+                // `viewToMaster` because cuts were master-time and a
+                // single delete had to wipe every duplicate occurrence;
+                // now each timeline slot owns its own cut.
+                removeCutAt(atTimeS, camId);
               }}
               onCutDrag={(fromAtTimeS, camId, rawNewT, ev) => {
                 // Same snap rules as the rest of the timeline: SHIFT
-                // bypasses, MATCH falls through (no candidatePositions
-                // for cut-set), grid modes round to the nearest beat/bar.
-                const masterFrom = viewToMaster(fromAtTimeS);
-                const masterTarget = viewToMaster(rawNewT);
-                const snappedMaster = ev.shiftKey
-                  ? masterTarget
-                  : useEditorStore.getState().snapMasterTime(masterTarget);
-                const landed = useEditorStore
+                // bypasses, grid modes round. No view↔master projection:
+                // cuts are timeline-anchored, snap is axis-agnostic.
+                const target = ev.shiftKey
+                  ? rawNewT
+                  : useEditorStore.getState().snapMasterTime(rawNewT);
+                return useEditorStore
                   .getState()
-                  .moveCut(masterFrom, camId, snappedMaster);
-                return masterToView(landed);
+                  .moveCut(fromAtTimeS, camId, target);
               }}
               paintPreview={(() => {
                 if (!holdGesture || !holdGesture.painting) return null;
                 const clip = clips.find((c) => c.id === holdGesture.camId);
                 if (!clip) return null;
                 const idx = clips.findIndex((c) => c.id === clip.id);
-                // Project the master-time hold endpoints into arr-time.
-                const fromS = masterToView(holdGesture.startS);
-                const toS = masterToView(currentTime);
+                // Hold-gesture endpoints live in timeline-time (matches
+                // where `holdGesture.startS` was recorded — see
+                // Editor.tsx's onKeyDown for digit keys + TAKE button).
+                // No `masterToView` projection: cuts are now timeline-
+                // anchored, and projecting a timeline-time value as
+                // master-time scans onto duplicate-pill slots.
+                const fromS = holdGesture.startS;
+                const toS = timelineT;
                 return {
                   fromS,
                   toS,
