@@ -1,9 +1,14 @@
 import { describe, it, expect } from "vitest";
 import {
   clipRangeS,
+  groupPillsIntoLanes,
   isImageClip,
   isVideoClip,
+  segmentsToAudioLane,
+  MASTER_AUDIO_ID,
   type ImageClip,
+  type Pill,
+  type Segment,
   type VideoClip,
 } from "./types";
 
@@ -179,5 +184,91 @@ describe("type guards", () => {
     const legacy = { ...video, kind: undefined } as VideoClip;
     expect(isVideoClip(legacy)).toBe(true);
     expect(isImageClip(legacy)).toBe(false);
+  });
+});
+
+describe("segmentsToAudioLane", () => {
+  it("maps a single segment to a single pill covering [0, span)", () => {
+    const segs: Segment[] = [{ in: 5, out: 12 }];
+    const pills = segmentsToAudioLane(segs);
+    expect(pills).toHaveLength(1);
+    expect(pills[0]).toMatchObject({
+      sourceRef: MASTER_AUDIO_ID,
+      sourceInS: 5,
+      sourceOutS: 12,
+      timelineStartS: 0,
+      timelineEndS: 7,
+    });
+  });
+
+  it("packs multiple segments contiguously on the timeline", () => {
+    const segs: Segment[] = [
+      { in: 0, out: 3 },
+      { in: 10, out: 15 },
+      { in: 30, out: 31 },
+    ];
+    const pills = segmentsToAudioLane(segs);
+    expect(pills.map((p) => [p.timelineStartS, p.timelineEndS])).toEqual([
+      [0, 3],
+      [3, 8],
+      [8, 9],
+    ]);
+  });
+
+  it("preserves duplicate-source segments as distinct pills", () => {
+    // Same chunk appearing twice in the arrangement → two pills with the
+    // same source-window but distinct ids and distinct timeline windows.
+    const segs: Segment[] = [
+      { in: 0, out: 4, chunkId: "c-1" },
+      { in: 10, out: 12 },
+      { in: 0, out: 4, chunkId: "c-1" },
+    ];
+    const pills = segmentsToAudioLane(segs);
+    expect(pills).toHaveLength(3);
+    expect(pills[0].id).not.toBe(pills[2].id);
+    expect(pills[0].sourceInS).toBe(0);
+    expect(pills[2].sourceInS).toBe(0);
+    expect(pills[0].timelineStartS).toBe(0);
+    expect(pills[2].timelineStartS).toBe(6);
+  });
+});
+
+describe("groupPillsIntoLanes", () => {
+  function pill(id: string, camId: string, arrStartS: number, arrEndS: number): Pill {
+    return {
+      id,
+      camId,
+      arrStartS,
+      arrEndS,
+      sourceInS: 0,
+      sourceOutS: arrEndS - arrStartS,
+      originalArrStartS: arrStartS,
+      originalArrEndS: arrEndS,
+      originalSourceInS: 0,
+      originalSourceOutS: arrEndS - arrStartS,
+    };
+  }
+
+  it("groups pills by camId and sorts each lane by arrStartS", () => {
+    const pills: Pill[] = [
+      pill("p2", "cam-A", 5, 10),
+      pill("p1", "cam-A", 0, 5),
+      pill("p3", "cam-B", 0, 10),
+    ];
+    const lanes = groupPillsIntoLanes(pills);
+    const a = lanes.find((l) => l.id === "cam-A")!;
+    const b = lanes.find((l) => l.id === "cam-B")!;
+    expect(a.pills.map((p) => p.id)).toEqual(["p1", "p2"]);
+    expect(b.pills.map((p) => p.id)).toEqual(["p3"]);
+  });
+
+  it("preserves duplicate-source pills (same camId, different timeline slots)", () => {
+    const pills: Pill[] = [
+      pill("a-1", "cam-A", 0, 5),
+      pill("a-1-dup", "cam-A", 10, 15),
+    ];
+    const lanes = groupPillsIntoLanes(pills);
+    expect(lanes).toHaveLength(1);
+    expect(lanes[0].pills).toHaveLength(2);
   });
 });

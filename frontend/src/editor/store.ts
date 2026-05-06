@@ -108,6 +108,12 @@ export type PanelTab = "sync" | "options" | "overlays" | "export";
 
 export interface PlaybackSlice {
   currentTime: number;
+  /** Timeline-time of the playhead — emitted by the audio walker
+   *  authoritatively from `(currentPillIdx, masterT)`. Consumers that
+   *  draw the playhead or display the song time read THIS, not a
+   *  `masterToArr(currentTime)` projection (which scans by master-time
+   *  and snaps duplicate-source pills onto the first occurrence). */
+  timelineT: number;
   isPlaying: boolean;
   loop: LoopRegion | null;
   // Set by seek(t); useAudioMaster watches this and writes
@@ -439,6 +445,12 @@ interface EditorState {
   setClipDisplayDims(camId: string, w: number, h: number): void;
 
   setCurrentTime(t: number): void;
+  /** Walker-side atomic update of both master- and timeline-time. The
+   *  walker computes timeline-time from its authoritative `currentPillIdx`
+   *  + master-offset-within-segment; consumers (playhead, transport
+   *  clock) read `timelineT` directly so duplicate-source pills don't
+   *  collapse onto the first occurrence on the song view. */
+  setPlayhead(masterT: number, timelineT: number): void;
   setPlaying(playing: boolean): void;
   setLoop(loop: LoopRegion | null): void;
   setAbBypass(bypass: boolean): void;
@@ -681,6 +693,7 @@ const TRIM_EPS = 0.05; // seconds — minimum trim window length
 
 const initialPlayback: PlaybackSlice = {
   currentTime: 0,
+  timelineT: 0,
   isPlaying: false,
   loop: null,
   seekRequest: null,
@@ -1241,6 +1254,15 @@ export const useEditorStore = create<EditorState>()(
     setCurrentTime(t) {
       set({ playback: { ...get().playback, currentTime: t } });
     },
+    setPlayhead(masterT, timelineT) {
+      set({
+        playback: {
+          ...get().playback,
+          currentTime: masterT,
+          timelineT,
+        },
+      });
+    },
     setPlaying(playing) {
       const s = get();
       if (s.playback.isPlaying === playing) return;
@@ -1280,10 +1302,42 @@ export const useEditorStore = create<EditorState>()(
       const meta = get().jobMeta;
       const dur = meta?.duration ?? Infinity;
       const clamped = Math.max(0, Math.min(t, dur));
+      const s = get();
+      const segs = s.arrangementSegments;
+      const hint = opts?.segmentIdxHint ?? null;
+      // Compute timeline-time for this seek synchronously so the playhead
+      // doesn't flash to the first-occurrence position before the walker
+      // catches up next tick. When the caller passes a segmentIdxHint we
+      // know exactly which occurrence they meant — without it we fall back
+      // to a master-time scan (only correct for non-duplicate jobs).
+      let timelineT = clamped;
+      if (segs.length > 0) {
+        const arrStarts: number[] = [];
+        let cursor = 0;
+        for (const seg of segs) {
+          arrStarts.push(cursor);
+          cursor += Math.max(0, seg.out - seg.in);
+        }
+        let segIdx = -1;
+        if (hint != null && hint >= 0 && hint < segs.length) {
+          segIdx = hint;
+        } else {
+          for (let i = 0; i < segs.length; i++) {
+            if (clamped >= segs[i].in - 1e-3 && clamped < segs[i].out) {
+              segIdx = i;
+              break;
+            }
+          }
+        }
+        if (segIdx >= 0) {
+          timelineT = arrStarts[segIdx] + Math.max(0, clamped - segs[segIdx].in);
+        }
+      }
       set({
         playback: {
-          ...get().playback,
+          ...s.playback,
           currentTime: clamped,
+          timelineT,
           seekRequest: clamped,
           // A user-initiated seek overrides any deferred loop-shift wrap —
           // the user's intent is to be at `t`, not at the OP-1 wrap point.
@@ -1295,7 +1349,7 @@ export const useEditorStore = create<EditorState>()(
           // the audio walker resume on the right occurrence instead of
           // snapping to the first match. null/undefined = no hint, the
           // walker scans normally.
-          seekSegmentIdxHint: opts?.segmentIdxHint ?? null,
+          seekSegmentIdxHint: hint,
         },
       });
     },

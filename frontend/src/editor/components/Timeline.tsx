@@ -232,6 +232,11 @@ export function Timeline({
   const clearAllFx = useEditorStore((s) => s.clearAllFx);
   const preparingCamIds = useEditorStore((s) => s.preparingCamIds);
   const currentTime = useEditorStore((s) => s.playback.currentTime);
+  // Authoritative timeline-time from the audio walker. Used for the
+  // playhead position so duplicate-source pills (same master-time used
+  // multiple times in the song) don't bounce the cursor onto the first
+  // occurrence's arr-position.
+  const timelineT = useEditorStore((s) => s.playback.timelineT);
   const holdGesture = useEditorStore((s) => s.holdGesture);
   const snapMode = useEditorStore((s) => s.ui.snapMode);
   const lanesLocked = useEditorStore((s) => s.ui.lanesLocked);
@@ -305,11 +310,11 @@ export function Timeline({
   // having moved this render — otherwise scrolling away while paused
   // would snap straight back. Comparison happens in *view* space so the
   // arrangement-mode path doesn't re-paint to master-time gaps.
-  const lastPlayheadRef = useRef(currentTime);
-  const currentTimeView = masterToView(currentTime);
+  const lastPlayheadRef = useRef(timelineT);
+  const currentTimeView = timelineT;
   useEffect(() => {
-    const moved = currentTime !== lastPlayheadRef.current;
-    lastPlayheadRef.current = currentTime;
+    const moved = timelineT !== lastPlayheadRef.current;
+    lastPlayheadRef.current = timelineT;
     if (!moved) return;
     if (currentTimeView >= viewStart && currentTimeView <= viewEnd) return;
     const next = Math.max(
@@ -317,7 +322,7 @@ export function Timeline({
       Math.min(maxScroll, currentTimeView - timelineStartS),
     );
     if (Math.abs(next - clampedScroll) > 1e-6) setScrollX(next);
-  }, [currentTime, currentTimeView, viewStart, viewEnd, timelineStartS, maxScroll, clampedScroll, setScrollX]);
+  }, [timelineT, currentTimeView, viewStart, viewEnd, timelineStartS, maxScroll, clampedScroll, setScrollX]);
 
   // ---- Layout offsets (canvas y-coordinates per lane) ----
   const videoBands = clips.map((_, i) => ({
@@ -832,7 +837,11 @@ export function Timeline({
     // BeatRuler's `Math.floor(x)` bar tick. Without the snap the
     // sub-pixel smear of an odd-width stroke makes the playhead read
     // as 1-2 px right of the bar mark even when the time math is exact.
-    const xpFloat = tToX(currentTime);
+    // Drive from `timelineT` directly — the walker's authoritative
+    // timeline-position. A `tToX(currentTime)` projection would scan the
+    // segments list by master-time and snap onto the first occurrence
+    // when the same chunk appears twice in the song.
+    const xpFloat = arrTToX(timelineT);
     const xp = Math.floor(xpFloat) + 0.5;
     ctx.strokeStyle = "#FF5722";
     ctx.lineWidth = 1.5;
@@ -897,6 +906,7 @@ export function Timeline({
     arrangementSegments,
     arrTotal,
     arrTToX,
+    timelineT,
     loop,
     currentTime,
     clips,
@@ -1013,7 +1023,7 @@ export function Timeline({
   const findLaneAt = videoLaneAt;
 
   function classifyAudioHit(x: number): "trim-in" | "trim-out" | "playhead" | "loop" | null {
-    const xp = tToX(currentTime);
+    const xp = arrTToX(timelineT);
     // Trim handles render at every arr-time occurrence of trim.in /
     // trim.out — a chunk repeated in long-form yields N draggable
     // handles that all wire to the same master-time value. Hit-test
