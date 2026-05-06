@@ -52,7 +52,7 @@ const READOUT_TIMEOUT_MS = 800;
 export function StageInteractionOverlay() {
   const exportSpec = useEditorStore((s) => s.exportSpec);
   const clips = useEditorStore((s) => s.clips);
-  const currentTime = useEditorStore((s) => s.playback.currentTime);
+  const currentTime = useEditorStore((s) => s.playback.timelineT);
   const activeCamId = useEditorStore((s) => s.activeCamId(currentTime));
   const setClipViewportTransform = useEditorStore(
     (s) => s.setClipViewportTransform,

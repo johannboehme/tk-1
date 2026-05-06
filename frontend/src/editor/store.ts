@@ -2287,15 +2287,14 @@ export const useEditorStore = create<EditorState>()(
     },
     activeCamId(t) {
       const s = get();
-      const time = t ?? s.playback.currentTime;
-      // Active-cam resolution is always pill-based. arr-time is the
-      // playhead's master-time projected through the segment-walker
-      // (= identity in single-take jobs where arrangementSegments is
-      // empty). The pill+cut tiebreaker is uniform across job kinds.
-      const arrT = masterToArr(time, s.arrangementSegments);
+      // `t` is timeline-time (the song-position the caller is asking
+      // about). Defaults to the walker's authoritative `timelineT`, NOT
+      // `currentTime` — the latter is master-time and would scan-snap
+      // duplicate-pill slots onto the first occurrence's cam.
+      const time = t ?? s.playback.timelineT;
       const active = activeCamAtArr(
         s.cuts,
-        arrT,
+        time,
         s.pills,
         s.arrangementSegments,
       );

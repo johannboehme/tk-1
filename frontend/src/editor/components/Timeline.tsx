@@ -467,42 +467,29 @@ export function Timeline({
   );
 
   // Strip projections — cuts/fx live in master-time inside the store so
-  // they remain anchored to the source media regardless of how the user
-  // reorders the arrangement. The ProgramStrip + FxStripLayer render in
-  // arr-time, so we pre-project here: each occurrence of a chunk that
-  // contains a cut produces a corresponding splice tab on the strip; FX
-  // capsules that straddle a segment boundary split into per-segment
-  // slices. For single-take's whole-master segment both projections are
-  // Identity (one occurrence per cut, one slice per fx).
-  const stripCuts = useMemo(
-    () =>
-      cuts.flatMap((cut) =>
-        mastersToArrAll(cut.atTimeS, arrangementSegments).map((arrT) => ({
-          ...cut,
-          atTimeS: arrT,
-        })),
-      ),
-    [cuts, arrangementSegments],
-  );
+  // Cuts and FX live in timeline-time (= arr-time) since the
+  // master-time refactor. The ProgramStrip + FxStripLayer also render
+  // in arr-time, so the strip data is exactly the stored data — no
+  // per-occurrence projection. The legacy `mastersToArrAll` /
+  // `sliceByArrSegments` path was correct for master-time-anchored
+  // capsules but for timeline-anchored ones it'd either drop the entry
+  // (timeline-T not in any seg's master range) or — worse — duplicate
+  // it across every chunk whose master-time happened to coincide with
+  // the timeline-T value. Passing through 1:1 keeps the cut at the
+  // exact timeline slot the user placed it in. Trim markers in this
+  // file still go through `mastersToArrAll` because trim is a
+  // master-axis concept (one value, all occurrences need a handle).
+  const stripCuts = cuts;
   const stripFx = useMemo(() => {
     const out: typeof fx = [];
     for (const f of fx) {
-      const slices = sliceByArrSegments(f.inS, f.outS, arrangementSegments);
-      if (slices.length === 0) continue;
-      for (let i = 0; i < slices.length; i++) {
-        out.push({
-          ...f,
-          inS: slices[i].arrStartS,
-          outS: slices[i].arrEndS,
-          // Multi-slice fx need unique React keys downstream; the live
-          // recording case is always single-slice so the original id
-          // stays in liveFxIds for the pulser path.
-          id: slices.length === 1 ? f.id : `${f.id}::${i}`,
-        });
-      }
+      const inT = Math.max(0, f.inS);
+      const outT = Math.min(arrTotal, f.outS);
+      if (outT <= inT) continue;
+      out.push({ ...f, inS: inT, outS: outT });
     }
     return out;
-  }, [fx, arrangementSegments]);
+  }, [fx, arrTotal]);
   const stripDuration = arrTotal;
 
   // ---- Active-cam status per lane (drives LED color) ----
@@ -514,7 +501,7 @@ export function Timeline({
     });
     const activeId = (() => {
       const s = useEditorStore.getState();
-      return s.activeCamId(currentTime);
+      return s.activeCamId(timelineT);
     })();
     for (const cam of clips) {
       const range = ranges.find((r) => r.id === cam.id)!;

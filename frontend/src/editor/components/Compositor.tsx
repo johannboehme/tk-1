@@ -35,7 +35,7 @@ export function Compositor({ cams, audioUrl }: Props) {
   // comparison on the returned string short-circuits between flips.
   // (The previous two-selector form re-rendered the whole compositor
   // every frame just to feed currentTime into activeCamId.)
-  const activeCamId = useEditorStore((s) => s.activeCamId(s.playback.currentTime));
+  const activeCamId = useEditorStore((s) => s.activeCamId(s.playback.timelineT));
   const showTestPattern = activeCamId === null;
 
   return (

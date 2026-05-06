@@ -349,7 +349,14 @@ export default function Editor() {
     function tick() {
       raf = null;
       const s = useEditorStore.getState();
-      const tNow = s.playback.currentTime;
+      // FX live in timeline-time. The hold's `inS` was written from
+      // `playback.timelineT` in beginFxHold; growing `outS` from
+      // master-time would create an inS/outS pair from two different
+      // axes and the capsule would either span backwards (→ FX dead)
+      // or grow into a duplicate-pill slot (→ FX bleeds across the
+      // song). Use timelineT throughout the hold so the capsule
+      // covers the timeline span the user actually held the pad.
+      const tNow = s.playback.timelineT;
       // Extend live-recording fx.
       const slots = Object.keys(s.fxHolds);
       for (const slot of slots) s.tickFxHold(slot, tNow);

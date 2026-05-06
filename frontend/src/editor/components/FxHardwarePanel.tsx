@@ -437,13 +437,13 @@ function FxPad({ pad }: { pad: PadDef }) {
         // Different pad → drop the prior preview before latching new.
         endFxHold(existingSlot);
       }
-      const t = s.snapMasterTime(s.playback.currentTime);
+      const t = s.snapMasterTime(s.playback.timelineT);
       beginFxHold(pad.slotKey, pad.kind, t);
       return;
     }
 
     // Playback running → record-mode (press-and-hold).
-    const t = s.snapMasterTime(s.playback.currentTime);
+    const t = s.snapMasterTime(s.playback.timelineT);
     beginFxHold(pad.slotKey, pad.kind, t);
   }
   function handleUp() {
@@ -1683,7 +1683,11 @@ function EnvelopePlayhead({
 }) {
   const fxHolds = useEditorStore((s) => s.fxHolds);
   const fx = useEditorStore((s) => s.fx);
-  const currentTime = useEditorStore((s) => s.playback.currentTime);
+  // FX inS/outS live in timeline-time. The indicator's "where on the
+  // ADSR curve are we right now" computation must compare against the
+  // same axis — using master-time would put the dot in the wrong phase
+  // every time the playhead enters a duplicate-pill slot.
+  const currentTime = useEditorStore((s) => s.playback.timelineT);
 
   // Pick the active hold for this kind (persistent beats preview).
   let activeHold:
