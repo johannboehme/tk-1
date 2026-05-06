@@ -10,6 +10,7 @@
 // offset instead of the whole cam — so a single chunk can be tuned without
 // disturbing the rest of the take.
 import { useEditorStore } from "../store";
+import { segmentIndexAtArr } from "../arrangement-time";
 import { isVideoClip, MASTER_AUDIO_ID } from "../types";
 import { ChunkyButton } from "./ChunkyButton";
 import { Knob } from "./Knob";
@@ -48,6 +49,24 @@ export function SyncTuner({ lastSyncOverrideMs }: Props) {
     (s) => s.setPillSourceOffsetMs,
   );
   const resetPill = useEditorStore((s) => s.resetPill);
+  const conformAudioStartToPill = useEditorStore(
+    (s) => s.conformAudioStartToPill,
+  );
+  // Subscribe to anything that changes whether CONFORM is meaningful so
+  // the disabled state stays correct as pills, segments, and the nudge
+  // shift around.
+  const pillAudioStartMs = useEditorStore((s) => {
+    if (!selectedPillId) return null;
+    const p = s.pills.find((pp) => pp.id === selectedPillId);
+    if (!p) return null;
+    const idx = segmentIndexAtArr(p.originalArrStartS, s.arrangementSegments);
+    if (idx < 0) return null;
+    return s.arrangementSegments[idx]?.audioStartMs ?? null;
+  });
+  const audioStartNudgeS = useEditorStore(
+    (s) => s.jobMeta?.audioStartNudgeS ?? 0,
+  );
+  const bpmPhaseS = useEditorStore((s) => s.jobMeta?.bpm?.phase ?? null);
   const abBypass = useEditorStore((s) => s.offset.abBypass);
   const setAbBypass = useEditorStore((s) => s.setAbBypass);
   // currentTime read imperatively in the loop-around-playhead handler
@@ -127,6 +146,21 @@ export function SyncTuner({ lastSyncOverrideMs }: Props) {
     lastSyncOverrideMs !== null &&
     selectedClip !== null &&
     lastSyncOverrideMs !== userOverrideMs;
+
+  // CONFORM is meaningful when a pill is selected AND the source segment
+  // has a detected onset to anchor on. Disabled when the resulting nudge
+  // would equal the current one — the action is idempotent.
+  const conformDelta =
+    pillMode && pillAudioStartMs !== null && bpmPhaseS !== null
+      ? Math.round(
+          (pillAudioStartMs / 1000 - bpmPhaseS - audioStartNudgeS) * 1e6,
+        ) / 1e3
+      : null;
+  const conformEnabled =
+    pillMode &&
+    pillAudioStartMs !== null &&
+    bpmPhaseS !== null &&
+    Math.abs(conformDelta ?? 0) > 1e-3;
 
   return (
     <div className="flex flex-col gap-5">
@@ -265,6 +299,30 @@ export function SyncTuner({ lastSyncOverrideMs }: Props) {
               </ChunkyButton>
             </div>
           </div>
+
+          {/* Bar-grid conform — re-anchor the master beat phase to this
+              pill's source onset. Only shown in pill-mode; the action
+              shifts the global `audioStartNudgeS`, but the trigger is
+              the selected pill so it lives next to the pill controls. */}
+          {pillMode && (
+            <div className="flex flex-col gap-1.5">
+              <span className="label">Bar Grid</span>
+              <ChunkyButton
+                variant="secondary"
+                size="sm"
+                onClick={() => {
+                  if (selectedPillId) conformAudioStartToPill(selectedPillId);
+                }}
+                disabled={!conformEnabled}
+              >
+                {pillAudioStartMs === null
+                  ? "CONFORM TO PILL · NO ONSET"
+                  : conformDelta !== null && conformEnabled
+                    ? `CONFORM TO PILL (${formatMs(conformDelta).trim()})`
+                    : "CONFORM TO PILL"}
+              </ChunkyButton>
+            </div>
+          )}
 
           {/* Resets */}
           <div className="grid grid-cols-2 gap-1.5">

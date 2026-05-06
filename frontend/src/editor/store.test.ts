@@ -1382,6 +1382,187 @@ describe("useEditorStore", () => {
     });
   });
 
+  describe("conformAudioStartToPill", () => {
+    // The bar grid anchors at `bpm.phase + audioStartNudgeS` (master-time).
+    // Conforming to a pill picks that pill's source segment audioStartMs as
+    // the new anchor — the nudge becomes whatever shifts `bpm.phase` onto
+    // it. Lets the user re-snap drift between FX/cut grid and a specific
+    // chunk's onset when many pills accumulated small accumulated offsets
+    // (e.g. arrangement-mode jobs from triage).
+    function loadArrangementWithAudioStarts() {
+      useEditorStore.getState().loadJob(
+        {
+          ...baseJobMeta,
+          duration: 180,
+          bpm: { value: 120, phase: 1.0, manualOverride: false },
+        },
+        {
+          clips: [
+            {
+              id: "cam-1",
+              filename: "a.mp4",
+              color: "#fff",
+              sourceDurationS: 200,
+              syncOffsetMs: 0,
+            },
+          ],
+          arrangementSegments: [
+            { in: 0, out: 60, audioStartMs: 1500, chunkId: "c0" },
+            { in: 60, out: 120, audioStartMs: 60_321, chunkId: "c1" },
+          ],
+          arrangement: [
+            { id: "item-0", chunkId: "c0" },
+            { id: "item-1", chunkId: "c1" },
+          ],
+          chunks: [
+            {
+              id: "c0",
+              startMs: 0,
+              endMs: 60_000,
+              audioStartMs: 1500,
+              bpmOctaveShift: 0,
+              effectiveBpm: 120,
+              beatsPerBar: 4,
+              accepted: true,
+              trimMode: "free",
+            },
+            {
+              id: "c1",
+              startMs: 60_000,
+              endMs: 120_000,
+              audioStartMs: 60_321,
+              bpmOctaveShift: 0,
+              effectiveBpm: 120,
+              beatsPerBar: 4,
+              accepted: true,
+              trimMode: "free",
+            },
+          ],
+        },
+      );
+    }
+
+    test("aligns audioStartNudgeS so beat-phase lands on the pill's segment audioStartMs", () => {
+      loadArrangementWithAudioStarts();
+      const pills = useEditorStore.getState().pills;
+      const pillItem1 = pills.find((p) => p.fromArrangementItemId === "item-1");
+      expect(pillItem1).toBeTruthy();
+      const result = useEditorStore
+        .getState()
+        .conformAudioStartToPill(pillItem1!.id);
+      expect(result).toBe("ok");
+      // segment.audioStartMs = 60321 ms = 60.321 s; bpm.phase = 1.0 s.
+      // newNudgeS = 60.321 - 1.0 = 59.321
+      const nudge = useEditorStore.getState().jobMeta?.audioStartNudgeS;
+      expect(nudge).toBeCloseTo(59.321, 6);
+    });
+
+    test("returns 'unchanged' when nudge already matches the pill's audio-start", () => {
+      loadArrangementWithAudioStarts();
+      // First conform sets the nudge; running it again is a no-op.
+      const pills = useEditorStore.getState().pills;
+      const pillItem0 = pills.find((p) => p.fromArrangementItemId === "item-0");
+      expect(pillItem0).toBeTruthy();
+      expect(
+        useEditorStore.getState().conformAudioStartToPill(pillItem0!.id),
+      ).toBe("ok");
+      // segment.audioStartMs = 1500 ms = 1.5 s; bpm.phase = 1.0 s → nudge = 0.5
+      expect(useEditorStore.getState().jobMeta?.audioStartNudgeS).toBeCloseTo(
+        0.5,
+        6,
+      );
+      expect(
+        useEditorStore.getState().conformAudioStartToPill(pillItem0!.id),
+      ).toBe("unchanged");
+    });
+
+    test("returns 'no-pill' for an unknown pill id", () => {
+      loadArrangementWithAudioStarts();
+      expect(
+        useEditorStore.getState().conformAudioStartToPill("does-not-exist"),
+      ).toBe("no-pill");
+    });
+
+    test("returns 'no-bpm' when bpm is not set", () => {
+      // Same arrangement but no bpm on jobMeta.
+      useEditorStore.getState().loadJob(
+        { ...baseJobMeta, duration: 180 },
+        {
+          clips: [
+            {
+              id: "cam-1",
+              filename: "a.mp4",
+              color: "#fff",
+              sourceDurationS: 200,
+              syncOffsetMs: 0,
+            },
+          ],
+          arrangementSegments: [
+            { in: 0, out: 60, audioStartMs: 1500, chunkId: "c0" },
+          ],
+          arrangement: [{ id: "item-0", chunkId: "c0" }],
+          chunks: [
+            {
+              id: "c0",
+              startMs: 0,
+              endMs: 60_000,
+              audioStartMs: 1500,
+              bpmOctaveShift: 0,
+              effectiveBpm: 0,
+              beatsPerBar: 4,
+              accepted: true,
+              trimMode: "free",
+            },
+          ],
+        },
+      );
+      const pill = useEditorStore.getState().pills[0];
+      expect(useEditorStore.getState().conformAudioStartToPill(pill.id)).toBe(
+        "no-bpm",
+      );
+    });
+
+    test("returns 'no-audio-start' when the pill's segment has no audioStartMs", () => {
+      useEditorStore.getState().loadJob(
+        {
+          ...baseJobMeta,
+          duration: 60,
+          bpm: { value: 120, phase: 1.0, manualOverride: false },
+        },
+        {
+          clips: [
+            {
+              id: "cam-1",
+              filename: "a.mp4",
+              color: "#fff",
+              sourceDurationS: 200,
+              syncOffsetMs: 0,
+            },
+          ],
+          // Bare single-segment arrangement (no audioStartMs).
+          arrangementSegments: [{ in: 0, out: 60 }],
+          arrangement: [{ id: "item-0", chunkId: "c0" }],
+          chunks: [
+            {
+              id: "c0",
+              startMs: 0,
+              endMs: 60_000,
+              bpmOctaveShift: 0,
+              effectiveBpm: 120,
+              beatsPerBar: 4,
+              accepted: true,
+              trimMode: "free",
+            },
+          ],
+        },
+      );
+      const pill = useEditorStore.getState().pills[0];
+      expect(useEditorStore.getState().conformAudioStartToPill(pill.id)).toBe(
+        "no-audio-start",
+      );
+    });
+  });
+
   describe("setClipViewportTransform / reset", () => {
     function loadOneCam() {
       useEditorStore.getState().loadJob(baseJobMeta, {
