@@ -1394,7 +1394,7 @@ describe("useEditorStore", () => {
         {
           ...baseJobMeta,
           duration: 180,
-          bpm: { value: 120, phase: 1.0, manualOverride: false },
+          bpm: { value: 120, confidence: 1, phase: 1.0, manualOverride: false },
         },
         {
           clips: [
@@ -1527,7 +1527,7 @@ describe("useEditorStore", () => {
         {
           ...baseJobMeta,
           duration: 60,
-          bpm: { value: 120, phase: 1.0, manualOverride: false },
+          bpm: { value: 120, confidence: 1, phase: 1.0, manualOverride: false },
         },
         {
           clips: [
