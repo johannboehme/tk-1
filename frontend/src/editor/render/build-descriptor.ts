@@ -83,16 +83,15 @@ export interface EditorStoreSnapshot {
  * code path that adds the intrinsic on top.
  *
  * Time arguments:
- *   - `tMaster` is the master-audio source-time. FX queries still anchor
- *     here because `PunchFx.inS/outS` are master-time in the V1 schema.
- *     A subsequent commit moves FX to timeline-time and drops the dual
- *     argument.
- *   - `tTimeline` is the walker's authoritative timeline-position. Pill
- *     resolution AND source-time computation use this directly: when the
- *     same chunk repeats in the song, master-time alone can't tell the
- *     occurrences apart, so the renderer picks a deterministic-but-wrong
- *     pill. Threading `tTimeline` through preserves the pill identity the
- *     walker already knows.
+ *   - `tMaster` is the master-audio source-time. Kept on the descriptor
+ *     so backends that need it for diagnostics still see it; not used
+ *     for any pill / cut / fx resolution anymore.
+ *   - `tTimeline` is the walker's authoritative timeline-position. ALL
+ *     resolution (pill picker, cuts, FX) anchors here so duplicate
+ *     pills in the song stay distinct. When the caller omits it (legacy
+ *     callers, test stubs) we fall back to projecting `tMaster` — works
+ *     for non-duplicate jobs, returns the FIRST occurrence's slot for
+ *     duplicates. The runtime always supplies it.
  */
 export function buildPreviewFrameDescriptor(
   snapshot: EditorStoreSnapshot,
@@ -100,20 +99,15 @@ export function buildPreviewFrameDescriptor(
   tTimeline?: number,
 ): FrameDescriptor {
   const output = computeOutputSnapped(snapshot.clips, snapshot.exportSpec.resolution);
-  const fxOut = buildFx(snapshot, tMaster);
+  const segments = snapshot.arrangementSegments ?? [];
+  const tArr = tTimeline ?? masterToArr(tMaster, segments);
+  const fxOut = buildFx(snapshot, tArr);
 
   if (!output) {
     return { tMaster, output: null, layers: [], fx: fxOut };
   }
 
-  // Active-cam resolution: pill resolution lives in timeline-time. When
-  // the caller didn't pass `tTimeline` (test stubs, legacy callers) we
-  // fall back to projecting `tMaster` — correct for non-duplicate jobs,
-  // wrong for chunks repeated in the song (picks the FIRST occurrence,
-  // shows pill 1 where pill 3 should be). New runtime always supplies it.
-  const segments = snapshot.arrangementSegments ?? [];
   const pills = snapshot.pills ?? [];
-  const tArr = tTimeline ?? masterToArr(tMaster, segments);
   const active = activeCamAtArr(snapshot.cuts, tArr, pills, segments);
   let layers: FrameLayer[] = [];
   if (active) {
@@ -204,7 +198,7 @@ function buildPreviewLayersFromPill(
 
 function buildFx(
   snapshot: EditorStoreSnapshot,
-  tMaster: number,
+  tTimeline: number,
 ): FrameFx[] {
   const out: FrameFx[] = [];
   const selectedKind = snapshot.selectedFxKind ?? null;
@@ -230,7 +224,7 @@ function buildFx(
   }
 
   // Persistent: real PunchFx capsules on the timeline. ADSR-sampled.
-  for (const f of activeFxAt(snapshot.fx, tMaster)) {
+  for (const f of activeFxAt(snapshot.fx, tTimeline)) {
     const def = fxCatalog[f.kind];
     const useOverride = selectedKind === f.kind;
     const baseParams = f.params ?? {};
@@ -243,7 +237,7 @@ function buildFx(
       f.envelope ??
       INSTANT_ENVELOPE;
     const holding = heldIds.has(f.id);
-    const wetness = envelopeAt(env, f.outS - f.inS, tMaster - f.inS, holding);
+    const wetness = envelopeAt(env, f.outS - f.inS, tTimeline - f.inS, holding);
     if (wetness <= 0) continue;
     // Per-kind wetness application — each effect knows how to dim
     // itself intelligently. Generic alpha-blend over source doesn't

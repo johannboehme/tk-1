@@ -1846,7 +1846,7 @@ export function Timeline({
                   // Single-active-hold guard: ignore if another TAKE is
                   // already engaged (button or keyboard).
                   if (s.holdGesture) return;
-                  const startS = s.snapMasterTime(s.playback.currentTime);
+                  const startS = s.snapMasterTime(s.playback.timelineT);
                   s.beginHoldGesture(clip.id, startS);
                   s.addCut({ atTimeS: startS, camId: clip.id });
                   const existing = takePromoteTimerRef.current.get(clip.id);
@@ -1868,7 +1868,7 @@ export function Timeline({
                   // otherwise a stale onTakeFinish (after a cancelHold
                   // via Esc) shouldn't re-apply anything.
                   if (!hold || hold.camId !== clip.id) return;
-                  const endS = s2.snapMasterTime(s2.playback.currentTime);
+                  const endS = s2.snapMasterTime(s2.playback.timelineT);
                   if (hold.painting) {
                     s2.applyHoldRelease(
                       clip.id,

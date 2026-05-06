@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { generatePills, reconcilePills } from "./arrangement-pills";
-import type { Clip, Pill } from "./types";
+import { activeCamAtArr, generatePills, reconcilePills } from "./arrangement-pills";
+import type { Clip, Pill, Segment } from "./types";
+import type { Cut } from "../storage/jobs-db";
 
 const makeVideoClip = (
   id: string,
@@ -303,5 +304,94 @@ describe("reconcilePills", () => {
     ];
     const reconciled = reconcilePills(arr, chunks, cams, stored);
     expect(reconciled.find((p) => p.id === "c::removed")).toBeUndefined();
+  });
+});
+
+describe("activeCamAtArr — timeline-time cut isolation across duplicate pills", () => {
+  // Bug 3 regression guard. Pre-refactor, `Cut.atTimeS` was master-time
+  // and the resolver projected it via masterToArr — which scans by
+  // master-time and returns the FIRST occurrence. So a cut placed
+  // inside pill 1 also fired over pill 3 (a duplicate of pill 1's
+  // chunk). Cuts are now timeline-time so the cut sits at one specific
+  // timeline-position and only matches the pill that occupies it.
+
+  function makePill(id: string, camId: string, arrStartS: number, arrEndS: number): Pill {
+    return {
+      id,
+      camId,
+      arrStartS,
+      arrEndS,
+      sourceInS: 0,
+      sourceOutS: arrEndS - arrStartS,
+      originalArrStartS: arrStartS,
+      originalArrEndS: arrEndS,
+      originalSourceInS: 0,
+      originalSourceOutS: arrEndS - arrStartS,
+    };
+  }
+
+  it("a cut at timeline-T fires only for the pill at that timeline slot", () => {
+    // Two cams covering the entire song so cuts can switch freely.
+    // cam-A spans [0, 15], cam-B spans [0, 15] (multi-lane). One cut
+    // sequence: A → B inside pill 1 region, then back to A inside the
+    // duplicate-source slot. The resolver must read each cut at its
+    // exact timeline-position; pre-refactor, master-time projection
+    // would have collapsed pill 1 and pill 3 onto the same cut state.
+    const pills: Pill[] = [
+      makePill("a-full", "cam-A", 0, 15),
+      makePill("b-full", "cam-B", 0, 15),
+    ];
+    const cuts: Cut[] = [
+      { atTimeS: 0, camId: "cam-A" },
+      { atTimeS: 5, camId: "cam-B" },
+      { atTimeS: 12, camId: "cam-A" }, // inside duplicate slot
+    ];
+    const segments: Segment[] = [
+      { in: 0, out: 5 },
+      { in: 50, out: 55 },
+      { in: 0, out: 5 }, // master shared with seg 0
+    ];
+    expect(activeCamAtArr(cuts, 1, pills, segments)?.camId).toBe("cam-A");
+    expect(activeCamAtArr(cuts, 7, pills, segments)?.camId).toBe("cam-B");
+    expect(activeCamAtArr(cuts, 11, pills, segments)?.camId).toBe("cam-B"); // before t=12 override
+    expect(activeCamAtArr(cuts, 13, pills, segments)?.camId).toBe("cam-A");
+  });
+
+  it("a cut at timeline-T does NOT fire over a duplicate pill at a different timeline slot", () => {
+    // The smoking-gun assertion. Pre-refactor, master-time-anchored
+    // cuts would project to the FIRST occurrence's arr-time — so a cut
+    // placed conceptually "inside pill 3" (master 2.0) projected to
+    // arr 2.0 (pill 1's slot) and there was no way to put a cut purely
+    // inside pill 3.
+    const pills: Pill[] = [
+      makePill("a-1", "cam-A", 0, 5),
+      makePill("b-1", "cam-B", 5, 10),
+      makePill("a-dup", "cam-A", 10, 15),
+      makePill("b-2", "cam-B", 15, 20),
+    ];
+    // User clicks while looking at the duplicate pill (timeline 12) and
+    // sets a cut to cam-B there. Stored as `atTimeS: 12` (timeline-time).
+    const cuts: Cut[] = [{ atTimeS: 12, camId: "cam-B" }];
+    const segments: Segment[] = [
+      { in: 0, out: 5 },
+      { in: 50, out: 55 },
+      { in: 0, out: 5 }, // duplicate of seg 0
+      { in: 100, out: 105 },
+    ];
+    // Pill 1 (timeline 0..5): no cut yet → fall back to first covering
+    // pill (cam-A). The cut at t=12 is in the future for the playhead
+    // here and must not bleed back.
+    expect(activeCamAtArr(cuts, 1, pills, segments)?.camId).toBe("cam-A");
+    // Pill 3 duplicate slot (timeline 12): the cut is in scope, switch
+    // to cam-B — but only IF a cam-B pill covers this slot. The pill at
+    // timeline 12 is a-dup (cam-A); cam-B has no covering pill, so the
+    // resolver's rule is "fall back to the first covering pill" which
+    // is a-dup. Either outcome is acceptable here — the critical point
+    // is that pill 1's slot (timeline 1) is NOT affected by this cut.
+    const atDup = activeCamAtArr(cuts, 12, pills, segments);
+    expect(atDup).not.toBeNull();
+    // Pill 4 (timeline 17, cam-B): the cut is in scope, cam-B has a
+    // covering pill — we get cam-B.
+    expect(activeCamAtArr(cuts, 17, pills, segments)?.camId).toBe("cam-B");
   });
 });
