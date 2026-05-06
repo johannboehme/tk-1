@@ -27,6 +27,7 @@ import {
 import { opfs } from "../../storage/opfs";
 import { loadAsset } from "../asset-source";
 import type { BackendCapabilities } from "../../editor/render/factory";
+import { probeWebGPUVideoFrameUpload } from "../capabilities";
 import { ShowwavesVisualizer } from "./visualizer/showwaves";
 import { ShowfreqsVisualizer } from "./visualizer/showfreqs";
 import type { Visualizer } from "./visualizer/types";
@@ -122,9 +123,9 @@ const ctx = self as unknown as DedicatedWorkerGlobalScope;
 /** Detect render-backend capabilities inside the worker. The compositor
  *  uses these to pick WebGPU → WebGL2 → Canvas2D in the Factory ladder.
  *  - webgl2: sync probe via OffscreenCanvas.getContext.
- *  - webgpu: async probe via requestAdapter — null means "API exists
- *            but no compatible adapter on this platform" (Linux-Chrome
- *            without dedicated GPU is the typical fail case). */
+ *  - webgpu: async probe via requestAdapter() + a VideoFrame upload
+ *            check. The upload step matters because Firefox 148 has an
+ *            adapter but rejects VideoFrame in copyExternalImageToTexture. */
 async function probeBackendCapabilities(): Promise<BackendCapabilities> {
   let webgl2 = false;
   try {
@@ -138,9 +139,9 @@ async function probeBackendCapabilities(): Promise<BackendCapabilities> {
   if (gpu) {
     try {
       const adapter = await gpu.requestAdapter();
-      webgpu = adapter != null;
+      if (adapter) webgpu = await probeWebGPUVideoFrameUpload(adapter);
     } catch {
-      /* requestAdapter threw — leave webgpu=false */
+      /* requestAdapter or upload-probe threw — leave webgpu=false */
     }
   }
   return { webgl2, webgpu };

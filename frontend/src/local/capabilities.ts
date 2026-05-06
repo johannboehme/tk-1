@@ -92,15 +92,14 @@ export function detectCapabilities(): Capabilities {
 let webgpuProbeCache: Promise<boolean> | null = null;
 
 /**
- * Real WebGPU probe: actually calls `navigator.gpu.requestAdapter()`.
- * This is the only way to know if the platform has a usable adapter
- * (Linux Chrome / FF can have `navigator.gpu` but no compatible
- * adapter). Cached — call as many times as you like.
- *
- * Usage at app boot:
- *   const caps = detectCapabilities();
- *   caps.webgpu = await probeWebGPU();
- *   // … pass `caps` to consumers (compositor, factory, etc.)
+ * Real WebGPU probe: actually calls `navigator.gpu.requestAdapter()`,
+ * then verifies that `queue.copyExternalImageToTexture` accepts a
+ * `VideoFrame`. The video-source probe matters because the renderer
+ * uploads `VideoFrame`s every tick — Firefox 148 ships an adapter but
+ * its impl of `copyExternalImageToTexture` only accepts ImageBitmap /
+ * HTMLImageElement / HTMLCanvasElement / OffscreenCanvas, so passing a
+ * `VideoFrame` throws TypeError on every tick. Reporting webgpu=false
+ * for that case lets the WebGL2 fallback take over cleanly.
  */
 export function probeWebGPU(): Promise<boolean> {
   if (webgpuProbeCache) return webgpuProbeCache;
@@ -108,14 +107,67 @@ export function probeWebGPU(): Promise<boolean> {
     if (typeof navigator === "undefined") return false;
     const nav = navigator as Navigator & { gpu?: GPU };
     if (!nav.gpu) return false;
+    let adapter: GPUAdapter | null = null;
     try {
-      const adapter = await nav.gpu.requestAdapter();
-      return adapter != null;
+      adapter = await nav.gpu.requestAdapter();
     } catch {
       return false;
     }
+    if (!adapter) return false;
+    return await probeWebGPUVideoFrameUpload(adapter);
   })();
   return webgpuProbeCache;
+}
+
+/**
+ * Tries `queue.copyExternalImageToTexture({ source: VideoFrame })` once.
+ * Returns false if the impl throws (Firefox today) or rejects (anything
+ * unexpected). On success the device + texture are cleaned up.
+ *
+ * Exported so the render worker (which does its own `requestAdapter()`
+ * before spawning the compositor) can reuse the same check.
+ */
+export async function probeWebGPUVideoFrameUpload(
+  adapter: GPUAdapter,
+): Promise<boolean> {
+  if (typeof OffscreenCanvas === "undefined") return false;
+  if (typeof VideoFrame === "undefined") {
+    // No VideoFrame in this browser — nothing to render anyway. Refuse
+    // WebGPU so the WebGL2 fallback (which uploads via `<video>`) runs.
+    return false;
+  }
+  let device: GPUDevice | null = null;
+  let frame: VideoFrame | null = null;
+  let tex: GPUTexture | null = null;
+  try {
+    device = await adapter.requestDevice();
+    const canvas = new OffscreenCanvas(2, 2);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return false;
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, 2, 2);
+    frame = new VideoFrame(canvas, { timestamp: 0 });
+    tex = device.createTexture({
+      label: "webgpu-probe",
+      size: { width: 2, height: 2, depthOrArrayLayers: 1 },
+      format: "rgba8unorm",
+      usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    device.pushErrorScope("validation");
+    device.queue.copyExternalImageToTexture(
+      { source: frame, flipY: false },
+      { texture: tex },
+      { width: 2, height: 2, depthOrArrayLayers: 1 },
+    );
+    const err = await device.popErrorScope();
+    return err === null;
+  } catch {
+    return false;
+  } finally {
+    frame?.close();
+    tex?.destroy();
+    device?.destroy();
+  }
 }
 
 /** Test-only: clear the WebGPU probe cache. Used so a test that

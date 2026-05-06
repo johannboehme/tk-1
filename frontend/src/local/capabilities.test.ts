@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   detectCapabilities,
   meetsMinRequirements,
+  probeWebGPUVideoFrameUpload,
   supportsLargeMediaFiles,
   LEGACY_BROWSER_MAX_FILE_BYTES,
   type Capabilities,
@@ -234,5 +235,78 @@ describe("detectCapabilities — gpu-related fields", () => {
   it("webgl2 is false in jsdom (no WebGL2 implementation)", () => {
     const caps = detectCapabilities();
     expect(caps.webgl2).toBe(false);
+  });
+});
+
+describe("probeWebGPUVideoFrameUpload", () => {
+  // jsdom hat weder OffscreenCanvas noch VideoFrame — wir mocken minimal,
+  // damit der Probe-Pfad einmal mit "upload geht" und einmal mit "upload
+  // wirft" durchläuft. Modelliert Firefox 148, das einen Adapter hat aber
+  // bei copyExternalImageToTexture(VideoFrame) wirft.
+
+  const FakeOffscreenCanvas = class {
+    width: number;
+    height: number;
+    constructor(w: number, h: number) {
+      this.width = w;
+      this.height = h;
+    }
+    getContext() {
+      return {
+        fillStyle: "",
+        fillRect: () => undefined,
+      };
+    }
+  };
+  const FakeVideoFrame = class {
+    constructor(_src: unknown, _opts: unknown) {}
+    close() {}
+  };
+
+  function makeAdapter(opts: { uploadThrows: boolean }): GPUAdapter {
+    const fakeQueue = {
+      copyExternalImageToTexture: () => {
+        if (opts.uploadThrows) {
+          throw new TypeError(
+            "GPUQueue.copyExternalImageToTexture: 'source' member …",
+          );
+        }
+      },
+    };
+    const fakeDevice = {
+      queue: fakeQueue,
+      pushErrorScope: () => undefined,
+      popErrorScope: async () => null,
+      createTexture: () => ({ destroy: () => undefined }),
+      destroy: () => undefined,
+    };
+    return {
+      requestDevice: async () => fakeDevice,
+    } as unknown as GPUAdapter;
+  }
+
+  beforeEach(() => {
+    vi.stubGlobal("OffscreenCanvas", FakeOffscreenCanvas);
+    vi.stubGlobal("VideoFrame", FakeVideoFrame);
+    vi.stubGlobal("GPUTextureUsage", {
+      COPY_DST: 1,
+      TEXTURE_BINDING: 4,
+    });
+  });
+
+  it("returns true when copyExternalImageToTexture accepts a VideoFrame", async () => {
+    const adapter = makeAdapter({ uploadThrows: false });
+    expect(await probeWebGPUVideoFrameUpload(adapter)).toBe(true);
+  });
+
+  it("returns false when copyExternalImageToTexture throws (Firefox today)", async () => {
+    const adapter = makeAdapter({ uploadThrows: true });
+    expect(await probeWebGPUVideoFrameUpload(adapter)).toBe(false);
+  });
+
+  it("returns false when VideoFrame is missing in the environment", async () => {
+    vi.stubGlobal("VideoFrame", undefined);
+    const adapter = makeAdapter({ uploadThrows: false });
+    expect(await probeWebGPUVideoFrameUpload(adapter)).toBe(false);
   });
 });
