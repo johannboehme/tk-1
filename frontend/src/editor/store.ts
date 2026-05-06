@@ -26,7 +26,7 @@ import {
   activeCamAtArr,
   reconcilePills,
 } from "./arrangement-pills";
-import { masterToArr } from "./arrangement-time";
+import { masterToArr, sliceByArrSegments } from "./arrangement-time";
 import type { ArrangementItem, Chunk } from "../storage/jobs-db";
 import { classifyAspectRatio } from "./exportPresets";
 import { DEFAULT_VIEWPORT_TRANSFORM } from "./render/element-transform";
@@ -1112,7 +1112,16 @@ export const useEditorStore = create<EditorState>()(
           typeof opts?.audioVolume === "number" && opts.audioVolume >= 0
             ? Math.min(4, opts.audioVolume)
             : 1.0,
-        arrangementSegments: opts?.arrangementSegments ?? [],
+        // Composed-timeline invariant: every loaded job carries at least
+        // one segment. Editor.tsx feeds the synthesized shape from
+        // synthesizeJobLoadShape; callers that omit it (legacy tests,
+        // simplified harnesses) get a default single-segment covering
+        // the whole master so the segment walker has a real range to
+        // walk and arr-time projections stay Identity for direct-mode.
+        arrangementSegments:
+          opts?.arrangementSegments && opts.arrangementSegments.length > 0
+            ? opts.arrangementSegments
+            : [{ in: 0, out: meta.duration }],
       });
     },
 
@@ -1326,7 +1335,7 @@ export const useEditorStore = create<EditorState>()(
       const probe = t + direction * step * 0.5;
       const candidate = snapTime(probe, mode, {
         bpm,
-        beatPhase: effectiveBeatPhaseS(s.jobMeta, s.arrangementSegments),
+        beatPhase: effectiveBeatPhaseS(s.jobMeta),
         beatsPerBar,
         barOffsetBeats: effectiveBarOffsetBeats(s.jobMeta),
       });
@@ -1354,15 +1363,10 @@ export const useEditorStore = create<EditorState>()(
       if (!clamped) return;
 
       // Defer the wrap to the OLD loop end whenever the playhead is OUTSIDE
-      // the new loop region. Loop bounds + pendingWrapAt all live in arr-
-      // time on the composed timeline (= master in direct-mode), so the
-      // playhead's master-time is projected into arr-time before the
-      // inside/outside test.
-      const t_master = s.playback.currentTime;
-      const t_view =
-        s.arrangementSegments.length > 0
-          ? masterToArr(t_master, s.arrangementSegments)
-          : t_master;
+      // the new loop region. Loop bounds + pendingWrapAt live in arr-time
+      // on the composed timeline; master-time is projected through the
+      // segments (Identity for single-take's whole-master segment).
+      const t_view = masterToArr(s.playback.currentTime, s.arrangementSegments);
       const insideNew = t_view >= clamped.start && t_view < clamped.end;
       const pendingWrapAt = insideNew ? null : loop.end;
 
@@ -1389,11 +1393,7 @@ export const useEditorStore = create<EditorState>()(
       }
       const clamped = clampLoopToBounds(loop, s.arrangementSegments, s.trim);
       if (!clamped) return;
-      const t_master = s.playback.currentTime;
-      const t_view =
-        s.arrangementSegments.length > 0
-          ? masterToArr(t_master, s.arrangementSegments)
-          : t_master;
+      const t_view = masterToArr(s.playback.currentTime, s.arrangementSegments);
       const insideNew = t_view >= clamped.start && t_view < clamped.end;
       // Preserve any existing pendingWrapAt — multiple drags before the
       // first wrap fires should keep the earliest old-end as the trigger
@@ -2024,7 +2024,7 @@ export const useEditorStore = create<EditorState>()(
         s.ui.snapMode,
         {
           bpm: s.jobMeta?.bpm?.value ?? null,
-          beatPhase: effectiveBeatPhaseS(s.jobMeta, s.arrangementSegments),
+          beatPhase: effectiveBeatPhaseS(s.jobMeta),
           beatsPerBar: effectiveBeatsPerBar(s.jobMeta),
           barOffsetBeats: effectiveBarOffsetBeats(s.jobMeta),
         },
@@ -2126,14 +2126,32 @@ export const useEditorStore = create<EditorState>()(
 
     buildEditSpec() {
       const s = get();
-      // Long-form jobs: emit the arrangement-segment list verbatim so
-      // the renderer slices the master audio + video to match the
-      // user's chunk arrangement. Direct-mode jobs fall back to the
-      // single-trim region.
-      const segments =
-        s.arrangementSegments.length > 0
-          ? s.arrangementSegments
-          : [{ in: s.trim.in, out: s.trim.out }];
+      // Master-trim is universal: every job slices its arrangement
+      // segments to the trim window. Single-take jobs come in with one
+      // segment [0, duration] so the slice collapses to [trim.in, trim.out];
+      // long-form jobs slice each chunk at the trim boundaries (chunks
+      // entirely outside the trim window drop, chunks partially inside
+      // get clipped). Slice ranges keep their original master-time
+      // bounds — the renderer reads `segments[i].{in, out}` as
+      // master-time slices to extract.
+      const slices = sliceByArrSegments(
+        s.trim.in,
+        s.trim.out,
+        s.arrangementSegments,
+      );
+      const segments = slices.map((sl) => {
+        const out: Segment = { in: sl.masterStartS, out: sl.masterEndS };
+        // Pass through audioStartMs / chunkId for any chunk-anchored
+        // metadata the renderer might inspect downstream — we don't
+        // re-derive it from the slice (the original segment's anchor
+        // doesn't move with a trim cut).
+        const seg = s.arrangementSegments.find(
+          (g) => g.in <= sl.masterStartS && g.out >= sl.masterEndS,
+        );
+        if (seg?.audioStartMs != null) out.audioStartMs = seg.audioStartMs;
+        if (seg?.chunkId != null) out.chunkId = seg.chunkId;
+        return out;
+      });
       return {
         version: 1,
         segments,
@@ -2177,7 +2195,7 @@ export const useEditorStore = create<EditorState>()(
       if (mode === "off" || mode === "match") return t;
       return snapTime(t, mode, {
         bpm: s.jobMeta?.bpm?.value ?? null,
-        beatPhase: effectiveBeatPhaseS(s.jobMeta, s.arrangementSegments),
+        beatPhase: effectiveBeatPhaseS(s.jobMeta),
         beatsPerBar: effectiveBeatsPerBar(s.jobMeta),
         barOffsetBeats: effectiveBarOffsetBeats(s.jobMeta),
       });

@@ -21,3 +21,4 @@ app/static/
 .coverage
 htmlcov/
 uv.lock
+frontend/pnpm-lock.yaml

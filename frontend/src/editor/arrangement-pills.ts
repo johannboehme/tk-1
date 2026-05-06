@@ -1,18 +1,15 @@
 /**
  * Pill auto-generation, reconciliation, and active-pill resolution.
  *
- * The editor is uniformly pill-based. Every job — long-form arrangement
- * or single-take — renders through `pills[]`. The generator below
- * produces one pill per editing slot:
+ * The editor is uniformly pill-based. Every job runs through the same
+ * `(arrangement × chunks × clips)` shape — long-form jobs feed their
+ * persisted arrangement, single-take jobs synthesize a single
+ * arrangement-item + chunk in `synthesizeJobLoadShape` so the pill
+ * generator stays mode-agnostic.
  *
- *   - Long-form jobs (arrangement non-empty): one pill per
- *     (cam × arrangement-item) intersection. Pill ID
- *     `${camId}::${arrangementItemId}` round-trips user edits across
- *     editor mounts.
- *
- *   - Single-take jobs (arrangement empty): one pill per cam covering
- *     the cam's full visible master-time range. Pill ID
- *     `${camId}::__default__`.
+ * Pill ID `${camId}::${arrangementItemId}` round-trips user edits across
+ * editor mounts; single-take jobs keep the legacy `__default__` item id
+ * so pre-refactor persisted pill edits stay matched.
  *
  * Pure helpers — no store, no IO, no React.
  */
@@ -20,17 +17,13 @@ import type { ArrangementItem, Chunk, Cut } from "../storage/jobs-db";
 import { camSourceTimeS } from "../local/timing/cam-time";
 import { masterToArr } from "./arrangement-time";
 import {
-  clipRangeS,
   isImageClip,
   isVideoClip,
+  clipRangeS,
   type Clip,
   type Pill,
   type Segment,
 } from "./types";
-
-/** Single-take pill id sentinel. Stable so reconcile keeps user edits
- *  across editor mounts even when the job has no arrangement. */
-const DEFAULT_ITEM_ID = "__default__";
 
 /** Tolerance for pill-dirtiness comparisons. Anything sub-millisecond
  *  is rounding noise, not a user edit. */
@@ -52,59 +45,16 @@ export function isPillDirty(p: Pill): boolean {
 /**
  * Build the editor's pill list from the persisted job state.
  *
- * Dispatches on whether the job carries an arrangement:
- *   - `arrangement.length > 0` → emit one pill per (cam × item)
- *     intersection in playback order.
- *   - empty / missing arrangement → emit one pill per cam, anchored
- *     at the cam's full master-time range. arr-time == master-time
- *     in this case (no segment-walker mapping).
+ * Emits one pill per (cam × arrangement-item) intersection in playback
+ * order. Single-take jobs come in with a synthetic single-item
+ * arrangement (see `synthesizeJobLoadShape`) so this function stays
+ * mode-agnostic — its only inputs are the same `(arrangement, chunks,
+ * clips)` triple regardless of the job's source.
  *
  * Originals are baked in so the per-pill RESET action restores the
  * pill to the slot the editor would generate today.
  */
 export function generatePills(
-  arrangement: readonly ArrangementItem[],
-  chunks: readonly Chunk[],
-  clips: readonly Clip[],
-): Pill[] {
-  if (arrangement.length === 0 || chunks.length === 0) {
-    return generateDefaultPills(clips);
-  }
-  return generateArrangementPills(arrangement, chunks, clips);
-}
-
-function generateDefaultPills(clips: readonly Clip[]): Pill[] {
-  const out: Pill[] = [];
-  for (const clip of clips) {
-    const range = clipRangeS(clip);
-    if (range.endS <= range.startS) continue;
-    if (isImageClip(clip)) {
-      out.push(makePill({
-        camId: clip.id,
-        itemId: DEFAULT_ITEM_ID,
-        arrStartS: range.startS,
-        arrEndS: range.endS,
-        sourceInS: 0,
-        sourceOutS: clip.durationS,
-      }));
-      continue;
-    }
-    if (!isVideoClip(clip)) continue;
-    const sourceInS = clip.trimInS ?? 0;
-    const sourceOutS = clip.trimOutS ?? clip.sourceDurationS;
-    out.push(makePill({
-      camId: clip.id,
-      itemId: DEFAULT_ITEM_ID,
-      arrStartS: range.startS,
-      arrEndS: range.endS,
-      sourceInS,
-      sourceOutS,
-    }));
-  }
-  return out;
-}
-
-function generateArrangementPills(
   arrangement: readonly ArrangementItem[],
   chunks: readonly Chunk[],
   clips: readonly Clip[],

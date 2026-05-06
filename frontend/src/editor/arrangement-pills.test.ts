@@ -20,14 +20,38 @@ const makeVideoClip = (
   selectedCandidateIdx: 0,
 });
 
-describe("generatePills (single-take = no arrangement)", () => {
-  it("emits one pill per cam covering its full master range", () => {
+/** Synthetic single-take inputs — mirrors what `synthesizeJobLoadShape`
+ *  feeds into `loadJob` for direct-mode jobs. The arrangement-item id is
+ *  the legacy `__default__` sentinel so pill ids stay stable across the
+ *  refactor. */
+const makeSyntheticSingleTake = (durationS: number) => ({
+  arrangement: [{ id: "__default__", chunkId: "__default_chunk__" }],
+  chunks: [
+    {
+      id: "__default_chunk__",
+      startMs: 0,
+      endMs: durationS * 1000,
+      bpmOctaveShift: 0 as const,
+      effectiveBpm: 0,
+      beatsPerBar: 4,
+      accepted: true,
+      trimMode: "free" as const,
+    },
+  ],
+});
+
+describe("generatePills (single-take via synthetic arrangement)", () => {
+  it("emits one pill per cam, ID anchored on the __default__ sentinel", () => {
     const cams: Clip[] = [
       makeVideoClip("cam-a", 0, 30),
       makeVideoClip("cam-b", 0, 45),
     ];
-    const pills = generatePills([], [], cams);
+    // Single-take's synthetic chunk spans the WIDEST cam (max sourceDurationS)
+    // — this is what synthesizeJobLoadShape produces when fed master duration.
+    const { arrangement, chunks } = makeSyntheticSingleTake(45);
+    const pills = generatePills(arrangement, chunks, cams);
     expect(pills.length).toBe(2);
+    // cam-a clipped at its own range (30s); cam-b uses its full 45s.
     expect(pills[0]).toMatchObject({
       id: "cam-a::__default__",
       camId: "cam-a",
@@ -35,10 +59,6 @@ describe("generatePills (single-take = no arrangement)", () => {
       arrEndS: 30,
       sourceInS: 0,
       sourceOutS: 30,
-      originalArrStartS: 0,
-      originalArrEndS: 30,
-      originalSourceInS: 0,
-      originalSourceOutS: 30,
       fromArrangementItemId: "__default__",
     });
     expect(pills[1].id).toBe("cam-b::__default__");
@@ -208,8 +228,10 @@ describe("reconcilePills", () => {
     // offset → fresh generation puts the pill at e.g. arr=2.896. Reconcile
     // would otherwise keep stored.arrStartS=0 and only refresh originals,
     // so the pill renders at 0 while the cuts strip / clipRangeS expect
-    // 2.896. Direct-mode bypasses the stored pill entirely.
+    // 2.896. Single-take goes through the synthetic arrangement+chunk
+    // (mirroring synthesizeJobLoadShape).
     const cam: Clip[] = [makeVideoClip("c", -2896, 100)];
+    const synth = makeSyntheticSingleTake(100);
     const stored: Pill[] = [
       {
         id: "c::__default__",
@@ -225,19 +247,23 @@ describe("reconcilePills", () => {
         fromArrangementItemId: "__default__",
       },
     ];
-    const reconciled = reconcilePills([], [], cam, stored);
+    const reconciled = reconcilePills(synth.arrangement, synth.chunks, cam, stored);
     expect(reconciled.length).toBe(1);
     expect(reconciled[0].arrStartS).toBeCloseTo(2.896, 3);
-    expect(reconciled[0].arrEndS).toBeCloseTo(2.896 + 100, 3);
+    // Synthetic chunk spans [0, 100s]; cam-clip-vs-chunk intersection
+    // ends at 2.896+100=102.896s in master, but the chunk caps at 100s,
+    // so arrEndS = 100 (clipped by chunk bound).
+    expect(reconciled[0].arrEndS).toBeCloseTo(100, 3);
   });
 
-  it("ignores polluted stored pills in direct-mode (originals diverged from arr by previous reconcile)", () => {
+  it("ignores polluted stored pills (originals diverged from arr by previous reconcile)", () => {
     // Reload race: a previous reconcile cycle refreshed `originalArrStartS`
     // to the post-sync fresh value (2.896) but left `arrStartS=0`. Then the
     // pill got persisted in that polluted state. The unedited-heuristic
-    // can no longer recognize it because arr ≠ original. Direct-mode
-    // sidesteps this entirely: pill is always regenerated.
+    // can no longer recognize it because arr ≠ original. Without the
+    // userEdited flag, the pill is always regenerated.
     const cam: Clip[] = [makeVideoClip("c", -2896, 100)];
+    const synth = makeSyntheticSingleTake(100);
     const stored: Pill[] = [
       {
         id: "c::__default__",
@@ -254,7 +280,7 @@ describe("reconcilePills", () => {
         fromArrangementItemId: "__default__",
       },
     ];
-    const reconciled = reconcilePills([], [], cam, stored);
+    const reconciled = reconcilePills(synth.arrangement, synth.chunks, cam, stored);
     expect(reconciled.length).toBe(1);
     expect(reconciled[0].arrStartS).toBeCloseTo(2.896, 3);
   });

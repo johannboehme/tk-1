@@ -11,16 +11,14 @@
  * call — caller decides about diffing.
  */
 import type { Clip, ExportSpec, Pill, Segment } from "../types";
-import { clipRangeS, isImageClip, normaliseRotation } from "../types";
+import { isImageClip, normaliseRotation } from "../types";
 import type { Cut } from "../../storage/jobs-db";
 import type { FxKind, PunchFx } from "../fx/types";
-import { activeCamAt, type CamRange } from "../cuts";
 import { activeCamAtArr } from "../arrangement-pills";
 import { masterToArr } from "../arrangement-time";
 import { activeFxAt } from "../fx/active";
 import { fxCatalog } from "../fx/catalog";
 import { envelopeAt, INSTANT_ENVELOPE, type ADSREnvelope } from "../fx/envelope";
-import { camSourceTimeS } from "../../local/timing/cam-time";
 import { resolveOutputDims } from "../output-frame";
 import {
   buildElementFitRect,
@@ -95,53 +93,31 @@ export function buildPreviewFrameDescriptor(
     return { tMaster, output: null, layers: [], fx: fxOut };
   }
 
-  // Active-cam resolution forks on whether this is a long-form session.
-  //
-  //   Arrangement-mode (pills + segments populated): the preview's
-  //   "what cam is on PROGRAM at song-time `tArr`" question is answered
-  //   from the same pill+cuts table the renderer uses. Source-time of
-  //   the active cam comes from the active pill's stored sourceIn/Out
-  //   so user trim/move edits show up in the preview without a
-  //   re-extraction round-trip.
-  //
-  //   Direct-mode: legacy clipRangeS-based resolver.
-  const useArrMode =
-    (snapshot.pills?.length ?? 0) > 0 &&
-    (snapshot.arrangementSegments?.length ?? 0) > 0;
+  // Active-cam resolution: the pill+cuts table is the single source of
+  // truth. Pills are populated for every job (single-take = synthetic
+  // single arrangement-item, long-form = the user's arrangement) so the
+  // resolver runs identically in both. Source-time comes from the
+  // active pill's stored `sourceIn/Out`, picking up user trim/move
+  // edits without a re-extraction round-trip.
+  const segments = snapshot.arrangementSegments ?? [];
+  const pills = snapshot.pills ?? [];
+  const tArr = masterToArr(tMaster, segments);
+  const active = activeCamAtArr(snapshot.cuts, tArr, pills, segments);
   let layers: FrameLayer[] = [];
-  if (useArrMode) {
-    const segments = snapshot.arrangementSegments!;
-    const pills = snapshot.pills!;
-    const tArr = masterToArr(tMaster, segments);
-    const active = activeCamAtArr(snapshot.cuts, tArr, pills, segments);
-    if (active) {
-      layers = buildPreviewLayersFromPill(
-        snapshot.clips,
-        active.camId,
-        active.pill,
-        tArr,
-        output,
-      );
-    }
-  } else {
-    const ranges: CamRange[] = computeCamRanges(snapshot.clips);
-    const activeId = activeCamAt(snapshot.cuts, tMaster, ranges);
-    if (activeId) {
-      layers = buildPreviewLayers(snapshot.clips, activeId, tMaster, output);
-    }
+  if (active) {
+    layers = buildPreviewLayersFromPill(
+      snapshot.clips,
+      active.camId,
+      active.pill,
+      tArr,
+      output,
+    );
   }
 
   return { tMaster, output, layers, fx: fxOut };
 }
 
 // ---------- internals ----------
-
-function computeCamRanges(clips: readonly Clip[]): CamRange[] {
-  return clips.map((c) => {
-    const r = clipRangeS(c);
-    return { id: c.id, startS: r.startS, endS: r.endS };
-  });
-}
 
 function computeOutputSnapped(
   clips: readonly Clip[],
@@ -152,10 +128,10 @@ function computeOutputSnapped(
   return { w: Math.round(raw.w), h: Math.round(raw.h) };
 }
 
-/** Arrangement-mode variant: the active pill's `sourceIn/Out` is the
- *  authoritative source-time mapping (user-edited via the Timeline's
- *  pill-trim handles), so we read it directly and ignore the cam's
- *  master-time anchor. */
+/** Build preview layers from the active pill. The pill's `sourceIn/Out`
+ *  is the authoritative source-time mapping (user-edited via the
+ *  Timeline's pill-trim handles), so we read it directly and ignore
+ *  the cam's master-time anchor. */
 function buildPreviewLayersFromPill(
   clips: readonly Clip[],
   activeId: string,
@@ -179,73 +155,26 @@ function buildPreviewLayersFromPill(
     { w: output.w, h: output.h },
     clip.viewportTransform ?? DEFAULT_VIEWPORT_TRANSFORM,
   );
+  // Linear interpolation between the pill's source endpoints. Bakes any
+  // driftRatio into the pill's `sourceOutS - sourceInS` span, which is
+  // wider/narrower than `arrEndS - arrStartS` whenever drift ≠ 1. A
+  // naive `sourceIn + (tArr - arrStart)` would silently ignore drift and
+  // produce wrong source frames on a drifted cam.
+  const arrSpan = pill.arrEndS - pill.arrStartS;
+  const sourceTimeS =
+    arrSpan > 0
+      ? pill.sourceInS +
+        ((tArr - pill.arrStartS) * (pill.sourceOutS - pill.sourceInS)) /
+          arrSpan
+      : pill.sourceInS;
   const source = isImageClip(clip)
     ? { kind: "image" as const, clipId: clip.id }
     : {
         kind: "video" as const,
         clipId: clip.id,
-        sourceTimeS: pill.sourceInS + (tArr - pill.arrStartS),
+        sourceTimeS,
         sourceDurS: clip.sourceDurationS,
       };
-  return [
-    {
-      layerId: clip.id,
-      source,
-      weight: 1,
-      fitRect,
-      rotationDeg: userRot,
-      flipX,
-      flipY,
-      displayW: dispW,
-      displayH: dispH,
-    },
-  ];
-}
-
-function buildPreviewLayers(
-  clips: readonly Clip[],
-  activeId: string,
-  tMaster: number,
-  output: OutputDims,
-): FrameLayer[] {
-  const clip = clips.find((c) => c.id === activeId);
-  if (!clip) return [];
-
-  // Preview source = `<video>` (post-intrinsic) or `<img>` — already
-  // post-intrinsic. User rotation is what the backend applies.
-  const userRot = normaliseRotation(clip.rotation);
-  const flipX = !!clip.flipX;
-  const flipY = !!clip.flipY;
-
-  // displayW/H = the source pixel buffer's dimensions after USER rotation.
-  // For preview the `<video>` reports videoWidth = post-intrinsic; the
-  // store mirrors that into clip.displayW/H. After USER rotation 90/270
-  // we swap.
-  const baseW = clip.displayW ?? 0;
-  const baseH = clip.displayH ?? 0;
-  if (baseW <= 0 || baseH <= 0) return [];
-  const swap = userRot === 90 || userRot === 270;
-  const dispW = swap ? baseH : baseW;
-  const dispH = swap ? baseW : baseH;
-
-  const fitRect: FitRect = buildElementFitRect(
-    { w: dispW, h: dispH },
-    { w: output.w, h: output.h },
-    clip.viewportTransform ?? DEFAULT_VIEWPORT_TRANSFORM,
-  );
-
-  const source = isImageClip(clip)
-    ? { kind: "image" as const, clipId: clip.id }
-    : {
-        kind: "video" as const,
-        clipId: clip.id,
-        sourceTimeS: camSourceTimeS(tMaster, {
-          masterStartS: clipRangeS(clip).anchorS,
-          driftRatio: clip.driftRatio,
-        }),
-        sourceDurS: clip.sourceDurationS,
-      };
-
   return [
     {
       layerId: clip.id,

@@ -14,6 +14,7 @@ import {
   effectiveBeatsPerBar,
   effectiveBarOffsetBeats,
 } from "../../selectors/timing";
+import { arrToMaster, masterToArr } from "../../arrangement-time";
 import { buildRulerTicks } from "./beat-ruler-ticks";
 
 interface BeatRulerProps {
@@ -42,8 +43,15 @@ export function BeatRuler({
 }: BeatRulerProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const bpm = useEditorStore((s) => s.jobMeta?.bpm?.value ?? null);
+  // The selectors return master-time. The ruler renders against the
+  // arr-time canvas (`viewStartS`/`viewEndS` are arr-time), so project
+  // master-bar phase into arr-time once. With single-take's
+  // whole-master segment this is Identity; long-form gets one master-
+  // bar grid running continuously across the song instead of a
+  // separate phase per chunk.
+  const arrSegments = useEditorStore((s) => s.arrangementSegments);
   const beatPhase = useEditorStore((s) =>
-    effectiveBeatPhaseS(s.jobMeta, s.arrangementSegments),
+    masterToArr(effectiveBeatPhaseS(s.jobMeta), arrSegments),
   );
   const beatsPerBar = useEditorStore((s) => effectiveBeatsPerBar(s.jobMeta));
   const barOffsetBeats = useEditorStore((s) =>
@@ -201,8 +209,10 @@ export function BeatRuler({
     if (visibleS <= 0) return;
     const rect = (e.target as HTMLCanvasElement).getBoundingClientRect();
     const x = e.clientX - rect.left;
-    const t = viewStartS + (x / contentWidthPx) * visibleS;
-    seek(t);
+    // Canvas runs in arr-time; `seek` takes master-time. Identity
+    // for single-take's whole-master segment.
+    const arrT = viewStartS + (x / contentWidthPx) * visibleS;
+    seek(arrToMaster(arrT, arrSegments));
   }
 
   return (

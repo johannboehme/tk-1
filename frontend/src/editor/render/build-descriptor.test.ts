@@ -4,9 +4,11 @@ import {
   buildPreviewFrameDescriptor,
   type EditorStoreSnapshot,
 } from "./build-descriptor";
-import type { Clip, ImageClip, VideoClip } from "../types";
+import type { Clip, ImageClip, Segment, VideoClip } from "../types";
+import { clipRangeS } from "../types";
 import type { Cut } from "../../storage/jobs-db";
 import type { PunchFx } from "../fx/types";
+import { generatePills } from "../arrangement-pills";
 
 function video(id: string, displayW?: number, displayH?: number, more: Partial<VideoClip> = {}): VideoClip {
   return {
@@ -41,12 +43,45 @@ function image(id: string, displayW?: number, displayH?: number, more: Partial<I
   };
 }
 
+/** Auto-derive pills + segments from `clips` so individual tests stay
+ *  focused on the cam/cut/rotation behavior they care about. Mirrors
+ *  what synthesizeJobLoadShape + generatePills produce in production
+ *  for a single-take job: one segment spanning the master range, plus
+ *  pills produced via `generatePills` (which honours driftRatio and
+ *  syncOffset via camSourceTimeS). Tests that need different shapes
+ *  pass them explicitly via `over`. */
+function deriveSegments(clips: readonly Clip[]): Segment[] {
+  let hi = 0;
+  for (const c of clips) {
+    const r = clipRangeS(c);
+    if (r.endS > hi) hi = r.endS;
+  }
+  return [{ in: 0, out: hi || 60 }];
+}
+
 function snap(over: Partial<EditorStoreSnapshot> = {}): EditorStoreSnapshot {
+  const clips = over.clips ?? [];
+  const segments = deriveSegments(clips);
+  const arrangement = [{ id: "__default__", chunkId: "__default_chunk__" }];
+  const chunks = [
+    {
+      id: "__default_chunk__",
+      startMs: 0,
+      endMs: segments[0].out * 1000,
+      bpmOctaveShift: 0 as const,
+      effectiveBpm: 0,
+      beatsPerBar: 4,
+      accepted: true,
+      trimMode: "free" as const,
+    },
+  ];
   return {
-    clips: [],
+    clips,
     cuts: [],
     fx: [],
     exportSpec: { preset: "web" },
+    pills: generatePills(arrangement, chunks, clips),
+    arrangementSegments: segments,
     ...over,
   };
 }

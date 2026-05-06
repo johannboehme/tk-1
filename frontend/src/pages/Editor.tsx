@@ -31,7 +31,7 @@ import {
   type EditSpecLocal,
 } from "../local/jobs";
 import { isVideoAsset, type MediaAsset, type VideoAsset } from "../storage/jobs-db";
-import { arrangementToSegments } from "../local/arrange/chunks-to-segments";
+import { synthesizeJobLoadShape } from "../editor/job-synth";
 import { decodeAudioToMonoPcm } from "../local/codec";
 import { computeWaveformPeaks } from "../local/waveform-peaks";
 import { exportSpecToRenderOpts } from "../editor/exportPresets";
@@ -690,14 +690,16 @@ export default function Editor() {
                 }
               : null));
 
-      // Long-form jobs land here with a populated `arrangement[]` —
-      // translate it into a flat segment list so the editor's audio
-      // master walks the user's chunk sequence and `buildEditSpec`
-      // emits a multi-segment EditSpec the renderer slices natively.
-      const arrangementSegments =
-        j.mode === "longform" && Array.isArray(j.arrangement) && j.arrangement.length > 0
-          ? arrangementToSegments(j.arrangement, j.chunks ?? [])
-          : [];
+      // Mode-agnostic data shape: long-form jobs feed their persisted
+      // arrangement straight through; single-take jobs get a synthetic
+      // single-segment shape covering the full master audio. The editor
+      // walks every job through the same path from here on — the segment
+      // walker, pill generator, time projections, and loop clamping all
+      // run identically because every helper is Identity for a single
+      // [0, duration] segment.
+      const masterDurationS = wave?.duration ?? j.durationS ?? 0;
+      const { arrangementSegments, arrangement, chunks } =
+        synthesizeJobLoadShape(j, masterDurationS);
 
       loadJob(
         {
@@ -707,7 +709,7 @@ export default function Editor() {
           // and trim defaults are anchored here, not on cam-1's media
           // duration (which would put trim.out somewhere mid-audio if
           // cam-1 was shorter than the studio track).
-          duration: wave?.duration ?? j.durationS ?? 0,
+          duration: masterDurationS,
           width: j.width ?? 1920,
           height: j.height ?? 1080,
           algoOffsetMs: j.sync?.offsetMs ?? 0,
@@ -728,13 +730,8 @@ export default function Editor() {
           fx: j.fx ?? [],
           audioVolume: j.audioVolume,
           arrangementSegments,
-          // First-class pills: passed to loadJob so reconcileArrangementPills
-          // can splice user-edited pills (move / trim) on top of the
-          // freshly-generated default. `storedPills` is read from the
-          // LocalJob so a refresh / re-open keeps the user's edits.
-          arrangement:
-            j.mode === "longform" ? (j.arrangement ?? []) : undefined,
-          chunks: j.mode === "longform" ? (j.chunks ?? []) : undefined,
+          arrangement,
+          chunks,
           storedPills: j.pills ?? [],
         },
       );
@@ -781,12 +778,14 @@ export default function Editor() {
         const tin = Math.max(0, Math.min(j.trim.in, audioMax));
         const tout = Math.max(tin, Math.min(j.trim.out, audioMax));
         useEditorStore.getState().setTrim({ in: tin, out: tout });
-      } else if (arrangementSegments.length > 0) {
-        // Long-form first-load: derive trim from the span across ALL
-        // segments so skip-to-end / zoom-to-fit cover every active
-        // region. Arrangement order can place a duplicated early
-        // chunk after later ones, so we MUST take min/max — not
-        // first.in / last.out — to get a sensible window.
+      } else {
+        // First-load default: derive trim from the master-time span
+        // covered by the arrangement segments so skip-to-end / zoom-to-
+        // fit cover every active region. Arrangement order can place a
+        // duplicated early chunk after later ones, so take min/max
+        // across all segments — not first.in / last.out — to get a
+        // sensible window. Single-take's whole-master segment yields
+        // [0, duration] (= the full audio range).
         let lo = Infinity;
         let hi = -Infinity;
         for (const seg of arrangementSegments) {
@@ -797,13 +796,13 @@ export default function Editor() {
           useEditorStore.getState().setTrim({ in: lo, out: hi });
         }
       }
-      // Long-form: park the playhead at the first segment's in-point so
-      // the user pressing Space starts on real material instead of
-      // tripping the audio walker's "in-gap → hard seek" branch (audible
-      // as a momentary scratchy attack at master-time 0). The hint binds
-      // the audio walker to segment 0 so duplicate-chunk arrangements
-      // start at the right occurrence.
-      if (arrangementSegments.length > 0) {
+      // Park the playhead at the first segment's in-point (= 0 for
+      // single-take) so the user pressing Space starts on real material
+      // instead of tripping the audio walker's "in-gap → hard seek"
+      // branch (audible as a momentary scratchy attack). The
+      // segmentIdxHint binds the walker to segment 0 so duplicate-chunk
+      // arrangements start at the right occurrence.
+      {
         useEditorStore
           .getState()
           .seek(arrangementSegments[0].in, { segmentIdxHint: 0 });
