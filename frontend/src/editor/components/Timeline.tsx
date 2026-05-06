@@ -675,44 +675,61 @@ export function Timeline({
     // Trim-dim, trim-handles, and audio-start marker — universal across
     // single-take and long-form. Trim sits in master-time; project each
     // marker through `mastersToArrAll` so it lands at every arr-time
-    // occurrence (a chunk repeated in long-form yields multiple ticks).
+    // occurrence (a chunk repeated in long-form yields multiple ticks
+    // / multiple dim-bands / multiple draggable handles, all wired to
+    // the same master-time value).
     {
-      const trimInArrPositions = mastersToArrAll(trim.in, arrangementSegments);
-      const trimOutArrPositions = mastersToArrAll(trim.out, arrangementSegments);
-      // Dim the un-trimmed arr-time region: everything before the
-      // *earliest* trim.in occurrence and after the *latest* trim.out
-      // occurrence sits outside the export window.
-      const arrTotalLocal = totalArrDuration(arrangementSegments);
-      const earliestIn = trimInArrPositions.length
-        ? Math.min(...trimInArrPositions)
-        : 0;
-      const latestOut = trimOutArrPositions.length
-        ? Math.max(...trimOutArrPositions)
-        : arrTotalLocal;
-      const xInBound = arrTToX(earliestIn);
-      const xOutBound = arrTToX(latestOut);
+      // Playable arr-time slices = master-trim window intersected with
+      // every segment. Each playable slice carries through unchanged;
+      // everything between slices is the dim-region (un-trimmed
+      // material). Empty slice list (trim outside all segments) → dim
+      // the whole canvas.
+      const playableSlices = sliceByArrSegments(
+        trim.in,
+        trim.out,
+        arrangementSegments,
+      );
       ctx.fillStyle = "rgba(232,225,208,0.78)";
-      if (xInBound > 0) {
-        ctx.fillRect(0, audioBand.top, xInBound, audioLaneHeight);
+      let dimCursor = 0;
+      for (const slice of playableSlices) {
+        const xStart = Math.max(0, arrTToX(slice.arrStartS));
+        const xEnd = Math.min(audioRightX, arrTToX(slice.arrEndS));
+        if (xStart > dimCursor) {
+          ctx.fillRect(
+            dimCursor,
+            audioBand.top,
+            xStart - dimCursor,
+            audioLaneHeight,
+          );
+        }
+        dimCursor = Math.max(dimCursor, xEnd);
       }
-      if (xOutBound < audioRightX) {
+      if (dimCursor < audioRightX) {
         ctx.fillRect(
-          xOutBound,
+          dimCursor,
           audioBand.top,
-          audioRightX - xOutBound,
+          audioRightX - dimCursor,
           audioLaneHeight,
         );
       }
-      // Trim-handles at the bound positions only — long-form duplicates
-      // don't get extra handles (a single drag controls the master-time
-      // value, all occurrences move together).
-      drawHandle(ctx, xInBound, audioBand.top, audioLaneHeight);
-      drawHandle(
-        ctx,
-        Math.min(xOutBound, audioRightX),
-        audioBand.top,
-        audioLaneHeight,
-      );
+      // Trim-handles at every arr-time occurrence of trim.in / trim.out.
+      // Each is independently hit-testable in `classifyAudioHit`; all
+      // of them drag the same master-time value, so a duplicated chunk
+      // shows N handles that move together when any one is grabbed.
+      const trimInArrPositions = mastersToArrAll(trim.in, arrangementSegments);
+      const trimOutArrPositions = mastersToArrAll(trim.out, arrangementSegments);
+      for (const arrT of trimInArrPositions) {
+        const xH = arrTToX(arrT);
+        if (xH >= 0 && xH <= audioRightX) {
+          drawHandle(ctx, xH, audioBand.top, audioLaneHeight);
+        }
+      }
+      for (const arrT of trimOutArrPositions) {
+        const xH = arrTToX(arrT);
+        if (xH >= 0 && xH <= audioRightX) {
+          drawHandle(ctx, xH, audioBand.top, audioLaneHeight);
+        }
+      }
 
       // Audio-start marker — orange tick at every arr-time occurrence
       // of `audioStartS + audioStartNudgeS`. Single-take's identity
@@ -982,19 +999,17 @@ export function Timeline({
 
   function classifyAudioHit(x: number): "trim-in" | "trim-out" | "playhead" | "loop" | null {
     const xp = tToX(currentTime);
-    // Trim handles live at the *earliest* trim.in occurrence and the
-    // *latest* trim.out occurrence in arr-time — same anchors the
-    // drawing path uses. mastersToArrAll yields one position for
-    // single-take's identity projection, multiple for chunk repeats.
+    // Trim handles render at every arr-time occurrence of trim.in /
+    // trim.out — a chunk repeated in long-form yields N draggable
+    // handles that all wire to the same master-time value. Hit-test
+    // every occurrence so any of them can start a drag.
     const trimInArr = mastersToArrAll(trim.in, arrangementSegments);
-    const trimOutArr = mastersToArrAll(trim.out, arrangementSegments);
-    if (trimInArr.length > 0) {
-      const xIn = arrTToX(Math.min(...trimInArr));
-      if (Math.abs(x - xIn) <= HANDLE_HIT) return "trim-in";
+    for (const arrT of trimInArr) {
+      if (Math.abs(x - arrTToX(arrT)) <= HANDLE_HIT) return "trim-in";
     }
-    if (trimOutArr.length > 0) {
-      const xOut = arrTToX(Math.max(...trimOutArr));
-      if (Math.abs(x - xOut) <= HANDLE_HIT) return "trim-out";
+    const trimOutArr = mastersToArrAll(trim.out, arrangementSegments);
+    for (const arrT of trimOutArr) {
+      if (Math.abs(x - arrTToX(arrT)) <= HANDLE_HIT) return "trim-out";
     }
     if (Math.abs(x - xp) <= HANDLE_HIT) return "playhead";
     if (loop) {
