@@ -15,7 +15,6 @@
  */
 import type { ArrangementItem, Chunk, Cut } from "../storage/jobs-db";
 import { camSourceTimeS } from "../local/timing/cam-time";
-import { masterToArr } from "./arrangement-time";
 import {
   isImageClip,
   isVideoClip,
@@ -188,10 +187,19 @@ export function reconcilePills(
  *
  * Rules:
  *   1. Find every pill that covers `arrT`.
- *   2. Find the latest cut whose master-time maps to an arr-time ≤ arrT
- *      AND whose `camId` has a covering pill. That cam wins.
+ *   2. Find the latest cut whose timeline-time ≤ arrT AND whose `camId`
+ *      has a covering pill. That cam wins.
  *   3. If no cut applies, fall back to the FIRST covering pill.
  *   4. If no pill covers `arrT`, return null (= test pattern).
+ *
+ * Cuts are stored in timeline-time (`Cut.atTimeS` is now song-position,
+ * not master-position). The legacy master-time → arr-time projection is
+ * gone: when the same chunk repeats in the song, master-time can't tell
+ * the occurrences apart, so a cut "at master 5.0" would have fired in
+ * every duplicate. Storing in timeline-time means a cut placed inside
+ * pill 1 fires only there, not in pill 3 (= duplicate). The migration
+ * pass on Job-load converts old master-time cuts to first-occurrence
+ * timeline-time so existing edits keep working.
  *
  * Returns the active pill so callers (compositor + Timeline) can pull
  * its source-time mapping without re-scanning.
@@ -200,7 +208,7 @@ export function activeCamAtArr(
   cuts: readonly Cut[],
   arrT: number,
   pills: readonly Pill[],
-  segments: readonly Segment[],
+  _segments: readonly Segment[],
 ): { camId: string; pill: Pill } | null {
   if (pills.length === 0) return null;
   const covering = pills.filter(
@@ -210,7 +218,7 @@ export function activeCamAtArr(
   let chosen: { camId: string; pill: Pill } | null = null;
   let bestArrT = -Infinity;
   for (const cut of cuts) {
-    const cutArr = masterToArr(cut.atTimeS, segments);
+    const cutArr = cut.atTimeS;
     if (cutArr > arrT) continue;
     if (cutArr <= bestArrT) continue;
     const pill = covering.find((p) => p.camId === cut.camId);

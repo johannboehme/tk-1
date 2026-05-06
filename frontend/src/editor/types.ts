@@ -84,6 +84,91 @@ export function pillRangeS(pill: Pill): { startS: number; endS: number } {
   return { startS: pill.arrStartS, endS: pill.arrEndS };
 }
 
+/**
+ * One slot of master-audio on the editor timeline.
+ *
+ * The audio-lane is the linear sequence of audio pills the walker iterates
+ * through during playback. Each pill maps a region of an underlying audio
+ * source to a span on the timeline. Duplicate-source pills (same `sourceRef`
+ * + same source-window appearing more than once) get distinct pill ids and
+ * distinct timeline windows, so the walker advances through them by index
+ * rather than scanning master-time — that's how same-master-time duplicates
+ * stop colliding into a single playback occurrence.
+ */
+export interface AudioPill {
+  id: string;
+  /** Stable handle of the audio source this pill plays. V1: every pill
+   *  references the same master audio file (one job = one master audio),
+   *  so this is `MASTER_AUDIO_ID`. V2 — when the timeline can mix audio
+   *  from multiple sources — each pill carries its blob-id. */
+  sourceRef: string;
+  /** Inclusive position INSIDE the audio source (seconds). */
+  sourceInS: number;
+  /** Exclusive position INSIDE the audio source (seconds). */
+  sourceOutS: number;
+  /** Inclusive timeline-time the pill starts at. */
+  timelineStartS: number;
+  /** Exclusive timeline-time the pill ends at. */
+  timelineEndS: number;
+}
+
+/** A single video lane on the timeline = one cam's pill stack in playback
+ *  order. Lanes are independent of one another — overlapping pills from
+ *  different lanes are exactly what cuts pick between. */
+export interface VideoLane {
+  id: string;
+  /** Pills of this lane in `timelineStartS` order. The pill type
+   *  (`Pill`) carries the same fields under legacy names: `arrStartS`/
+   *  `arrEndS` are timeline-time, `sourceInS`/`sourceOutS` are
+   *  source-time inside `clip[camId]`. */
+  pills: Pill[];
+}
+
+/** Group pills by their `camId` into lanes, preserving timeline order
+ *  inside each lane. Stable lane id = camId. */
+export function groupPillsIntoLanes(pills: readonly Pill[]): VideoLane[] {
+  const byCam = new Map<string, Pill[]>();
+  for (const p of pills) {
+    const arr = byCam.get(p.camId);
+    if (arr) arr.push(p);
+    else byCam.set(p.camId, [p]);
+  }
+  const out: VideoLane[] = [];
+  for (const [id, ps] of byCam) {
+    ps.sort((a, b) => a.arrStartS - b.arrStartS);
+    out.push({ id, pills: ps });
+  }
+  return out;
+}
+
+/** Build the audio-lane from a list of master-time `Segment`s. Each
+ *  segment becomes one `AudioPill` whose source-window is the segment
+ *  `{in, out}` (master-time = source-time, since V1 has a single audio
+ *  source) and whose timeline window is the cumulative running offset.
+ *  Direct-mode jobs synthesize a single `[{in:0, out:durationS}]`
+ *  segment and produce a single audio pill — same code path as
+ *  long-form. */
+export function segmentsToAudioLane(
+  segments: readonly Segment[],
+): AudioPill[] {
+  const out: AudioPill[] = [];
+  let cursor = 0;
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    const span = Math.max(0, seg.out - seg.in);
+    out.push({
+      id: `audio-${i}-${seg.chunkId ?? "seg"}`,
+      sourceRef: MASTER_AUDIO_ID,
+      sourceInS: seg.in,
+      sourceOutS: seg.out,
+      timelineStartS: cursor,
+      timelineEndS: cursor + span,
+    });
+    cursor += span;
+  }
+  return out;
+}
+
 export interface ReactiveModulation {
   band: "bass" | "low_mids" | "mids" | "highs";
   param: "scale" | "y" | "rotate";

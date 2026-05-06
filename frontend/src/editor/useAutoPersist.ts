@@ -89,6 +89,10 @@ export function buildPersistPatch(
     // gestures. Direct-mode jobs leave pills empty; storing [] here is
     // a no-op round-trip.
     pills: s.pills,
+    // Stamp the persisted job so the next load skips the master→timeline
+    // migration on cuts/fx. The runtime is now timeline-time-native and
+    // every write here goes out in that axis.
+    editorSchema: "v2-timeline",
   };
 }
 

@@ -32,6 +32,16 @@ import {
 } from "../local/jobs";
 import { isVideoAsset, type MediaAsset, type VideoAsset } from "../storage/jobs-db";
 import { synthesizeJobLoadShape } from "../editor/job-synth";
+import { masterToArr } from "../editor/arrangement-time";
+import type { Segment } from "../editor/types";
+
+/** Project a master-time `t` to its FIRST occurrence's timeline-time
+ *  for the cut/fx schema migration. `masterToArr` already does that —
+ *  this is just a stable alias so the call-site reads as "migration
+ *  step", not "current-time projection". */
+function masterToArrFirst(t: number, segments: readonly Segment[]): number {
+  return masterToArr(t, segments);
+}
 import { decodeAudioToMonoPcm } from "../local/codec";
 import { computeWaveformPeaks } from "../local/waveform-peaks";
 import { exportSpecToRenderOpts } from "../editor/exportPresets";
@@ -209,7 +219,7 @@ export default function Editor() {
       // hotkey + the cam-switch this triggers. No-op when perf disabled.
       trackKeypressToPaint(e.key);
       trackCamSwitchToPaint(clip.id);
-      const startS = s.snapMasterTime(s.playback.currentTime);
+      const startS = s.snapTimelineTime(s.playback.timelineT);
       // beginHoldGesture must happen BEFORE addCut, so the snapshot
       // captures cuts as they were *before* the immediate tap-cut lands.
       s.beginHoldGesture(clip.id, startS);
@@ -227,7 +237,7 @@ export default function Editor() {
       const s = useEditorStore.getState();
       const hold = s.holdGesture;
       if (!hold) return;
-      const endS = s.snapMasterTime(s.playback.currentTime);
+      const endS = s.snapTimelineTime(s.playback.timelineT);
       if (hold.painting) {
         // Paint-mode commit: drop everything in (start, end], add the
         // trailing resume-cut (handled by applyHoldRelease).
@@ -339,7 +349,14 @@ export default function Editor() {
     function tick() {
       raf = null;
       const s = useEditorStore.getState();
-      const tNow = s.playback.currentTime;
+      // FX live in timeline-time. The hold's `inS` was written from
+      // `playback.timelineT` in beginFxHold; growing `outS` from
+      // master-time would create an inS/outS pair from two different
+      // axes and the capsule would either span backwards (→ FX dead)
+      // or grow into a duplicate-pill slot (→ FX bleeds across the
+      // song). Use timelineT throughout the hold so the capsule
+      // covers the timeline span the user actually held the pad.
+      const tNow = s.playback.timelineT;
       // Extend live-recording fx.
       const slots = Object.keys(s.fxHolds);
       for (const slot of slots) s.tickFxHold(slot, tNow);
@@ -462,13 +479,13 @@ export default function Editor() {
           return;
         }
         if (existingSlot != null) s.endFxHold(existingSlot);
-        const t = s.snapMasterTime(s.playback.currentTime);
+        const t = s.snapTimelineTime(s.playback.timelineT);
         s.beginFxHold(slotKey, kind, t);
         ensureTick();
         return;
       }
 
-      const t = s.snapMasterTime(s.playback.currentTime);
+      const t = s.snapTimelineTime(s.playback.timelineT);
       s.beginFxHold(slotKey, kind, t);
       ensureTick();
     }
@@ -701,6 +718,27 @@ export default function Editor() {
       const { arrangementSegments, arrangement, chunks } =
         synthesizeJobLoadShape(j, masterDurationS);
 
+      // Cut/FX time-axis migration: pre-v2 jobs stored cuts and fx in
+      // master-time. We're now timeline-time-native (so duplicate pills
+      // can carry independent cuts/fx). Project legacy values to the
+      // FIRST occurrence's timeline-time — a duplicate's user edits
+      // didn't exist before so there's no data loss; non-duplicate
+      // arrangements get a 1:1 projection (master == timeline).
+      const needsMigration = (j.editorSchema ?? "v1-master") === "v1-master";
+      const cutsForLoad = needsMigration
+        ? (j.cuts ?? []).map((c) => ({
+            ...c,
+            atTimeS: masterToArrFirst(c.atTimeS, arrangementSegments),
+          }))
+        : (j.cuts ?? []);
+      const fxForLoad = needsMigration
+        ? (j.fx ?? []).map((f) => ({
+            ...f,
+            inS: masterToArrFirst(f.inS, arrangementSegments),
+            outS: masterToArrFirst(f.outS, arrangementSegments),
+          }))
+        : (j.fx ?? []);
+
       loadJob(
         {
           id: j.id,
@@ -726,8 +764,8 @@ export default function Editor() {
         {
           lastSyncOverrideMs: null,
           clips: clipInits,
-          cuts: j.cuts ?? [],
-          fx: j.fx ?? [],
+          cuts: cutsForLoad,
+          fx: fxForLoad,
           audioVolume: j.audioVolume,
           arrangementSegments,
           arrangement,

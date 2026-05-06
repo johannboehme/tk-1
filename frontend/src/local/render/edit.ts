@@ -1023,7 +1023,12 @@ export async function editRenderMulti(
         const outTimestampUs = framesEmitted * frameDurationUs;
         const isFirstInSeg = framesEmitted === segStartFrame;
         const myFrameNum = framesEmitted;
-        const captured = { src, outTs: outTimestampUs, isFirstInSeg, tMaster };
+        const captured = {
+          src,
+          outTs: outTimestampUs,
+          isFirstInSeg,
+          tArr,
+        };
         framesEmitted++;
         chainInFlight++;
         outputQueue = outputQueue.then(async () => {
@@ -1039,11 +1044,10 @@ export async function editRenderMulti(
               frameDurationUs,
               captured.src.rot,
               captured.src.transform,
-              // FX must be looked up at master time (tMaster), not the
-              // segment-relative output timestamp — segments shift
-              // output time so FX queries with output time miss every
-              // FX.
-              captured.tMaster,
+              // FX live in timeline-time (= arrangement-time). Pass tArr
+              // so the FX-active query lines up with the editor: a recording
+              // at the duplicate-pill slot fires there and only there.
+              captured.tArr,
             );
             encoder.pushFrame(composed, { keyFrame: captured.isFirstInSeg });
             composed.close();

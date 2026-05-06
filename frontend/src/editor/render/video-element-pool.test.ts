@@ -190,87 +190,91 @@ describe("VideoElementPool — decoder warmup", () => {
 });
 
 describe("VideoElementPool — syncAll behaviour", () => {
+  function targets(entries: Array<[string, number]>) {
+    return new Map(entries.map(([id, t]) => [id, { sourceT: t }]));
+  }
+
   it("seeks element when drift > 100 ms", () => {
     const { pool, fakes } = makePoolWithFakes([cam("a")]);
     fakes[0].currentTime = 0;
-    pool.syncAll(0.5, false); // sourceT=0.5, drift=0.5 → seek
+    pool.syncAll(targets([["a", 0.5]]), false);
     expect(fakes[0].currentTime).toBe(0.5);
   });
 
   it("does NOT seek when drift ≤ 100 ms", () => {
     const { pool, fakes } = makePoolWithFakes([cam("a")]);
     fakes[0].currentTime = 0.45;
-    pool.syncAll(0.5, false); // drift = 0.05 < 0.1
+    pool.syncAll(targets([["a", 0.5]]), false); // drift = 0.05 < 0.1
     expect(fakes[0].currentTime).toBe(0.45);
   });
 
   it("plays element when in-range and isPlaying=true", () => {
     const { pool, fakes } = makePoolWithFakes([cam("a")]);
     fakes[0].paused = true;
-    pool.syncAll(2, true);
+    pool.syncAll(targets([["a", 2]]), true);
     expect(fakes[0].play).toHaveBeenCalled();
   });
 
   it("pauses element when isPlaying=false even if in-range", () => {
     const { pool, fakes } = makePoolWithFakes([cam("a")]);
     fakes[0].paused = false;
-    pool.syncAll(2, false);
+    pool.syncAll(targets([["a", 2]]), false);
     expect(fakes[0].pause).toHaveBeenCalled();
   });
 
   it("pauses element when sourceT is outside [0, sourceDurS)", () => {
     const { pool, fakes } = makePoolWithFakes([cam("a", { sourceDurationS: 5 })]);
     fakes[0].paused = false;
-    pool.syncAll(10, true); // sourceT=10, sourceDurS=5 → out of range
+    pool.syncAll(targets([["a", 10]]), true);
     expect(fakes[0].pause).toHaveBeenCalled();
   });
 
-  it("respects syncOffsetMs / driftRatio in sourceTime calculation", () => {
-    // syncOffsetMs=200 → anchor = -0.2; drift=2 → sourceT(t=0.5) = (0.5+0.2)*2 = 1.4
+  it("pauses element when no target is provided (cam not on PROGRAM this tick)", () => {
+    const { pool, fakes } = makePoolWithFakes([cam("a")]);
+    fakes[0].paused = false;
+    pool.syncAll(new Map(), true);
+    expect(fakes[0].pause).toHaveBeenCalled();
+  });
+
+  it("uses the supplied sourceT verbatim — pill-trim already baked in by caller", () => {
+    // Two consecutive syncAlls with the same isPlaying=false: the second
+    // call's sourceT is what wins, regardless of cam-anchor or drift.
+    // This is the duplicate-pill fix: the pool no longer recomputes
+    // source-time from cam-anchor; it trusts the descriptor's pill-aware
+    // value.
     const { pool, fakes } = makePoolWithFakes([
       cam("a", { syncOffsetMs: 200, driftRatio: 2, sourceDurationS: 10 }),
     ]);
-    pool.syncAll(0.5, false);
+    pool.syncAll(targets([["a", 1.4]]), false);
     expect(fakes[0].currentTime).toBeCloseTo(1.4, 6);
+    pool.syncAll(targets([["a", 6.7]]), false);
+    expect(fakes[0].currentTime).toBeCloseTo(6.7, 6);
   });
 });
 
-describe("VideoElementPool — isInRange", () => {
+describe("VideoElementPool — isSourceInRange", () => {
   // Used by the preview-runtime to decide whether a missing/seeking
   // video frame should be filled by the last-good cache (in-range, the
   // <video> is just decoding) or left as background black (out-of-range
-  // is the correct empty state for that cam at this master time).
+  // is the correct empty state for that cam at this source time).
   it("returns true when sourceT is inside [0, sourceDurS)", () => {
     const { pool } = makePoolWithFakes([cam("a", { sourceDurationS: 5 })]);
-    expect(pool.isInRange("a", 2)).toBe(true);
+    expect(pool.isSourceInRange("a", 2)).toBe(true);
   });
 
   it("returns false when sourceT >= sourceDurS", () => {
     const { pool } = makePoolWithFakes([cam("a", { sourceDurationS: 5 })]);
-    expect(pool.isInRange("a", 10)).toBe(false);
+    expect(pool.isSourceInRange("a", 10)).toBe(false);
   });
 
-  it("returns false when sourceT < 0 (cam not yet anchored)", () => {
-    const { pool } = makePoolWithFakes([
-      cam("a", { syncOffsetMs: -2000, sourceDurationS: 5 }),
-    ]);
-    // anchorS = 2 (positive offset shifts cam right), masterT=1 → sourceT=-1
-    expect(pool.isInRange("a", 1)).toBe(false);
-  });
-
-  it("respects driftRatio in sourceTime calculation", () => {
-    const { pool } = makePoolWithFakes([
-      cam("a", { driftRatio: 0.5, sourceDurationS: 5 }),
-    ]);
-    // sourceT(masterT=4) = 4*0.5 = 2 → in-range
-    // sourceT(masterT=12) = 12*0.5 = 6 → out-of-range
-    expect(pool.isInRange("a", 4)).toBe(true);
-    expect(pool.isInRange("a", 12)).toBe(false);
+  it("returns false when sourceT < 0", () => {
+    const { pool } = makePoolWithFakes([cam("a", { sourceDurationS: 5 })]);
+    expect(pool.isSourceInRange("a", -1)).toBe(false);
   });
 
   it("returns false for unknown clipId", () => {
     const { pool } = makePoolWithFakes([cam("a")]);
-    expect(pool.isInRange("nonexistent", 0)).toBe(false);
+    expect(pool.isSourceInRange("nonexistent", 0)).toBe(false);
   });
 });
 
@@ -290,13 +294,18 @@ describe("VideoElementPool — setCams reconciliation", () => {
     expect(pool.getElement("b")).not.toBe(fakes[0]);
   });
 
-  it("updates sync constants when same-id clip changes drift", () => {
+  it("updates source-duration when same-id clip's metadata reports late", () => {
+    // Anchor + drift no longer live in the pool — they're applied
+    // pill-aware in the descriptor builder. The pool only tracks
+    // sourceDurS for in-range checks. This test simulates a metadata
+    // update that bumps sourceDurS upward, putting a previously-
+    // out-of-range sourceT back inside the cam's media.
     const { pool, fakes } = makePoolWithFakes([
-      cam("a", { driftRatio: 1, sourceDurationS: 10 }),
+      cam("a", { sourceDurationS: 1 }),
     ]);
-    pool.setCams([cam("a", { driftRatio: 2, sourceDurationS: 10 })]);
-    pool.syncAll(0.5, false);
-    expect(fakes[0].currentTime).toBeCloseTo(1.0, 6); // (0.5)*2
+    pool.setCams([cam("a", { sourceDurationS: 10 })]);
+    pool.syncAll(new Map([["a", { sourceT: 5 }]]), false);
+    expect(fakes[0].currentTime).toBeCloseTo(5, 6);
   });
 });
 

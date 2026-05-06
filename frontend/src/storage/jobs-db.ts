@@ -429,6 +429,15 @@ export interface LocalJob {
    *  structured-clone natively. Optional / undefined for jobs synced
    *  before this field existed (or direct-mode jobs). */
   triageEnvelope?: Float32Array;
+
+  /** Editor-state schema version stamp. Drives on-load migration of
+   *  cuts + fx between time axes:
+   *    - undefined / "v1-master" → cuts/fx are master-time-anchored
+   *      (pre-Pill-refactor schema). Loader projects them to
+   *      first-occurrence timeline-time and stamps `"v2-timeline"`.
+   *    - "v2-timeline" → cuts/fx are already timeline-time. No
+   *      migration. New jobs are created with this stamp directly. */
+  editorSchema?: "v1-master" | "v2-timeline";
 }
 
 /** Persisted shape of `Pill` (from editor/types). Mirrored here to keep

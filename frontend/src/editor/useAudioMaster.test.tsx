@@ -589,6 +589,64 @@ describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => 
       expect(mB.playSpy).not.toHaveBeenCalled();
     });
 
+    it("emits authoritative timelineT for the playhead through duplicate-source segments", async () => {
+      // Arrangement: A → B → A' (duplicate of A's master range). The
+      // visible playhead must walk linearly through the timeline 0 → 5
+      // → 10 → 15 even though the master clock returns to A's range
+      // for A'. A `masterToArr` projection would scan to the FIRST
+      // occurrence and snap the playhead UI back onto A's slot.
+      const segs = [
+        { in: 0, out: 5 },
+        { in: 50, out: 55 },
+        { in: 0, out: 5 }, // duplicate of seg 0
+      ];
+      const { mA, mB } = await setup(60);
+      useEditorStore.getState().setArrangementSegments(segs);
+      // Start of song.
+      useEditorStore.getState().seek(0, { segmentIdxHint: 0 });
+      await act(async () => {
+        await flushAll();
+      });
+      await act(async () => {
+        useEditorStore.getState().setPlaying(true);
+        await flushAll();
+      });
+      // Tick inside seg 0.
+      await act(async () => {
+        mA.setCurrentTime(2);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      expect(useEditorStore.getState().playback.timelineT).toBeCloseTo(2, 2);
+
+      // Hop into seg 1 by simulating a user-seek with the disambiguating
+      // hint (the timeline UI sends segmentIdxHint when clicking on a
+      // specific occurrence).
+      useEditorStore.getState().seek(52, { segmentIdxHint: 1 });
+      await act(async () => {
+        await flushAll();
+        mA.setCurrentTime(52);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      // timelineT = arrStart[1] (5) + (52 - 50) = 7.
+      expect(useEditorStore.getState().playback.timelineT).toBeCloseTo(7, 2);
+
+      // Now jump to the DUPLICATE occurrence. Without the hint a
+      // master-time scan would think we're in seg 0; with the hint the
+      // walker rebinds to seg 2 and emits timelineT = arrStart[2] (10) +
+      // (2 - 0) = 12.
+      useEditorStore.getState().seek(2, { segmentIdxHint: 2 });
+      await act(async () => {
+        await flushAll();
+        mA.setCurrentTime(2);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      expect(useEditorStore.getState().playback.timelineT).toBeCloseTo(12, 2);
+      // Critical: with the hint the playhead must NOT snap back to 2 (=
+      // first occurrence's arr-position).
+      expect(useEditorStore.getState().playback.timelineT).not.toBeCloseTo(2, 2);
+      void mB;
+    });
+
     it(
       "end of last segment does NOT swap roles (the loop-back bug). " +
         "The active element keeps playing past `out` until the timeout " +

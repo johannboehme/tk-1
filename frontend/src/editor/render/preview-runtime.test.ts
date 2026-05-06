@@ -128,7 +128,7 @@ function makePool(): VideoElementPool {
   const pool = {
     syncAll: vi.fn(),
     getElement: vi.fn((id: string) => elements.get(id) ?? null),
-    isInRange: vi.fn((id: string) => inRange.get(id) ?? true),
+    isSourceInRange: vi.fn((id: string) => inRange.get(id) ?? true),
     setCams: vi.fn(),
     mount: vi.fn(),
     unmount: vi.fn(),
@@ -166,7 +166,7 @@ function makeFakeVideoEl(over: { readyState?: number; seeking?: boolean } = {}):
 
 function makeRuntime(opts: {
   snap: EditorStoreSnapshot;
-  playback?: { currentTime: number; isPlaying: boolean };
+  playback?: { currentTime: number; timelineT?: number; isPlaying: boolean };
   cams?: Record<string, { videoUrl: string }>;
   backend?: MockBackend;
   pool?: VideoElementPool;
@@ -178,7 +178,12 @@ function makeRuntime(opts: {
   const pool = opts.pool ?? makePool();
   const canvas = document.createElement("canvas");
   const cams = opts.cams ?? {};
-  const playback = opts.playback ?? { currentTime: 0, isPlaying: false };
+  const playbackIn = opts.playback ?? { currentTime: 0, isPlaying: false };
+  const playback = {
+    currentTime: playbackIn.currentTime,
+    timelineT: playbackIn.timelineT ?? playbackIn.currentTime,
+    isPlaying: playbackIn.isPlaying,
+  };
   const rt = new PreviewRuntime({
     canvas,
     cams,
@@ -227,7 +232,7 @@ describe("PreviewRuntime — init lifecycle", () => {
       raf: () => 0,
       cancelRaf: () => undefined,
       readSnapshot: () => snapshot(),
-      readPlayback: () => ({ currentTime: 0, isPlaying: false }),
+      readPlayback: () => ({ currentTime: 0, timelineT: 0, isPlaying: false }),
     });
     await rt.init();
     // pixel = cssW * dpr * scale = 200 * 2 * 0.5 = 200; cssH * 2 * 0.5 = 100
@@ -254,7 +259,14 @@ describe("PreviewRuntime — tick", () => {
     });
     await rt.init();
     rt.tick();
-    expect((pool as unknown as { syncAll: ReturnType<typeof vi.fn> }).syncAll).toHaveBeenCalledWith(1.5, true);
+    // syncAll receives a Map<clipId, target> built from descriptor.layers'
+    // pre-resolved sourceTimeS, plus the playback flag.
+    const syncAll = (pool as unknown as { syncAll: ReturnType<typeof vi.fn> }).syncAll;
+    expect(syncAll).toHaveBeenCalledTimes(1);
+    const [targets, playing] = syncAll.mock.calls[0];
+    expect(targets).toBeInstanceOf(Map);
+    expect((targets as Map<string, { sourceT: number }>).get("a")?.sourceT).toBeCloseTo(1.5, 6);
+    expect(playing).toBe(true);
     expect(backend.drawFrame).toHaveBeenCalled();
     expect(backend.lastDescriptor?.tMaster).toBe(1.5);
     expect(backend.lastDescriptor?.layers).toHaveLength(1);
@@ -461,7 +473,7 @@ describe("PreviewRuntime — image clips without pre-set dims", () => {
     const loadBitmap = vi.fn(async () => fakeBitmap);
     const backend = makeBackend();
     const pool = makePool();
-    const playback = { currentTime: 0, isPlaying: false };
+    const playback = { currentTime: 0, timelineT: 0, isPlaying: false };
     const snap: { value: EditorStoreSnapshot } = { value: snapshot({ clips: [] }) };
     const canvas = document.createElement("canvas");
     const rt = new PreviewRuntime({
@@ -643,7 +655,7 @@ describe("PreviewRuntime — last-good-frame cache (hides black flash on seek/wr
       raf: () => 0,
       cancelRaf: () => undefined,
       readSnapshot: () => snap.value,
-      readPlayback: () => ({ currentTime: 0.5, isPlaying: false }),
+      readPlayback: () => ({ currentTime: 0.5, timelineT: 0.5, isPlaying: false }),
       createBitmapFromVideo,
     });
     await rt.init();
@@ -712,7 +724,7 @@ describe("PreviewRuntime — setCams (live + Media flow)", () => {
       .setCams;
     (pool as unknown as { _add: (id: string) => void })._add("a");
     const clipsBefore: Clip[] = [videoClip("a")];
-    const playback = { currentTime: 0, isPlaying: false };
+    const playback = { currentTime: 0, timelineT: 0, isPlaying: false };
     const snap: { value: EditorStoreSnapshot } = { value: snapshot({ clips: clipsBefore }) };
     const canvas = document.createElement("canvas");
     const rt = new PreviewRuntime({
@@ -753,7 +765,7 @@ describe("PreviewRuntime — setCams (live + Media flow)", () => {
     const loadBitmap = vi.fn(async () => fakeBitmap);
     const backend = makeBackend();
     const pool = makePool();
-    const playback = { currentTime: 0, isPlaying: false };
+    const playback = { currentTime: 0, timelineT: 0, isPlaying: false };
     const snap: { value: EditorStoreSnapshot } = { value: snapshot({ clips: [] }) };
     const canvas = document.createElement("canvas");
     const rt = new PreviewRuntime({
@@ -832,7 +844,7 @@ describe("PreviewRuntime — start/stop loop", () => {
       raf,
       cancelRaf,
       readSnapshot: () => snapshot(),
-      readPlayback: () => ({ currentTime: 0, isPlaying: false }),
+      readPlayback: () => ({ currentTime: 0, timelineT: 0, isPlaying: false }),
     });
     await rt.init();
     rt.start();
@@ -857,7 +869,7 @@ describe("PreviewRuntime — start/stop loop", () => {
       raf,
       cancelRaf: () => undefined,
       readSnapshot: () => snapshot(),
-      readPlayback: () => ({ currentTime: 0, isPlaying: false }),
+      readPlayback: () => ({ currentTime: 0, timelineT: 0, isPlaying: false }),
     });
     await rt.init();
     rt.start();
@@ -1000,7 +1012,7 @@ describe("PreviewRuntime — frame-budget watchdog", () => {
       raf: () => 0,
       cancelRaf: () => undefined,
       readSnapshot: () => snapshot(),
-      readPlayback: () => ({ currentTime: 0, isPlaying: false }),
+      readPlayback: () => ({ currentTime: 0, timelineT: 0, isPlaying: false }),
       now: () => {
         const v = nowSeq[Math.min(nowIdx, nowSeq.length - 1)] ?? 0;
         nowIdx++;

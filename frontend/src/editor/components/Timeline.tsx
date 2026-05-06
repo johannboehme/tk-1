@@ -232,6 +232,11 @@ export function Timeline({
   const clearAllFx = useEditorStore((s) => s.clearAllFx);
   const preparingCamIds = useEditorStore((s) => s.preparingCamIds);
   const currentTime = useEditorStore((s) => s.playback.currentTime);
+  // Authoritative timeline-time from the audio walker. Used for the
+  // playhead position so duplicate-source pills (same master-time used
+  // multiple times in the song) don't bounce the cursor onto the first
+  // occurrence's arr-position.
+  const timelineT = useEditorStore((s) => s.playback.timelineT);
   const holdGesture = useEditorStore((s) => s.holdGesture);
   const snapMode = useEditorStore((s) => s.ui.snapMode);
   const lanesLocked = useEditorStore((s) => s.ui.lanesLocked);
@@ -305,11 +310,11 @@ export function Timeline({
   // having moved this render — otherwise scrolling away while paused
   // would snap straight back. Comparison happens in *view* space so the
   // arrangement-mode path doesn't re-paint to master-time gaps.
-  const lastPlayheadRef = useRef(currentTime);
-  const currentTimeView = masterToView(currentTime);
+  const lastPlayheadRef = useRef(timelineT);
+  const currentTimeView = timelineT;
   useEffect(() => {
-    const moved = currentTime !== lastPlayheadRef.current;
-    lastPlayheadRef.current = currentTime;
+    const moved = timelineT !== lastPlayheadRef.current;
+    lastPlayheadRef.current = timelineT;
     if (!moved) return;
     if (currentTimeView >= viewStart && currentTimeView <= viewEnd) return;
     const next = Math.max(
@@ -317,7 +322,7 @@ export function Timeline({
       Math.min(maxScroll, currentTimeView - timelineStartS),
     );
     if (Math.abs(next - clampedScroll) > 1e-6) setScrollX(next);
-  }, [currentTime, currentTimeView, viewStart, viewEnd, timelineStartS, maxScroll, clampedScroll, setScrollX]);
+  }, [timelineT, currentTimeView, viewStart, viewEnd, timelineStartS, maxScroll, clampedScroll, setScrollX]);
 
   // ---- Layout offsets (canvas y-coordinates per lane) ----
   const videoBands = clips.map((_, i) => ({
@@ -462,42 +467,29 @@ export function Timeline({
   );
 
   // Strip projections — cuts/fx live in master-time inside the store so
-  // they remain anchored to the source media regardless of how the user
-  // reorders the arrangement. The ProgramStrip + FxStripLayer render in
-  // arr-time, so we pre-project here: each occurrence of a chunk that
-  // contains a cut produces a corresponding splice tab on the strip; FX
-  // capsules that straddle a segment boundary split into per-segment
-  // slices. For single-take's whole-master segment both projections are
-  // Identity (one occurrence per cut, one slice per fx).
-  const stripCuts = useMemo(
-    () =>
-      cuts.flatMap((cut) =>
-        mastersToArrAll(cut.atTimeS, arrangementSegments).map((arrT) => ({
-          ...cut,
-          atTimeS: arrT,
-        })),
-      ),
-    [cuts, arrangementSegments],
-  );
+  // Cuts and FX live in timeline-time (= arr-time) since the
+  // master-time refactor. The ProgramStrip + FxStripLayer also render
+  // in arr-time, so the strip data is exactly the stored data — no
+  // per-occurrence projection. The legacy `mastersToArrAll` /
+  // `sliceByArrSegments` path was correct for master-time-anchored
+  // capsules but for timeline-anchored ones it'd either drop the entry
+  // (timeline-T not in any seg's master range) or — worse — duplicate
+  // it across every chunk whose master-time happened to coincide with
+  // the timeline-T value. Passing through 1:1 keeps the cut at the
+  // exact timeline slot the user placed it in. Trim markers in this
+  // file still go through `mastersToArrAll` because trim is a
+  // master-axis concept (one value, all occurrences need a handle).
+  const stripCuts = cuts;
   const stripFx = useMemo(() => {
     const out: typeof fx = [];
     for (const f of fx) {
-      const slices = sliceByArrSegments(f.inS, f.outS, arrangementSegments);
-      if (slices.length === 0) continue;
-      for (let i = 0; i < slices.length; i++) {
-        out.push({
-          ...f,
-          inS: slices[i].arrStartS,
-          outS: slices[i].arrEndS,
-          // Multi-slice fx need unique React keys downstream; the live
-          // recording case is always single-slice so the original id
-          // stays in liveFxIds for the pulser path.
-          id: slices.length === 1 ? f.id : `${f.id}::${i}`,
-        });
-      }
+      const inT = Math.max(0, f.inS);
+      const outT = Math.min(arrTotal, f.outS);
+      if (outT <= inT) continue;
+      out.push({ ...f, inS: inT, outS: outT });
     }
     return out;
-  }, [fx, arrangementSegments]);
+  }, [fx, arrTotal]);
   const stripDuration = arrTotal;
 
   // ---- Active-cam status per lane (drives LED color) ----
@@ -509,7 +501,7 @@ export function Timeline({
     });
     const activeId = (() => {
       const s = useEditorStore.getState();
-      return s.activeCamId(currentTime);
+      return s.activeCamId(timelineT);
     })();
     for (const cam of clips) {
       const range = ranges.find((r) => r.id === cam.id)!;
@@ -832,7 +824,11 @@ export function Timeline({
     // BeatRuler's `Math.floor(x)` bar tick. Without the snap the
     // sub-pixel smear of an odd-width stroke makes the playhead read
     // as 1-2 px right of the bar mark even when the time math is exact.
-    const xpFloat = tToX(currentTime);
+    // Drive from `timelineT` directly — the walker's authoritative
+    // timeline-position. A `tToX(currentTime)` projection would scan the
+    // segments list by master-time and snap onto the first occurrence
+    // when the same chunk appears twice in the song.
+    const xpFloat = arrTToX(timelineT);
     const xp = Math.floor(xpFloat) + 0.5;
     ctx.strokeStyle = "#FF5722";
     ctx.lineWidth = 1.5;
@@ -897,6 +893,7 @@ export function Timeline({
     arrangementSegments,
     arrTotal,
     arrTToX,
+    timelineT,
     loop,
     currentTime,
     clips,
@@ -1013,7 +1010,7 @@ export function Timeline({
   const findLaneAt = videoLaneAt;
 
   function classifyAudioHit(x: number): "trim-in" | "trim-out" | "playhead" | "loop" | null {
-    const xp = tToX(currentTime);
+    const xp = arrTToX(timelineT);
     // Trim handles render at every arr-time occurrence of trim.in /
     // trim.out — a chunk repeated in long-form yields N draggable
     // handles that all wire to the same master-time value. Hit-test
@@ -1745,35 +1742,38 @@ export function Timeline({
               viewEndS={viewEnd}
               width={canvasWidth}
               onRemoveCut={(atTimeS, camId) => {
-                // Strip runs in arr-time; convert back to master before
-                // mutating the store. removeCutAt resolves the cut by
-                // (master-time, camId), so a single call removes ALL
-                // arr-occurrences of a duplicated chunk's cut at once,
-                // which matches the user's mental model.
-                removeCutAt(viewToMaster(atTimeS), camId);
+                // Strip and store both run in timeline-time after the
+                // cut/fx axis flip — pass the strip's `atTimeS`
+                // through verbatim. Pre-refactor this projected through
+                // `viewToMaster` because cuts were master-time and a
+                // single delete had to wipe every duplicate occurrence;
+                // now each timeline slot owns its own cut.
+                removeCutAt(atTimeS, camId);
               }}
               onCutDrag={(fromAtTimeS, camId, rawNewT, ev) => {
                 // Same snap rules as the rest of the timeline: SHIFT
-                // bypasses, MATCH falls through (no candidatePositions
-                // for cut-set), grid modes round to the nearest beat/bar.
-                const masterFrom = viewToMaster(fromAtTimeS);
-                const masterTarget = viewToMaster(rawNewT);
-                const snappedMaster = ev.shiftKey
-                  ? masterTarget
-                  : useEditorStore.getState().snapMasterTime(masterTarget);
-                const landed = useEditorStore
+                // bypasses, grid modes round. No view↔master projection:
+                // cuts are timeline-anchored, snap is axis-agnostic.
+                const target = ev.shiftKey
+                  ? rawNewT
+                  : useEditorStore.getState().snapTimelineTime(rawNewT);
+                return useEditorStore
                   .getState()
-                  .moveCut(masterFrom, camId, snappedMaster);
-                return masterToView(landed);
+                  .moveCut(fromAtTimeS, camId, target);
               }}
               paintPreview={(() => {
                 if (!holdGesture || !holdGesture.painting) return null;
                 const clip = clips.find((c) => c.id === holdGesture.camId);
                 if (!clip) return null;
                 const idx = clips.findIndex((c) => c.id === clip.id);
-                // Project the master-time hold endpoints into arr-time.
-                const fromS = masterToView(holdGesture.startS);
-                const toS = masterToView(currentTime);
+                // Hold-gesture endpoints live in timeline-time (matches
+                // where `holdGesture.startS` was recorded — see
+                // Editor.tsx's onKeyDown for digit keys + TAKE button).
+                // No `masterToView` projection: cuts are now timeline-
+                // anchored, and projecting a timeline-time value as
+                // master-time scans onto duplicate-pill slots.
+                const fromS = holdGesture.startS;
+                const toS = timelineT;
                 return {
                   fromS,
                   toS,
@@ -1836,7 +1836,7 @@ export function Timeline({
                   // Single-active-hold guard: ignore if another TAKE is
                   // already engaged (button or keyboard).
                   if (s.holdGesture) return;
-                  const startS = s.snapMasterTime(s.playback.currentTime);
+                  const startS = s.snapTimelineTime(s.playback.timelineT);
                   s.beginHoldGesture(clip.id, startS);
                   s.addCut({ atTimeS: startS, camId: clip.id });
                   const existing = takePromoteTimerRef.current.get(clip.id);
@@ -1858,7 +1858,7 @@ export function Timeline({
                   // otherwise a stale onTakeFinish (after a cancelHold
                   // via Esc) shouldn't re-apply anything.
                   if (!hold || hold.camId !== clip.id) return;
-                  const endS = s2.snapMasterTime(s2.playback.currentTime);
+                  const endS = s2.snapTimelineTime(s2.playback.timelineT);
                   if (hold.painting) {
                     s2.applyHoldRelease(
                       clip.id,

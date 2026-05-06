@@ -442,7 +442,24 @@ export function useAudioMaster(
       const active = state.active === "A" ? refA : refB;
       const idle = state.active === "A" ? refB : refA;
       const t = active.currentTime;
-      store.setCurrentTime(t);
+      // Compute timeline-time from the authoritative segment idx so
+      // duplicate-source pills don't snap to the first occurrence's
+      // arr-position. We do this BEFORE any segment-validation logic so
+      // a momentary master-time drift past `seg.out` (RAF stall, browser
+      // nudge) doesn't bounce the playhead back to a duplicate even for
+      // a single tick.
+      {
+        const segs = store.arrangementSegments;
+        let pillT = t;
+        if (segs.length > 0 && state.currentSegmentIdx != null) {
+          const idx = state.currentSegmentIdx;
+          if (idx >= 0 && idx < segs.length) {
+            const arrStarts = segmentArrStarts(segs);
+            pillT = arrStarts[idx] + Math.max(0, t - segs[idx].in);
+          }
+        }
+        store.setPlayhead(t, pillT);
+      }
 
       // Has an armed crossfade fired already? Detect by
       // audioContext.currentTime — on the audio render thread the
@@ -519,16 +536,16 @@ export function useAudioMaster(
       const segs = store.arrangementSegments;
       if (segs.length > 0) {
         let curIdx = state.currentSegmentIdx ?? -1;
-        // Validate the cached index — if master-time has drifted out of
-        // its window (e.g. browser nudged currentTime past the end while
-        // we were waiting on a frame), fall back to a scan.
-        if (curIdx >= 0 && curIdx < segs.length) {
-          const seg = segs[curIdx];
-          if (t < seg.in - 1e-3 || t >= seg.out) curIdx = -1;
-        } else {
+        // The cached index is AUTHORITATIVE — set on user-seek and on
+        // every crossfade hop. We do NOT invalidate it just because the
+        // browser nudged `t` past `seg.out` for a tick; that would scan
+        // for the first master-time match and bounce the playhead onto
+        // a duplicate occurrence (the "1-2-1-4" bug). The only legitimate
+        // reasons for re-scanning are: (a) startup with no prior state
+        // (curIdx == null), (b) the segment list shape changed and the
+        // old index is now out-of-bounds.
+        if (curIdx < 0 || curIdx >= segs.length) {
           curIdx = -1;
-        }
-        if (curIdx === -1) {
           for (let i = 0; i < segs.length; i++) {
             if (t >= segs[i].in - 1e-3 && t < segs[i].out) {
               curIdx = i;
@@ -562,7 +579,8 @@ export function useAudioMaster(
             /* ignore */
           }
           state.currentSegmentIdx = nextIdx;
-          store.setCurrentTime(target);
+          const arrStarts = segmentArrStarts(segs);
+          store.setPlayhead(target, arrStarts[nextIdx]);
           rafRef.current = requestAnimationFrame(tick);
           return;
         }
