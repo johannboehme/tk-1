@@ -26,7 +26,11 @@ import {
   activeCamAtArr,
   reconcilePills,
 } from "./arrangement-pills";
-import { masterToArr, sliceByArrSegments } from "./arrangement-time";
+import {
+  masterToArr,
+  segmentIndexAtArr,
+  sliceByArrSegments,
+} from "./arrangement-time";
 import type { ArrangementItem, Chunk } from "../storage/jobs-db";
 import { classifyAspectRatio } from "./exportPresets";
 import { DEFAULT_VIEWPORT_TRANSFORM } from "./render/element-transform";
@@ -501,6 +505,14 @@ interface EditorState {
   setAudioStartNudgeS(s: number): void;
   /** Increment the master-audio nudge by `deltaMs` (ms; signed). */
   nudgeAudioStartMs(deltaMs: number): void;
+  /** Re-anchor the bar grid (= master `audioStartNudgeS`) so beat 0 lands
+   *  on the audio onset of the given pill's source segment. Used to
+   *  re-align the grid against a single chunk after small accumulated
+   *  drift between FX/cut snap-times and the audio. Pass-through return
+   *  codes mirror triage's `conformChunk` so the UI can disable / toast. */
+  conformAudioStartToPill(
+    pillId: string,
+  ): "ok" | "no-pill" | "no-bpm" | "no-audio-start" | "unchanged";
   /** Set the time-signature numerator (= beats per bar). Re-runs the
    *  whole-bar grid + bar-line ruler the next render. */
   setBeatsPerBar(n: number): void;
@@ -1556,6 +1568,30 @@ export const useEditorStore = create<EditorState>()(
       if (!meta) return;
       const cur = meta.audioStartNudgeS ?? 0;
       get().setAudioStartNudgeS(cur + deltaMs / 1000);
+    },
+    conformAudioStartToPill(pillId) {
+      const s = get();
+      const pill = s.pills.find((p) => p.id === pillId);
+      if (!pill) return "no-pill";
+      const meta = s.jobMeta;
+      const phase = meta?.bpm?.phase;
+      if (!meta || typeof phase !== "number") return "no-bpm";
+      // Resolve the segment via the pill's auto-generated arr-position —
+      // immune to any post-load drag that moved arrStartS off its
+      // arrangement-item's segment range.
+      const segIdx = segmentIndexAtArr(
+        pill.originalArrStartS,
+        s.arrangementSegments,
+      );
+      if (segIdx < 0) return "no-audio-start";
+      const seg = s.arrangementSegments[segIdx];
+      if (typeof seg.audioStartMs !== "number") return "no-audio-start";
+      const targetPhaseS = seg.audioStartMs / 1000;
+      const newNudgeS = Math.round((targetPhaseS - phase) * 1000) / 1000;
+      const cur = meta.audioStartNudgeS ?? 0;
+      if (Math.abs(newNudgeS - cur) < 1e-6) return "unchanged";
+      set({ jobMeta: { ...meta, audioStartNudgeS: newNudgeS } });
+      return "ok";
     },
     setBeatsPerBar(n) {
       const meta = get().jobMeta;
