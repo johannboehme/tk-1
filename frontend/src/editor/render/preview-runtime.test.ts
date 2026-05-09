@@ -125,10 +125,13 @@ function makePool(): VideoElementPool {
   // care that the runtime delegates correctly.
   const elements = new Map<string, HTMLVideoElement>();
   const inRange = new Map<string, boolean>();
+  const tokens = new Map<string, number>();
   const pool = {
     syncAll: vi.fn(),
     getElement: vi.fn((id: string) => elements.get(id) ?? null),
     isSourceInRange: vi.fn((id: string) => inRange.get(id) ?? true),
+    isAwaitingFreshFrame: vi.fn(() => false),
+    getFreshFrameToken: vi.fn((id: string) => tokens.get(id) ?? 0),
     setCams: vi.fn(),
     mount: vi.fn(),
     unmount: vi.fn(),
@@ -138,8 +141,13 @@ function makePool(): VideoElementPool {
   (pool as unknown as {
     _add: (id: string, el?: HTMLVideoElement) => void;
     _setInRange: (id: string, v: boolean) => void;
+    _bumpFreshFrameToken: (id: string) => void;
   })._add = (id: string, el?: HTMLVideoElement) => {
     elements.set(id, el ?? document.createElement("video"));
+  };
+  (pool as unknown as { _bumpFreshFrameToken: (id: string) => void })
+    ._bumpFreshFrameToken = (id: string) => {
+    tokens.set(id, (tokens.get(id) ?? 0) + 1);
   };
   (pool as unknown as { _setInRange: (id: string, v: boolean) => void })._setInRange =
     (id: string, v: boolean) => {
@@ -272,21 +280,41 @@ describe("PreviewRuntime — tick", () => {
     expect(backend.lastDescriptor?.layers).toHaveLength(1);
   });
 
-  it("populates the sources map with the pool's video element for the active cam", async () => {
+  it("populates the sources map with a fresh ImageBitmap for the active cam", async () => {
+    // Video sources are ALWAYS routed through `createImageBitmap`
+    // (refreshed per pool freshFrameToken) — the backend never samples
+    // the live `<video>` element directly. This avoids Chrome's
+    // first-`copyExternalImageToTexture`-after-seek orientation bug.
+    const fakeBitmap = { close: vi.fn() } as unknown as ImageBitmap;
+    const createBitmapFromVideo = vi.fn(async () => fakeBitmap);
     const backend = makeBackend();
     const pool = makePool();
-    (pool as unknown as { _add: (id: string) => void })._add("a");
+    const readyEl = makeFakeVideoEl({ readyState: 4, seeking: false });
+    (pool as unknown as { _add: (id: string, el?: HTMLVideoElement) => void })._add(
+      "a",
+      readyEl,
+    );
+    (pool as unknown as { _bumpFreshFrameToken: (id: string) => void })
+      ._bumpFreshFrameToken("a"); // a frame is now available
     const { rt } = makeRuntime({
       snap: snapshot({ clips: [videoClip("a")] }),
       playback: { currentTime: 0.5, isPlaying: false },
       cams: { a: { videoUrl: "a.mp4" } },
       backend,
       pool,
+      createBitmapFromVideo,
     });
     await rt.init();
+    // Tick A: kicks off createImageBitmap (token > lastSnapshotToken).
+    rt.tick();
+    await Promise.resolve();
+    await Promise.resolve();
+    // Tick B: bitmap is in lastGoodFrames → source is populated.
     rt.tick();
     const src = backend.lastSources?.get("a");
     expect(src?.kind).toBe("video");
+    expect((src as { fallback?: ImageBitmap }).fallback).toBe(fakeBitmap);
+    expect((src as { preferFallback?: boolean }).preferFallback).toBe(true);
   });
 
   it("does not draw when init was not called", () => {
@@ -556,6 +584,46 @@ describe("PreviewRuntime — last-good-frame cache (hides black flash on seek/wr
     expect((src as { preferFallback?: boolean }).preferFallback).toBe(true);
   });
 
+  it("uses cached fallback while pool reports awaitingFreshFrame (post-seek flip-flicker mitigation)", async () => {
+    // After a seek, Chrome's copyExternalImageToTexture occasionally
+    // ships the first frame upside-down — the pool's
+    // `awaitingFreshFrame` flag covers that window via rVFC. The
+    // runtime must keep substituting the cached bitmap during that
+    // window even when `el.seeking === false`.
+    const fakeBitmap = { close: vi.fn() } as unknown as ImageBitmap;
+    const createBitmapFromVideo = vi.fn(async () => fakeBitmap);
+    const backend = makeBackend();
+    const pool = makePool();
+    const readyEl = makeFakeVideoEl({ readyState: 4, seeking: false });
+    (pool as unknown as { _add: (id: string, el?: HTMLVideoElement) => void })._add(
+      "a",
+      readyEl,
+    );
+    let nowMs = 0;
+    const { rt } = makeRuntime({
+      snap: snapshot({ clips: [videoClip("a")] }),
+      playback: { currentTime: 0.5, isPlaying: false },
+      cams: { a: { videoUrl: "a.mp4" } },
+      backend,
+      pool,
+      createBitmapFromVideo,
+      now: () => nowMs,
+    });
+    await rt.init();
+    rt.tick();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Pool flags the slot as awaiting a fresh frame (just-issued seek,
+    // rVFC hasn't fired yet). Element is no longer `seeking` per the
+    // event timeline, but the first frame is still suspect.
+    (pool.isAwaitingFreshFrame as ReturnType<typeof vi.fn>).mockReturnValue(true);
+    nowMs = 50;
+    rt.tick();
+    const src = backend.lastSources?.get("a");
+    expect((src as { preferFallback?: boolean }).preferFallback).toBe(true);
+  });
+
   it("does NOT use fallback when layer is out of range (black is correct)", async () => {
     const fakeBitmap = { close: vi.fn() } as unknown as ImageBitmap;
     const createBitmapFromVideo = vi.fn(async () => fakeBitmap);
@@ -600,7 +668,12 @@ describe("PreviewRuntime — last-good-frame cache (hides black flash on seek/wr
     }
   });
 
-  it("does NOT use fallback when video is ready (real frame wins)", async () => {
+  it("ALWAYS draws video sources from the cached bitmap (never the live element)", async () => {
+    // Architectural invariant: video sources are ALWAYS routed
+    // through the rVFC-driven `createImageBitmap` cache. There's no
+    // "live element wins" case anymore — the bitmap path is the
+    // only path, because the GPU upload of `<video>` elements is
+    // what occasionally lands the first post-seek frame upside-down.
     const fakeBitmap = { close: vi.fn() } as unknown as ImageBitmap;
     const createBitmapFromVideo = vi.fn(async () => fakeBitmap);
     const backend = makeBackend();
@@ -625,7 +698,8 @@ describe("PreviewRuntime — last-good-frame cache (hides black flash on seek/wr
     rt.tick();
     const src = backend.lastSources?.get("a");
     expect(src?.kind).toBe("video");
-    expect((src as { preferFallback?: boolean }).preferFallback).not.toBe(true);
+    expect((src as { fallback?: ImageBitmap }).fallback).toBe(fakeBitmap);
+    expect((src as { preferFallback?: boolean }).preferFallback).toBe(true);
   });
 
   it("evicts cached bitmap on cam removal (no leak)", async () => {
@@ -672,12 +746,13 @@ describe("PreviewRuntime — last-good-frame cache (hides black flash on seek/wr
     expect(fakeBitmap.close).toHaveBeenCalledTimes(1);
   });
 
-  it("throttles snapshot creation per layer (~100ms)", async () => {
-    const fakeBitmap = { close: vi.fn() } as unknown as ImageBitmap;
+  it("snapshot refresh is gated by pool.getFreshFrameToken, not wall-clock", async () => {
+    // Snapshots are token-driven: one new bitmap per presented video
+    // frame (rVFC bumps the pool's freshFrameToken). Multiple RAFs
+    // within the same frame don't trigger redundant snapshots.
     const createBitmapFromVideo = vi.fn(async () => ({
       close: vi.fn(),
     }) as unknown as ImageBitmap);
-    void fakeBitmap;
     const backend = makeBackend();
     const pool = makePool();
     const readyEl = makeFakeVideoEl({ readyState: 4, seeking: false });
@@ -685,7 +760,9 @@ describe("PreviewRuntime — last-good-frame cache (hides black flash on seek/wr
       "a",
       readyEl,
     );
-    let nowMs = 0;
+    const bumpToken = (pool as unknown as {
+      _bumpFreshFrameToken: (id: string) => void;
+    })._bumpFreshFrameToken;
     const { rt } = makeRuntime({
       snap: snapshot({ clips: [videoClip("a")] }),
       playback: { currentTime: 0.5, isPlaying: false },
@@ -693,21 +770,27 @@ describe("PreviewRuntime — last-good-frame cache (hides black flash on seek/wr
       backend,
       pool,
       createBitmapFromVideo,
-      now: () => nowMs,
     });
     await rt.init();
 
-    // Many fast ticks within the throttle window.
-    for (let i = 0; i < 6; i++) {
-      nowMs = i * 16; // ~60Hz
+    // Tick A: no token yet → first snapshot (cold path).
+    rt.tick();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(createBitmapFromVideo).toHaveBeenCalledTimes(1);
+
+    // Several ticks WITHOUT bumping the token → no extra snapshots.
+    for (let i = 0; i < 4; i++) {
       rt.tick();
       await Promise.resolve();
     }
     expect(createBitmapFromVideo).toHaveBeenCalledTimes(1);
 
-    // Step past the throttle window.
-    nowMs = 200;
+    // Bump the token (a new presented frame from rVFC) → next tick
+    // refreshes the snapshot.
+    bumpToken("a");
     rt.tick();
+    await Promise.resolve();
     await Promise.resolve();
     expect(createBitmapFromVideo).toHaveBeenCalledTimes(2);
   });

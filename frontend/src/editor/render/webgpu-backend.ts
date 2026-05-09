@@ -90,6 +90,8 @@ export class WebGPUBackend implements CompositorBackend {
   private readbackRowCount = 0;
   private readbackRgba: Uint8ClampedArray<ArrayBuffer> | null = null;
 
+
+
   async init(canvas: AnyCanvas, caps: BackendCaps): Promise<void> {
     this.canvas = canvas;
     if (typeof navigator === "undefined" || !("gpu" in navigator)) {
@@ -267,16 +269,21 @@ export class WebGPUBackend implements CompositorBackend {
         const upload = this.uploadSource(device, src);
         if (!upload) continue;
 
-        // Uniforms schreiben.
+        // Empirically verified via `webgpu-backend-video-flip.browser.test.ts`:
+        // both `createImageBitmap(<video>)` AND `createImageBitmap(<canvas>)`
+        // produce top-down bitmaps in Chrome (DOM convention). Uploading
+        // with `flipY: false` preserves orientation; sampling with
+        // `srcFlipY=false` reads correctly. No video-specific flip is
+        // needed here — the WebGL2 backend's flip is a workaround for
+        // GL's flipped Y-axis convention, not for any video-decoder
+        // bottom-up storage. We're DOM-convention top-to-bottom on the
+        // WebGPU side and stay that way.
         writeLayerUniforms(
           this.layerUniformScratch,
           d.output.w,
           d.output.h,
           layer.fitRect,
           uvMatrixCM(layer),
-          // copyExternalImageToTexture mit flipY=false respektiert die
-          // Source-UV-Convention 1:1. Daher srcFlipY=false hier — kein
-          // browser-driver-Workaround wie in WebGL2 nötig.
           false,
         );
         device.queue.writeBuffer(
@@ -652,16 +659,20 @@ export class WebGPUBackend implements CompositorBackend {
   }
 
   /** Lädt die Source-Pixel in `this.layerTex` und gibt das Texture
-   *  zurück; null wenn die Source noch nicht ready ist (Video-readyState).
+   *  zurück; null wenn die Source noch nicht ready ist.
    *
-   *  Phase 1: alle Source-Kinds via `copyExternalImageToTexture`.
-   *  importExternalTexture für Video-Zero-Copy ist eine künftige
-   *  Optimierung. */
+   *  Live `<video>` sources are NEVER passed in here — the runtime's
+   *  `buildSourcesMap` resolves them to a freshly captured
+   *  `ImageBitmap` (refreshed via `requestVideoFrameCallback` against
+   *  the underlying element). That keeps Chrome's
+   *  `copyExternalImageToTexture(<video>)` orientation bug out of the
+   *  hot path entirely — the bitmap path is reliably correct because
+   *  `createImageBitmap` always honours the source's display matrix. */
   private uploadSource(
     device: GPUDevice,
     src: LayerSource,
   ): GPUTexture | null {
-    let imageSource: HTMLVideoElement | VideoFrame | ImageBitmap | HTMLImageElement;
+    let imageSource: VideoFrame | ImageBitmap | HTMLImageElement;
     let srcW: number;
     let srcH: number;
     switch (src.kind) {
@@ -676,18 +687,15 @@ export class WebGPUBackend implements CompositorBackend {
         }
         break;
       case "video":
-        // Runtime-supplied fallback wins over a not-yet-ready <video>
-        // — hides the black flash during seek/wrap.
-        if (src.preferFallback && src.fallback) {
-          imageSource = src.fallback;
-          srcW = src.fallback.width || 1;
-          srcH = src.fallback.height || 1;
-          break;
-        }
-        if (src.element.readyState < 2) return null;
-        imageSource = src.element;
-        srcW = src.element.videoWidth || 1;
-        srcH = src.element.videoHeight || 1;
+        // The runtime always supplies a fallback bitmap for video and
+        // sets `preferFallback`; the live element is kept around for
+        // metadata but never sampled by the GPU here. If no bitmap
+        // exists yet (cold start, before the first rVFC has fired),
+        // skip — the next tick will have one.
+        if (!src.fallback) return null;
+        imageSource = src.fallback;
+        srcW = src.fallback.width || 1;
+        srcH = src.fallback.height || 1;
         break;
       case "videoframe":
         imageSource = src.frame;

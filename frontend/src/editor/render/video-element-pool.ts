@@ -59,7 +59,40 @@ interface Slot {
   sourceDurS: number;
   warmed: boolean;
   cleanups: Array<() => void>;
+  /** Last `sourceT` we synced this slot to. Used per-tick to tell a
+   *  natural advance (small forward delta) apart from a jump (chunk
+   *  click / scrub / loop wrap) so the seek policy can pick the right
+   *  drift threshold. `null` until first contact, and reset whenever
+   *  the slot leaves the cam's `[0, sourceDurS)` range — re-entry
+   *  counts as first contact. */
+  prevTargetSourceT: number | null;
+  /** True from the moment we issue a `currentTime` write until the
+   *  underlying decoder has actually presented a fresh frame for that
+   *  new position. While set, the runtime keeps drawing the cached
+   *  last-good bitmap (which was captured via `createImageBitmap` —
+   *  the orientation-safe path) rather than risking a stale or
+   *  not-yet-decoded sample. */
+  awaitingFreshFrame: boolean;
+  /** Monotonically increases on every presented video frame (each
+   *  `requestVideoFrameCallback` fire). The runtime watches this to
+   *  decide when to refresh its `createImageBitmap`-based snapshot
+   *  cache: a bumped token means the decoder has a new frame ready
+   *  and the snapshot will pick up something newer than the previous
+   *  capture. Wraps at `Number.MAX_SAFE_INTEGER` (irrelevant in
+   *  practice — never reached). */
+  freshFrameToken: number;
+  /** Pending continuous `requestVideoFrameCallback` handle. We chain
+   *  rVFCs so we get one fire per presented frame for the lifetime of
+   *  the slot — that drives both the `awaitingFreshFrame` clear AND
+   *  the `freshFrameToken` increment. Null between unmount and the
+   *  first arming. */
+  rvfcHandle: number | null;
 }
+
+// `requestVideoFrameCallback` / `cancelVideoFrameCallback` are part of
+// the standard `HTMLVideoElement` lib types (Chrome ≥ 90, Safari ≥ 17,
+// Firefox ≥ 124). We runtime-check below for engines that haven't
+// shipped them yet and fall back to a setTimeout-based watcher.
 
 /** Per-tick sync target per cam. `sourceT` is seconds INSIDE the cam's
  *  media — already accounting for pill-trim, drift, anchor. The pool
@@ -123,6 +156,26 @@ export class VideoElementPool {
     return sourceT >= 0 && sourceT < slot.sourceDurS;
   }
 
+  /** True while we've issued a seek to this slot's `<video>` but the
+   *  decoder hasn't presented the post-seek frame yet. The runtime
+   *  uses this as a hint to skip rendering until a fresh frame lands
+   *  (avoids a brief stale-frame display during scrub / loop wrap). */
+  isAwaitingFreshFrame(clipId: string): boolean {
+    return this.slots.get(clipId)?.awaitingFreshFrame ?? false;
+  }
+
+  /** Monotonically-increasing token bumped on every presented video
+   *  frame (per slot). The preview runtime watches this to refresh
+   *  its `createImageBitmap` snapshot cache exactly once per new
+   *  frame — every backend draw of the video then samples that
+   *  bitmap instead of the live `<video>`, which sidesteps Chrome's
+   *  `copyExternalImageToTexture` orientation bug entirely. Returns 0
+   *  for unknown clipIds and for slots that haven't presented any
+   *  frame yet. */
+  getFreshFrameToken(clipId: string): number {
+    return this.slots.get(clipId)?.freshFrameToken ?? 0;
+  }
+
   /** Re-syncs every cam in the pool against per-cam sync targets. The
    *  runtime supplies `targets` from the current frame descriptor, where
    *  each entry is the active pill's `sourceIn/Out` evaluated at the
@@ -135,6 +188,9 @@ export class VideoElementPool {
     for (const slot of this.slots.values()) {
       const t = targets.get(slot.clipId);
       if (!t) {
+        // No target = cam not on PROGRAM. Reset prev-target so the next
+        // in-range tick is treated as first contact (precise snap).
+        slot.prevTargetSourceT = null;
         if (!slot.el.paused) slot.el.pause();
         continue;
       }
@@ -201,7 +257,25 @@ export class VideoElementPool {
       sourceDurS: cam.clip.sourceDurationS,
       warmed: false,
       cleanups: [],
+      prevTargetSourceT: null,
+      awaitingFreshFrame: false,
+      freshFrameToken: 0,
+      rvfcHandle: null,
     };
+    // Continuous rVFC chain: every presented frame bumps the slot's
+    // token AND clears `awaitingFreshFrame` if it was set. Self-rearms
+    // so the chain runs for the lifetime of the slot.
+    armContinuousFrameCallback(slot);
+    slot.cleanups.push(() => {
+      if (slot.rvfcHandle != null) {
+        try {
+          el.cancelVideoFrameCallback(slot.rvfcHandle);
+        } catch {
+          /* handle may have already fired and been replaced */
+        }
+        slot.rvfcHandle = null;
+      }
+    });
 
     const reportDims = () => {
       if (el.videoWidth > 0 && el.videoHeight > 0) {
@@ -244,23 +318,98 @@ export class VideoElementPool {
   }
 }
 
+// Stutter policy (mirrors `local/timing/cam-preview-sync.ts`): a per-
+// tick `<video>.currentTime = X` write tears the decoder open from
+// the nearest keyframe. On multi-GB phone recordings that takes
+// 100–400 ms; if we re-issue every 16 ms because drift exceeded a
+// tight threshold, we never let the decoder finish and playback
+// stutters indefinitely. So:
+//   • Jumps (large forward / any meaningful backward delta in the
+//     source target) snap precisely — a user-meaningful resync.
+//   • Natural advance is left alone unless drift is catastrophic.
+//   • Mid-seek (`el.seeking`) ticks do nothing; we wait for the
+//     in-flight seek to complete before considering another.
+const JUMP_FORWARD_S = 0.5;
+const JUMP_BACKWARD_S = 0.02;
+const JUMP_DRIFT_THRESHOLD_S = 0.05;
+const NATURAL_DRIFT_THRESHOLD_S = 0.5;
+
 function syncSlot(slot: Slot, sourceT: number, isPlaying: boolean): void {
   const inRange = sourceT >= 0 && sourceT < slot.sourceDurS;
   const v = slot.el;
   if (!inRange) {
+    slot.prevTargetSourceT = null;
     if (!v.paused) v.pause();
     return;
   }
-  if (Math.abs(v.currentTime - sourceT) > 0.1) {
+  // Skip while a previous seek is still resolving. Don't update
+  // prevTargetSourceT either — we want the next free tick to see the
+  // full source-target delta from before the seek, so it can keep
+  // classifying it as the same jump.
+  if (v.seeking) return;
+
+  const drift = Math.abs(v.currentTime - sourceT);
+  const prev = slot.prevTargetSourceT;
+  const isJump =
+    prev === null ||
+    sourceT - prev > JUMP_FORWARD_S ||
+    sourceT - prev < -JUMP_BACKWARD_S;
+  const driftThreshold = isJump
+    ? JUMP_DRIFT_THRESHOLD_S
+    : NATURAL_DRIFT_THRESHOLD_S;
+
+  if (drift > driftThreshold) {
     try {
       v.currentTime = Math.max(0, Math.min(slot.sourceDurS, sourceT));
+      // The continuous rVFC chain (armed in addSlot) will clear the
+      // flag on the next presented frame. We just set the flag here
+      // to signal "this slot is mid-seek" so the runtime knows to
+      // hold its current bitmap until a fresh frame lands.
+      slot.awaitingFreshFrame = true;
     } catch {
       /* element not ready yet — next tick */
     }
   }
+  slot.prevTargetSourceT = sourceT;
+
   if (isPlaying && v.paused) {
     v.play().catch(() => undefined);
   } else if (!isPlaying && !v.paused) {
     v.pause();
   }
+}
+
+/** Self-rearming rVFC chain: each presented frame bumps the slot's
+ *  `freshFrameToken` AND clears `awaitingFreshFrame` if it was set,
+ *  then schedules itself again so the next frame fires the same
+ *  callback. Runs for the slot's lifetime; cancelled in the slot's
+ *  cleanups when the cam is removed.
+ *
+ *  Why drive snapshot refresh from rVFC instead of from RAF: rVFC
+ *  fires exactly once per ACTUALLY-PRESENTED frame, with the source
+ *  in a stable display orientation. RAF fires per render-tick
+ *  whether or not the video has new content; if we snapshot on RAF
+ *  we'd either over-snapshot (same frame multiple times) or
+ *  occasionally snapshot on a tick where the source is mid-update
+ *  (the orientation-bug window). rVFC gives us "exactly one
+ *  reliable snapshot trigger per real frame".
+ *
+ *  Falls back to no-op when rVFC isn't supported — the runtime's
+ *  existing time-throttled snapshot path keeps working. */
+function armContinuousFrameCallback(slot: Slot): void {
+  const v = slot.el;
+  if (typeof v.requestVideoFrameCallback !== "function") return;
+  const onFrame = () => {
+    slot.freshFrameToken =
+      slot.freshFrameToken < Number.MAX_SAFE_INTEGER
+        ? slot.freshFrameToken + 1
+        : 1;
+    slot.awaitingFreshFrame = false;
+    if (typeof v.requestVideoFrameCallback === "function") {
+      slot.rvfcHandle = v.requestVideoFrameCallback(onFrame);
+    } else {
+      slot.rvfcHandle = null;
+    }
+  };
+  slot.rvfcHandle = v.requestVideoFrameCallback(onFrame);
 }

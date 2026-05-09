@@ -80,7 +80,6 @@ export interface PreviewRuntimeOptions {
  *  60Hz `createImageBitmap(<video>)` would churn the heap without
  *  meaningful benefit — the cache only needs to overbridge the 1–3
  *  decode-frames after a seek. */
-const SNAPSHOT_THROTTLE_MS = 100;
 const READY_HAVE_CURRENT_DATA = 2;
 
 export class PreviewRuntime {
@@ -96,16 +95,24 @@ export class PreviewRuntime {
    *  the same image clip lingers across many RAF ticks before its
    *  bitmap resolves. */
   private bitmapsLoading = new Set<string>();
-  /** Last successfully decoded `<video>` frame per layerId, captured
-   *  whenever the element was ready at draw time. While the element is
-   *  mid-seek (after a scrub or loop wrap) we hand this bitmap to the
-   *  backend instead of the empty/transparent video — without it, the
-   *  unconditional black background-clear flashes through for the
-   *  1–3 decode frames the seek takes. */
-  private lastGoodFrames = new Map<
-    string,
-    { bitmap: ImageBitmap; lastSnapshotMs: number }
-  >();
+  /** Per-layer ImageBitmap snapshot of the live `<video>`. The
+   *  backend draws THIS, never the `<video>` element directly —
+   *  `createImageBitmap` honours the source's display matrix
+   *  reliably, while `copyExternalImageToTexture(<video>)` /
+   *  `importExternalTexture(<video>)` occasionally land the first
+   *  frame after a seek with the wrong vertical orientation (Chrome
+   *  GPU pipeline state hiccup). Routing every video frame through
+   *  ImageBitmap structurally avoids the bug.
+   *
+   *  Refreshed on every new presented frame, signalled by the pool's
+   *  `getFreshFrameToken` (driven by `requestVideoFrameCallback` —
+   *  one token bump per real frame). */
+  private lastGoodFrames = new Map<string, { bitmap: ImageBitmap }>();
+  /** Per-layer bookkeeping for snapshot scheduling: which fresh-frame
+   *  token we last captured for. When the pool reports a higher
+   *  token, we know a NEW frame is available and the snapshot should
+   *  be refreshed. */
+  private lastSnapshotToken = new Map<string, number>();
   /** Layers for which a snapshot is currently in flight. Prevents two
    *  overlapping `createImageBitmap` calls for the same layer (the
    *  second would race the first and leak the loser). */
@@ -422,29 +429,35 @@ export class PreviewRuntime {
       if (layer.source.kind === "video") {
         const el = this.pool?.getElement(layer.layerId);
         if (!el) continue;
-        // Last-good-frame fallback: only when (a) the cam is currently
-        // in-range (out-of-range layers correctly stay black), (b) the
-        // <video> can't deliver a fresh frame this tick (mid-seek or
-        // pre-decode), and (c) we have a snapshot to substitute. Misses
-        // any of these → standard video source.
         const target = targets.get(layer.layerId);
         const inRange =
           target != null
             ? (this.pool?.isSourceInRange(layer.layerId, target.sourceT) ?? true)
             : false;
-        const ready =
-          !el.seeking && el.readyState >= READY_HAVE_CURRENT_DATA;
+        if (!inRange) continue;
+        // We ALWAYS hand the backend the cached ImageBitmap and never
+        // the live `<video>` element. createImageBitmap respects the
+        // source's display matrix reliably; the GPU upload path for
+        // <video> elements (copyExternalImageToTexture /
+        // importExternalTexture) occasionally lands the first frame
+        // after a seek upside-down, which is the visible flip-flicker
+        // on scrub / pill change. Routing through ImageBitmap
+        // structurally eliminates that path. Cost: one extra
+        // createImageBitmap per presented frame (~1 ms on typical
+        // hardware; cheaper than the orientation-bug whack-a-mole).
         const cached = this.lastGoodFrames.get(layer.layerId);
-        if (inRange && !ready && cached) {
-          out.set(layer.layerId, {
-            kind: "video",
-            element: el,
-            fallback: cached.bitmap,
-            preferFallback: true,
-          });
-        } else {
-          out.set(layer.layerId, { kind: "video", element: el });
+        if (!cached) {
+          // No bitmap yet — happens for ~1 rVFC after the cam enters
+          // the descriptor (cold start, cam swap). Skip the layer
+          // until the first snapshot lands; the next tick has it.
+          continue;
         }
+        out.set(layer.layerId, {
+          kind: "video",
+          element: el,
+          fallback: cached.bitmap,
+          preferFallback: true,
+        });
       } else if (layer.source.kind === "image") {
         const cached = this.bitmaps.get(layer.layerId);
         if (cached) {
@@ -457,25 +470,24 @@ export class PreviewRuntime {
     return out;
   }
 
-  /** After a successful drawFrame, capture the live `<video>` of every
-   *  active layer that's currently in-range and ready. Per-layer
-   *  throttle keeps this cheap: most ticks hit the fast path
-   *  (`now() - lastSnapshotMs < 100ms` → noop). The held bitmap is what
-   *  `buildSourcesMap` substitutes during seeks/wraps. */
+  /** Token-driven snapshot refresh. The pool bumps each slot's
+   *  `freshFrameToken` exactly once per presented video frame
+   *  (driven by `requestVideoFrameCallback`). On every tick we check
+   *  whether the token has advanced for any active video layer; if
+   *  so, we kick off a `createImageBitmap` to capture the new frame.
+   *  The captured bitmap becomes the source the backend draws — the
+   *  live `<video>` element is never sampled by the GPU directly,
+   *  which keeps Chrome's video-upload orientation bug structurally
+   *  out of the picture. */
   private maybeRefreshSnapshots(
     layers: ReadonlyArray<{ layerId: string; source: { kind: string } }>,
     targets: ReadonlyMap<string, PoolSyncTarget>,
   ): void {
     if (!this.pool) return;
-    let now: number | null = null;
     for (const layer of layers) {
       if (layer.source.kind !== "video") continue;
       if (this.snapshotInFlight.has(layer.layerId)) continue;
-      const existing = this.lastGoodFrames.get(layer.layerId);
-      if (now === null) now = this.opts.now();
-      if (existing && now - existing.lastSnapshotMs < SNAPSHOT_THROTTLE_MS) {
-        continue;
-      }
+
       const el = this.pool.getElement(layer.layerId);
       if (!el) continue;
       if (el.seeking || el.readyState < READY_HAVE_CURRENT_DATA) continue;
@@ -484,7 +496,17 @@ export class PreviewRuntime {
         continue;
       }
 
+      // Only snapshot when the pool reports a NEW presented frame
+      // (token bumped). Without this gate we'd capture the same
+      // frame multiple times per RAF, wasting work.
+      const currentToken = this.pool.getFreshFrameToken(layer.layerId);
+      const lastToken = this.lastSnapshotToken.get(layer.layerId) ?? 0;
+      if (currentToken === lastToken && this.lastGoodFrames.has(layer.layerId)) {
+        continue;
+      }
+
       this.snapshotInFlight.add(layer.layerId);
+      this.lastSnapshotToken.set(layer.layerId, currentToken);
       const layerId = layer.layerId;
       void this.opts
         .createBitmapFromVideo(el)
@@ -508,10 +530,7 @@ export class PreviewRuntime {
               /* already closed */
             }
           }
-          this.lastGoodFrames.set(layerId, {
-            bitmap: bm,
-            lastSnapshotMs: this.opts.now(),
-          });
+          this.lastGoodFrames.set(layerId, { bitmap: bm });
         })
         .catch(() => {
           this.snapshotInFlight.delete(layerId);
@@ -534,6 +553,7 @@ export class PreviewRuntime {
         /* already closed */
       }
       this.lastGoodFrames.delete(id);
+      this.lastSnapshotToken.delete(id);
     }
   }
 
@@ -652,10 +672,41 @@ async function defaultLoadBitmap(url: string): Promise<ImageBitmap> {
   return createImageBitmap(blob);
 }
 
+/** Capture the current displayed frame from a `<video>` element as an
+ *  ImageBitmap, going through a Canvas2D `drawImage` intermediate.
+ *
+ *  Why the indirection (vs the obvious `createImageBitmap(el)`):
+ *  Chrome's direct `createImageBitmap(<video>)` path occasionally
+ *  hands back the GPU decoder's RAW frame buffer — which for hardware-
+ *  decoded video can be in CODEC orientation (the display rotation
+ *  matrix from the MP4 has not been applied). Symptoms: a 90°-rotated
+ *  phone recording renders rotated/upside-down on the GPU even though
+ *  the on-screen `<video>` plays correctly.
+ *
+ *  The fix: draw through Canvas2D's `drawImage(<video>)`, which is the
+ *  same code path the on-screen `<video>` tag uses internally — it
+ *  ALWAYS applies the display matrix correctly. Then capture an
+ *  ImageBitmap of the canvas. Round-trip is one extra GPU→GPU copy
+ *  (cheap on modern hardware) but the orientation is guaranteed.
+ *
+ *  The intermediate canvas is sized at `videoWidth × videoHeight`,
+ *  which by spec is the POST-rotation display dimensions. */
 async function defaultCreateBitmapFromVideo(
   el: HTMLVideoElement,
 ): Promise<ImageBitmap> {
-  return createImageBitmap(el);
+  const w = Math.max(1, el.videoWidth || 1);
+  const h = Math.max(1, el.videoHeight || 1);
+  const off = new OffscreenCanvas(w, h);
+  const ctx = off.getContext("2d");
+  if (!ctx) {
+    // Browser without OffscreenCanvas 2D (very rare) — fall back to
+    // the direct path. Most browsers that lack this also lack WebGPU,
+    // so the WebGL2 backend's own video-orientation handling is what
+    // ends up running.
+    return createImageBitmap(el);
+  }
+  ctx.drawImage(el, 0, 0, w, h);
+  return createImageBitmap(off);
 }
 
 function collectVideoCams(clips: readonly Clip[], cams: ClipUrlMap): VideoCam[] {
