@@ -19,15 +19,18 @@
  *     the supplied `onDimsReport` callback (post-rotation already
  *     applied by the browser).
  *
- * Per-tick sync (drives by `syncAll(masterT, isPlaying)` from the
+ * Per-tick sync (driven by `syncAll(targets, isPlaying)` from the
  * runtime's RAF):
- *   - Seek-drift correction: hard `currentTime = sourceT` when more
- *     than 100 ms off (browsers handle ~50 ms gracefully).
+ *   - Seek-drift correction with jump-vs-natural classification: a
+ *     master jump (chunk click / scrub / loop wrap) snaps precisely;
+ *     natural ~16 ms forward advance is only corrected when drift is
+ *     catastrophic. Per-tick `currentTime = X` writes tear the decoder
+ *     open from the nearest keyframe, which on multi-GB phone files
+ *     causes a positive-feedback stutter loop if we re-seek every
+ *     frame. The two-threshold policy (precise on jumps, lenient on
+ *     natural advance) breaks that loop.
  *   - Play/pause based on whether the source-time is inside the cam's
  *     `[0, sourceDurationS)` range AND the master clock is playing.
- *
- * Same math as the old CamCanvas — just lifted into a class so a single
- * RAF owns N cams instead of one effect-binding per cam.
  */
 import type { VideoClip } from "../types";
 
@@ -59,6 +62,13 @@ interface Slot {
   sourceDurS: number;
   warmed: boolean;
   cleanups: Array<() => void>;
+  /** Last `sourceT` we synced this slot to. Used per-tick to tell a
+   *  natural advance (small forward delta) apart from a jump (chunk
+   *  click / scrub / loop wrap) so the seek policy can pick the right
+   *  drift threshold. `null` until first contact, and reset whenever
+   *  the slot leaves the cam's `[0, sourceDurS)` range — re-entry
+   *  counts as first contact. */
+  prevTargetSourceT: number | null;
 }
 
 /** Per-tick sync target per cam. `sourceT` is seconds INSIDE the cam's
@@ -113,10 +123,10 @@ export class VideoElementPool {
   }
 
   /** Whether the supplied `sourceT` lands inside the cam's source-time
-   *  range. The runtime uses this to gate the last-good-frame fallback:
-   *  out-of-range cams should stay black (correct empty state), in-range
-   *  cams that are mid-seek should hold the cached frame to hide the
-   *  decode-latency flash. */
+   *  range. The runtime uses this to decide whether a missing frame
+   *  should be filled by its last-good cache (in-range = the `<video>`
+   *  is just decoding) or left as background black (out-of-range is the
+   *  correct empty state for that cam at this source time). */
   isSourceInRange(clipId: string, sourceT: number): boolean {
     const slot = this.slots.get(clipId);
     if (!slot) return false;
@@ -135,6 +145,9 @@ export class VideoElementPool {
     for (const slot of this.slots.values()) {
       const t = targets.get(slot.clipId);
       if (!t) {
+        // No target = cam not on PROGRAM. Reset prev-target so the next
+        // in-range tick is treated as first contact (precise snap).
+        slot.prevTargetSourceT = null;
         if (!slot.el.paused) slot.el.pause();
         continue;
       }
@@ -201,6 +214,7 @@ export class VideoElementPool {
       sourceDurS: cam.clip.sourceDurationS,
       warmed: false,
       cleanups: [],
+      prevTargetSourceT: null,
     };
 
     const reportDims = () => {
@@ -244,20 +258,55 @@ export class VideoElementPool {
   }
 }
 
+// Stutter policy (mirrors `local/timing/cam-preview-sync.ts`): a per-
+// tick `<video>.currentTime = X` write tears the decoder open from
+// the nearest keyframe. On multi-GB phone recordings that takes
+// 100–400 ms; if we re-issue every 16 ms because drift exceeded a
+// tight threshold, we never let the decoder finish and playback
+// stutters indefinitely. So:
+//   • Jumps (large forward / any meaningful backward delta in the
+//     source target) snap precisely — a user-meaningful resync.
+//   • Natural advance is left alone unless drift is catastrophic.
+//   • Mid-seek (`el.seeking`) ticks do nothing; we wait for the
+//     in-flight seek to complete before considering another.
+const JUMP_FORWARD_S = 0.5;
+const JUMP_BACKWARD_S = 0.02;
+const JUMP_DRIFT_THRESHOLD_S = 0.05;
+const NATURAL_DRIFT_THRESHOLD_S = 0.5;
+
 function syncSlot(slot: Slot, sourceT: number, isPlaying: boolean): void {
   const inRange = sourceT >= 0 && sourceT < slot.sourceDurS;
   const v = slot.el;
   if (!inRange) {
+    slot.prevTargetSourceT = null;
     if (!v.paused) v.pause();
     return;
   }
-  if (Math.abs(v.currentTime - sourceT) > 0.1) {
+  // Skip while a previous seek is still resolving. Don't update
+  // prevTargetSourceT either — we want the next free tick to see the
+  // full source-target delta from before the seek, so it can keep
+  // classifying it as the same jump.
+  if (v.seeking) return;
+
+  const drift = Math.abs(v.currentTime - sourceT);
+  const prev = slot.prevTargetSourceT;
+  const isJump =
+    prev === null ||
+    sourceT - prev > JUMP_FORWARD_S ||
+    sourceT - prev < -JUMP_BACKWARD_S;
+  const driftThreshold = isJump
+    ? JUMP_DRIFT_THRESHOLD_S
+    : NATURAL_DRIFT_THRESHOLD_S;
+
+  if (drift > driftThreshold) {
     try {
       v.currentTime = Math.max(0, Math.min(slot.sourceDurS, sourceT));
     } catch {
       /* element not ready yet — next tick */
     }
   }
+  slot.prevTargetSourceT = sourceT;
+
   if (isPlaying && v.paused) {
     v.play().catch(() => undefined);
   } else if (!isPlaying && !v.paused) {

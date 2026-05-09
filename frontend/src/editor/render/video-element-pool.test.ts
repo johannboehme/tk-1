@@ -22,6 +22,7 @@ function makeFakeVideo() {
     readyState: 0,
     currentTime: 0,
     paused: true,
+    seeking: false,
     videoWidth: 0,
     videoHeight: 0,
     style: {} as Record<string, string>,
@@ -194,17 +195,17 @@ describe("VideoElementPool — syncAll behaviour", () => {
     return new Map(entries.map(([id, t]) => [id, { sourceT: t }]));
   }
 
-  it("seeks element when drift > 100 ms", () => {
+  it("snaps on first contact (jump threshold) when drift exceeds 50 ms", () => {
     const { pool, fakes } = makePoolWithFakes([cam("a")]);
     fakes[0].currentTime = 0;
-    pool.syncAll(targets([["a", 0.5]]), false);
+    pool.syncAll(targets([["a", 0.5]]), false); // first contact = jump
     expect(fakes[0].currentTime).toBe(0.5);
   });
 
-  it("does NOT seek when drift ≤ 100 ms", () => {
+  it("does NOT seek when first-contact drift sits at the 50 ms jump threshold", () => {
     const { pool, fakes } = makePoolWithFakes([cam("a")]);
     fakes[0].currentTime = 0.45;
-    pool.syncAll(targets([["a", 0.5]]), false); // drift = 0.05 < 0.1
+    pool.syncAll(targets([["a", 0.5]]), false); // drift 0.05, threshold 0.05
     expect(fakes[0].currentTime).toBe(0.45);
   });
 
@@ -249,6 +250,96 @@ describe("VideoElementPool — syncAll behaviour", () => {
     expect(fakes[0].currentTime).toBeCloseTo(1.4, 6);
     pool.syncAll(targets([["a", 6.7]]), false);
     expect(fakes[0].currentTime).toBeCloseTo(6.7, 6);
+  });
+
+  it("does NOT re-seek on natural advance with sub-half-second drift", () => {
+    // After the initial snap, two ticks worth of natural forward advance
+    // (+~16 ms each) leave the element 0.05 s behind. The old policy
+    // would seek every tick because drift > 100 ms once it accumulates,
+    // tearing the decoder open mid-flight on big phone recordings. The
+    // new policy holds for natural drift up to 500 ms.
+    const { pool, fakes } = makePoolWithFakes([
+      cam("a", { sourceDurationS: 600 }),
+    ]);
+    pool.syncAll(targets([["a", 10]]), true); // first contact = snap
+    expect(fakes[0].currentTime).toBe(10);
+    // Element drifts to 9.85 (150 ms behind) while master target moves to
+    // 10.016 — this MUST not seek again.
+    fakes[0].currentTime = 9.85;
+    pool.syncAll(targets([["a", 10.016]]), true);
+    expect(fakes[0].currentTime).toBe(9.85);
+  });
+
+  it("seeks on a forward jump even when drift is small", () => {
+    // The user clicked further down the timeline. Source target jumps
+    // 5 s ahead. Even though the element is < 50 ms behind the OLD
+    // target, it's now far behind the NEW one — must snap precisely.
+    const { pool, fakes } = makePoolWithFakes([
+      cam("a", { sourceDurationS: 600 }),
+    ]);
+    pool.syncAll(targets([["a", 10]]), true);
+    fakes[0].currentTime = 10;
+    pool.syncAll(targets([["a", 15]]), true); // sourceT delta > 0.5
+    expect(fakes[0].currentTime).toBe(15);
+  });
+
+  it("seeks on a backward jump (loop wrap)", () => {
+    const { pool, fakes } = makePoolWithFakes([
+      cam("a", { sourceDurationS: 60 }),
+    ]);
+    pool.syncAll(targets([["a", 14.0]]), true); // first contact
+    fakes[0].currentTime = 14.0;
+    pool.syncAll(targets([["a", 10.0]]), true); // wrap backward
+    expect(fakes[0].currentTime).toBe(10.0);
+  });
+
+  it("seeks on catastrophic natural drift (> 500 ms)", () => {
+    // Element fell way behind (e.g. tab throttled, GC pause). Even
+    // without a target jump, > 500 ms is a hard resync.
+    const { pool, fakes } = makePoolWithFakes([
+      cam("a", { sourceDurationS: 600 }),
+    ]);
+    pool.syncAll(targets([["a", 10]]), true);
+    fakes[0].currentTime = 8; // 2 s behind
+    pool.syncAll(targets([["a", 10.1]]), true); // small target advance, big drift
+    expect(fakes[0].currentTime).toBe(10.1);
+  });
+
+  it("skips the entire tick while the element is mid-seek", () => {
+    // Stacking another `currentTime` write on top of an in-flight seek
+    // tears the decoder open mid-flight. Pool must NOT touch the
+    // element while seeking is true; the next free tick handles it.
+    const { pool, fakes } = makePoolWithFakes([
+      cam("a", { sourceDurationS: 600 }),
+    ]);
+    pool.syncAll(targets([["a", 10]]), true);
+    expect(fakes[0].currentTime).toBe(10);
+    fakes[0].play.mockClear();
+    (fakes[0] as unknown as { seeking: boolean }).seeking = true;
+    fakes[0].currentTime = 5; // pretend the element is mid-seek somewhere else
+    pool.syncAll(targets([["a", 20]]), true);
+    expect(fakes[0].currentTime).toBe(5); // unchanged — no write while seeking
+    expect(fakes[0].play).not.toHaveBeenCalled(); // no play() during seek
+  });
+
+  it("re-snaps precisely when a paused-out cam comes back on PROGRAM", () => {
+    // Cam goes off PROGRAM (no target) for a tick, then comes back. The
+    // re-entry tick should treat the new sourceT as first contact
+    // (precise threshold), not continue from the stale prev-target —
+    // the element may have stalled at its old position.
+    const { pool, fakes } = makePoolWithFakes([
+      cam("a", { sourceDurationS: 600 }),
+    ]);
+    pool.syncAll(targets([["a", 10]]), true); // on PROGRAM
+    fakes[0].currentTime = 10.0; // aligned
+    pool.syncAll(new Map(), true); // off PROGRAM — pause + reset prev
+    // Element has stalled at 10.0 while master kept advancing. Re-entry
+    // sourceT is 10.2 — drift = 0.2 (above the precise jump threshold
+    // of 0.05, below the lenient natural threshold of 0.5). Without
+    // the prev-target reset this would have been classified as natural
+    // advance and held; the reset makes it first-contact → snap.
+    pool.syncAll(targets([["a", 10.2]]), true);
+    expect(fakes[0].currentTime).toBe(10.2);
   });
 });
 
