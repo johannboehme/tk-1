@@ -58,6 +58,7 @@ import type {
   VisualizerWorkerDescriptor,
 } from "./render/edit.worker";
 import { decodeAudioToMonoPcm } from "./codec";
+import { collectSyncFailureReport } from "./diagnostics";
 import { computeEnergyCurves } from "./render/energy";
 import { extractTimelineFrames } from "./render/frames";
 import type { TextOverlay } from "./render/ass-builder";
@@ -272,14 +273,15 @@ export async function createJob(
 
   // Kick off sync without awaiting — UI subscribes for results.
   useOpsStore.getState().startSyncOp(jobId, { pct: 0, stage: "queued" });
-  void runSync(jobId, audioExt).catch((err) => {
-    // Preserve the stage the op was in when it threw — without this the
-    // banner just shows the raw decoder message and the user can't tell
-    // whether the master audio or a specific cam was the culprit.
-    const stage = useOpsStore.getState().ops[jobId]?.sync?.stage;
-    const raw = err instanceof Error ? err.message : String(err);
-    const error = stage ? `[${stage}] ${raw}` : raw;
-    useOpsStore.getState().failSyncOp(jobId, error);
+  void runSync(jobId, audioExt).catch(async (err) => {
+    // Build a rich diagnostic report so a screenshot of the banner is
+    // self-sufficient for triage — browser, capabilities, file in
+    // flight, and the original Error.name/stack survive instead of
+    // being flattened into a single opaque "File could not be read!"
+    // string. Banner shows the summary; full report ships behind a
+    // "Show details" toggle on the same banner.
+    const { summary, report } = await collectSyncFailureReport(jobId, err);
+    useOpsStore.getState().failSyncOp(jobId, summary, report);
   });
 
   return jobId;
@@ -289,6 +291,7 @@ interface SyncProgressPatch {
   pct?: number;
   stage?: string;
   detail?: string;
+  currentFile?: import("./ops-store").SyncOpFileContext;
 }
 
 function reportSyncProgress(jobId: string, patch: SyncProgressPatch): void {
@@ -333,7 +336,25 @@ async function runCamPrep(
     mapPct: (frac: number) => number;
   },
 ): Promise<VideoAsset> {
+  // Record the file we're about to read BEFORE the load — if loading
+  // itself throws (OPFS read failure, handle permission revoked) the
+  // diagnostic still names which cam was in flight. We refine with the
+  // resolved File's actual size/type once the load succeeds.
+  reportSyncProgress(jobId, {
+    currentFile: {
+      name: cam.filename,
+      sourceKind: assetSource(cam).kind,
+    },
+  });
   const videoFile = await loadAssetFile(cam);
+  reportSyncProgress(jobId, {
+    currentFile: {
+      name: videoFile.name,
+      size: videoFile.size,
+      type: videoFile.type,
+      sourceKind: assetSource(cam).kind,
+    },
+  });
 
   // SYNC stage — only if matching is requested.
   let sync: SyncResult | undefined;
@@ -473,8 +494,21 @@ async function runSync(jobId: string, audioExt: string): Promise<void> {
   // Decode the master studio audio once; every cam syncs against this.
   // Master decode gets the 2..5 % slice of the global bar — small for
   // typical few-MB songs but visible for hour-long master tracks.
+  const audioSrc = jobAudioSource(job);
+  reportSyncProgress(jobId, {
+    currentFile: { name: job.audioFilename, sourceKind: audioSrc.kind },
+  });
   const audioFile = await loadJobAudio(job, audioExt);
-  reportSyncProgress(jobId, { pct: 2, stage: "decoding-studio-audio" });
+  reportSyncProgress(jobId, {
+    pct: 2,
+    stage: "decoding-studio-audio",
+    currentFile: {
+      name: audioFile.name,
+      size: audioFile.size,
+      type: audioFile.type,
+      sourceKind: audioSrc.kind,
+    },
+  });
   const studioMonoPcm = await decodeAudioToMonoPcm(audioFile, 22050, {
     onProgress: (frac) => {
       reportSyncProgress(jobId, {

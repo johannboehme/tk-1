@@ -159,7 +159,7 @@ export default function JobPage() {
       </section>
 
       {syncFailed && syncOp?.error && (
-        <Banner kind="error" text={syncOp.error} />
+        <Banner kind="error" text={syncOp.error} details={syncOp.errorReport} />
       )}
       {err && <Banner kind="error" text={err} />}
 
@@ -315,7 +315,33 @@ function JobSubtitle({ job }: { job: LocalJob }) {
   );
 }
 
-function Banner({ kind, text }: { kind: "error"; text: string }) {
+function Banner({
+  kind,
+  text,
+  details,
+}: {
+  kind: "error";
+  text: string;
+  /** Optional multi-line plaintext diagnostic. When set, the banner
+   *  shows a "Show details" toggle + "Copy details" affordance so the
+   *  user can ship the report to us without poking around devtools. */
+  details?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  async function copy() {
+    if (!details) return;
+    try {
+      await navigator.clipboard.writeText(details);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1600);
+    } catch {
+      // Clipboard API can refuse in non-secure contexts; the user can
+      // still select + copy from the open <pre> in that case.
+    }
+  }
+
   return (
     <div
       className={[
@@ -323,7 +349,30 @@ function Banner({ kind, text }: { kind: "error"; text: string }) {
         kind === "error" ? "border-danger text-danger" : "",
       ].join(" ")}
     >
-      {text}
+      <div>{text}</div>
+      {details && (
+        <div className="mt-1 flex items-center gap-3 text-xs">
+          <button
+            type="button"
+            onClick={() => setOpen((v) => !v)}
+            className="underline underline-offset-2 hover:opacity-80"
+          >
+            {open ? "Hide details" : "Show details"}
+          </button>
+          <button
+            type="button"
+            onClick={copy}
+            className="underline underline-offset-2 hover:opacity-80"
+          >
+            {copied ? "Copied" : "Copy details"}
+          </button>
+        </div>
+      )}
+      {details && open && (
+        <pre className="mt-2 whitespace-pre-wrap break-words text-[11px] leading-snug text-ink-2 bg-paper-hi border border-rule rounded p-3 max-h-80 overflow-auto">
+          {details}
+        </pre>
+      )}
     </div>
   );
 }
