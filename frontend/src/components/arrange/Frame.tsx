@@ -13,6 +13,8 @@
 import { useEffect, useRef, useState } from "react";
 import type { Chunk, VideoAsset } from "../../storage/jobs-db";
 import { useChunkThumbnail } from "./useChunkThumbnail";
+import { useArrangeStore } from "../../local/arrange/arrange-store";
+import { renderMelOverlay } from "../../local/arrange/chunk-mel-render";
 
 interface FrameProps {
   jobId: string | null;
@@ -70,6 +72,19 @@ export function Frame({
   const thumb = useChunkThumbnail(jobId, cam, chunk, visible);
   const camColor = cam?.color ?? "#FF5722";
   const lengthS = (chunk.endMs - chunk.startMs) / 1000;
+
+  // Mel overlay — phosphor screen-blended onto the (tiled) still.
+  // dstFrames scales with the frame's display width so wider, length-
+  // proportional frames keep crisp time resolution instead of blurring
+  // a fixed 96-column canvas across hundreds of pixels.
+  const mel = useArrangeStore((s) => s.melByChunkId[chunk.id] ?? null);
+  const melCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  useEffect(() => {
+    const canvas = melCanvasRef.current;
+    if (!canvas || !mel) return;
+    const cols = Math.max(48, Math.min(512, Math.floor(width)));
+    renderMelOverlay(canvas, mel, cols);
+  }, [mel, width]);
 
   // Tile-count shown in the image area: wider frames carry more
   // copies of the thumbnail, faking the "multiple still frames in a
@@ -159,6 +174,21 @@ export function Frame({
             )}
           </div>
         ))}
+        {/* Mel overlay — spans the whole image area regardless of
+         *  tile-count. Screen-blended onto whatever sits below
+         *  (thumbnails or empty bg) so the audio identity reads
+         *  uniformly across the strip. */}
+        <canvas
+          ref={melCanvasRef}
+          aria-hidden
+          className="absolute inset-0 h-full w-full pointer-events-none"
+          style={{
+            gridColumn: `1 / -1`,
+            mixBlendMode: "screen",
+            opacity: mel ? 0.85 : 0,
+            transition: "opacity 600ms ease-out",
+          }}
+        />
       </div>
 
       {/* Bottom label band: chunk index + spectral mini-dot + bar count.

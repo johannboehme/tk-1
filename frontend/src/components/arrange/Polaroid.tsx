@@ -16,6 +16,12 @@ import { motion } from "framer-motion";
 import type { Chunk, VideoAsset } from "../../storage/jobs-db";
 import { useChunkThumbnail } from "./useChunkThumbnail";
 import { useArrangeStore } from "../../local/arrange/arrange-store";
+import { renderMelOverlay } from "../../local/arrange/chunk-mel-render";
+
+/** Image-well column count for the screen-blended mel overlay. The
+ *  well is ~108 px wide on the deployed card; 96 internal columns
+ *  give the browser room to bilinear-bleed without blocking up. */
+const POLAROID_MEL_COLS = 96;
 
 interface PolaroidProps {
   jobId: string | null;
@@ -73,6 +79,17 @@ export function Polaroid({
   const thumb = useChunkThumbnail(jobId, cam, chunk, visible);
   const lengthS = (chunk.endMs - chunk.startMs) / 1000;
   const camColor = cam?.color ?? "#FF5722";
+
+  // Mel overlay — phosphor "haunts" the still photograph via screen
+  // blend. Subscribed per-chunk so the polaroid only rerenders when
+  // *its own* mel finishes computing, not on every other chunk's.
+  const mel = useArrangeStore((s) => s.melByChunkId[chunk.id] ?? null);
+  const melCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  useEffect(() => {
+    const canvas = melCanvasRef.current;
+    if (!canvas || !mel) return;
+    renderMelOverlay(canvas, mel, POLAROID_MEL_COLS);
+  }, [mel]);
 
   // Drag-from-Polaroid → drop-on-Strip. We start the drag on
   // pointerdown but only after the user has moved past a small
@@ -178,6 +195,21 @@ export function Polaroid({
         ) : (
           <PolaroidEmpty failed={thumb.failed} camColor={camColor} />
         )}
+        {/* Mel overlay — OP-1 phosphor screen-blended onto the still.
+         *  Wine-floor LUT means quiet bins stay near-black so the
+         *  photograph reads through; loud amber peaks light up the
+         *  print like a darkroom double exposure. Fades in once the
+         *  worker delivers the chunk's mel data. */}
+        <canvas
+          ref={melCanvasRef}
+          aria-hidden
+          className="absolute inset-0 h-full w-full pointer-events-none"
+          style={{
+            mixBlendMode: "screen",
+            opacity: mel ? 0.9 : 0,
+            transition: "opacity 600ms ease-out",
+          }}
+        />
         {/* Spectral fingerprint stripe — 3px on the right edge of the
          *  image well, fading at top + bottom so it doesn't slam into
          *  the corners. Reads as part of the photograph rather than a
