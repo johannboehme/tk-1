@@ -63,13 +63,6 @@ export function CamPreviewArrange() {
 
   useEffect(() => {
     if (!videoEl) return;
-    // Skip while the element is recovering from a previous seek; stacking
-    // another `currentTime` write tears the decoder open mid-flight on
-    // huge phone recordings — same anti-stutter rule the Triage preview
-    // uses. `prevMasterT` stays unchanged so the next non-seeking tick
-    // sees the full delta and classifies the situation correctly.
-    if (videoEl.seeking) return;
-
     const action = decideCamPreviewAction({
       masterT: currentTime,
       syncOffsetMs,

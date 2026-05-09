@@ -67,16 +67,6 @@ export function CamPreview() {
 
   useEffect(() => {
     if (!videoEl) return;
-    // Skip while the element is still recovering from a previous seek.
-    // Stacking another `currentTime = X` on top of an in-flight seek
-    // tears the decoder open mid-flight on huge phone recordings —
-    // exactly the post-seek stutter loop the user reports.
-    if (videoEl.seeking) {
-      // Don't update prevMasterT — we want the NEXT non-seeking tick to
-      // see the full delta from before the seek so it can classify it
-      // as a jump.
-      return;
-    }
     const action = decideCamPreviewAction({
       masterT: currentTime,
       syncOffsetMs,

@@ -27,8 +27,15 @@
  *     and let the element play freely. Browsers keep audio + a muted
  *     `<video>` close enough on their own clock for triage purposes,
  *     and small natural drift is invisible.
- *   • Caller is expected to skip the action when `videoEl.seeking` so
- *     we don't stack seeks on a still-decoding element.
+ *
+ * The caller does NOT need to skip while `videoEl.seeking` — the
+ * jump-vs-natural classifier above is what prevents the stutter loop.
+ * A seeking-guard in the caller would break responsive scrubbing and
+ * loop-wrap (any tick that lands during the 100-400 ms decoder warmup
+ * would be silently dropped, leaving the video frozen at a stale frame).
+ * Browsers handle "newer setCurrentTime supersedes in-flight seek"
+ * internally — the decoder may pay extra cycles, but the visible target
+ * is always the latest one.
  */
 
 import { camSourceTimeS, type CamTimeRef } from "./cam-time";
