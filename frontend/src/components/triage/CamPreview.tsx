@@ -15,6 +15,7 @@ import { useEffect, useState } from "react";
 import { resolveCamAssetUrl } from "../../local/jobs";
 import { useTriageStore } from "../../local/triage/triage-store";
 import { CamPickerDropdown } from "../CamPickerDropdown";
+import { decideCamPreviewAction } from "./cam-preview-sync";
 
 export function CamPreview() {
   const jobId = useTriageStore((s) => s.jobId);
@@ -31,6 +32,8 @@ export function CamPreview() {
   const syncOffsetMs = cam
     ? (cam.sync?.offsetMs ?? 0) + (cam.syncOverrideMs ?? 0)
     : 0;
+  const driftRatio = cam?.sync?.driftRatio ?? 1;
+  const sourceDurationS = cam?.durationS ?? null;
 
   useEffect(() => {
     if (!jobId || !camId) {
@@ -55,15 +58,31 @@ export function CamPreview() {
 
   useEffect(() => {
     if (!videoEl) return;
-    const sourceT = currentTime - syncOffsetMs / 1000;
-    if (sourceT < 0) {
+    const action = decideCamPreviewAction({
+      masterT: currentTime,
+      syncOffsetMs,
+      sourceDurationS,
+      driftRatio,
+    });
+    if (action.kind === "pause-before-start") {
       if (!videoEl.paused) videoEl.pause();
       return;
     }
-    if (Math.abs(videoEl.currentTime - sourceT) > 0.05) {
-      videoEl.currentTime = sourceT;
+    if (Math.abs(videoEl.currentTime - action.sourceT) > 0.05) {
+      videoEl.currentTime = action.sourceT;
     }
-  }, [currentTime, syncOffsetMs, videoEl]);
+    if (action.kind === "pause-after-end") {
+      if (!videoEl.paused) videoEl.pause();
+      return;
+    }
+    // Cam IS visible. If the master is playing but our element is paused
+    // (e.g. we just crossed sourceT=0 after a `pause-before-start` window),
+    // resume — without this, the preview stays frozen on the first
+    // post-anchor frame even though the master plays on.
+    if (isPlaying && videoEl.paused) {
+      void videoEl.play().catch(() => undefined);
+    }
+  }, [currentTime, syncOffsetMs, driftRatio, sourceDurationS, isPlaying, videoEl]);
 
   useEffect(() => {
     if (!videoEl) return;

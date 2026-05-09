@@ -28,6 +28,7 @@ import type { Chunk, VideoAsset } from "../../storage/jobs-db";
 import { loadAssetFile } from "../asset-source";
 import { resolveCamAssetUrl } from "../jobs";
 import { planTileStrip } from "../render/frames/strategy";
+import { camSourceTimeS } from "../timing/cam-time";
 
 /** Target output width for tier-3 (on-demand seek) thumbnails — drawn
  *  from the full-res video, so we can pick a number that's plenty
@@ -450,8 +451,15 @@ function findCoveringTileIdx(
   syncOffsetMs: number,
   plan: StripPlan,
 ): number | null {
-  const sourceInS = chunk.startMs / 1000 - syncOffsetMs / 1000;
-  const sourceOutS = chunk.endMs / 1000 - syncOffsetMs / 1000;
+  // Sign convention: positive `syncOffsetMs` means the cam started BEFORE
+  // master t=0 (pre-roll). The cam's source-time-0 sits at master
+  // `-syncOffsetMs/1000`, so source-time at master T is
+  // `T − (−syncOffsetMs/1000) = T + syncOffsetMs/1000`. See
+  // `local/timing/cam-time.ts` and `editor/types.ts:clipRangeS` for the
+  // canonical definition.
+  const camRef = { masterStartS: -syncOffsetMs / 1000, driftRatio: 1 };
+  const sourceInS = camSourceTimeS(chunk.startMs / 1000, camRef);
+  const sourceOutS = camSourceTimeS(chunk.endMs / 1000, camRef);
   if (sourceOutS <= 0) return null;
   const midS = (sourceInS + sourceOutS) / 2;
   let bestIdx = -1;
@@ -561,7 +569,11 @@ async function seekAndCapture(
   // its end (sourceTimeS > duration) get the boundary frame instead
   // of nothing — better a slightly-off thumbnail than an "out of
   // range" placeholder that the user has no way to act on.
-  const rawSource = masterTimeS - probe.syncOffsetMs / 1000;
+  // See `findCoveringTileIdx` above for the sign convention.
+  const rawSource = camSourceTimeS(masterTimeS, {
+    masterStartS: -probe.syncOffsetMs / 1000,
+    driftRatio: 1,
+  });
   const sourceTimeS = Math.max(0, Math.min(v.duration - 0.05, rawSource));
 
   let seekedFired = false;
