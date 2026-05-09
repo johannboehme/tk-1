@@ -6,9 +6,10 @@
  * aluminium-bezel viewfinder shell that fits the Arrange "playback
  * cockpit" look — sub-300px wide on desktop, ~80px square on mobile.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { resolveCamAssetUrl } from "../../local/jobs";
 import { useArrangeStore } from "../../local/arrange/arrange-store";
+import { decideCamPreviewAction } from "../../local/timing/cam-preview-sync";
 import { CamPickerDropdown } from "../CamPickerDropdown";
 
 /** Cam preview viewfinder. Sizes itself: 84×84 below sm, 240×135 above. */
@@ -28,6 +29,16 @@ export function CamPreviewArrange() {
   const syncOffsetMs = cam
     ? (cam.sync?.offsetMs ?? 0) + (cam.syncOverrideMs ?? 0)
     : 0;
+  const driftRatio = cam?.sync?.driftRatio ?? 1;
+  const sourceDurationS = cam?.durationS ?? null;
+
+  // Tracks the previous master tick so the decider can tell natural
+  // RAF advance apart from a meaningful jump (chunk click / scrub).
+  // Reset on cam change so the next tick re-snaps.
+  const prevMasterTRef = useRef<number | null>(null);
+  useEffect(() => {
+    prevMasterTRef.current = null;
+  }, [camId]);
 
   useEffect(() => {
     if (!jobId || !camId) {
@@ -52,19 +63,44 @@ export function CamPreviewArrange() {
 
   useEffect(() => {
     if (!videoEl) return;
-    const sourceT = currentTime - syncOffsetMs / 1000;
-    if (sourceT < 0) {
+    // Skip while the element is recovering from a previous seek; stacking
+    // another `currentTime` write tears the decoder open mid-flight on
+    // huge phone recordings — same anti-stutter rule the Triage preview
+    // uses. `prevMasterT` stays unchanged so the next non-seeking tick
+    // sees the full delta and classifies the situation correctly.
+    if (videoEl.seeking) return;
+
+    const action = decideCamPreviewAction({
+      masterT: currentTime,
+      syncOffsetMs,
+      sourceDurationS,
+      driftRatio,
+      videoCurrentTimeS: Number.isFinite(videoEl.currentTime)
+        ? videoEl.currentTime
+        : null,
+      prevMasterT: prevMasterTRef.current,
+    });
+    prevMasterTRef.current = currentTime;
+
+    if (action.kind === "pause-before-start") {
       if (!videoEl.paused) videoEl.pause();
       return;
     }
-    if (Math.abs(videoEl.currentTime - sourceT) > 0.05) {
+    if (action.kind === "seek") {
       try {
-        videoEl.currentTime = sourceT;
+        videoEl.currentTime = action.sourceT;
       } catch {
-        /* ignore */
+        /* element not ready yet — next tick */
       }
     }
-  }, [currentTime, syncOffsetMs, videoEl]);
+    if (action.kind === "pause-after-end") {
+      if (!videoEl.paused) videoEl.pause();
+      return;
+    }
+    if (isPlaying && videoEl.paused) {
+      void videoEl.play().catch(() => undefined);
+    }
+  }, [currentTime, syncOffsetMs, driftRatio, sourceDurationS, isPlaying, videoEl]);
 
   useEffect(() => {
     if (!videoEl) return;

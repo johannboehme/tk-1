@@ -11,11 +11,11 @@
  * Triage v1: no preload pool, no gapless cam-switch — accept a brief
  * black flash on cam-switch since this is a curation phase.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { resolveCamAssetUrl } from "../../local/jobs";
 import { useTriageStore } from "../../local/triage/triage-store";
 import { CamPickerDropdown } from "../CamPickerDropdown";
-import { decideCamPreviewAction } from "./cam-preview-sync";
+import { decideCamPreviewAction } from "../../local/timing/cam-preview-sync";
 
 export function CamPreview() {
   const jobId = useTriageStore((s) => s.jobId);
@@ -34,6 +34,15 @@ export function CamPreview() {
     : 0;
   const driftRatio = cam?.sync?.driftRatio ?? 1;
   const sourceDurationS = cam?.durationS ?? null;
+
+  // Tracks the previous `masterT` so the per-tick decider can tell
+  // natural ~16 ms RAF advance apart from a meaningful jump (chunk
+  // click / scrub / loop wrap). Reset whenever the active cam changes
+  // so the next tick re-snaps to the new element.
+  const prevMasterTRef = useRef<number | null>(null);
+  useEffect(() => {
+    prevMasterTRef.current = null;
+  }, [camId]);
 
   useEffect(() => {
     if (!jobId || !camId) {
@@ -58,17 +67,33 @@ export function CamPreview() {
 
   useEffect(() => {
     if (!videoEl) return;
+    // Skip while the element is still recovering from a previous seek.
+    // Stacking another `currentTime = X` on top of an in-flight seek
+    // tears the decoder open mid-flight on huge phone recordings —
+    // exactly the post-seek stutter loop the user reports.
+    if (videoEl.seeking) {
+      // Don't update prevMasterT — we want the NEXT non-seeking tick to
+      // see the full delta from before the seek so it can classify it
+      // as a jump.
+      return;
+    }
     const action = decideCamPreviewAction({
       masterT: currentTime,
       syncOffsetMs,
       sourceDurationS,
       driftRatio,
+      videoCurrentTimeS: Number.isFinite(videoEl.currentTime)
+        ? videoEl.currentTime
+        : null,
+      prevMasterT: prevMasterTRef.current,
     });
+    prevMasterTRef.current = currentTime;
+
     if (action.kind === "pause-before-start") {
       if (!videoEl.paused) videoEl.pause();
       return;
     }
-    if (Math.abs(videoEl.currentTime - action.sourceT) > 0.05) {
+    if (action.kind === "seek") {
       videoEl.currentTime = action.sourceT;
     }
     if (action.kind === "pause-after-end") {
@@ -76,9 +101,9 @@ export function CamPreview() {
       return;
     }
     // Cam IS visible. If the master is playing but our element is paused
-    // (e.g. we just crossed sourceT=0 after a `pause-before-start` window),
-    // resume — without this, the preview stays frozen on the first
-    // post-anchor frame even though the master plays on.
+    // (e.g. we just crossed sourceT=0 after a `pause-before-start`
+    // window), resume — without this, the preview stays frozen on the
+    // first post-anchor frame even though the master plays on.
     if (isPlaying && videoEl.paused) {
       void videoEl.play().catch(() => undefined);
     }
