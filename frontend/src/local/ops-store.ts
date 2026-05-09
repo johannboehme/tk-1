@@ -15,11 +15,26 @@
  */
 import { create } from "zustand";
 
+export interface SyncOpFileContext {
+  name: string;
+  size?: number;
+  type?: string;
+  sourceKind: "opfs" | "handle";
+}
+
 export interface SyncOpState {
   pct: number;
   stage: string;
   detail?: string;
   error?: string;
+  /** Multi-line plaintext diagnostic report attached when an op fails.
+   *  Carries browser, capability, file-in-flight, and original-error
+   *  context so the user can copy-paste it back to us for triage. */
+  errorReport?: string;
+  /** The file currently being read/decoded, if any. Set as soon as the
+   *  pipeline knows which asset it's working on so a failure mid-decode
+   *  can report which file was in flight. */
+  currentFile?: SyncOpFileContext;
 }
 
 export interface RenderOpState {
@@ -46,7 +61,7 @@ interface OpsStore {
   // ─── sync ────────────────────────────────────────────────────────────
   startSyncOp: (jobId: string, init?: Partial<SyncOpState>) => void;
   updateSyncOp: (jobId: string, patch: Partial<SyncOpState>) => void;
-  failSyncOp: (jobId: string, message: string) => void;
+  failSyncOp: (jobId: string, message: string, report?: string) => void;
   clearSyncOp: (jobId: string) => void;
 
   // ─── render ──────────────────────────────────────────────────────────
@@ -83,14 +98,17 @@ export const useOpsStore = create<OpsStore>((set) => ({
       };
     }),
 
-  failSyncOp: (jobId, message) =>
+  failSyncOp: (jobId, message, report) =>
     set((s) => {
       const existing = s.ops[jobId]?.sync;
       const base = existing ?? { pct: 100, stage: "failed" };
       return {
         ops: {
           ...s.ops,
-          [jobId]: { ...s.ops[jobId], sync: { ...base, error: message } },
+          [jobId]: {
+            ...s.ops[jobId],
+            sync: { ...base, error: message, errorReport: report },
+          },
         },
       };
     }),
