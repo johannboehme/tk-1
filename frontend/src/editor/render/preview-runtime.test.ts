@@ -713,6 +713,76 @@ describe("PreviewRuntime — last-good-frame cache (hides black flash on seek/wr
   });
 });
 
+describe("PreviewRuntime — extended snapshot scope (hot-covering cams)", () => {
+  // The lastGoodFrame snapshot is captured for every cam whose pill
+  // covers the playhead, not just the active layer. That way a cam
+  // about to be cut to (e.g. via a cut that's coming up in 50ms) has
+  // a fresh bitmap ready when its <video> kicks off the seek; the
+  // existing `inRange && !ready && cached` fallback then bridges the
+  // 1–3 decode frames seamlessly without a black flash.
+
+  function multiCamSnapshot(activeCamId: string): EditorStoreSnapshot {
+    // Two video clips with overlapping pills at timelineT=0.5; cuts
+    // pick the active cam by the rule "latest cut <= arrT wins".
+    const base = snapshot({ clips: [videoClip("a"), videoClip("b")] });
+    return { ...base, cuts: [{ atTimeS: 0, camId: activeCamId }] };
+  }
+
+  it("refreshes lastGoodFrame for non-active hot covering cams", async () => {
+    // Without this, the very first cam-switch from A → B has no cached
+    // snapshot for B and the latch can't substitute anything. With this
+    // the snapshot pipeline keeps every hot covering cam fresh so a
+    // valid fallback is always within 100ms of being current.
+    const createBitmapFromVideo = vi.fn(
+      async (_el: HTMLVideoElement) =>
+        ({ close: vi.fn() }) as unknown as ImageBitmap,
+    );
+    const backend = makeBackend();
+    const pool = makePool();
+    const elA = makeFakeVideoEl({ readyState: 4, seeking: false });
+    const elB = makeFakeVideoEl({ readyState: 4, seeking: false });
+    (pool as unknown as { _add: (id: string, el?: HTMLVideoElement) => void })._add(
+      "a",
+      elA,
+    );
+    (pool as unknown as { _add: (id: string, el?: HTMLVideoElement) => void })._add(
+      "b",
+      elB,
+    );
+    const snap: { value: EditorStoreSnapshot } = {
+      value: multiCamSnapshot("a"),
+    };
+    const canvas = document.createElement("canvas");
+    const rt = new PreviewRuntime({
+      canvas,
+      cams: { a: { videoUrl: "a.mp4" }, b: { videoUrl: "b.mp4" } },
+      capabilities: { webgl2: false, webgpu: false },
+      cssW: 100,
+      cssH: 50,
+      dpr: 1,
+      initialScale: 1,
+      createBackendFn: vi.fn(async () => backend),
+      createPool: () => pool,
+      raf: () => 0,
+      cancelRaf: () => undefined,
+      readSnapshot: () => snap.value,
+      readPlayback: () => ({ currentTime: 0.5, timelineT: 0.5, isPlaying: false }),
+      createBitmapFromVideo,
+    });
+    await rt.init();
+    rt.tick();
+    await Promise.resolve();
+    await Promise.resolve();
+    // Both A (active) and B (hot covering, not active) should have been
+    // snapshotted — otherwise the cam-switch latch can't substitute.
+    const calledEls = createBitmapFromVideo.mock.calls.map(
+      (c: [HTMLVideoElement]) => c[0],
+    );
+    expect(calledEls).toContain(elA);
+    expect(calledEls).toContain(elB);
+  });
+});
+
 describe("PreviewRuntime — setCams (live + Media flow)", () => {
   it("forwards a newly-added cam URL to the pool on the next tick", async () => {
     // Repro for the bug where adding a video to an already-running editor
