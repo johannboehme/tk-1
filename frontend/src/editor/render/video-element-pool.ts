@@ -282,12 +282,6 @@ function syncSlot(slot: Slot, sourceT: number, isPlaying: boolean): void {
     if (!v.paused) v.pause();
     return;
   }
-  // Skip while a previous seek is still resolving. Don't update
-  // prevTargetSourceT either — we want the next free tick to see the
-  // full source-target delta from before the seek, so it can keep
-  // classifying it as the same jump.
-  if (v.seeking) return;
-
   const drift = Math.abs(v.currentTime - sourceT);
   const prev = slot.prevTargetSourceT;
   const isJump =

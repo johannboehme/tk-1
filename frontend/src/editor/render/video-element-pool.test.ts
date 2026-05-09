@@ -305,10 +305,11 @@ describe("VideoElementPool — syncAll behaviour", () => {
     expect(fakes[0].currentTime).toBe(10.1);
   });
 
-  it("skips the entire tick while the element is mid-seek", () => {
-    // Stacking another `currentTime` write on top of an in-flight seek
-    // tears the decoder open mid-flight. Pool must NOT touch the
-    // element while seeking is true; the next free tick handles it.
+  it("still calls play() to resume after a mid-seek tick (browser pauses implicitly during seek)", () => {
+    // The browser pauses the element implicitly while it's seeking. If
+    // we suppress play() during seeking, the element never resumes once
+    // the seek completes — playback freezes. Browsers handle a fresh
+    // currentTime write supersession internally; we don't need to skip.
     const { pool, fakes } = makePoolWithFakes([
       cam("a", { sourceDurationS: 600 }),
     ]);
@@ -316,10 +317,9 @@ describe("VideoElementPool — syncAll behaviour", () => {
     expect(fakes[0].currentTime).toBe(10);
     fakes[0].play.mockClear();
     (fakes[0] as unknown as { seeking: boolean }).seeking = true;
-    fakes[0].currentTime = 5; // pretend the element is mid-seek somewhere else
+    fakes[0].paused = true; // browser implicit pause during seek
     pool.syncAll(targets([["a", 20]]), true);
-    expect(fakes[0].currentTime).toBe(5); // unchanged — no write while seeking
-    expect(fakes[0].play).not.toHaveBeenCalled(); // no play() during seek
+    expect(fakes[0].play).toHaveBeenCalled(); // recovery path runs
   });
 
   it("re-snaps precisely when a paused-out cam comes back on PROGRAM", () => {
