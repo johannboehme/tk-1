@@ -23,6 +23,7 @@ import {
   chunkStemHeuristic,
   type ChunkMelData,
 } from "../../local/arrange/chunk-mel";
+import { PHOSPHOR_LUT } from "../../local/arrange/chunk-mel-render";
 import { CamPreviewArrange } from "./CamPreviewArrange";
 
 // ─── Props (presentational layer) ──────────────────────────────────────
@@ -58,39 +59,6 @@ export interface CockpitDisplayProps {
    *  Resolves to a master-time seek inside the displayed chunk. */
   onSeekToFraction?: (fraction: number) => void;
 }
-
-// ─── Phosphor color ramp ───────────────────────────────────────────────
-// Three-stop interpolation tuned for OP-1 amber. Floor is not pure black
-// — real LCDs leak a tiny warm bloom even when "off". Mid is hand-warm
-// copper. Peak is phosphor-flare amber that reads as "lit" without going
-// neon-orange. Baked once at module load: 256 × 4 bytes.
-const PHOSPHOR_LUT: Uint8ClampedArray = (() => {
-  const lut = new Uint8ClampedArray(256 * 4);
-  const FLOOR_RGB = [14, 8, 7];
-  const MID_RGB = [154, 72, 24];
-  const PEAK_RGB = [255, 138, 79];
-  const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
-  for (let i = 0; i < 256; i++) {
-    const t = i / 255;
-    let r: number, g: number, b: number;
-    if (t < 0.5) {
-      const u = t / 0.5;
-      r = lerp(FLOOR_RGB[0], MID_RGB[0], u);
-      g = lerp(FLOOR_RGB[1], MID_RGB[1], u);
-      b = lerp(FLOOR_RGB[2], MID_RGB[2], u);
-    } else {
-      const u = (t - 0.5) / 0.5;
-      r = lerp(MID_RGB[0], PEAK_RGB[0], u);
-      g = lerp(MID_RGB[1], PEAK_RGB[1], u);
-      b = lerp(MID_RGB[2], PEAK_RGB[2], u);
-    }
-    lut[i * 4 + 0] = r;
-    lut[i * 4 + 1] = g;
-    lut[i * 4 + 2] = b;
-    lut[i * 4 + 3] = 255;
-  }
-  return lut;
-})();
 
 // ─── Top-level shell (store-coupled) ───────────────────────────────────
 
