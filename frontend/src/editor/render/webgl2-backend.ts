@@ -228,11 +228,19 @@ export class WebGL2Backend implements CompositorBackend {
       gl.uniformMatrix2fv(this.layerLocs.uvMat, false, uvMatrixCM(layer));
       // HTMLVideoElement / VideoFrame uploads ignore UNPACK_FLIP_Y_WEBGL
       // on Chrome's hardware path, so we compensate at sample time.
-      // ImageBitmap honours the flag — flip stays at 0 there.
-      gl.uniform1f(
-        this.layerLocs.srcFlipY,
-        src.kind === "video" || src.kind === "videoframe" ? 1 : 0,
-      );
+      // ImageBitmap honours the flag — flip stays at 0 there. Critical
+      // edge: `kind === "video"` with `preferFallback` set uploads the
+      // CACHED ImageBitmap, NOT the <video> element. That bitmap
+      // honours UNPACK_FLIP_Y_WEBGL like any other ImageBitmap, so
+      // srcFlipY MUST be 0 here — otherwise the shader flips again,
+      // and the user sees a single upside-down frame at every pill /
+      // cam transition while the seek-fallback bridges the decode gap.
+      const usingFallbackBitmap =
+        src.kind === "video" && src.preferFallback && src.fallback != null;
+      const needsShaderFlip =
+        (src.kind === "video" && !usingFallbackBitmap) ||
+        src.kind === "videoframe";
+      gl.uniform1f(this.layerLocs.srcFlipY, needsShaderFlip ? 1 : 0);
       this.quad.draw();
     }
 

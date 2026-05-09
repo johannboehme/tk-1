@@ -344,7 +344,7 @@ export class PreviewRuntime {
     this.backend.drawFrame(descriptor, sources);
     const drawMs = this.opts.now() - t0;
 
-    this.maybeRefreshSnapshots(descriptor.layers, targets);
+    this.maybeRefreshSnapshots(targets);
 
     // Feed the adaptive scaler. Only react when the backend itself is
     // straining — visualizers/overlays/store reads are out of scope.
@@ -458,34 +458,35 @@ export class PreviewRuntime {
   }
 
   /** After a successful drawFrame, capture the live `<video>` of every
-   *  active layer that's currently in-range and ready. Per-layer
-   *  throttle keeps this cheap: most ticks hit the fast path
-   *  (`now() - lastSnapshotMs < 100ms` → noop). The held bitmap is what
-   *  `buildSourcesMap` substitutes during seeks/wraps. */
+   *  HOT COVERING cam — not just the active layer. Per-layer throttle
+   *  keeps this cheap (`now() - lastSnapshotMs < 100ms` → noop). The
+   *  held bitmap is what `buildSourcesMap` substitutes during seeks
+   *  and wraps. Iterating targets (which hot-keep populates with every
+   *  covering pill's cam) means a cam that isn't currently active but
+   *  is about to be cut to via a cut still has a fresh fallback ready
+   *  for the seek-in-progress window before its first decoded frame
+   *  lands. Image clips have entries in `targets` too but the pool
+   *  returns null for them, so they're filtered naturally. */
   private maybeRefreshSnapshots(
-    layers: ReadonlyArray<{ layerId: string; source: { kind: string } }>,
     targets: ReadonlyMap<string, PoolSyncTarget>,
   ): void {
     if (!this.pool) return;
     let now: number | null = null;
-    for (const layer of layers) {
-      if (layer.source.kind !== "video") continue;
-      if (this.snapshotInFlight.has(layer.layerId)) continue;
-      const existing = this.lastGoodFrames.get(layer.layerId);
+    for (const [layerId, target] of targets) {
+      if (this.snapshotInFlight.has(layerId)) continue;
+      const existing = this.lastGoodFrames.get(layerId);
       if (now === null) now = this.opts.now();
       if (existing && now - existing.lastSnapshotMs < SNAPSHOT_THROTTLE_MS) {
         continue;
       }
-      const el = this.pool.getElement(layer.layerId);
+      const el = this.pool.getElement(layerId);
       if (!el) continue;
       if (el.seeking || el.readyState < READY_HAVE_CURRENT_DATA) continue;
-      const target = targets.get(layer.layerId);
-      if (!target || !this.pool.isSourceInRange(layer.layerId, target.sourceT)) {
+      if (!this.pool.isSourceInRange(layerId, target.sourceT)) {
         continue;
       }
 
-      this.snapshotInFlight.add(layer.layerId);
-      const layerId = layer.layerId;
+      this.snapshotInFlight.add(layerId);
       void this.opts
         .createBitmapFromVideo(el)
         .then((bm) => {
@@ -655,7 +656,13 @@ async function defaultLoadBitmap(url: string): Promise<ImageBitmap> {
 async function defaultCreateBitmapFromVideo(
   el: HTMLVideoElement,
 ): Promise<ImageBitmap> {
-  return createImageBitmap(el);
+  // `imageOrientation: "from-image"` forces a deterministic Y-convention
+  // for the snapshot across browser/driver combos. Without it the
+  // default is "browser-defined" for HTMLVideoElement, which on some
+  // GPU drivers produces bitmaps that don't match the live <video>
+  // upload path's Y-orientation — visible as a flipped fallback frame
+  // when the cam-switch guard substitutes the snapshot.
+  return createImageBitmap(el, { imageOrientation: "from-image" });
 }
 
 function collectVideoCams(clips: readonly Clip[], cams: ClipUrlMap): VideoCam[] {

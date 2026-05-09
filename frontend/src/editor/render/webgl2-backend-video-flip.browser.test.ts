@@ -114,4 +114,64 @@ describe("WebGL2Backend vs Canvas2DBackend — video source orientation parity",
     const topMatchesBot = colorDist(c2dBot, glTop);
     expect(topMatchesTop).toBeLessThan(topMatchesBot);
   }, 15000);
+
+  it("WebGL2 fallback-bitmap render keeps the same orientation as live <video>", async () => {
+    // Regression: when the runtime hands a `preferFallback=true` source
+    // with a cached ImageBitmap (the seek-bridging path), the WebGL2
+    // backend uploads the bitmap, NOT the <video>. ImageBitmaps honour
+    // UNPACK_FLIP_Y_WEBGL=true and arrive already flipped — if the
+    // shader's u_srcFlipY is still 1 (because src.kind === "video"),
+    // the second flip in the fragment shader produces an upside-down
+    // frame. This was visible at every pill / cam transition in the
+    // editor preview during the seek-fallback window.
+    const cachedBitmap = await createImageBitmap(videoEl);
+
+    // First render: live <video> path (no fallback).
+    const live = document.createElement("canvas");
+    const liveBackend = new WebGL2Backend();
+    await liveBackend.init(live, { pixelW: W, pixelH: H });
+    liveBackend.drawFrame(
+      descriptor(),
+      new Map([["v", { kind: "video", element: videoEl }]]),
+    );
+    const liveGl = live.getContext("webgl2")!;
+    const liveTop = readWebGLPixel(liveGl, W / 2, 8);
+    const liveBot = readWebGLPixel(liveGl, W / 2, H - 8);
+
+    // Second render: preferFallback=true, same video frame as the cache.
+    const fb = document.createElement("canvas");
+    const fbBackend = new WebGL2Backend();
+    await fbBackend.init(fb, { pixelW: W, pixelH: H });
+    fbBackend.drawFrame(
+      descriptor(),
+      new Map([
+        [
+          "v",
+          {
+            kind: "video",
+            element: videoEl,
+            fallback: cachedBitmap,
+            preferFallback: true,
+          },
+        ],
+      ]),
+    );
+    const fbGl = fb.getContext("webgl2")!;
+    const fbTop = readWebGLPixel(fbGl, W / 2, 8);
+    const fbBot = readWebGLPixel(fbGl, W / 2, H - 8);
+
+    liveBackend.dispose();
+    fbBackend.dispose();
+    cachedBitmap.close();
+
+    // eslint-disable-next-line no-console
+    console.log("liveTop", liveTop, "liveBot", liveBot, "fbTop", fbTop, "fbBot", fbBot);
+
+    // The fallback render must keep the SAME orientation as the live
+    // render. If srcFlipY is wrong for the bitmap path, fbTop matches
+    // liveBot (and vice versa) — a clear inversion signature.
+    const topMatchesTop = colorDist(liveTop, fbTop);
+    const topMatchesBot = colorDist(liveBot, fbTop);
+    expect(topMatchesTop).toBeLessThan(topMatchesBot);
+  }, 15000);
 });
