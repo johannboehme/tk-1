@@ -22,6 +22,11 @@ import {
   SkipFwdIcon,
 } from "../../editor/components/icons";
 import { useTriageStore } from "../../local/triage/triage-store";
+import {
+  joinFocusedGuarded,
+  rejectFocusedGuarded,
+  splitFocusedGuarded,
+} from "../../local/triage/triage-guarded-actions";
 
 export function TriageTransportBar() {
   const isPlaying = useTriageStore((s) => s.playback.isPlaying);
@@ -31,14 +36,11 @@ export function TriageTransportBar() {
   const focusedChunkId = useTriageStore((s) => s.focusedChunkId);
   const focusRelative = useTriageStore((s) => s.focusRelative);
   const acceptFocused = useTriageStore((s) => s.acceptFocused);
-  const rejectFocused = useTriageStore((s) => s.rejectFocused);
   const chunks = useTriageStore((s) => s.chunks);
   const audioDuration = useTriageStore((s) => s.audioDuration);
   // Don't subscribe to currentTime — it changes 60×/s. Pull imperatively
   // when needed (only the clock readout cares) and render that as a
   // separate component so updates stay scoped.
-  const splitChunkAt = useTriageStore((s) => s.splitChunkAt);
-  const joinChunks = useTriageStore((s) => s.joinChunks);
   const resetChunk = useTriageStore((s) => s.resetChunk);
   const conformChunk = useTriageStore((s) => s.conformChunk);
   const insertChunkAtPlayhead = useTriageStore((s) => s.insertChunkAtPlayhead);
@@ -145,7 +147,7 @@ export function TriageTransportBar() {
         acceptFocused();
       } else if (e.code === "Backspace") {
         e.preventDefault();
-        rejectFocused();
+        void rejectFocusedGuarded();
       } else if (e.code === "KeyL") {
         e.preventDefault();
         const cur = useTriageStore.getState().playback.loopEnabled;
@@ -154,16 +156,13 @@ export function TriageTransportBar() {
         e.preventDefault();
         const st = useTriageStore.getState();
         if (st.focusedChunkId) {
-          splitChunkAt(
-            st.focusedChunkId,
-            Math.round(st.playback.currentTime * 1000),
-          );
+          void splitFocusedGuarded(Math.round(st.playback.currentTime * 1000));
         }
       } else if (e.code === "KeyJ" && !e.metaKey && !e.ctrlKey && !e.altKey) {
         e.preventDefault();
         const st = useTriageStore.getState();
         if (st.focusedChunkId) {
-          joinChunks(st.focusedChunkId, e.shiftKey ? "next" : "prev");
+          void joinFocusedGuarded(e.shiftKey ? "next" : "prev");
         }
       } else if (e.code === "KeyN" && !e.metaKey && !e.ctrlKey && !e.altKey) {
         e.preventDefault();
@@ -184,10 +183,7 @@ export function TriageTransportBar() {
     setPlaying,
     focusRelative,
     acceptFocused,
-    rejectFocused,
     setLoopEnabled,
-    splitChunkAt,
-    joinChunks,
     conformChunk,
     insertChunkAtPlayhead,
     resetChunk,
@@ -272,7 +268,7 @@ export function TriageTransportBar() {
         <ChunkyButton
           variant="secondary"
           size="sm"
-          onClick={() => rejectFocused()}
+          onClick={() => void rejectFocusedGuarded()}
           disabled={!focusedChunkId}
           title="Drop focused chunk · Backspace"
           aria-label="Drop focused chunk"

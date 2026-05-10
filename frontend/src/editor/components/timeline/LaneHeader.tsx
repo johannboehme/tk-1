@@ -44,7 +44,9 @@ interface Props {
   /** Reset this cam to the primary candidate, no override, no startOffset. */
   onReset?: () => void;
   /** Optional delete handler. When provided, a small × button shows on
-   *  hover. Prompts via window.confirm before firing. */
+   *  hover. Caller is responsible for any confirm gating before
+   *  destroying the cam — keeps the count-aware confirm dialog at the
+   *  caller, which can read pills/cuts/fx. */
   onDelete?: () => void;
   height?: number;
   /** When true, render a compact (~64 px) variant: drop the filename
@@ -142,8 +144,8 @@ export function LaneHeader({
        *  whole header (over the cam-color stripe edge), styled like
        *  the transport's secondary ChunkyButton: paper-hi face,
        *  embossed shadow, ink text. Always-visible so the affordance
-       *  is discoverable without hover. Click → window.confirm
-       *  before firing. */}
+       *  is discoverable without hover. Confirm gating is the
+       *  caller's responsibility (Editor.tsx — needs cut/FX counts). */}
       {onDelete && (
         <button
           type="button"
@@ -151,9 +153,7 @@ export function LaneHeader({
           title={`Remove ${name}`}
           onClick={(e) => {
             e.stopPropagation();
-            if (window.confirm(`Remove ${name} from this project?`)) {
-              onDelete();
-            }
+            onDelete();
           }}
           className="absolute top-0 left-0 z-20 w-[14px] h-[14px] flex items-center justify-center rounded-br-md border-r border-b border-rule/60 bg-hot text-paper-hi shadow-emboss hover:bg-hot-pressed active:shadow-pressed font-mono text-[10px] leading-none opacity-0 group-hover:opacity-100 transition-opacity"
         >

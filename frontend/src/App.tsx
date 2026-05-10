@@ -20,6 +20,7 @@ import { Settings } from "./pages/Settings";
 import { BrowserTooOld } from "./pages/BrowserTooOld";
 import Triage from "./pages/Triage";
 import Upload from "./pages/Upload";
+import ConfirmDialogHost from "./components/ConfirmDialogHost";
 
 export default function App() {
   const location = useLocation();
@@ -88,6 +89,7 @@ export default function App() {
       </Routes>
       <Footer overlay={isFullBleed} />
       <HelpOverlay />
+      <ConfirmDialogHost />
     </div>
   );
 }

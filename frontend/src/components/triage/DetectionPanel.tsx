@@ -76,9 +76,11 @@ export function DetectionPanel() {
         state.envelope,
         config,
       ).then((result) => {
-        // Preserve the user's per-chunk accept/reject decisions across
-        // re-detection. The min-bars filter is a view concern and
-        // doesn't touch chunk.accepted here.
+        // Preserve the user's per-chunk accept/reject decisions AND
+        // the chunk id across re-detection. The id match keeps any
+        // arrangement / pill references pointing at the right chunk
+        // so a slider tweak that re-detects the same chunk geometry
+        // doesn't quietly empty the user's arrangement.
         const merged = result.chunks.map((c) => {
           const prev = state.chunks.find(
             (p) => p.startMs === c.startMs && p.endMs === c.endMs,
@@ -86,6 +88,7 @@ export function DetectionPanel() {
           if (prev) {
             return {
               ...c,
+              id: prev.id,
               accepted: prev.accepted,
               bpmOctaveShift: prev.bpmOctaveShift,
               detectedBpm: c.detectedBpm ?? prev.detectedBpm,

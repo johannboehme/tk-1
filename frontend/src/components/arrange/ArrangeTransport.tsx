@@ -28,6 +28,10 @@ import {
   effectiveBarsForChunk,
   useArrangeStore,
 } from "../../local/arrange/arrange-store";
+import {
+  duplicateItemWithEdits,
+  removeItemGuarded,
+} from "../../local/arrange/arrange-guarded-actions";
 
 export function ArrangeTransport() {
   const isPlaying = useArrangeStore((s) => s.playback.isPlaying);
@@ -35,9 +39,7 @@ export function ArrangeTransport() {
   const arrangement = useArrangeStore((s) => s.arrangement);
   const focusedItemId = useArrangeStore((s) => s.focusedItemId);
   const focusRelative = useArrangeStore((s) => s.focusRelative);
-  const removeItem = useArrangeStore((s) => s.removeItem);
   const shiftItem = useArrangeStore((s) => s.shiftItem);
-  const duplicateItem = useArrangeStore((s) => s.duplicateItem);
   const chunkPool = useArrangeStore((s) => s.chunks);
   const jobBpm = useArrangeStore((s) => s.jobBpm);
   const jobBeatsPerBar = useArrangeStore((s) => s.jobBeatsPerBar);
@@ -146,7 +148,7 @@ export function ArrangeTransport() {
         const id = useArrangeStore.getState().focusedItemId;
         if (id) {
           e.preventDefault();
-          removeItem(id);
+          void removeItemGuarded(id);
         }
       } else if (
         !e.metaKey &&
@@ -161,13 +163,13 @@ export function ArrangeTransport() {
         const id = useArrangeStore.getState().focusedItemId;
         if (id) {
           e.preventDefault();
-          duplicateItem(id);
+          void duplicateItemWithEdits(id);
         }
       }
     }
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [setPlaying, focusRelative, shiftItem, removeItem, duplicateItem]);
+  }, [setPlaying, focusRelative, shiftItem]);
 
   const seekToItem = useArrangeStore((s) => s.seekToItem);
   const onPrevItem = () => {
@@ -267,7 +269,7 @@ export function ArrangeTransport() {
           <ChunkyButton
             variant="secondary"
             size="sm"
-            onClick={() => duplicateItem(focusedItem.id)}
+            onClick={() => void duplicateItemWithEdits(focusedItem.id)}
             title="Duplicate frame · D"
             aria-label="Duplicate frame"
             iconLeft={<CopyIcon className="w-4 h-4" />}
@@ -275,7 +277,7 @@ export function ArrangeTransport() {
           <ChunkyButton
             variant="secondary"
             size="sm"
-            onClick={() => removeItem(focusedItem.id)}
+            onClick={() => void removeItemGuarded(focusedItem.id)}
             title="Drop frame · Backspace"
             aria-label="Drop frame"
             iconLeft={<TrashIcon className="w-4 h-4" />}
