@@ -37,6 +37,10 @@ import {
   effectiveChunkBpm,
   useTriageStore,
 } from "../../local/triage/triage-store";
+import {
+  joinFocusedGuarded,
+  splitFocusedGuarded,
+} from "../../local/triage/triage-guarded-actions";
 import type { Chunk } from "../../storage/jobs-db";
 
 const CONFORM_STATUS_LABEL: Record<string, string> = {
@@ -58,8 +62,6 @@ export function ChunkInspector() {
   const resetBpm = useTriageStore((s) => s.resetBpmToDetected);
   const setBeatsPerBar = useTriageStore((s) => s.setBeatsPerBar);
   const extendChunkBars = useTriageStore((s) => s.extendChunkBars);
-  const splitChunkAt = useTriageStore((s) => s.splitChunkAt);
-  const joinChunks = useTriageStore((s) => s.joinChunks);
   const resetChunk = useTriageStore((s) => s.resetChunk);
   const conformChunk = useTriageStore((s) => s.conformChunk);
   const revertConform = useTriageStore((s) => s.revertConform);
@@ -120,9 +122,9 @@ export function ChunkInspector() {
           jobBpmValue={jobBpm?.value ?? null}
           beatsPerBar={beatsPerBar}
           onExtend={(back, fwd) => extendChunkBars(focused.id, back, fwd)}
-          onSplit={() => splitChunkAt(focused.id, Math.round(currentTime * 1000))}
-          onJoinPrev={() => joinChunks(focused.id, "prev")}
-          onJoinNext={() => joinChunks(focused.id, "next")}
+          onSplit={() => void splitFocusedGuarded(Math.round(currentTime * 1000))}
+          onJoinPrev={() => void joinFocusedGuarded("prev")}
+          onJoinNext={() => void joinFocusedGuarded("next")}
           onReset={() => resetChunk(focused.id)}
           onConform={() => conformChunk(focused.id)}
           onRevertConform={() => revertConform(focused.id)}

@@ -5,10 +5,12 @@
  * Arrange store and writes them back to the job row in IDB. Debounced
  * 250 ms — same cadence as Triage.
  *
- * Downstream invalidation: any change to the arrangement drops the
- * persisted `pills` so the Editor re-seeds from the new arrangement
- * on its next mount. Same "step back, change, downstream regenerates"
- * contract as Triage→Arrange.
+ * Downstream propagation: arrangement mutations persist verbatim. The
+ * Editor's `reconcilePills` runs on every mount and matches stored
+ * pills to fresh arrangement items by id (`camId::arrangementItemId`),
+ * preserving user-edited pills and dropping orphans automatically.
+ * Wiping the pills array here would force a full regeneration and
+ * destroy user edits unnecessarily — so we don't.
  *
  * Mirrors `useTriagePersist`.
  */
@@ -22,14 +24,6 @@ const DEBOUNCE_MS = 250;
 export function useArrangePersist() {
   const lastWrittenRef = useRef<string | null>(null);
   const timeoutRef = useRef<number | null>(null);
-  /** True until we've persisted at least one mutation; the very first
-   *  arrangement-change is the `initFromJob` hydration, not a user
-   *  edit, and must not wipe the editor's pills. */
-  const initialLoadRef = useRef(true);
-  /** Set when the subscription sees an actual arrangement mutation
-   *  (post-load). Read + cleared by the next debounced write to
-   *  decide whether to invalidate downstream pills. */
-  const arrangementDirtyRef = useRef(false);
 
   useEffect(() => {
     function scheduleWrite() {
@@ -54,12 +48,9 @@ export function useArrangePersist() {
           if (!overlay) return v;
           return { ...v, syncOverrideMs: overlay.syncOverrideMs ?? 0 };
         });
-        const invalidatePills = arrangementDirtyRef.current;
-        arrangementDirtyRef.current = false;
         await jobsDb.updateJob(s.jobId, {
           arrangement: s.arrangement,
           videos: updatedVideos,
-          ...(invalidatePills ? { pills: [] } : {}),
         });
         timeoutRef.current = null;
       }, DEBOUNCE_MS);
@@ -68,15 +59,6 @@ export function useArrangePersist() {
     const unsub = useArrangeStore.subscribe((s, prev) => {
       const arrangementChanged = s.arrangement !== prev.arrangement;
       const camsChanged = s.cams !== prev.cams;
-      // Same first-load gate as Triage — initFromJob's arrangement
-      // hydration must not invalidate the editor's pills.
-      if (arrangementChanged) {
-        if (initialLoadRef.current) {
-          initialLoadRef.current = false;
-        } else {
-          arrangementDirtyRef.current = true;
-        }
-      }
       if (arrangementChanged || camsChanged) scheduleWrite();
     });
     return () => {

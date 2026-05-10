@@ -43,6 +43,8 @@ function masterToArrFirst(t: number, segments: readonly Segment[]): number {
   return masterToArr(t, segments);
 }
 import { decodeAudioToMonoPcm } from "../local/codec";
+import { confirmDestructive } from "../lib/confirm";
+import { countEditsAffectedByCamRemoval } from "../local/edits-impact";
 import { computeWaveformPeaks } from "../local/waveform-peaks";
 import { exportSpecToRenderOpts } from "../editor/exportPresets";
 import { loadAssetFile } from "../local/asset-source";
@@ -1144,9 +1146,46 @@ export default function Editor() {
               peaks={assets.wave.peaks}
               audioDuration={assets.wave.duration}
               onDeleteClip={(camId) => {
-                void removeCamFromJob(id, camId).catch((e) => {
-                  setErr(e instanceof Error ? e.message : "Delete failed");
-                });
+                void (async () => {
+                  try {
+                    const fresh = await jobsDb.getJob(id);
+                    const pills = fresh?.pills ?? [];
+                    const cuts = fresh?.cuts ?? [];
+                    const fx = fresh?.fx ?? [];
+                    const impact = countEditsAffectedByCamRemoval(
+                      camId,
+                      pills,
+                      cuts,
+                      fx,
+                    );
+                    const hasEdits =
+                      impact.cuts > 0 || impact.userEditedPills > 0;
+                    if (hasEdits) {
+                      const bits: string[] = [];
+                      if (impact.cuts > 0)
+                        bits.push(
+                          `${impact.cuts} cut${impact.cuts === 1 ? "" : "s"}`,
+                        );
+                      if (impact.userEditedPills > 0)
+                        bits.push(
+                          `${impact.userEditedPills} edited pill${
+                            impact.userEditedPills === 1 ? "" : "s"
+                          }`,
+                        );
+                      const ok = await confirmDestructive({
+                        title: "Remove cam?",
+                        body: `Removing this cam will drop ${bits.join(
+                          ", ",
+                        )} from the editor.`,
+                        destructiveLabel: "Remove cam",
+                      });
+                      if (!ok) return;
+                    }
+                    await removeCamFromJob(id, camId);
+                  } catch (e) {
+                    setErr(e instanceof Error ? e.message : "Delete failed");
+                  }
+                })();
               }}
             />
           ) : (

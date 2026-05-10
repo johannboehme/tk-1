@@ -10,12 +10,15 @@
  * snapMode (→ job.ui.snapMode, shared with editor), per-cam
  * syncOverrideMs.
  *
- * Downstream invalidation: any change to `chunks` (split / merge /
- * accept / re-chop) drops the persisted `arrangement` and `pills` so
- * the Arrange + Editor pages re-seed from the new chunk set on their
- * next mount. The user's mental model — "if I step back and change
- * something, everything downstream is regenerated" — is enforced
- * here so callers don't have to remember to invalidate.
+ * Downstream propagation (non-destructive): a chunk-list mutation
+ * applies a diff to the persisted `arrangement` (drop items whose
+ * chunk vanished or got rejected; preserve everything else).
+ * `pills` are NOT wiped here — the Editor's `reconcilePills` matches
+ * stored pills against the fresh arrangement on every mount, which
+ * preserves user-edited pills correctly. Wiping would drop those edits
+ * unnecessarily. Confirm dialogs (in the Triage UI before destructive
+ * actions) gate the user-visible loss; this hook just persists the
+ * resulting state.
  *
  * Mirrors the editor's `useAutoPersist` pattern.
  */
@@ -23,19 +26,25 @@ import { useEffect, useRef } from "react";
 import { jobsDb } from "../jobs";
 import { useTriageStore } from "./triage-store";
 import { isVideoAsset } from "../../storage/jobs-db";
+import { propagateTriageChangesToArrangement } from "./diff-arrangement";
+import type { Chunk } from "../../storage/jobs-db";
 
 const DEBOUNCE_MS = 250;
 
 export function useTriagePersist() {
   const lastWrittenRef = useRef<string | null>(null);
   const timeoutRef = useRef<number | null>(null);
-  /** True until we've persisted at least one mutation; used to gate the
-   *  arrangement+pills invalidation so loading a job into Triage
-   *  doesn't itself wipe downstream state on the very first save. */
+  /** True until we've persisted at least one mutation; used to gate
+   *  arrangement diff-propagation so loading a job into Triage doesn't
+   *  itself touch downstream state on the very first save. */
   const initialLoadRef = useRef(true);
+  /** Snapshot of the chunks the last persisted arrangement was diffed
+   *  against. Lets the next chunk-mutation persist compute a real diff
+   *  (added / removed / modified) instead of a blanket wipe. */
+  const lastPersistedChunksRef = useRef<readonly Chunk[]>([]);
   /** Tracks whether the last observed mutation actually touched the
-   *  chunks list. Drives whether the next persist run wipes the
-   *  arrangement + pills downstream. Set in the subscription, read +
+   *  chunks list. Drives whether the next persist run runs the
+   *  arrangement diff-propagation. Set in the subscription, read +
    *  cleared inside the debounced write. */
   const chunksDirtyRef = useRef(false);
 
@@ -78,15 +87,23 @@ export function useTriagePersist() {
               manualOverride: s.jobBpm.manualOverride,
             }
           : job.bpm;
-        // Downstream invalidation. A genuine chunk mutation (split /
-        // merge / accept toggle / re-chop) means the Arrange page's
-        // arrangement and the Editor's pills both reference stale
-        // chunk bounds. Wipe both so the next page mount re-seeds
-        // from the new chunk set. Skip on the first persist of a
-        // load so opening a job doesn't drop the user's existing
-        // arrangement.
-        const invalidateDownstream = chunksDirtyRef.current && !isFirstWrite;
+        // Downstream propagation. On a real chunk mutation (post-load),
+        // diff against the previously-persisted chunks set and prune
+        // arrangement items whose chunk got dropped. The Editor's
+        // reconcile pass picks up new pill geometry on its own —
+        // wiping pills here would needlessly drop user edits.
+        const propagate = chunksDirtyRef.current && !isFirstWrite;
         chunksDirtyRef.current = false;
+        const prevChunks = lastPersistedChunksRef.current ?? [];
+        const nextArrangement = propagate
+          ? propagateTriageChangesToArrangement(
+              prevChunks,
+              s.chunks,
+              job.arrangement ?? [],
+            )
+          : null;
+        const arrangementChanged =
+          nextArrangement !== null && nextArrangement !== (job.arrangement ?? []);
         await jobsDb.updateJob(s.jobId, {
           chunks: s.chunks,
           silenceConfig: s.silenceConfig,
@@ -94,8 +111,11 @@ export function useTriagePersist() {
           beatsPerBar: s.beatsPerBar,
           ui: { ...(job.ui ?? {}), snapMode: s.snapMode },
           videos: updatedVideos,
-          ...(invalidateDownstream ? { arrangement: [], pills: [] } : {}),
+          ...(arrangementChanged && nextArrangement !== null
+            ? { arrangement: nextArrangement }
+            : {}),
         });
+        lastPersistedChunksRef.current = s.chunks;
         timeoutRef.current = null;
       }, DEBOUNCE_MS);
     }
@@ -112,15 +132,16 @@ export function useTriagePersist() {
       const cur = watched(s);
       const old = watched(prev);
       // Track chunk-list mutations separately so the persist run knows
-      // whether to wipe downstream state. Reference-equality is good
-      // enough — Triage actions return a fresh chunks array on every
-      // mutation, identity reads as the right ground truth. The very
-      // first chunks-change after mount is the `initFromJob` load
-      // hydrating the store with the persisted chunks; that's not a
-      // user edit and must not invalidate the existing arrangement.
+      // whether to run the arrangement diff-propagation. Reference-
+      // equality is good enough — Triage actions return a fresh chunks
+      // array on every mutation, identity reads as the right ground
+      // truth. The first chunks-change after mount is `initFromJob`
+      // hydrating the store; capture it as the diff baseline but don't
+      // mark dirty.
       if (cur.chunks !== old.chunks) {
         if (initialLoadRef.current) {
           initialLoadRef.current = false;
+          lastPersistedChunksRef.current = s.chunks;
         } else {
           chunksDirtyRef.current = true;
         }

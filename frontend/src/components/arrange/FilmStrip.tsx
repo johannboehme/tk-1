@@ -17,6 +17,7 @@
  */
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { useArrangeStore } from "../../local/arrange/arrange-store";
+import { removeItemGuarded } from "../../local/arrange/arrange-guarded-actions";
 import {
   effectiveBarsForChunk,
   frameWidthForBars,
@@ -43,7 +44,6 @@ export function FilmStrip() {
   const focusItem = useArrangeStore((s) => s.focusItem);
   const seekToItem = useArrangeStore((s) => s.seekToItem);
   const reorderItem = useArrangeStore((s) => s.reorderItem);
-  const removeItem = useArrangeStore((s) => s.removeItem);
   const setStripScrollPx = useArrangeStore((s) => s.setStripScrollPx);
   const setStripMetrics = useArrangeStore((s) => s.setStripMetrics);
   const jobBpm = useArrangeStore((s) => s.jobBpm);
@@ -280,7 +280,7 @@ export function FilmStrip() {
                   e.preventDefault();
                   // Right-click = drop the item (matches the inspector
                   // affordance)
-                  removeItem(item.id);
+                  void removeItemGuarded(item.id);
                 }}
               />
               <InsertionCursor
