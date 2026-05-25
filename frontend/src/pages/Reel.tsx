@@ -101,7 +101,7 @@ export default function Reel() {
       </header>
 
       {/* 3-column body */}
-      <div className="flex-1 min-h-0 grid grid-cols-[240px_minmax(0,1fr)_340px]">
+      <div className="flex-1 min-h-0 grid grid-cols-[220px_minmax(0,1fr)_clamp(360px,28vw,440px)]">
         {/* Left: ordered project list */}
         <aside className="border-r border-rule bg-paper-hi/50 overflow-y-auto p-3 flex flex-col gap-2">
           <span className="label">Projects · order</span>
