@@ -73,17 +73,7 @@ export function ReelPlayer({
   const boxRef = useRef<HTMLDivElement>(null);
   const vidRef = useRef<HTMLVideoElement>(null);
   const [natural, setNatural] = useState<{ w: number; h: number } | null>(null);
-  const [boxW, setBoxW] = useState(0);
   const rafRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    const el = boxRef.current;
-    if (!el) return;
-    const ro = new ResizeObserver(() => setBoxW(el.clientWidth));
-    ro.observe(el);
-    setBoxW(el.clientWidth);
-    return () => ro.disconnect();
-  }, []);
 
   useEffect(() => {
     setNatural(null);
@@ -95,6 +85,8 @@ export function ReelPlayer({
   }, [memberId]);
 
   // Paused: seek the picture to the playhead (external scrub / member select).
+  // Wait for `loadeddata` (a decoded frame is available) so the seeked frame
+  // actually paints instead of staying black.
   useEffect(() => {
     if (playing) return;
     const v = vidRef.current;
@@ -106,8 +98,8 @@ export function ReelPlayer({
         /* pre-load */
       }
     };
-    if (v.readyState >= 1) apply();
-    else v.addEventListener("loadedmetadata", apply, { once: true });
+    if (v.readyState >= 2) apply();
+    else v.addEventListener("loadeddata", apply, { once: true });
   }, [localTime, memberId, playing]);
 
   // Playing: run the video, advance the global playhead, hop members.
@@ -119,6 +111,10 @@ export function ReelPlayer({
 
     const start = () => {
       try {
+        // Set muted BEFORE play() — an unmuted play() from an effect (not the
+        // click's gesture stack) is blocked by the browser, which is why
+        // "play did nothing". Muted playback is always allowed.
+        v.muted = muted;
         if (Math.abs(v.currentTime - localTime) > 0.3) v.currentTime = localTime;
       } catch {
         /* pre-load */
@@ -170,12 +166,14 @@ export function ReelPlayer({
   };
   const vp = cur?.member.viewport ?? { scale: 1, x: 0, y: 0 };
   const placed = applyViewportTransform(coverRect, vp);
-  const cssScale = stage.w > 0 ? boxW / stage.w : 1;
+  // Position in PERCENT of the stage: the box is sized to the stage aspect,
+  // so stage coords map 1:1 onto the box without needing its pixel width
+  // (which was racy to measure and left the video at 0×0 → black).
   const css = {
-    left: placed.dstX * cssScale,
-    top: placed.dstY * cssScale,
-    width: placed.dstW * cssScale,
-    height: placed.dstH * cssScale,
+    left: `${(placed.dstX / stage.w) * 100}%`,
+    top: `${(placed.dstY / stage.h) * 100}%`,
+    width: `${(placed.dstW / stage.w) * 100}%`,
+    height: `${(placed.dstH / stage.h) * 100}%`,
   };
 
   const dragRef = useRef<{ lx: number; ly: number; x: number; y: number } | null>(
@@ -194,7 +192,9 @@ export function ReelPlayer({
       const d = dragRef.current;
       if (!d || !memberId) return;
       const k = e.altKey ? PRECISION_DRAG_FACTOR : DRAG_FACTOR;
-      const inv = cssScale === 0 ? 1 : 1 / cssScale;
+      // client-px → stage-px using the box's live width (box spans stage.w).
+      const boxPxW = boxRef.current?.getBoundingClientRect().width || stage.w;
+      const inv = (stage.w / boxPxW) || 1;
       const nx = d.x + (e.clientX - d.lx) * inv * k;
       const ny = d.y + (e.clientY - d.ly) * inv * k;
       d.x = nx;
@@ -203,7 +203,7 @@ export function ReelPlayer({
       d.ly = e.clientY;
       onFraming(memberId, { x: nx, y: ny });
     },
-    [cssScale, memberId, onFraming],
+    [memberId, onFraming, stage.w],
   );
   const onPointerUp = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     try {
@@ -256,12 +256,18 @@ export function ReelPlayer({
           <div className="absolute inset-0 flex items-center justify-center font-mono text-xs text-danger">
             project deleted
           </div>
+        ) : !cur.member.videoUrl ? (
+          <div className="absolute inset-0 flex items-center justify-center px-6 text-center font-mono text-[11px] text-paper-hi/70">
+            Can't read this project's video — open it once in its editor to
+            grant access, then reopen the reel.
+          </div>
         ) : (
           <video
             key={memberId ?? "none"}
             ref={vidRef}
-            src={cur.member.videoUrl ?? undefined}
+            src={cur.member.videoUrl}
             playsInline
+            muted
             preload="auto"
             className="absolute object-cover"
             style={{ ...css, pointerEvents: "none" }}
@@ -292,7 +298,7 @@ export function ReelPlayer({
 function CornerMarks({
   rect,
 }: {
-  rect: { left: number; top: number; width: number; height: number };
+  rect: { left: string; top: string; width: string; height: string };
 }) {
   const SIZE = 13;
   const W = 2;

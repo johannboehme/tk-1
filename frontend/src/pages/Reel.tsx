@@ -35,7 +35,10 @@ export default function Reel() {
 
   const [playheadS, setPlayheadS] = useState(0);
   const [playing, setPlaying] = useState(false);
-  const [muted, setMuted] = useState(false);
+  // Start muted so playback isn't blocked by the browser's autoplay policy
+  // (play() runs from an effect, not the click's gesture stack). The SOUND
+  // toggle unmutes.
+  const [muted, setMuted] = useState(true);
 
   const stage =
     exportSpec.resolution && typeof exportSpec.resolution === "object"
