@@ -39,7 +39,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useEditorStore } from "./store";
 import { nextLoopWrapMasterT } from "./arrangement-loop";
-import { segmentArrStarts, segmentIndexAtArr } from "./arrangement-time";
+import {
+  arrToMaster,
+  segmentArrStarts,
+  segmentIndexAtArr,
+} from "./arrangement-time";
 import { attachLoopGlitchProbe, isProbeEnabled } from "./audio-glitch-probe";
 
 export interface AudioMasterHandle {
@@ -352,8 +356,18 @@ export function useAudioMaster(
         ? refsStable.b.current
         : refsStable.a.current;
     if (!idleEl) return;
+    // `loop.start` is arr-time on the composed tape; the <audio> clock is
+    // master-time. Project before parking — Identity for single-take, but
+    // off by the segment offset in long-form (the tick re-parks at the
+    // correct wrapTargetMasterT before any crossfade, so this was masked,
+    // but parking the right master-time up front avoids a cold-decoder
+    // attack if a wrap fires immediately after the loop is set).
+    const parkMasterT = arrToMaster(
+      loop.start,
+      useEditorStore.getState().arrangementSegments,
+    );
     try {
-      idleEl.currentTime = clampSeek(loop.start, idleEl.duration);
+      idleEl.currentTime = clampSeek(parkMasterT, idleEl.duration);
     } catch {
       /* not ready yet — next tick will catch up */
     }
