@@ -849,4 +849,129 @@ describe("triage-store · seam preview", () => {
     useTriageStore.getState().closeSeam();
     expect(useTriageStore.getState().playback.loop).toBeNull();
   });
+
+  it("openSeam defaults B to the next kept chunk", () => {
+    seed([
+      makeChunk({ id: "a", startMs: 10000, endMs: 20000 }),
+      makeChunk({ id: "b", startMs: 30000, endMs: 50000 }),
+      makeChunk({ id: "c", startMs: 60000, endMs: 70000 }),
+    ]);
+    useTriageStore.getState().openSeam("a");
+    expect(useTriageStore.getState().playback.seam?.bId).toBe("b");
+  });
+
+  it("openSeam skips dropped chunks when choosing default B", () => {
+    seed([
+      makeChunk({ id: "a", startMs: 10000, endMs: 20000 }),
+      makeChunk({ id: "x", startMs: 25000, endMs: 28000, accepted: false }),
+      makeChunk({ id: "b", startMs: 30000, endMs: 50000 }),
+    ]);
+    useTriageStore.getState().openSeam("a");
+    expect(useTriageStore.getState().playback.seam?.bId).toBe("b");
+  });
+
+  it("openSeam leaves B null when A is the last kept chunk", () => {
+    seed([
+      makeChunk({ id: "a", startMs: 10000, endMs: 20000 }),
+      makeChunk({ id: "b", startMs: 30000, endMs: 50000, accepted: false }),
+    ]);
+    useTriageStore.getState().openSeam("a");
+    expect(useTriageStore.getState().playback.seam?.bId).toBeNull();
+  });
+
+  it("seamStep(1) advances the pair to the next transition", () => {
+    seed([
+      makeChunk({ id: "a", startMs: 10000, endMs: 20000 }),
+      makeChunk({ id: "b", startMs: 30000, endMs: 50000 }),
+      makeChunk({ id: "c", startMs: 60000, endMs: 70000 }),
+    ]);
+    useTriageStore.getState().openSeam("a"); // a → b
+    useTriageStore.getState().seamStep(1);
+    const seam = useTriageStore.getState().playback.seam;
+    expect(seam?.aId).toBe("b");
+    expect(seam?.bId).toBe("c");
+  });
+
+  it("seamStep(1) is a no-op at the last transition", () => {
+    seed([
+      makeChunk({ id: "a", startMs: 10000, endMs: 20000 }),
+      makeChunk({ id: "b", startMs: 30000, endMs: 50000 }),
+      makeChunk({ id: "c", startMs: 60000, endMs: 70000 }),
+    ]);
+    useTriageStore.getState().openSeam("b"); // b → c (last transition)
+    useTriageStore.getState().seamStep(1);
+    const seam = useTriageStore.getState().playback.seam;
+    expect(seam?.aId).toBe("b");
+    expect(seam?.bId).toBe("c");
+  });
+
+  it("seamStep(-1) steps back and clamps at the first transition", () => {
+    seed([
+      makeChunk({ id: "a", startMs: 10000, endMs: 20000 }),
+      makeChunk({ id: "b", startMs: 30000, endMs: 50000 }),
+      makeChunk({ id: "c", startMs: 60000, endMs: 70000 }),
+    ]);
+    useTriageStore.getState().openSeam("b"); // b → c
+    useTriageStore.getState().seamStep(-1);
+    let seam = useTriageStore.getState().playback.seam;
+    expect(seam?.aId).toBe("a");
+    expect(seam?.bId).toBe("b");
+    useTriageStore.getState().seamStep(-1); // clamp
+    seam = useTriageStore.getState().playback.seam;
+    expect(seam?.aId).toBe("a");
+    expect(seam?.bId).toBe("b");
+  });
+
+  it("swapSeam swaps A and B", () => {
+    seed([
+      makeChunk({ id: "a", startMs: 10000, endMs: 20000 }),
+      makeChunk({ id: "b", startMs: 30000, endMs: 50000 }),
+    ]);
+    useTriageStore.getState().openSeam("a"); // a → b
+    useTriageStore.getState().swapSeam();
+    const seam = useTriageStore.getState().playback.seam;
+    expect(seam?.aId).toBe("b");
+    expect(seam?.bId).toBe("a");
+  });
+});
+
+describe("triage-store · nudgeChunkEdge", () => {
+  beforeEach(() => useTriageStore.getState().reset());
+
+  it("steps an on-grid edge forward by the chosen subdivision", () => {
+    // 120 BPM, 4/4 → beat 0.5s; anchor = startMs = 1.0s.
+    seed([makeChunk({ id: "c", startMs: 1000, endMs: 5000, detectedBpm: 120 })], {
+      jobBpm: 120,
+    });
+    // end 5.0 is on the 1/4 grid (anchor 1.0, step 0.5) → +0.5 = 5.5s
+    useTriageStore.getState().nudgeChunkEdge("c", "end", "1/4", 1);
+    expect(useTriageStore.getState().chunks[0].endMs).toBe(5500);
+  });
+
+  it("snaps an off-grid edge to the subdivision before stepping", () => {
+    seed([makeChunk({ id: "c", startMs: 1000, endMs: 5300, detectedBpm: 120 })], {
+      jobBpm: 120,
+    });
+    // end 5.3 → snap to 1/4 grid → 5.5 → +0.5 = 6.0s
+    useTriageStore.getState().nudgeChunkEdge("c", "end", "1/4", 1);
+    expect(useTriageStore.getState().chunks[0].endMs).toBe(6000);
+  });
+
+  it("steps the start edge back by a whole bar", () => {
+    // bar = 2.0s; start 5.0 on grid → -2.0 = 3.0s
+    seed([makeChunk({ id: "c", startMs: 5000, endMs: 9000, detectedBpm: 120 })], {
+      jobBpm: 120,
+    });
+    useTriageStore.getState().nudgeChunkEdge("c", "start", "1", -1);
+    expect(useTriageStore.getState().chunks[0].startMs).toBe(3000);
+  });
+
+  it("never lets the edges cross (min 100ms apart)", () => {
+    seed([makeChunk({ id: "c", startMs: 1000, endMs: 1400, detectedBpm: 120 })], {
+      jobBpm: 120,
+    });
+    // pulling end back by a bar would cross start → clamped to start+100
+    useTriageStore.getState().nudgeChunkEdge("c", "end", "1", -1);
+    expect(useTriageStore.getState().chunks[0].endMs).toBe(1100);
+  });
 });

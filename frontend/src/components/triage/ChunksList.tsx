@@ -17,6 +17,7 @@ import {
   chunkPassesFilter,
   useTriageStore,
 } from "../../local/triage/triage-store";
+import { buildSequence } from "../../local/triage/triage-sequence";
 import type { Chunk } from "../../storage/jobs-db";
 
 const HOT_COLOR = "#FF5722";
@@ -30,6 +31,7 @@ export function ChunksList() {
   const setSeamB = useTriageStore((s) => s.setSeamB);
   const openSeam = useTriageStore((s) => s.openSeam);
   const closeSeam = useTriageStore((s) => s.closeSeam);
+  const seamStep = useTriageStore((s) => s.seamStep);
   const minChunkBars = useTriageStore((s) => s.minChunkBars);
   const jobBpmValue = useTriageStore((s) => s.jobBpm?.value ?? null);
   const beatsPerBar = useTriageStore((s) => s.beatsPerBar);
@@ -42,6 +44,15 @@ export function ChunksList() {
     (c) =>
       c.accepted && chunkPassesFilter(c, minChunkBars, jobBpmValue, beatsPerBar),
   ).length;
+
+  // Seam stepping availability (kept chunks only): a transition needs A
+  // plus a following chunk, so A can step within [0, kept-2].
+  const seamSeq = seam
+    ? buildSequence(chunks, minChunkBars, jobBpmValue, beatsPerBar)
+    : [];
+  const seamIdxA = seam ? seamSeq.findIndex((c) => c.id === seam.aId) : -1;
+  const canSeamPrev = seamIdxA > 0;
+  const canSeamNext = seamIdxA >= 0 && seamIdxA < seamSeq.length - 2;
 
   const listRef = useRef<HTMLUListElement | null>(null);
   // Auto-scroll focused row into view with a comfortable offset so the
@@ -56,13 +67,20 @@ export function ChunksList() {
     if (!row) return;
     const listRect = list.getBoundingClientRect();
     const rowRect = row.getBoundingClientRect();
-    const targetRowOffsetWithinList =
-      rowRect.top - listRect.top + list.scrollTop;
-    // Offset = ~30 % of list height so two-three siblings stay visible
-    // above the focused row.
+    const rowTop = rowRect.top - listRect.top;
+    const rowBottom = rowRect.bottom - listRect.top;
+    // Already fully visible → leave the list alone (mirrors the timeline's
+    // auto-follow). This stops the list from jumping on every sequence
+    // advance when the next chunk is already on screen.
+    if (rowTop >= 0 && rowBottom <= list.clientHeight) return;
+    // Off-screen → bring it in with ~30 % headroom so a couple of
+    // siblings stay visible above the focused row.
+    const targetRowOffsetWithinList = rowTop + list.scrollTop;
     const offset = Math.max(48, list.clientHeight * 0.3);
-    const desiredScrollTop = targetRowOffsetWithinList - offset;
-    list.scrollTo({ top: desiredScrollTop, behavior: "smooth" });
+    list.scrollTo({
+      top: targetRowOffsetWithinList - offset,
+      behavior: "smooth",
+    });
   }, [focusedId]);
 
   if (sorted.length === 0) {
@@ -112,6 +130,20 @@ export function ChunksList() {
           >
             Seam
           </button>
+          {seam && (
+            <div className="flex items-center gap-0.5">
+              <SeamStepButton
+                dir={-1}
+                disabled={!canSeamPrev}
+                onClick={() => seamStep(-1)}
+              />
+              <SeamStepButton
+                dir={1}
+                disabled={!canSeamNext}
+                onClick={() => seamStep(1)}
+              />
+            </div>
+          )}
           <span className="font-mono text-[10px] tabular text-ink-3">
             {keptCount} kept
           </span>
@@ -276,6 +308,31 @@ function ChunkRow({
         </div>
       </div>
     </li>
+  );
+}
+
+/** Prev/next button to step the seam pair to the adjacent transition.
+ *  Only shown while a seam preview is active. */
+function SeamStepButton({
+  dir,
+  disabled,
+  onClick,
+}: {
+  dir: -1 | 1;
+  disabled: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className="font-mono text-[10px] leading-none px-1.5 py-1 rounded border border-black/20 text-ink-2 transition-colors hover:bg-paper-deep disabled:opacity-30 disabled:cursor-not-allowed"
+      title={dir === 1 ? "Next transition" : "Previous transition"}
+      aria-label={dir === 1 ? "Next transition" : "Previous transition"}
+    >
+      {dir === 1 ? "▶" : "◀"}
+    </button>
   );
 }
 

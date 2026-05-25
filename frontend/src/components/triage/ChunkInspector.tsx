@@ -25,6 +25,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ChunkyButton } from "../../editor/components/ChunkyButton";
 import { BpmReadoutView } from "../../editor/components/BpmReadoutView";
+import type { SnapMode } from "../../editor/snap";
 import {
   JoinNextIcon,
   JoinPrevIcon,
@@ -66,6 +67,7 @@ export function ChunkInspector() {
   const conformChunk = useTriageStore((s) => s.conformChunk);
   const revertConform = useTriageStore((s) => s.revertConform);
   const insertChunkAtPlayhead = useTriageStore((s) => s.insertChunkAtPlayhead);
+  const seamActive = useTriageStore((s) => s.playback.seam !== null);
   // Subscribe to currentTime so canSplit stays live as the playhead
   // moves — without this the Split button would only refresh when
   // some other store-state change triggers a render.
@@ -81,6 +83,11 @@ export function ChunkInspector() {
   const hasPrev = focused != null && focusedSortedIdx > 0;
   const hasNext =
     focused != null && focusedSortedIdx >= 0 && focusedSortedIdx < sortedById.length - 1;
+
+  // In seam mode the detail panel is replaced by a seam-specific one —
+  // the normal chunk actions (insert / split / join / reset) don't apply
+  // to auditioning a transition.
+  if (seamActive) return <SeamInspector />;
 
   return (
     <section className="rounded-md border border-rule overflow-hidden bg-paper-hi shadow-panel h-full flex flex-col min-h-0">
@@ -519,6 +526,208 @@ function ChunkBody({
           </ChunkyButton>
         </div>
       </Section>
+    </div>
+  );
+}
+
+// ─── Seam-mode detail panel ──────────────────────────────────────────────
+
+const SEAM_HOT = "#FF5722";
+
+/** Direct nudge units — one button per grid step, no mode to pre-select.
+ *  Labels match the DeckStrip snap plate (1 · 1/2 · 1/4 · 1/8 · 1/16) so
+ *  the whole app speaks one grid vocabulary. */
+const NUDGE_UNITS: { label: string; mode: SnapMode }[] = [
+  { label: "1", mode: "1" },
+  { label: "1/2", mode: "1/2" },
+  { label: "1/4", mode: "1/4" },
+  { label: "1/8", mode: "1/8" },
+  { label: "1/16", mode: "1/16" },
+];
+
+/** Replaces the chunk detail panel while a seam preview is active. Shows
+ *  the A→B pair with only the actions that make sense for tuning a
+ *  transition: direct per-edge nudge buttons (A's out, B's in) for every
+ *  grid unit, Conform each side onto its bar grid, and Swap. No insert /
+ *  split / join / reset. */
+function SeamInspector() {
+  const seam = useTriageStore((s) => s.playback.seam);
+  const chunks = useTriageStore((s) => s.chunks);
+  const jobBpm = useTriageStore((s) => s.jobBpm?.value ?? null);
+  const beatsPerBar = useTriageStore((s) => s.beatsPerBar);
+  const nudgeChunkEdge = useTriageStore((s) => s.nudgeChunkEdge);
+  const conformChunk = useTriageStore((s) => s.conformChunk);
+  const swapSeam = useTriageStore((s) => s.swapSeam);
+  const closeSeam = useTriageStore((s) => s.closeSeam);
+
+  const a = seam ? chunks.find((c) => c.id === seam.aId) ?? null : null;
+  const b = seam?.bId ? chunks.find((c) => c.id === seam.bId) ?? null : null;
+  if (!seam || !a) return null;
+
+  const sorted = [...chunks].sort((x, y) => x.startMs - y.startMs);
+  const idxOf = (id: string) => sorted.findIndex((c) => c.id === id) + 1;
+
+  return (
+    <section className="rounded-md border border-rule overflow-hidden bg-paper-hi shadow-panel h-full flex flex-col min-h-0">
+      <header
+        className="flex-none border-b border-rule px-3 py-2 flex items-center justify-between"
+        style={{
+          background:
+            "linear-gradient(180deg, #FAF6EC 0%, #E8E1D0 60%, #DDD4BE 100%)",
+          boxShadow:
+            "inset 0 1px 0 rgba(255,255,255,0.7), inset 0 -1px 0 rgba(0,0,0,0.10)",
+        }}
+      >
+        <span className="font-display tracking-label uppercase text-[10px] text-ink-2">
+          Seam · transition
+        </span>
+        <button
+          type="button"
+          onClick={() => closeSeam()}
+          className="font-mono text-[9px] tracking-label uppercase text-ink-3 hover:text-ink px-1"
+          title="Close seam preview · Esc"
+        >
+          ✕ close
+        </button>
+      </header>
+
+      <div className="flex-1 min-h-0 overflow-y-auto p-3 flex flex-col gap-2">
+        <SeamLaneRow
+          role="A"
+          chunk={a}
+          idx={idxOf(a.id)}
+          jobBpm={jobBpm}
+          beatsPerBar={beatsPerBar}
+          onNudge={(mode, dir) => nudgeChunkEdge(a.id, "end", mode, dir)}
+          onConform={() => conformChunk(a.id)}
+        />
+
+        <div className="text-center font-mono text-[9px] tracking-label uppercase text-ink-3">
+          ↓ cut ↓
+        </div>
+
+        {b ? (
+          <SeamLaneRow
+            role="B"
+            chunk={b}
+            idx={idxOf(b.id)}
+            jobBpm={jobBpm}
+            beatsPerBar={beatsPerBar}
+            onNudge={(mode, dir) => nudgeChunkEdge(b.id, "start", mode, dir)}
+            onConform={() => conformChunk(b.id)}
+          />
+        ) : (
+          <div className="rounded border border-dashed border-rule bg-paper-deep p-3 text-center font-mono text-[10px] tracking-label uppercase text-ink-3">
+            ◇ pick B — click a chunk in the list
+          </div>
+        )}
+
+        <Section title="TRANSITION">
+          <ChunkyButton
+            variant="secondary"
+            size="xs"
+            disabled={!b}
+            onClick={() => swapSeam()}
+            title="Swap A and B — audition the reverse transition"
+          >
+            ⇅ Swap A / B
+          </ChunkyButton>
+        </Section>
+      </div>
+    </section>
+  );
+}
+
+function SeamLaneRow({
+  role,
+  chunk,
+  idx,
+  jobBpm,
+  beatsPerBar,
+  onNudge,
+  onConform,
+}: {
+  role: "A" | "B";
+  chunk: Chunk;
+  idx: number;
+  jobBpm: number | null;
+  beatsPerBar: number;
+  onNudge: (mode: SnapMode, dir: -1 | 1) => void;
+  onConform: () => void;
+}) {
+  const startS = chunk.startMs / 1000;
+  const endS = chunk.endMs / 1000;
+  const bpm = effectiveChunkBpm(chunk, jobBpm);
+  const bars = bpm > 0 ? ((endS - startS) * bpm) / 60 / beatsPerBar : 0;
+  const canNudge = bpm > 0;
+
+  return (
+    <div className="rounded border border-rule bg-paper-deep p-2 flex flex-col gap-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <span
+          className="font-display tracking-label uppercase text-[9px] shrink-0"
+          style={{ color: SEAM_HOT }}
+        >
+          {role === "A" ? "A · out" : "B · in"}
+        </span>
+        <span className="font-mono text-[9px] tabular text-ink-3 truncate">
+          #{idx.toString().padStart(2, "0")} · {formatTime(startS)}→
+          {formatTime(endS)}
+          {bars > 0 ? ` · ${bars.toFixed(1)} bars` : ""}
+        </span>
+        <ChunkyButton
+          variant="secondary"
+          size="xs"
+          onClick={onConform}
+          title="Re-fit this chunk's bar grid from its audio"
+        >
+          Conform
+        </ChunkyButton>
+      </div>
+      <NudgeRow dir={-1} disabled={!canNudge} onNudge={onNudge} />
+      <NudgeRow dir={1} disabled={!canNudge} onNudge={onNudge} />
+    </div>
+  );
+}
+
+/** A row of direct nudge buttons (one per grid unit) for one direction.
+ *  Left rows move the edge earlier, right rows later — one click each,
+ *  no mode to pre-select. */
+function NudgeRow({
+  dir,
+  disabled,
+  onNudge,
+}: {
+  dir: -1 | 1;
+  disabled: boolean;
+  onNudge: (mode: SnapMode, dir: -1 | 1) => void;
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="font-display text-[9px] tracking-label uppercase text-ink-3 w-[4.5rem] shrink-0 whitespace-nowrap">
+        {dir < 0 ? "◀ earlier" : "▶ later"}
+      </span>
+      <div className="flex items-center gap-1 flex-wrap">
+        {NUDGE_UNITS.map(({ label, mode }) => (
+          <button
+            key={mode}
+            type="button"
+            disabled={disabled}
+            onClick={() => onNudge(mode, dir)}
+            className="font-mono tabular text-[11px] leading-none w-12 py-1.5 rounded-[4px] border border-black/25 text-ink hover:brightness-[1.04] active:translate-y-px transition disabled:opacity-30 disabled:cursor-not-allowed"
+            style={{
+              background: "linear-gradient(180deg, #FAF6EC 0%, #E8E1D0 100%)",
+              boxShadow:
+                "inset 0 1px 0 rgba(255,255,255,0.75), 0 1px 1px rgba(0,0,0,0.18)",
+            }}
+            title={`${dir < 0 ? "Earlier" : "Later"} by ${
+              label === "1" ? "one bar" : label
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

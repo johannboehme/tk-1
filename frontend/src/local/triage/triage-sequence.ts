@@ -126,3 +126,21 @@ export function seamSpanS(
   if (bpm > 0 && beatsPerBar > 0) return (60 / bpm) * beatsPerBar * 2;
   return 2;
 }
+
+/** Default loop brackets for a seam pair: ~2 bars of A's tail + ~2 bars
+ *  of B's head. loopOut is 0 when B isn't set yet. */
+export function defaultSeamBrackets(
+  a: Chunk,
+  b: Chunk | null,
+  jobBpm: number | null,
+  beatsPerBar: number,
+): { loopInS: number; loopOutS: number } {
+  const spanA = seamSpanS(a, jobBpm, beatsPerBar);
+  const loopInS = Math.max(a.startMs / 1000, a.endMs / 1000 - spanA);
+  let loopOutS = 0;
+  if (b) {
+    const spanB = seamSpanS(b, jobBpm, beatsPerBar);
+    loopOutS = Math.min(b.endMs / 1000, b.startMs / 1000 + spanB);
+  }
+  return { loopInS, loopOutS };
+}
