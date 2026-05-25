@@ -44,6 +44,7 @@ import {
   applyDriftStretchInterleaved,
 } from "./audio-fx";
 import { Compositor } from "./compositor";
+import { SingleRenderSink, type RenderSink } from "./render-sink";
 import type { BackendCapabilities } from "../../editor/render/factory";
 import { CamFrameStream } from "./cam-frame-stream";
 import { makeTestPatternCanvas } from "./test-pattern";
@@ -555,6 +556,19 @@ export interface MultiCamRenderInput
    * `activeCamAt` resolver against `camRanges`.
    */
   pills?: import("../../editor/types").Pill[];
+  /**
+   * Output muxer seam. When omitted, the render owns a `SingleRenderSink`
+   * and finalizes it (the legacy single-job behaviour). When provided
+   * (Reel), the caller owns the shared muxer + its finalize; this render
+   * only streams its chunks in.
+   */
+  sink?: RenderSink;
+  /**
+   * Skip audio decode + encode entirely. Used by Reel member renders,
+   * where the orchestrator encodes one global, gapless audio track for
+   * all members and the per-member render contributes video only.
+   */
+  skipAudio?: boolean;
 }
 
 /**
@@ -671,18 +685,26 @@ export async function editRenderMulti(
   // shifts to compensate, and the two shifts compound — what looked
   // like correct alignment in the preview ended up several seconds out
   // in the export.
-  input.onProgress?.({ stage: "audio-decode", framesDone: 0, framesTotal: 0 });
-  let audio: { pcm: Float32Array; sampleRate: number; channels: number } | null;
-  if (input.audioPcm) {
-    audio = input.audioPcm;
-  } else if (input.audioFile) {
-    audio = await decodeStudioAudioInterleaved(input.audioFile);
-  } else {
-    throw new Error("editRenderMulti: either audioFile or audioPcm is required");
+  let audio: { pcm: Float32Array; sampleRate: number; channels: number } | null =
+    null;
+  if (!input.skipAudio) {
+    input.onProgress?.({ stage: "audio-decode", framesDone: 0, framesTotal: 0 });
+    if (input.audioPcm) {
+      audio = input.audioPcm;
+    } else if (input.audioFile) {
+      audio = await decodeStudioAudioInterleaved(input.audioFile);
+    } else {
+      throw new Error(
+        "editRenderMulti: either audioFile or audioPcm is required",
+      );
+    }
   }
   const audioCodec: AudioEncodeCodec = input.audioCodec ?? "aac";
-  const audioSampleRate = audio.sampleRate;
-  const audioChannels = audio.channels;
+  // When audio is skipped (Reel member render) the sink already carries the
+  // muxer's audio config; these fall back to standard values only for the
+  // own-sink path, which always has decoded audio.
+  const audioSampleRate = audio?.sampleRate ?? 48000;
+  const audioChannels = audio?.channels ?? 2;
 
   // Cam ranges on the master timeline + a test-pattern source for gaps.
   // Per-clip trim (video cams only) narrows the available window; image
@@ -729,64 +751,58 @@ export async function editRenderMulti(
   );
   await compositor.ensureSubtitleEngine();
 
-  // Construct the muxer EARLY so both the audio and video encoders can
-  // stream chunks straight in instead of buffering them in RAM until
-  // finish(). For a 30-min 4K + stereo 48k render the previous batch
-  // path accumulated multi-GB of encoded bytes (incl. ~1.4 GB audio
-  // PCM); streaming keeps RAM constant in render duration.
-  const target: MuxTarget = input.output
-    ? new FileSystemWritableFileStreamTarget(input.output)
-    : new ArrayBufferTarget();
-  const muxerVideoCodecKey: "avc" | "hevc" = videoCodec === "h265" ? "hevc" : "avc";
-  const muxer = new Muxer({
-    target,
-    video: {
-      codec: muxerVideoCodecKey,
+  // Output muxer seam. The own-sink path constructs (and later finalizes)
+  // a SingleRenderSink — identical to the legacy muxer behaviour. The Reel
+  // passes a shared sink it owns; this render only streams chunks in.
+  const ownSink = input.sink == null;
+  const sink: RenderSink =
+    input.sink ??
+    new SingleRenderSink({
       width: outputWidth,
       height: outputHeight,
-      frameRate: fps,
-    },
-    audio: {
-      codec: audioCodec,
-      numberOfChannels: audioChannels,
-      sampleRate: audioSampleRate,
-    },
-    fastStart: input.output ? false : "in-memory",
-    firstTimestampBehavior: "offset",
-  });
+      fps,
+      videoCodec,
+      audioCodec,
+      audioChannels,
+      audioSampleRate,
+      output: input.output,
+    });
 
   // Stream-encode audio: walks segments inline, emits encoded chunks,
-  // each pushed straight into the muxer. No intermediate trimmed-PCM
-  // buffer; no chunks accumulator. After this returns the input PCM
-  // can be released to GC.
-  input.onProgress?.({ stage: "audio-encode", framesDone: 0, framesTotal: 0 });
-  const audioCodecString = audioCodec === "opus" ? "opus" : "mp4a.40.2";
-  let audioMeta: Parameters<Muxer<MuxTarget>["addAudioChunkRaw"]>[4] | undefined;
-  await streamEncodeAudioWithSegments(audio.pcm, input.segments, {
-    numberOfChannels: audioChannels,
-    sampleRate: audioSampleRate,
-    bitrateBps: input.audioBitrateBps ?? 192_000,
-    codec: audioCodec,
-    onChunk: (chunk, description) => {
-      if (!audioMeta && description) {
-        audioMeta = {
-          decoderConfig: {
-            codec: audioCodecString,
-            sampleRate: audioSampleRate,
-            numberOfChannels: audioChannels,
-            description,
-          },
-        } as unknown as Parameters<Muxer<MuxTarget>["addAudioChunkRaw"]>[4];
-      }
-      muxer.addAudioChunkRaw(
-        chunk.data,
-        chunk.type,
-        chunk.timestampUs,
-        chunk.durationUs,
-        audioMeta,
-      );
-    },
-  });
+  // each pushed straight into the sink. Skipped for Reel member renders —
+  // the orchestrator encodes one global gapless track for all members.
+  if (!input.skipAudio && audio) {
+    input.onProgress?.({ stage: "audio-encode", framesDone: 0, framesTotal: 0 });
+    const audioCodecString = audioCodec === "opus" ? "opus" : "mp4a.40.2";
+    let audioMeta:
+      | Parameters<Muxer<MuxTarget>["addAudioChunkRaw"]>[4]
+      | undefined;
+    await streamEncodeAudioWithSegments(audio.pcm, input.segments, {
+      numberOfChannels: audioChannels,
+      sampleRate: audioSampleRate,
+      bitrateBps: input.audioBitrateBps ?? 192_000,
+      codec: audioCodec,
+      onChunk: (chunk, description) => {
+        if (!audioMeta && description) {
+          audioMeta = {
+            decoderConfig: {
+              codec: audioCodecString,
+              sampleRate: audioSampleRate,
+              numberOfChannels: audioChannels,
+              description,
+            },
+          } as unknown as Parameters<Muxer<MuxTarget>["addAudioChunkRaw"]>[4];
+        }
+        sink.addAudioChunk(
+          chunk.data,
+          chunk.type,
+          chunk.timestampUs,
+          chunk.durationUs,
+          audioMeta,
+        );
+      },
+    });
+  }
   // Drop our reference so the worker's PCM buffer is GC-eligible. (For
   // a 30-min stereo 48k input this is ~700 MB — no point keeping it
   // around through the video render.)
@@ -813,7 +829,7 @@ export async function editRenderMulti(
           },
         } as unknown as Parameters<Muxer<MuxTarget>["addVideoChunkRaw"]>[4];
       }
-      muxer.addVideoChunkRaw(
+      sink.addVideoChunk(
         chunk.data,
         chunk.type,
         chunk.timestampUs,
@@ -1109,19 +1125,19 @@ export async function editRenderMulti(
       throw new Error("Video encoder produced no description");
     }
 
-    input.onProgress?.({
-      stage: "muxing",
-      framesDone: videoChunksWritten,
-      framesTotal: framesEmitted,
-    });
-    muxer.finalize();
-
     let outputBytes: Uint8Array | null = null;
     let byteLength = 0;
-    if (!input.output) {
-      const buf = (target as ArrayBufferTarget).buffer;
-      outputBytes = new Uint8Array(buf);
-      byteLength = outputBytes.byteLength;
+    // Own-sink path finalizes its muxer here. With a shared (Reel) sink the
+    // orchestrator finalizes once after every member has streamed in.
+    if (ownSink) {
+      input.onProgress?.({
+        stage: "muxing",
+        framesDone: videoChunksWritten,
+        framesTotal: framesEmitted,
+      });
+      const res = sink.finalize();
+      outputBytes = res.output;
+      byteLength = res.byteLength;
     }
 
     return {
