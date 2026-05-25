@@ -535,9 +535,41 @@ export interface VisualizerRecord {
   opacity?: number;
 }
 
+/** A project reference inside a Reel, with its framing over the common
+ *  stage. References the project by `jobId` (no copy) — a deleted job
+ *  surfaces as a "missing" member at load time. */
+export interface ReelMemberRecord {
+  /** Stable slot id (a job may appear more than once in a reel). */
+  memberId: string;
+  jobId: string;
+  /** Per-member pan/zoom over the reel stage. Mirror of ViewportTransform. */
+  viewport?: { scale: number; x: number; y: number };
+  trimInS?: number;
+  trimOutS?: number;
+}
+
+/** A Reel: an ordered set of projects rendered back-to-back into one file.
+ *  Top-level entity, sibling to jobs — lives in its own object store. */
+export interface ReelRecord {
+  id: string;
+  title: string | null;
+  createdAt: number;
+  members: ReelMemberRecord[];
+  /** Common output frame (px) every member is letterboxed into. */
+  stage: { w: number; h: number };
+  /** Persisted export selections (codec / bitrate / aspect UI). Stored as
+   *  unknown to keep the storage layer decoupled from the editor's
+   *  ExportSpec, exactly like `LocalJob.exportSpec`. */
+  exportSpec?: unknown;
+  /** Last successful reel render. Output bytes at `reels/{id}/output.mp4`. */
+  lastRender?: { completedAt: number; outputBytes: number };
+}
+
 const DB_NAME = "videoaudiosync";
-const DB_VERSION = 8;
+const DB_VERSION = 9;
 const STORE = "jobs";
+/** Top-level Reel records (ordered project references + framing). */
+const REELS_STORE = "reels";
 const ANALYSIS_STORE = "audio-analysis";
 /** Per-chunk thumbnail JPEG bytes, keyed by `${jobId}::${camId}::${chunkId}`.
  *  Filled lazily by the Arrange page so reloads don't re-decode the
@@ -677,6 +709,13 @@ function db(): Promise<IDBPDatabase> {
             cursor = await cursor.continue();
           }
         }
+
+        // V8 → V9: top-level Reel store (ordered project references +
+        // per-member framing). Fresh store, no data migration.
+        if (oldVersion < 9 && !database.objectStoreNames.contains(REELS_STORE)) {
+          const s = database.createObjectStore(REELS_STORE, { keyPath: "id" });
+          s.createIndex("by-createdAt", "createdAt");
+        }
       },
       blocked(currentVersion, blockedVersion) {
         cancelled = true;
@@ -792,6 +831,52 @@ async function wipeAll(): Promise<void> {
   if (d.objectStoreNames.contains(CHUNK_MELS_STORE)) {
     await d.clear(CHUNK_MELS_STORE);
   }
+  if (d.objectStoreNames.contains(REELS_STORE)) {
+    await d.clear(REELS_STORE);
+  }
+}
+
+// ---- Reels ----
+
+async function listReels(): Promise<ReelRecord[]> {
+  const d = await db();
+  const all = (await d.getAll(REELS_STORE)) as ReelRecord[];
+  all.sort((a, b) => b.createdAt - a.createdAt);
+  return all;
+}
+
+async function getReel(id: string): Promise<ReelRecord | undefined> {
+  const d = await db();
+  return (await d.get(REELS_STORE, id)) as ReelRecord | undefined;
+}
+
+async function saveReel(reel: ReelRecord): Promise<void> {
+  const d = await db();
+  await d.put(REELS_STORE, reel);
+}
+
+async function updateReel(
+  id: string,
+  patch: Partial<ReelRecord>,
+): Promise<ReelRecord> {
+  const d = await db();
+  const tx = d.transaction(REELS_STORE, "readwrite");
+  const existing = (await tx.store.get(id)) as ReelRecord | undefined;
+  if (!existing) {
+    await tx.done;
+    throw new Error(`Reel not found: ${id}`);
+  }
+  const merged: ReelRecord = { ...existing, ...patch, id: existing.id };
+  await tx.store.put(merged);
+  await tx.done;
+  return merged;
+}
+
+/** Delete a reel record. OPFS output cleanup (`reels/{id}/output.mp4`) is
+ *  the caller's responsibility — the storage layer stays OPFS-free. */
+async function deleteReel(id: string): Promise<void> {
+  const d = await db();
+  await d.delete(REELS_STORE, id);
 }
 
 interface AnalysisRecord<T> {
@@ -962,6 +1047,11 @@ export const jobsDb = {
   getChunkMelSpec,
   saveChunkMelSpec,
   deleteChunkMelSpecsForJob,
+  listReels,
+  getReel,
+  saveReel,
+  updateReel,
+  deleteReel,
 };
 
 export type JobsDb = typeof jobsDb;

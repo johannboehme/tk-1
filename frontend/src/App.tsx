@@ -13,6 +13,7 @@ import Arrange from "./pages/Arrange";
 import Editor from "./pages/Editor";
 import { JobPermissionRoute } from "./components/JobPermissionRoute";
 import History from "./pages/History";
+import Reel from "./pages/Reel";
 import { Impressum } from "./pages/Impressum";
 import JobPage from "./pages/JobPage";
 import RenderScreen from "./pages/RenderScreen";
@@ -30,7 +31,8 @@ export default function App() {
     /^\/job\/[^/]+\/edit/.test(location.pathname) ||
     /^\/job\/[^/]+\/render$/.test(location.pathname) ||
     /^\/job\/[^/]+\/triage$/.test(location.pathname) ||
-    /^\/job\/[^/]+\/arrange$/.test(location.pathname);
+    /^\/job\/[^/]+\/arrange$/.test(location.pathname) ||
+    /^\/reel(\/|$)/.test(location.pathname);
   // `caps` starts with the sync probe (webgpu=false) and gets the
   // async-probed `webgpu` merged in once `initCapabilities()` resolves.
   // Both Settings (display) and any render-backend consumer that reads
@@ -82,6 +84,7 @@ export default function App() {
         <Route path="/job/:id/arrange" element={<JobPermissionRoute><Arrange /></JobPermissionRoute>} />
         <Route path="/job/:id/edit" element={<JobPermissionRoute><Editor /></JobPermissionRoute>} />
         <Route path="/job/:id/render" element={<JobPermissionRoute><RenderScreen /></JobPermissionRoute>} />
+        <Route path="/reel/:id" element={<Reel />} />
         <Route path="/settings" element={<Settings caps={caps} />} />
         <Route path="/impressum" element={<Impressum />} />
         <Route path="/datenschutz" element={<Datenschutz />} />
@@ -113,7 +116,7 @@ function TopBar() {
           <NavTab to="/" end>
             New
           </NavTab>
-          <NavTab to="/jobs">History</NavTab>
+          <NavTab to="/jobs">Library</NavTab>
           <NavTab to="/settings">Settings</NavTab>
         </nav>
       </div>
