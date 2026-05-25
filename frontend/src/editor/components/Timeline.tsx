@@ -1276,10 +1276,17 @@ export function Timeline({
           setSelectedPillId(p.id);
           setSelectedClipId(p.camId);
           if (lanesLocked) {
-            // Lock on → no drag setup. Fall back to a normal scrub
-            // click so the playhead still follows the user's pointer.
-            seekFromX(x, snapped(tRaw, e));
-            dragRef.current = { kind: "playhead" };
+            // Lock on → no drag setup. A locked pill click normally also
+            // scrubs so the playhead follows the pointer — but NOT while a
+            // loop is engaged. A scrub onto a pill outside the loop lands
+            // out of the loop region, and the audio walker's immediate-wrap
+            // (useAudioMaster) yanks playback straight back to loop.start,
+            // so the picked pill could never be auditioned. With a loop
+            // active, select only and leave the loop running untouched.
+            if (!loop) {
+              seekFromX(x, snapped(tRaw, e));
+              dragRef.current = { kind: "playhead" };
+            }
             return;
           }
           if (pillHit.zone === "left") {

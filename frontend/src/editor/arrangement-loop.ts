@@ -67,6 +67,32 @@ export function nextLoopWrapMasterT(
   };
 }
 
+/** Build a loop region of `seconds` length centered on the playhead.
+ *
+ *  Works purely in arr-time. The caller MUST pass the AUTHORITATIVE arr-time
+ *  playhead (`playback.timelineT`), NOT `masterToArr(currentTime)` — the
+ *  latter scans for the first segment whose master range contains the
+ *  playhead and snaps onto the FIRST occurrence when a chunk is repeated in
+ *  the arrangement, so the loop would land on the wrong occurrence (the
+ *  same first-match trap the walker avoids by tracking `currentSegmentIdx`).
+ *  Clamps the window to `[0, totalArrS]`, preserving its full length where
+ *  possible. Callers still pass the result through `setLoop`, which narrows
+ *  it to the master-trim window. */
+export function loopAroundPlayhead(
+  playheadArrT: number,
+  seconds: number,
+  totalArrS: number,
+): LoopRegion {
+  const half = seconds / 2;
+  let start = Math.max(0, playheadArrT - half);
+  let end = start + seconds;
+  if (end > totalArrS) {
+    end = totalArrS;
+    start = Math.max(0, end - seconds);
+  }
+  return { start, end };
+}
+
 /** Clamp the loop to the playable arr-time window: the intersection of
  *  the segments' totalArrDuration and the master-trim's projection into
  *  arr-time. Master-trim universally narrows the loop in both single-take

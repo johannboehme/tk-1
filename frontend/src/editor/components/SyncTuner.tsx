@@ -10,7 +10,8 @@
 // offset instead of the whole cam — so a single chunk can be tuned without
 // disturbing the rest of the take.
 import { useEditorStore } from "../store";
-import { segmentIndexAtArr } from "../arrangement-time";
+import { segmentIndexAtArr, totalArrDuration } from "../arrangement-time";
+import { loopAroundPlayhead } from "../arrangement-loop";
 import { isVideoClip, MASTER_AUDIO_ID } from "../types";
 import { ChunkyButton } from "./ChunkyButton";
 import { Knob } from "./Knob";
@@ -71,7 +72,6 @@ export function SyncTuner({ lastSyncOverrideMs }: Props) {
   const setAbBypass = useEditorStore((s) => s.setAbBypass);
   // currentTime read imperatively in the loop-around-playhead handler
   // — subscribing would re-render this whole panel 60×/sec for nothing.
-  const trim = useEditorStore((s) => s.trim);
   const setLoop = useEditorStore((s) => s.setLoop);
   const loop = useEditorStore((s) => s.playback.loop);
   const hasBpm = useEditorStore((s) => Boolean(s.jobMeta?.bpm));
@@ -106,11 +106,17 @@ export function SyncTuner({ lastSyncOverrideMs }: Props) {
   const totalMs = abBypass ? algoMs : algoMs + userOverrideMs;
 
   function setLoopAroundPlayhead(seconds: number) {
-    const t = useEditorStore.getState().playback.currentTime;
-    const half = seconds / 2;
-    const start = Math.max(trim.in, t - half);
-    const end = Math.min(trim.out, start + seconds);
-    setLoop({ start, end });
+    const s = useEditorStore.getState();
+    // Anchor on the AUTHORITATIVE arr-time playhead (`timelineT`), not on
+    // master-time — in long-form with a repeated chunk a master-time scan
+    // snaps onto the wrong occurrence. `setLoop` then narrows to the trim.
+    setLoop(
+      loopAroundPlayhead(
+        s.playback.timelineT,
+        seconds,
+        totalArrDuration(s.arrangementSegments),
+      ),
+    );
   }
 
   function nudgeWithHaptic(delta: number) {
@@ -439,18 +445,23 @@ function MasterAudioBranch() {
   const setAudioStartNudgeS = useEditorStore((s) => s.setAudioStartNudgeS);
   const nudgeAudioStartMs = useEditorStore((s) => s.nudgeAudioStartMs);
   // currentTime read imperatively in setLoopAroundPlayhead.
-  const trim = useEditorStore((s) => s.trim);
   const setLoop = useEditorStore((s) => s.setLoop);
   const loop = useEditorStore((s) => s.playback.loop);
 
   const audioNudgeMs = audioNudgeS * 1000;
 
   function setLoopAroundPlayhead(seconds: number) {
-    const t = useEditorStore.getState().playback.currentTime;
-    const half = seconds / 2;
-    const start = Math.max(trim.in, t - half);
-    const end = Math.min(trim.out, start + seconds);
-    setLoop({ start, end });
+    const s = useEditorStore.getState();
+    // Anchor on the AUTHORITATIVE arr-time playhead (`timelineT`), not on
+    // master-time — in long-form with a repeated chunk a master-time scan
+    // snaps onto the wrong occurrence. `setLoop` then narrows to the trim.
+    setLoop(
+      loopAroundPlayhead(
+        s.playback.timelineT,
+        seconds,
+        totalArrDuration(s.arrangementSegments),
+      ),
+    );
   }
 
   function nudgeWithHaptic(deltaMs: number) {

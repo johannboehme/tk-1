@@ -1,6 +1,35 @@
 import { describe, expect, test } from "vitest";
-import { nextLoopWrapMasterT, clampLoopToBounds } from "./arrangement-loop";
+import {
+  nextLoopWrapMasterT,
+  clampLoopToBounds,
+  loopAroundPlayhead,
+} from "./arrangement-loop";
 import type { Segment } from "./types";
+
+describe("loopAroundPlayhead", () => {
+  test("centers the window on the arr-time playhead", () => {
+    // A 2 s window around arr-time 5 is [4, 6].
+    expect(loopAroundPlayhead(5, 2, 10)).toEqual({ start: 4, end: 6 });
+  });
+
+  test("anchors on the arr-time playhead, not a master-time value", () => {
+    // The caller passes the AUTHORITATIVE arr-playhead (timelineT). For a
+    // repeated chunk's 2nd occurrence the playhead is arr 12 (even though
+    // its master-time also appears earlier); the loop must center at 12 →
+    // [10, 14], never on the first occurrence's arr-position.
+    expect(loopAroundPlayhead(12, 4, 20)).toEqual({ start: 10, end: 14 });
+  });
+
+  test("clamps to the playable arr-window at the end of the song", () => {
+    // Playhead at arr 19, total 20; a 4 s window would overrun → clamp so
+    // the window ends at 20 and keeps its full length: [16, 20].
+    expect(loopAroundPlayhead(19, 4, 20)).toEqual({ start: 16, end: 20 });
+  });
+
+  test("clamps to 0 at the start of the song", () => {
+    expect(loopAroundPlayhead(0.5, 4, 10)).toEqual({ start: 0, end: 4 });
+  });
+});
 
 describe("nextLoopWrapMasterT", () => {
   test("single synthetic segment (direct-mode equivalent) — arr-time == master-time", () => {

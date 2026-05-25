@@ -146,11 +146,11 @@ export function TransportBar() {
     });
     switch (target.kind) {
       case "loop": {
-        // Loop lives in arr-time on the composed timeline; project the
-        // playhead's master-time through `arrSegments` (Identity for
-        // single-take's whole-master segment).
-        const t_arr = masterToArr(t, arrSegments);
-        const newStart = t_arr;
+        // Loop lives in arr-time on the composed timeline. Anchor on the
+        // AUTHORITATIVE arr-playhead (`timelineT`), NOT `masterToArr(t)` —
+        // a master-time scan snaps onto the first occurrence of a repeated
+        // chunk, so the loop edge would jump to the wrong occurrence.
+        const newStart = s.playback.timelineT;
         const newEnd = Math.max(loop!.end, newStart + 1 / fps);
         setLoop({ start: newStart, end: newEnd });
         return;
@@ -182,8 +182,8 @@ export function TransportBar() {
     });
     switch (target.kind) {
       case "loop": {
-        const t_arr = masterToArr(t, arrSegments);
-        const newEnd = t_arr;
+        // Authoritative arr-playhead — see setInPointAtPlayhead's loop case.
+        const newEnd = s.playback.timelineT;
         const newStart = Math.min(loop!.start, newEnd - 1 / fps);
         setLoop({ start: newStart, end: newEnd });
         return;
@@ -209,13 +209,14 @@ export function TransportBar() {
       setLoop(null);
       return;
     }
-    // Anchor on the COMPOSED timeline (the user's tape). Loop bounds
-    // are arr-time; clamp to the playable arr-window so a fresh-open
-    // playhead at t=0 doesn't propose a region outside the active
-    // range — `setLoop` would clamp it to null and the toggle would
-    // appear to do nothing.
-    const t = useEditorStore.getState().playback.currentTime;
-    const t_arr = masterToArr(t, arrSegments);
+    // Anchor on the COMPOSED timeline (the user's tape) at the AUTHORITATIVE
+    // arr-playhead (`timelineT`). Using `masterToArr(currentTime)` would scan
+    // for the first segment whose master range contains the playhead and snap
+    // onto the FIRST occurrence of a repeated chunk — so in long-form the loop
+    // would land on the wrong occurrence (markers + audio jump away from where
+    // the user pressed). Clamp to the playable arr-window so a fresh-open
+    // playhead doesn't propose a region `setLoop` would clamp to null.
+    const t_arr = useEditorStore.getState().playback.timelineT;
     const hi = totalArrDuration(arrSegments);
     const start = Math.max(0, Math.min(hi - 1 / fps, t_arr));
     const end = Math.min(hi, start + 2);
