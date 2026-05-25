@@ -38,7 +38,10 @@ export interface ReelMember {
   jobId: string;
   title: string;
   fullDurationS: number;
+  /** Thumbnail strip URL for the member-list row. */
   posterUrl: string | null;
+  /** Cam-0 video URL for the framing preview (shows a real frame). */
+  videoUrl: string | null;
   viewport: ViewportTransform;
   trimInS: number;
   trimOutS: number;
@@ -156,6 +159,7 @@ async function hydrateMember(rec: ReelMemberRecord): Promise<ReelMember> {
     title: job?.title || rec.jobId.slice(0, 8),
     fullDurationS: job?.durationS ?? 0,
     posterUrl: null,
+    videoUrl: null,
     viewport: rec.viewport ?? { ...DEFAULT_VIEWPORT },
     trimInS: rec.trimInS ?? 0,
     trimOutS: rec.trimOutS ?? (job?.durationS ?? 0),
@@ -163,9 +167,12 @@ async function hydrateMember(rec: ReelMemberRecord): Promise<ReelMember> {
   };
   if (job?.videos?.length) {
     const cam0 = job.videos[0].id;
-    base.posterUrl =
-      (await resolveCamAssetUrl(rec.jobId, cam0, "frames").catch(() => null)) ??
-      (await resolveCamAssetUrl(rec.jobId, cam0, "video").catch(() => null));
+    base.posterUrl = await resolveCamAssetUrl(rec.jobId, cam0, "frames").catch(
+      () => null,
+    );
+    base.videoUrl = await resolveCamAssetUrl(rec.jobId, cam0, "video").catch(
+      () => null,
+    );
   }
   return base;
 }

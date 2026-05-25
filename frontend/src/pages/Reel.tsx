@@ -6,6 +6,7 @@ import { SegmentedControl } from "../editor/components/SegmentedControl";
 import { RuleStrip } from "../editor/components/RuleStrip";
 import { TrashIcon } from "../editor/components/icons";
 import { formatDuration } from "../components/ProgressBar";
+import { ReelStage } from "../components/reel/ReelStage";
 import { useReelStore } from "../local/reel/reel-store";
 import {
   ASPECT_RATIO_PRESETS,
@@ -34,6 +35,11 @@ export default function Reel() {
   const removeMember = useReelStore((s) => s.removeMember);
   const startRender = useReelStore((s) => s.startRender);
   const totalDurationS = useReelStore((s) => s.totalDurationS);
+  const selectedMemberId = useReelStore((s) => s.selectedMemberId);
+  const selectMember = useReelStore((s) => s.selectMember);
+  const setMemberViewport = useReelStore((s) => s.setMemberViewport);
+  const resetMemberViewport = useReelStore((s) => s.resetMemberViewport);
+  const selected = members.find((m) => m.memberId === selectedMemberId) ?? null;
 
   const stage = exportSpec.resolution && typeof exportSpec.resolution === "object"
     ? exportSpec.resolution
@@ -94,6 +100,21 @@ export default function Reel() {
             <RuleStrip count={24} className="text-rule flex-1 max-w-[160px]" />
           </div>
 
+          {selected && !selected.missing && (
+            <div className="mb-4 max-w-[640px]">
+              <ReelStage
+                stage={stage}
+                videoUrl={selected.videoUrl}
+                viewport={selected.viewport}
+                onViewport={(patch) => setMemberViewport(selected.memberId, patch)}
+                onReset={() => resetMemberViewport(selected.memberId)}
+              />
+              <p className="mt-1.5 font-mono text-[11px] text-ink-2">
+                {selected.title} — drag to pan · wheel to zoom · double-click to reset
+              </p>
+            </div>
+          )}
+
           {members.length === 0 ? (
             <p className="font-mono text-sm text-ink-2">
               This reel is empty. Add projects from the Library.
@@ -103,9 +124,14 @@ export default function Reel() {
               {members.map((m, i) => (
                 <li
                   key={m.memberId}
+                  onClick={() => selectMember(m.memberId)}
                   className={[
-                    "flex items-center gap-3 bg-paper-hi border rounded-lg p-2",
-                    m.missing ? "border-danger/60" : "border-rule",
+                    "flex items-center gap-3 bg-paper-hi border rounded-lg p-2 cursor-pointer transition-colors",
+                    m.missing
+                      ? "border-danger/60"
+                      : m.memberId === selectedMemberId
+                        ? "border-hot ring-1 ring-hot/40"
+                        : "border-rule hover:border-ink-2",
                   ].join(" ")}
                 >
                   <span className="font-mono text-xs tabular text-ink-2 w-6 text-center shrink-0">
