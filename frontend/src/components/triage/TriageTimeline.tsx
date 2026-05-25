@@ -70,6 +70,7 @@ export function TriageTimeline() {
   const seek = useTriageStore((s) => s.seek);
   const updateChunk = useTriageStore((s) => s.updateChunk);
   const currentTime = useTriageStore((s) => s.playback.currentTime);
+  const playbackMode = useTriageStore((s) => s.playback.mode);
 
   // Track wrapper width AND height so the waveform breathes vertically
   // when the user gives the timeline column more room.
@@ -123,8 +124,19 @@ export function TriageTimeline() {
     }
     const chunk = chunks.find((c) => c.id === focusedChunkId);
     if (!chunk) return;
+    const startS = chunk.startMs / 1000;
+    // Sequence mode advances the playhead to each chunk's start. Only pan
+    // when that point is off-screen — if it's already visible, let the
+    // playhead jump there without yanking the view. (Loop/continue keep
+    // the "bring the whole focused chunk into view" behaviour.)
+    if (playbackMode === "sequence") {
+      if (startS >= viewStartS && startS <= viewEndS) return;
+      const visibleDur = viewEndS - viewStartS;
+      setScrollX(Math.max(0, startS - visibleDur * 0.15));
+      return;
+    }
     const next = autoFollowScrollX({
-      chunkStartS: chunk.startMs / 1000,
+      chunkStartS: startS,
       chunkEndS: chunk.endMs / 1000,
       viewStartS,
       viewEndS,

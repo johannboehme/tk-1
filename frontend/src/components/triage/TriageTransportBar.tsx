@@ -22,6 +22,7 @@ import {
   SkipFwdIcon,
 } from "../../editor/components/icons";
 import { useTriageStore } from "../../local/triage/triage-store";
+import { PlaybackModeSwitch } from "./PlaybackModeSwitch";
 import {
   joinFocusedGuarded,
   rejectFocusedGuarded,
@@ -31,8 +32,9 @@ import {
 export function TriageTransportBar() {
   const isPlaying = useTriageStore((s) => s.playback.isPlaying);
   const setPlaying = useTriageStore((s) => s.setPlaying);
-  const loopEnabled = useTriageStore((s) => s.playback.loopEnabled);
-  const setLoopEnabled = useTriageStore((s) => s.setLoopEnabled);
+  const setMode = useTriageStore((s) => s.setMode);
+  const openSeam = useTriageStore((s) => s.openSeam);
+  const closeSeam = useTriageStore((s) => s.closeSeam);
   const focusedChunkId = useTriageStore((s) => s.focusedChunkId);
   const focusRelative = useTriageStore((s) => s.focusRelative);
   const acceptFocused = useTriageStore((s) => s.acceptFocused);
@@ -80,13 +82,13 @@ export function TriageTransportBar() {
   useRegisterShortcut({
     id: "triage.loop",
     keys: ["L"],
-    description: "Toggle loop on focused chunk",
+    description: "Cycle transport mode (Continue · Loop · Sequence)",
     group: "Transport",
   });
   useRegisterShortcut({
     id: "triage.split",
     keys: ["S"],
-    description: "Split focused chunk at the playhead",
+    description: "Split chunk at the playhead (or create one in empty space)",
     group: "Triage · Edit",
   });
   useRegisterShortcut({
@@ -119,6 +121,18 @@ export function TriageTransportBar() {
     description: "Reset focused chunk to detection boundaries",
     group: "Triage · Edit",
   });
+  useRegisterShortcut({
+    id: "triage.seam",
+    keys: ["T"],
+    description: "Seam preview — audition the transition from the focused chunk",
+    group: "Transport",
+  });
+  useRegisterShortcut({
+    id: "triage.seam-close",
+    keys: ["Esc"],
+    description: "Close seam preview",
+    group: "Transport",
+  });
 
   useEffect(() => {
     function isTextInput(target: EventTarget | null): boolean {
@@ -150,13 +164,24 @@ export function TriageTransportBar() {
         void rejectFocusedGuarded();
       } else if (e.code === "KeyL") {
         e.preventDefault();
-        const cur = useTriageStore.getState().playback.loopEnabled;
-        setLoopEnabled(!cur);
+        const cur = useTriageStore.getState().playback.mode;
+        setMode(
+          cur === "continue" ? "loop" : cur === "loop" ? "sequence" : "continue",
+        );
       } else if (e.code === "KeyS" && !e.metaKey && !e.ctrlKey && !e.altKey) {
         e.preventDefault();
         const st = useTriageStore.getState();
-        if (st.focusedChunkId) {
-          void splitFocusedGuarded(Math.round(st.playback.currentTime * 1000));
+        const tMs = Math.round(st.playback.currentTime * 1000);
+        const focused = st.focusedChunkId
+          ? st.chunks.find((c) => c.id === st.focusedChunkId)
+          : null;
+        const insideFocused =
+          focused != null && tMs > focused.startMs + 50 && tMs < focused.endMs - 50;
+        if (insideFocused) {
+          void splitFocusedGuarded(tMs);
+        } else if (!st.chunks.some((c) => tMs > c.startMs && tMs < c.endMs)) {
+          // Empty space → create a new chunk here instead of splitting.
+          insertChunkAtPlayhead();
         }
       } else if (e.code === "KeyJ" && !e.metaKey && !e.ctrlKey && !e.altKey) {
         e.preventDefault();
@@ -175,6 +200,17 @@ export function TriageTransportBar() {
         e.preventDefault();
         const st = useTriageStore.getState();
         if (st.focusedChunkId) resetChunk(st.focusedChunkId);
+      } else if (e.code === "KeyT" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        const st = useTriageStore.getState();
+        if (st.playback.seam) closeSeam();
+        else if (st.focusedChunkId) openSeam(st.focusedChunkId);
+      } else if (e.code === "Escape") {
+        const st = useTriageStore.getState();
+        if (st.playback.seam) {
+          e.preventDefault();
+          closeSeam();
+        }
       }
     }
     window.addEventListener("keydown", handler);
@@ -183,7 +219,9 @@ export function TriageTransportBar() {
     setPlaying,
     focusRelative,
     acceptFocused,
-    setLoopEnabled,
+    setMode,
+    openSeam,
+    closeSeam,
     conformChunk,
     insertChunkAtPlayhead,
     resetChunk,
@@ -278,16 +316,7 @@ export function TriageTransportBar() {
 
         <span className="h-6 w-px bg-rule mx-1" aria-hidden />
 
-        <ChunkyButton
-          variant={loopEnabled ? "primary" : "secondary"}
-          size="sm"
-          onClick={() => setLoopEnabled(!loopEnabled)}
-          title={loopEnabled ? "Loop on · L to disable" : "Loop off · L to enable"}
-          aria-label={loopEnabled ? "Disable loop" : "Enable loop"}
-          aria-pressed={loopEnabled}
-        >
-          ⟲ Loop
-        </ChunkyButton>
+        <PlaybackModeSwitch />
       </div>
 
       {/* Right rail — kept counter (the floating Footer overlay sits

@@ -47,7 +47,9 @@ import {
 } from "../local/triage/triage-store";
 import { useTriagePersist } from "../local/triage/useTriagePersist";
 import { getCachedAnalysis } from "../local/render/audio-analysis";
+import { AnimatePresence, motion } from "framer-motion";
 import { TriageTimeline } from "../components/triage/TriageTimeline";
+import { SeamStrip } from "../components/triage/SeamStrip";
 import { TriageTransportBar } from "../components/triage/TriageTransportBar";
 import { DetectionPanel } from "../components/triage/DetectionPanel";
 import { ChunkInspector } from "../components/triage/ChunkInspector";
@@ -72,6 +74,7 @@ export default function Triage() {
   const snapMode = useTriageStore((s) => s.snapMode);
   const setSnapMode = useTriageStore((s) => s.setSnapMode);
   const hasBpm = useTriageStore((s) => Boolean(s.jobBpm?.value));
+  const seamActive = useTriageStore((s) => s.playback.seam !== null);
   const syncOp = useSyncOp(id);
   useTriagePersist();
 
@@ -215,7 +218,7 @@ export default function Triage() {
           beatPhaseS: timing.beatPhaseS,
           snapMode: job!.ui?.snapMode ?? "1",
           minChunkBars: 0,
-          loopEnabled: true,
+          mode: "loop",
           pcm: new Float32Array(0),
           pcmSampleRate: 22050,
           envelope: job!.triageEnvelope!,
@@ -287,7 +290,7 @@ export default function Triage() {
           beatPhaseS: timing.beatPhaseS,
           snapMode: job!.ui?.snapMode ?? "1",
           minChunkBars: 0,
-          loopEnabled: true,
+          mode: "loop",
           pcm: result.pcm,
           pcmSampleRate: result.sampleRate,
           envelope: result.envelope,
@@ -387,13 +390,41 @@ export default function Triage() {
            *  flows to ControlRow above. */}
           <section className="flex-none px-3 py-2 flex">
             <div
-              className="flex-1 rounded-md overflow-hidden"
+              className="relative flex-1 rounded-md overflow-hidden"
               style={{
                 boxShadow: "inset 0 2px 4px rgba(0,0,0,0.08)",
                 height: 188,
               }}
             >
-              <TriageTimeline />
+              {/* The bottom strip morphs between the full timeline and the
+               *  seam editor — a tape-deck-style hinge into two lanes. The
+               *  188px box stays put so nothing else on the page reflows. */}
+              <AnimatePresence initial={false} mode="popLayout">
+                {seamActive ? (
+                  <motion.div
+                    key="seam"
+                    className="absolute inset-0"
+                    initial={{ opacity: 0, scaleY: 0.55 }}
+                    animate={{ opacity: 1, scaleY: 1 }}
+                    exit={{ opacity: 0, scaleY: 0.55 }}
+                    transition={{ duration: 0.24, ease: "easeOut" }}
+                    style={{ transformOrigin: "center" }}
+                  >
+                    <SeamStrip />
+                  </motion.div>
+                ) : (
+                  <motion.div
+                    key="timeline"
+                    className="absolute inset-0"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    transition={{ duration: 0.18, ease: "easeOut" }}
+                  >
+                    <TriageTimeline />
+                  </motion.div>
+                )}
+              </AnimatePresence>
             </div>
           </section>
 

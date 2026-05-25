@@ -698,3 +698,280 @@ describe("triage-store · snapshot housekeeping", () => {
     expect(useTriageStore.getState().chunks[0].preConformSnapshot).toBeUndefined();
   });
 });
+
+describe("triage-store · setMode", () => {
+  beforeEach(() => useTriageStore.getState().reset());
+
+  it("loop mode with a focused chunk arms the loop region", () => {
+    seed([makeChunk({ id: "c1", startMs: 2000, endMs: 6000 })]);
+    useTriageStore.getState().focusChunk("c1");
+    useTriageStore.getState().setMode("loop");
+    const pb = useTriageStore.getState().playback;
+    expect(pb.mode).toBe("loop");
+    expect(pb.loop).toEqual({ start: 2, end: 6 });
+  });
+
+  it("continue mode clears the loop region", () => {
+    seed([makeChunk({ id: "c1", startMs: 2000, endMs: 6000 })]);
+    useTriageStore.getState().focusChunk("c1");
+    useTriageStore.getState().setMode("continue");
+    const pb = useTriageStore.getState().playback;
+    expect(pb.mode).toBe("continue");
+    expect(pb.loop).toBeNull();
+  });
+
+  it("sequence mode clears the loop region", () => {
+    seed([makeChunk({ id: "c1", startMs: 2000, endMs: 6000 })]);
+    useTriageStore.getState().focusChunk("c1");
+    useTriageStore.getState().setMode("sequence");
+    const pb = useTriageStore.getState().playback;
+    expect(pb.mode).toBe("sequence");
+    expect(pb.loop).toBeNull();
+  });
+
+  it("focusing a chunk in continue mode does not arm a loop", () => {
+    seed([makeChunk({ id: "c1", startMs: 2000, endMs: 6000 })]);
+    useTriageStore.getState().setMode("continue");
+    useTriageStore.getState().focusChunk("c1");
+    const pb = useTriageStore.getState().playback;
+    expect(pb.loop).toBeNull();
+    expect(pb.currentTime).toBe(2);
+  });
+});
+
+describe("triage-store · sequence playback", () => {
+  beforeEach(() => useTriageStore.getState().reset());
+
+  it("sequenceAdvance sets focusedChunkId without touching currentTime", () => {
+    seed([
+      makeChunk({ id: "a", startMs: 0, endMs: 1000 }),
+      makeChunk({ id: "b", startMs: 2000, endMs: 3000 }),
+    ]);
+    useTriageStore.setState((s) => ({
+      playback: { ...s.playback, currentTime: 1.9 },
+    }));
+    useTriageStore.getState().sequenceAdvance("b");
+    expect(useTriageStore.getState().focusedChunkId).toBe("b");
+    expect(useTriageStore.getState().playback.currentTime).toBe(1.9);
+  });
+
+  it("setPlaying(true) in sequence snaps focus + time to the first kept chunk", () => {
+    seed([
+      makeChunk({ id: "b", startMs: 5000, endMs: 6000 }),
+      makeChunk({ id: "a", startMs: 1000, endMs: 2000 }),
+    ]);
+    useTriageStore.getState().setMode("sequence");
+    useTriageStore.getState().setPlaying(true);
+    expect(useTriageStore.getState().focusedChunkId).toBe("a"); // earliest startMs
+    expect(useTriageStore.getState().playback.currentTime).toBe(1);
+    expect(useTriageStore.getState().playback.isPlaying).toBe(true);
+  });
+
+  it("setPlaying(true) in sequence keeps focus if already on a kept chunk", () => {
+    seed([
+      makeChunk({ id: "a", startMs: 1000, endMs: 2000 }),
+      makeChunk({ id: "b", startMs: 5000, endMs: 6000 }),
+    ]);
+    useTriageStore.getState().setMode("sequence");
+    useTriageStore.getState().focusChunk("b");
+    useTriageStore.getState().setPlaying(true);
+    expect(useTriageStore.getState().focusedChunkId).toBe("b");
+  });
+
+  it("setPlaying(true) in sequence with no kept chunks stays paused", () => {
+    seed([makeChunk({ id: "a", startMs: 1000, endMs: 2000, accepted: false })]);
+    useTriageStore.getState().setMode("sequence");
+    useTriageStore.getState().setPlaying(true);
+    expect(useTriageStore.getState().playback.isPlaying).toBe(false);
+  });
+});
+
+describe("triage-store · seam preview", () => {
+  beforeEach(() => useTriageStore.getState().reset());
+
+  it("openSeam sets A, leaves B null, parks at loopIn, clears loop, pauses", () => {
+    seed([makeChunk({ id: "a", startMs: 10000, endMs: 20000 })]);
+    useTriageStore.getState().focusChunk("a");
+    useTriageStore.getState().setPlaying(true);
+    useTriageStore.getState().openSeam("a");
+    const pb = useTriageStore.getState().playback;
+    expect(pb.seam?.aId).toBe("a");
+    expect(pb.seam?.bId).toBeNull();
+    expect(pb.loop).toBeNull();
+    expect(pb.isPlaying).toBe(false);
+    // span = 2 bars @120 BPM = 4s → loopIn = 20 - 4 = 16
+    expect(pb.seam?.loopInS).toBe(16);
+    expect(pb.currentTime).toBe(16);
+  });
+
+  it("setSeamB sets B and a default loopOut bracket", () => {
+    seed([
+      makeChunk({ id: "a", startMs: 10000, endMs: 20000 }),
+      makeChunk({ id: "b", startMs: 50000, endMs: 70000 }),
+    ]);
+    useTriageStore.getState().openSeam("a");
+    useTriageStore.getState().setSeamB("b");
+    const seam = useTriageStore.getState().playback.seam;
+    expect(seam?.bId).toBe("b");
+    // span 4s → loopOut = 50 + 4 = 54
+    expect(seam?.loopOutS).toBe(54);
+  });
+
+  it("updateSeam merges bracket edits", () => {
+    seed([
+      makeChunk({ id: "a", startMs: 10000, endMs: 20000 }),
+      makeChunk({ id: "b", startMs: 50000, endMs: 70000 }),
+    ]);
+    useTriageStore.getState().openSeam("a");
+    useTriageStore.getState().setSeamB("b");
+    useTriageStore.getState().updateSeam({ loopInS: 17, loopOutS: 55 });
+    const seam = useTriageStore.getState().playback.seam;
+    expect(seam?.loopInS).toBe(17);
+    expect(seam?.loopOutS).toBe(55);
+  });
+
+  it("closeSeam clears seam and restores the mode's loop region", () => {
+    seed([makeChunk({ id: "a", startMs: 2000, endMs: 6000 })]);
+    useTriageStore.getState().focusChunk("a"); // loop mode default → loop armed
+    useTriageStore.getState().openSeam("a");
+    expect(useTriageStore.getState().playback.loop).toBeNull();
+    useTriageStore.getState().closeSeam();
+    const pb = useTriageStore.getState().playback;
+    expect(pb.seam).toBeNull();
+    expect(pb.loop).toEqual({ start: 2, end: 6 });
+  });
+
+  it("is orthogonal to mode — closing in continue restores no loop", () => {
+    seed([makeChunk({ id: "a", startMs: 2000, endMs: 6000 })]);
+    useTriageStore.getState().focusChunk("a");
+    useTriageStore.getState().setMode("continue");
+    useTriageStore.getState().openSeam("a");
+    useTriageStore.getState().closeSeam();
+    expect(useTriageStore.getState().playback.loop).toBeNull();
+  });
+
+  it("openSeam defaults B to the next kept chunk", () => {
+    seed([
+      makeChunk({ id: "a", startMs: 10000, endMs: 20000 }),
+      makeChunk({ id: "b", startMs: 30000, endMs: 50000 }),
+      makeChunk({ id: "c", startMs: 60000, endMs: 70000 }),
+    ]);
+    useTriageStore.getState().openSeam("a");
+    expect(useTriageStore.getState().playback.seam?.bId).toBe("b");
+  });
+
+  it("openSeam skips dropped chunks when choosing default B", () => {
+    seed([
+      makeChunk({ id: "a", startMs: 10000, endMs: 20000 }),
+      makeChunk({ id: "x", startMs: 25000, endMs: 28000, accepted: false }),
+      makeChunk({ id: "b", startMs: 30000, endMs: 50000 }),
+    ]);
+    useTriageStore.getState().openSeam("a");
+    expect(useTriageStore.getState().playback.seam?.bId).toBe("b");
+  });
+
+  it("openSeam leaves B null when A is the last kept chunk", () => {
+    seed([
+      makeChunk({ id: "a", startMs: 10000, endMs: 20000 }),
+      makeChunk({ id: "b", startMs: 30000, endMs: 50000, accepted: false }),
+    ]);
+    useTriageStore.getState().openSeam("a");
+    expect(useTriageStore.getState().playback.seam?.bId).toBeNull();
+  });
+
+  it("seamStep(1) advances the pair to the next transition", () => {
+    seed([
+      makeChunk({ id: "a", startMs: 10000, endMs: 20000 }),
+      makeChunk({ id: "b", startMs: 30000, endMs: 50000 }),
+      makeChunk({ id: "c", startMs: 60000, endMs: 70000 }),
+    ]);
+    useTriageStore.getState().openSeam("a"); // a → b
+    useTriageStore.getState().seamStep(1);
+    const seam = useTriageStore.getState().playback.seam;
+    expect(seam?.aId).toBe("b");
+    expect(seam?.bId).toBe("c");
+  });
+
+  it("seamStep(1) is a no-op at the last transition", () => {
+    seed([
+      makeChunk({ id: "a", startMs: 10000, endMs: 20000 }),
+      makeChunk({ id: "b", startMs: 30000, endMs: 50000 }),
+      makeChunk({ id: "c", startMs: 60000, endMs: 70000 }),
+    ]);
+    useTriageStore.getState().openSeam("b"); // b → c (last transition)
+    useTriageStore.getState().seamStep(1);
+    const seam = useTriageStore.getState().playback.seam;
+    expect(seam?.aId).toBe("b");
+    expect(seam?.bId).toBe("c");
+  });
+
+  it("seamStep(-1) steps back and clamps at the first transition", () => {
+    seed([
+      makeChunk({ id: "a", startMs: 10000, endMs: 20000 }),
+      makeChunk({ id: "b", startMs: 30000, endMs: 50000 }),
+      makeChunk({ id: "c", startMs: 60000, endMs: 70000 }),
+    ]);
+    useTriageStore.getState().openSeam("b"); // b → c
+    useTriageStore.getState().seamStep(-1);
+    let seam = useTriageStore.getState().playback.seam;
+    expect(seam?.aId).toBe("a");
+    expect(seam?.bId).toBe("b");
+    useTriageStore.getState().seamStep(-1); // clamp
+    seam = useTriageStore.getState().playback.seam;
+    expect(seam?.aId).toBe("a");
+    expect(seam?.bId).toBe("b");
+  });
+
+  it("swapSeam swaps A and B", () => {
+    seed([
+      makeChunk({ id: "a", startMs: 10000, endMs: 20000 }),
+      makeChunk({ id: "b", startMs: 30000, endMs: 50000 }),
+    ]);
+    useTriageStore.getState().openSeam("a"); // a → b
+    useTriageStore.getState().swapSeam();
+    const seam = useTriageStore.getState().playback.seam;
+    expect(seam?.aId).toBe("b");
+    expect(seam?.bId).toBe("a");
+  });
+});
+
+describe("triage-store · nudgeChunkEdge", () => {
+  beforeEach(() => useTriageStore.getState().reset());
+
+  it("steps an on-grid edge forward by the chosen subdivision", () => {
+    // 120 BPM, 4/4 → beat 0.5s; anchor = startMs = 1.0s.
+    seed([makeChunk({ id: "c", startMs: 1000, endMs: 5000, detectedBpm: 120 })], {
+      jobBpm: 120,
+    });
+    // end 5.0 is on the 1/4 grid (anchor 1.0, step 0.5) → +0.5 = 5.5s
+    useTriageStore.getState().nudgeChunkEdge("c", "end", "1/4", 1);
+    expect(useTriageStore.getState().chunks[0].endMs).toBe(5500);
+  });
+
+  it("snaps an off-grid edge to the subdivision before stepping", () => {
+    seed([makeChunk({ id: "c", startMs: 1000, endMs: 5300, detectedBpm: 120 })], {
+      jobBpm: 120,
+    });
+    // end 5.3 → snap to 1/4 grid → 5.5 → +0.5 = 6.0s
+    useTriageStore.getState().nudgeChunkEdge("c", "end", "1/4", 1);
+    expect(useTriageStore.getState().chunks[0].endMs).toBe(6000);
+  });
+
+  it("steps the start edge back by a whole bar", () => {
+    // bar = 2.0s; start 5.0 on grid → -2.0 = 3.0s
+    seed([makeChunk({ id: "c", startMs: 5000, endMs: 9000, detectedBpm: 120 })], {
+      jobBpm: 120,
+    });
+    useTriageStore.getState().nudgeChunkEdge("c", "start", "1", -1);
+    expect(useTriageStore.getState().chunks[0].startMs).toBe(3000);
+  });
+
+  it("never lets the edges cross (min 100ms apart)", () => {
+    seed([makeChunk({ id: "c", startMs: 1000, endMs: 1400, detectedBpm: 120 })], {
+      jobBpm: 120,
+    });
+    // pulling end back by a bar would cross start → clamped to start+100
+    useTriageStore.getState().nudgeChunkEdge("c", "end", "1", -1);
+    expect(useTriageStore.getState().chunks[0].endMs).toBe(1100);
+  });
+});
