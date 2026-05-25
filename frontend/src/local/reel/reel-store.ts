@@ -19,6 +19,7 @@ import {
   cancelReelRender,
   reelOutputPath,
 } from "../jobs";
+import { classifyAspectRatio, deriveResolution } from "../../editor/exportPresets";
 import { opfs } from "../../storage/opfs";
 
 const DEFAULT_VIEWPORT: ViewportTransform = { scale: 1, x: 0, y: 0 };
@@ -96,6 +97,30 @@ function uid(): string {
   return Math.random().toString(36).slice(2, 10);
 }
 
+/** Default the reel's output format to a project's native import frame, so
+ *  a same-format reel needs no manual setup. */
+async function exportSpecFromFirstJob(jobId: string | undefined): Promise<ExportSpec> {
+  if (!jobId) return DEFAULT_REEL_EXPORT;
+  const job = await jobsDb.getJob(jobId);
+  if (!job?.width || !job.height) return DEFAULT_REEL_EXPORT;
+  const aspect = classifyAspectRatio({ w: job.width, h: job.height });
+  if (aspect === "custom") {
+    return {
+      ...DEFAULT_REEL_EXPORT,
+      aspectRatio: "custom",
+      resolution: { w: job.width, h: job.height },
+      resolutionLongSide: Math.max(job.width, job.height),
+    };
+  }
+  const longSide = Math.max(job.width, job.height);
+  return {
+    ...DEFAULT_REEL_EXPORT,
+    aspectRatio: aspect,
+    resolution: deriveResolution(aspect, longSide),
+    resolutionLongSide: longSide,
+  };
+}
+
 /** Create + persist a new reel from the given projects (in order). Returns
  *  the new reel id for navigation. */
 export async function createReel(jobIds: string[]): Promise<string> {
@@ -104,13 +129,14 @@ export async function createReel(jobIds: string[]): Promise<string> {
     memberId: uid(),
     jobId,
   }));
+  const exportSpec = await exportSpecFromFirstJob(jobIds[0]);
   const record: ReelRecord = {
     id,
     title: null,
     createdAt: Date.now(),
     members,
-    stage: stageOf(DEFAULT_REEL_EXPORT),
-    exportSpec: DEFAULT_REEL_EXPORT,
+    stage: stageOf(exportSpec),
+    exportSpec,
   };
   await jobsDb.saveReel(record);
   return id;

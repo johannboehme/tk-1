@@ -65,6 +65,7 @@ import type {
   ReelWorkerMessage,
 } from "./render/reel.worker";
 import { buildRenderInputFromJob } from "./reel/build-render-input";
+import { clampSegmentsToContent } from "./reel/clamp-segments";
 import { projectLegacyCutsFx, synthesizeJobLoadShape } from "../editor/job-synth";
 import type { ViewportTransform } from "../editor/types";
 import { decodeAudioToMonoPcm } from "./codec";
@@ -1322,7 +1323,21 @@ export async function runReelRender(
       ...camInputs.map((c) => c.masterStartS + c.sourceDurationS),
       0,
     );
-    const segments = spec.segments;
+    // Clamp to the cams' actual content extent so a project whose audio
+    // outruns its video (or whose clips are trimmed) doesn't wedge a
+    // test-pattern tail between members.
+    const camRanges = camInputs.map((c) => {
+      if (c.kind === "image") {
+        return { startS: c.masterStartS, endS: c.masterStartS + c.sourceDurationS };
+      }
+      const trimInS = Math.max(0, c.trimInS ?? 0);
+      const trimOutS = Math.max(
+        trimInS + 0.05,
+        Math.min(c.sourceDurationS, c.trimOutS ?? c.sourceDurationS),
+      );
+      return { startS: c.masterStartS + trimInS, endS: c.masterStartS + trimOutS };
+    });
+    const segments = clampSegmentsToContent(spec.segments, camRanges);
     const videoFrameCount = segments.reduce(
       (a, s) => a + Math.max(0, Math.round((s.out - s.in) * fps)),
       0,
