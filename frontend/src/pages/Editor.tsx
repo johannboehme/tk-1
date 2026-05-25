@@ -31,17 +31,7 @@ import {
   type EditSpecLocal,
 } from "../local/jobs";
 import { isVideoAsset, type MediaAsset, type VideoAsset } from "../storage/jobs-db";
-import { synthesizeJobLoadShape } from "../editor/job-synth";
-import { masterToArr } from "../editor/arrangement-time";
-import type { Segment } from "../editor/types";
-
-/** Project a master-time `t` to its FIRST occurrence's timeline-time
- *  for the cut/fx schema migration. `masterToArr` already does that —
- *  this is just a stable alias so the call-site reads as "migration
- *  step", not "current-time projection". */
-function masterToArrFirst(t: number, segments: readonly Segment[]): number {
-  return masterToArr(t, segments);
-}
+import { projectLegacyCutsFx, synthesizeJobLoadShape } from "../editor/job-synth";
 import { decodeAudioToMonoPcm } from "../local/codec";
 import { confirmDestructive } from "../lib/confirm";
 import { countEditsAffectedByCamRemoval } from "../local/edits-impact";
@@ -722,24 +712,12 @@ export default function Editor() {
 
       // Cut/FX time-axis migration: pre-v2 jobs stored cuts and fx in
       // master-time. We're now timeline-time-native (so duplicate pills
-      // can carry independent cuts/fx). Project legacy values to the
-      // FIRST occurrence's timeline-time — a duplicate's user edits
-      // didn't exist before so there's no data loss; non-duplicate
-      // arrangements get a 1:1 projection (master == timeline).
-      const needsMigration = (j.editorSchema ?? "v1-master") === "v1-master";
-      const cutsForLoad = needsMigration
-        ? (j.cuts ?? []).map((c) => ({
-            ...c,
-            atTimeS: masterToArrFirst(c.atTimeS, arrangementSegments),
-          }))
-        : (j.cuts ?? []);
-      const fxForLoad = needsMigration
-        ? (j.fx ?? []).map((f) => ({
-            ...f,
-            inS: masterToArrFirst(f.inS, arrangementSegments),
-            outS: masterToArrFirst(f.outS, arrangementSegments),
-          }))
-        : (j.fx ?? []);
+      // can carry independent cuts/fx). Shared with the headless render-
+      // input factory so the Reel renders a job identically to the editor.
+      const { cuts: cutsForLoad, fx: fxForLoad } = projectLegacyCutsFx(
+        j,
+        arrangementSegments,
+      );
 
       loadJob(
         {

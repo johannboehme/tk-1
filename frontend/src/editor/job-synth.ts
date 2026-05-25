@@ -9,8 +9,15 @@
  *
  * Pure function — no IO, no React.
  */
-import type { ArrangementItem, Chunk, LocalJob } from "../storage/jobs-db";
+import type {
+  ArrangementItem,
+  Chunk,
+  Cut,
+  LocalJob,
+  PunchFxRecord,
+} from "../storage/jobs-db";
 import { arrangementToSegments } from "../local/arrange/chunks-to-segments";
+import { masterToArr } from "./arrangement-time";
 import type { Segment } from "./types";
 
 /** Stable arrangement-item id for the synthetic single-take wrapper.
@@ -66,4 +73,38 @@ export function synthesizeJobLoadShape(
       },
     ],
   };
+}
+
+/**
+ * Project legacy master-time cuts/fx onto timeline-time for jobs whose
+ * `editorSchema` predates the pill refactor ("v1-master"). The runtime is
+ * timeline-time-native (so duplicate pills carry independent cuts/fx), so
+ * legacy values get mapped to their first-occurrence timeline-time. v2
+ * jobs pass through unchanged.
+ *
+ * Shared by the editor mount (Editor.tsx) and the headless render-input
+ * factory so both paths apply the identical migration — a job rendered via
+ * the Reel must not differ from the same job opened in the editor.
+ *
+ * Pure function — no IO, no React.
+ */
+export function projectLegacyCutsFx(
+  job: LocalJob,
+  arrangementSegments: readonly Segment[],
+): { cuts: Cut[]; fx: PunchFxRecord[] } {
+  const needsMigration = (job.editorSchema ?? "v1-master") === "v1-master";
+  const cuts = needsMigration
+    ? (job.cuts ?? []).map((c) => ({
+        ...c,
+        atTimeS: masterToArr(c.atTimeS, arrangementSegments),
+      }))
+    : (job.cuts ?? []);
+  const fx = needsMigration
+    ? (job.fx ?? []).map((f) => ({
+        ...f,
+        inS: masterToArr(f.inS, arrangementSegments),
+        outS: masterToArr(f.outS, arrangementSegments),
+      }))
+    : (job.fx ?? []);
+  return { cuts, fx };
 }
