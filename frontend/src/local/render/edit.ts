@@ -45,6 +45,11 @@ import {
 } from "./audio-fx";
 import { Compositor } from "./compositor";
 import { SingleRenderSink, type RenderSink } from "./render-sink";
+import {
+  applyViewportTransform,
+  DEFAULT_VIEWPORT_TRANSFORM,
+} from "../../editor/render/element-transform";
+import type { ViewportTransform } from "../../editor/types";
 import type { BackendCapabilities } from "../../editor/render/factory";
 import { CamFrameStream } from "./cam-frame-stream";
 import { makeTestPatternCanvas } from "./test-pattern";
@@ -569,6 +574,14 @@ export interface MultiCamRenderInput
    * all members and the per-member render contributes video only.
    */
   skipAudio?: boolean;
+  /**
+   * Reel outer-fit: render the member at its native dimensions (the
+   * compositor stage stays native), then contain-fit + pan/zoom the whole
+   * composited frame onto a larger common `stage` (the reel output frame),
+   * letterboxing the aspect mismatch. The encoder runs at `stage` size.
+   * When omitted the encoder runs at the native stage (single-job path).
+   */
+  outer?: { stage: { w: number; h: number }; viewport?: ViewportTransform };
 }
 
 /**
@@ -660,10 +673,16 @@ export async function editRenderMulti(
   }
   const outputWidth = input.outputWidth ?? bboxW;
   const outputHeight = input.outputHeight ?? bboxH;
+  // Encoder/output dimensions. With a reel `outer` fit the compositor stays
+  // at the native (outputWidth × outputHeight) stage and the composited
+  // frame is contain-fit onto the larger `outer.stage`, which is what the
+  // encoder + muxer run at. Without it the two are identical.
+  const encW = input.outer ? input.outer.stage.w : outputWidth;
+  const encH = input.outer ? input.outer.stage.h : outputHeight;
   const videoCodec: VideoEncodeCodec = input.videoCodec ?? "h264";
 
   if (videoCodec === "h265") {
-    const ok = await isVideoCodecSupported("h265", outputWidth, outputHeight, fps);
+    const ok = await isVideoCodecSupported("h265", encW, encH, fps);
     if (!ok) {
       // Tear down decoders before bailing.
       for (const d of demuxResults) {
@@ -758,8 +777,8 @@ export async function editRenderMulti(
   const sink: RenderSink =
     input.sink ??
     new SingleRenderSink({
-      width: outputWidth,
-      height: outputHeight,
+      width: encW,
+      height: encH,
       fps,
       videoCodec,
       audioCodec,
@@ -813,8 +832,8 @@ export async function editRenderMulti(
   let videoMeta: Parameters<Muxer<MuxTarget>["addVideoChunkRaw"]>[4] | undefined;
   let videoChunksWritten = 0;
   const encoder = new StreamingVideoEncoder({
-    width: outputWidth,
-    height: outputHeight,
+    width: encW,
+    height: encH,
     frameRate: fps,
     videoCodec,
     bitrateBps: input.videoBitrateBps ?? 4_000_000,
@@ -823,8 +842,8 @@ export async function editRenderMulti(
         videoMeta = {
           decoderConfig: {
             codec: encoder.codec,
-            codedWidth: outputWidth,
-            codedHeight: outputHeight,
+            codedWidth: encW,
+            codedHeight: encH,
             description,
           },
         } as unknown as Parameters<Muxer<MuxTarget>["addVideoChunkRaw"]>[4];
@@ -866,6 +885,30 @@ export async function editRenderMulti(
   // frame N+1. Decoder, compositor, encoder run nebenläufig.
   let outputQueue: Promise<void> = Promise.resolve();
   let chainInFlight = 0;
+  // Reel outer-fit scratch canvas: the member's composited frame (native
+  // stage) gets contain-fit + pan/zoomed onto the reel stage, letterboxing
+  // the aspect mismatch with black. Allocated once, reused per frame.
+  const outer = input.outer;
+  const outerCanvas = outer ? new OffscreenCanvas(encW, encH) : null;
+  const outerCtx = outerCanvas
+    ? outerCanvas.getContext("2d", { alpha: false })
+    : null;
+  const outerRect = outer
+    ? (() => {
+        const disp = { w: outputWidth, h: outputHeight };
+        const s = Math.min(encW / disp.w, encH / disp.h);
+        const cover = {
+          dstX: (encW - disp.w * s) / 2,
+          dstY: (encH - disp.h * s) / 2,
+          dstW: disp.w * s,
+          dstH: disp.h * s,
+        };
+        return applyViewportTransform(
+          cover,
+          outer.viewport ?? DEFAULT_VIEWPORT_TRANSFORM,
+        );
+      })()
+    : null;
   try {
     // Per-segment arr-time cursor — accumulated so each frame's `tArr`
     // matches the editor's masterToArr projection, which is what pills
@@ -1065,8 +1108,28 @@ export async function editRenderMulti(
               // at the duplicate-pill slot fires there and only there.
               captured.tArr,
             );
-            encoder.pushFrame(composed, { keyFrame: captured.isFirstInSeg });
-            composed.close();
+            if (outerCtx && outerCanvas && outerRect) {
+              // Letterbox the native composited frame onto the reel stage.
+              outerCtx.fillStyle = "#000";
+              outerCtx.fillRect(0, 0, encW, encH);
+              outerCtx.drawImage(
+                composed as unknown as CanvasImageSource,
+                outerRect.dstX,
+                outerRect.dstY,
+                outerRect.dstW,
+                outerRect.dstH,
+              );
+              composed.close();
+              const outFrame = new VideoFrame(outerCanvas, {
+                timestamp: captured.outTs,
+                duration: frameDurationUs,
+              });
+              encoder.pushFrame(outFrame, { keyFrame: captured.isFirstInSeg });
+              outFrame.close();
+            } else {
+              encoder.pushFrame(composed, { keyFrame: captured.isFirstInSeg });
+              composed.close();
+            }
             const done = myFrameNum + 1;
             if (done % 30 === 0 || done === totalFrames) {
               input.onProgress?.({
@@ -1142,8 +1205,8 @@ export async function editRenderMulti(
 
     return {
       output: outputBytes,
-      width: outputWidth,
-      height: outputHeight,
+      width: encW,
+      height: encH,
       videoCodec: encodedVideo.codec,
       audioBackend: "webcodecs",
       audioSampleRate: audioSampleRate,

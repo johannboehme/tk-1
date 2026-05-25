@@ -26,6 +26,7 @@ import {
   jobsDb,
   type JobMode,
   type LocalJob,
+  type MediaAsset,
   type SyncResult,
   type VideoAsset,
 } from "../storage/jobs-db";
@@ -57,6 +58,15 @@ import type {
   EditWorkerMessage,
   VisualizerWorkerDescriptor,
 } from "./render/edit.worker";
+import type {
+  ReelMemberWorkerInput,
+  ReelWorkerEvent,
+  ReelWorkerInput,
+  ReelWorkerMessage,
+} from "./render/reel.worker";
+import { buildRenderInputFromJob } from "./reel/build-render-input";
+import { projectLegacyCutsFx, synthesizeJobLoadShape } from "../editor/job-synth";
+import type { ViewportTransform } from "../editor/types";
 import { decodeAudioToMonoPcm } from "./codec";
 import { collectSyncFailureReport } from "./diagnostics";
 import { computeEnergyCurves } from "./render/energy";
@@ -104,6 +114,11 @@ function jobAudioSource(job: LocalJob): AssetSource {
 }
 function outputPath(jobId: string): string {
   return `jobs/${jobId}/${OUTPUT_NAME}`;
+}
+/** Rendered Reel output (OPFS). Reels live under their own prefix, not the
+ *  per-job tree, so deleting a job never clobbers a reel and vice versa. */
+export function reelOutputPath(reelId: string): string {
+  return `reels/${reelId}/${OUTPUT_NAME}`;
 }
 function camVideoPath(jobId: string, camId: string, ext: string): string {
   return `jobs/${jobId}/${camId}.${ext}`;
@@ -864,6 +879,67 @@ export type VisualizerDescriptor =
   | { type: "showfreqs" };
 
 /**
+ * Build the per-cam worker descriptors from a job's assets + the editor's
+ * clip overrides. Each cam's master-timeline start is derived from its own
+ * sync algorithm + syncOverrideMs + startOffsetS (mirrors `clipRangeS()`
+ * on the editor side so render == preview). Shared by the single-job
+ * render and the Reel orchestrator.
+ */
+export function buildCamWorkerInputs(
+  videos: MediaAsset[],
+  clipOverrides?: EditSpecLocal["clipOverrides"],
+): CamWorkerInput[] {
+  const overridesById = new Map(
+    (clipOverrides ?? []).map((o) => [o.id, o] as const),
+  );
+  return videos.map((v): CamWorkerInput => {
+    const ov = overridesById.get(v.id);
+    const rotation = ov?.rotation ?? v.rotation ?? 0;
+    const flipX = ov?.flipX ?? v.flipX ?? false;
+    const flipY = ov?.flipY ?? v.flipY ?? false;
+    const viewportTransform = ov?.viewportTransform;
+    if (isImageAsset(v)) {
+      const startOffsetS = ov?.startOffsetS ?? v.startOffsetS ?? 0;
+      return {
+        id: v.id,
+        source: assetSource(v),
+        masterStartS: startOffsetS,
+        sourceDurationS: v.durationS,
+        driftRatio: 1,
+        kind: "image",
+        rotation,
+        flipX,
+        flipY,
+        viewportTransform,
+      };
+    }
+    const algoMs = v.sync?.offsetMs ?? 0;
+    const userMs = ov?.syncOverrideMs ?? 0;
+    const startOffsetS = ov?.startOffsetS ?? 0;
+    const masterStartS = -(algoMs + userMs) / 1000 + startOffsetS;
+    const sourceDurationS = v.durationS ?? 0;
+    const trimInS = Math.max(0, v.trimInS ?? 0);
+    const trimOutS = Math.max(
+      trimInS + 0.05,
+      Math.min(sourceDurationS, v.trimOutS ?? sourceDurationS),
+    );
+    return {
+      id: v.id,
+      source: assetSource(v),
+      masterStartS,
+      sourceDurationS,
+      driftRatio: v.sync?.driftRatio ?? 1,
+      trimInS,
+      trimOutS,
+      rotation,
+      flipX,
+      flipY,
+      viewportTransform,
+    };
+  });
+}
+
+/**
  * Tracks renders that are currently running so cancelEditRender can
  * terminate the underlying worker. One entry per active job; renders
  * for different jobs run concurrently with their own workers.
@@ -950,64 +1026,7 @@ export async function runEditRender(
     // position is derived from its own sync algorithm + the editor's
     // syncOverrideMs + startOffsetS; mirrors `clipRangeS()` on the editor
     // side so what the user previewed is what gets rendered.
-    const overridesById = new Map(
-      (spec.clipOverrides ?? []).map((o) => [o.id, o] as const),
-    );
-    const camInputs: CamWorkerInput[] = videos.map((v): CamWorkerInput => {
-      const ov = overridesById.get(v.id);
-      // User transform: prefer the latest from the editor's overrides
-      // (covers in-flight tweaks before auto-persist debounces) and fall
-      // back to whatever sits on the persisted asset row.
-      const rotation = ov?.rotation ?? v.rotation ?? 0;
-      const flipX = ov?.flipX ?? v.flipX ?? false;
-      const flipY = ov?.flipY ?? v.flipY ?? false;
-      const viewportTransform = ov?.viewportTransform;
-      if (isImageAsset(v)) {
-        // Image cams have no sync offset and no drift — masterStartS is
-        // the user-set placement, sourceDurationS is the user-set length.
-        const startOffsetS = ov?.startOffsetS ?? v.startOffsetS ?? 0;
-        return {
-          id: v.id,
-          source: assetSource(v),
-          masterStartS: startOffsetS,
-          sourceDurationS: v.durationS,
-          driftRatio: 1,
-          kind: "image",
-          rotation,
-          flipX,
-          flipY,
-          viewportTransform,
-        };
-      }
-      const algoMs = v.sync?.offsetMs ?? 0;
-      const userMs = ov?.syncOverrideMs ?? 0;
-      const startOffsetS = ov?.startOffsetS ?? 0;
-      const masterStartS = -(algoMs + userMs) / 1000 + startOffsetS;
-      // Per-clip trim: the cam still plays from source-time 0 onward
-      // (masterStartS unchanged), but we narrow its "available" master-
-      // timeline range to [trimInS, trimOutS]. activeCamAt + the
-      // editor's clipRangeS use this same window to pick the active
-      // cam, so cuts stay consistent between editor and render.
-      const sourceDurationS = v.durationS ?? 0;
-      const trimInS = Math.max(0, v.trimInS ?? 0);
-      const trimOutS = Math.max(
-        trimInS + 0.05,
-        Math.min(sourceDurationS, v.trimOutS ?? sourceDurationS),
-      );
-      return {
-        id: v.id,
-        source: assetSource(v),
-        masterStartS,
-        sourceDurationS,
-        driftRatio: v.sync?.driftRatio ?? 1,
-        trimInS,
-        trimOutS,
-        rotation,
-        flipX,
-        flipY,
-        viewportTransform,
-      };
-    });
+    const camInputs = buildCamWorkerInputs(videos, spec.clipOverrides);
 
     const cuts = spec.cuts ?? [];
     const masterDurationS = Math.max(
@@ -1155,6 +1174,281 @@ export async function cancelEditRender(jobId: string): Promise<void> {
   await opfs.deleteFile(outputPath(jobId)).catch(() => undefined);
   useOpsStore.getState().failRenderOp(jobId, "cancelled");
   removeRenderUnloadGuard(jobId);
+}
+
+// =============================================================================
+// Reel render — several projects rendered back-to-back into one MP4
+// =============================================================================
+
+let activeReelWorker: Worker | null = null;
+let activeReelId: string | null = null;
+
+export interface ReelRenderMember {
+  jobId: string;
+  /** Per-member pan/zoom over the common reel stage (framing). */
+  viewport?: ViewportTransform;
+}
+
+export interface ReelRenderInput {
+  reelId: string;
+  members: ReelRenderMember[];
+  /** Common output frame all members are letterboxed into. */
+  stage: { w: number; h: number };
+  fps?: number;
+  videoCodec?: "h264" | "h265";
+  audioCodec?: "aac" | "opus";
+  videoBitrateBps?: number;
+  audioBitrateBps?: number;
+  onProgress?: (p: { pct: number; stage: string }) => void;
+}
+
+/** Resample interleaved PCM to 48 kHz stereo via OfflineAudioContext.
+ *  Main-thread only (AudioContext is unavailable in workers). */
+async function resampleInterleavedTo48kStereo(
+  pcm: Float32Array,
+  srcSampleRate: number,
+  srcChannels: number,
+): Promise<Float32Array> {
+  const TARGET_SR = 48000;
+  const frames = Math.floor(pcm.length / Math.max(1, srcChannels));
+  if (frames === 0) return new Float32Array(0);
+  const srcBuf = new AudioBuffer({
+    length: frames,
+    numberOfChannels: srcChannels,
+    sampleRate: srcSampleRate,
+  });
+  for (let c = 0; c < srcChannels; c++) {
+    const ch = new Float32Array(frames);
+    for (let i = 0; i < frames; i++) ch[i] = pcm[i * srcChannels + c];
+    srcBuf.copyToChannel(ch, c);
+  }
+  const outFrames = Math.max(1, Math.ceil((frames * TARGET_SR) / srcSampleRate));
+  const octx = new OfflineAudioContext(2, outFrames, TARGET_SR);
+  const node = octx.createBufferSource();
+  node.buffer = srcBuf;
+  node.connect(octx.destination);
+  node.start();
+  const rendered = await octx.startRendering();
+  const L = rendered.getChannelData(0);
+  const R = rendered.numberOfChannels > 1 ? rendered.getChannelData(1) : L;
+  const out = new Float32Array(rendered.length * 2);
+  for (let i = 0; i < rendered.length; i++) {
+    out[i * 2] = L[i];
+    out[i * 2 + 1] = R[i];
+  }
+  return out;
+}
+
+/** Extract + concatenate stereo (interleaved) PCM time ranges. */
+function trimStereoBySegments(
+  pcm: Float32Array,
+  sampleRate: number,
+  segments: { in: number; out: number }[],
+): Float32Array {
+  if (segments.length === 0) return pcm;
+  const parts: Float32Array[] = [];
+  let total = 0;
+  for (const seg of segments) {
+    const start = Math.max(0, Math.floor(seg.in * sampleRate) * 2);
+    const end = Math.min(pcm.length, Math.floor(seg.out * sampleRate) * 2);
+    if (end > start) {
+      parts.push(pcm.subarray(start, end));
+      total += end - start;
+    }
+  }
+  const out = new Float32Array(total);
+  let cur = 0;
+  for (const p of parts) {
+    out.set(p, cur);
+    cur += p.length;
+  }
+  return out;
+}
+
+/** Pad (with silence) or trim interleaved stereo PCM to exactly
+ *  `targetFrames` audio frames so each member's audio matches its video
+ *  frame count — keeps A/V locked at every member boundary. */
+function padOrTrimStereo(pcm: Float32Array, targetFrames: number): Float32Array {
+  const target = Math.max(0, targetFrames) * 2;
+  if (pcm.length === target) return pcm;
+  const out = new Float32Array(target);
+  out.set(pcm.subarray(0, Math.min(pcm.length, target)));
+  return out;
+}
+
+/**
+ * Render several finished projects back-to-back into one MP4 at a common
+ * stage. Each member is rebuilt from its persisted edit
+ * (`buildRenderInputFromJob`) and rendered fresh through the shared
+ * pipeline — no pre-rendered output is reused. Audio is decoded, resampled
+ * to 48 kHz stereo, per-member trimmed + frame-padded, and concatenated
+ * into one gapless track encoded once in the worker.
+ *
+ * Writes to `reels/{reelId}/output.mp4`. Cancel via `cancelReelRender`.
+ */
+export async function runReelRender(
+  input: ReelRenderInput,
+): Promise<{ outputBytes: number }> {
+  if (activeReelWorker) {
+    throw new Error("A reel render is already in progress.");
+  }
+  const fps = input.fps ?? 30;
+  const videoCodec = input.videoCodec ?? "h264";
+  const audioCodec = input.audioCodec ?? "aac";
+  const TARGET_SR = 48000;
+
+  input.onProgress?.({ pct: 2, stage: "render-prep" });
+
+  const members: ReelMemberWorkerInput[] = [];
+  const audioParts: Float32Array[] = [];
+  const transfer: Transferable[] = [];
+
+  for (const mem of input.members) {
+    const job = await jobsDb.getJob(mem.jobId);
+    if (!job) throw new Error(`Reel member not found: ${mem.jobId}`);
+    const videos = job.videos ?? [];
+    if (videos.length === 0) {
+      throw new Error(`Reel member has no video: ${mem.jobId}`);
+    }
+
+    const spec = buildRenderInputFromJob(job);
+    const { arrangementSegments } = synthesizeJobLoadShape(
+      job,
+      job.durationS ?? 0,
+    );
+    const { fx } = projectLegacyCutsFx(job, arrangementSegments);
+    const camInputs = buildCamWorkerInputs(videos, spec.clipOverrides);
+    const masterDurationS = Math.max(
+      ...camInputs.map((c) => c.masterStartS + c.sourceDurationS),
+      0,
+    );
+    const segments = spec.segments;
+    const videoFrameCount = segments.reduce(
+      (a, s) => a + Math.max(0, Math.round((s.out - s.in) * fps)),
+      0,
+    );
+
+    // Audio: decode → volume → resample 48k/stereo → trim → frame-pad.
+    const audioExt = fileExtension(new File([], job.audioFilename), "wav");
+    const audioFile = await loadJobAudio(job, audioExt);
+    const decoded = await decodeStudioAudioInterleaved(audioFile);
+    const vol =
+      typeof spec.audioVolume === "number" && spec.audioVolume >= 0
+        ? Math.min(4, spec.audioVolume)
+        : 1;
+    if (vol !== 1) {
+      for (let i = 0; i < decoded.pcm.length; i++) decoded.pcm[i] *= vol;
+    }
+    const resampled = await resampleInterleavedTo48kStereo(
+      decoded.pcm,
+      decoded.sampleRate,
+      decoded.channels,
+    );
+    const trimmed = trimStereoBySegments(resampled, TARGET_SR, segments);
+    const targetSamples = Math.round((videoFrameCount / fps) * TARGET_SR);
+    audioParts.push(padOrTrimStereo(trimmed, targetSamples));
+
+    // Visualizers (member-local energy / waveform) only when used.
+    let energy: ReturnType<typeof computeEnergyCurves> | null = null;
+    const visualizers: VisualizerWorkerDescriptor[] = [];
+    if (spec.visualizers && spec.visualizers.length > 0) {
+      const mono = await decodeAudioToMonoPcm(audioFile, 22050);
+      energy = computeEnergyCurves(mono.pcm, 22050, 30);
+      for (const d of spec.visualizers) {
+        if (d.type === "showwaves") {
+          visualizers.push({
+            type: "showwaves",
+            pcm: mono.pcm,
+            sampleRate: 22050,
+          });
+          transfer.push(mono.pcm.buffer);
+        } else if (d.type === "showfreqs") {
+          visualizers.push({ type: "showfreqs", energy });
+        }
+      }
+    }
+
+    members.push({
+      cams: camInputs,
+      cuts: spec.cuts ?? [],
+      pills: spec.pills,
+      masterDurationS,
+      segments,
+      overlays: spec.overlays,
+      visualizers,
+      energy,
+      fx,
+      offsetMs: (job.sync?.offsetMs ?? 0) + (spec.offsetOverrideMs ?? 0),
+      driftRatio: job.sync?.driftRatio ?? 1,
+      nativeWidth: spec.exportOpts?.width ?? job.width,
+      nativeHeight: spec.exportOpts?.height ?? job.height,
+      viewport: mem.viewport,
+      videoFrameCount,
+    });
+  }
+
+  // One gapless global track.
+  const totalLen = audioParts.reduce((a, p) => a + p.length, 0);
+  const globalPcm = new Float32Array(totalLen);
+  {
+    let cur = 0;
+    for (const p of audioParts) {
+      globalPcm.set(p, cur);
+      cur += p.length;
+    }
+  }
+  transfer.push(globalPcm.buffer);
+
+  const workerInput: ReelWorkerInput = {
+    outputPath: reelOutputPath(input.reelId),
+    stage: input.stage,
+    fps,
+    videoCodec,
+    audioCodec,
+    videoBitrateBps: input.videoBitrateBps,
+    audioBitrateBps: input.audioBitrateBps,
+    audioPcm: { pcm: globalPcm, sampleRate: TARGET_SR, channels: 2 },
+    members,
+  };
+
+  input.onProgress?.({ pct: 4, stage: "encoding" });
+
+  const worker = new Worker(new URL("./render/reel.worker.ts", import.meta.url), {
+    type: "module",
+  });
+  activeReelWorker = worker;
+  activeReelId = input.reelId;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      worker.addEventListener("message", (e: MessageEvent<ReelWorkerEvent>) => {
+        const msg = e.data;
+        if (msg.type === "progress") input.onProgress?.(msg.progress);
+        else if (msg.type === "done") resolve();
+        else if (msg.type === "error") reject(new Error(msg.message));
+      });
+      worker.addEventListener("error", (e) =>
+        reject(new Error(e.message || "Reel render worker crashed")),
+      );
+      const start: ReelWorkerMessage = { type: "start", input: workerInput };
+      worker.postMessage(start, transfer);
+    });
+    const outputFile = await opfs.readFile(reelOutputPath(input.reelId));
+    input.onProgress?.({ pct: 100, stage: "rendered" });
+    return { outputBytes: outputFile.size };
+  } finally {
+    worker.terminate();
+    activeReelWorker = null;
+    activeReelId = null;
+  }
+}
+
+/** Cancel an in-progress reel render + remove the partial OPFS output. */
+export async function cancelReelRender(reelId: string): Promise<void> {
+  if (!activeReelWorker || activeReelId !== reelId) return;
+  activeReelWorker.terminate();
+  activeReelWorker = null;
+  activeReelId = null;
+  await opfs.deleteFile(reelOutputPath(reelId)).catch(() => undefined);
 }
 
 /**
