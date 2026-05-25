@@ -85,6 +85,11 @@ export function buildPersistPatch(
     fx: s.fx,
     audioVolume: s.audioVolume,
     exportSpec: s.exportSpec,
+    // Overlays + visualizer were editor-store-only until headless renders
+    // (Reel) needed them — persist so a job renders faithfully unmounted.
+    overlays: s.overlays,
+    visualizer: s.visualizer,
+    offsetOverrideMs: s.offset.userOverrideMs,
     // Persist user-edited pills so a refresh / re-open keeps move + trim
     // gestures. Direct-mode jobs leave pills empty; storing [] here is
     // a no-op round-trip.
@@ -148,7 +153,10 @@ export function useAutoPersist(jobId: string | null): void {
         state.jobMeta.barOffsetBeats !== prev.jobMeta?.barOffsetBeats ||
         state.fx !== prev.fx ||
         state.audioVolume !== prev.audioVolume ||
-        state.exportSpec !== prev.exportSpec
+        state.exportSpec !== prev.exportSpec ||
+        state.overlays !== prev.overlays ||
+        state.visualizer !== prev.visualizer ||
+        state.offset !== prev.offset
       ) {
         schedule();
       }

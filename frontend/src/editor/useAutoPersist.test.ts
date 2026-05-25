@@ -91,6 +91,41 @@ describe("buildPersistPatch", () => {
     expect(patch.bpm).toBeUndefined();
   });
 
+  test("persists overlays, visualizer, and offsetOverrideMs", () => {
+    useEditorStore.getState().loadJob(meta);
+    useEditorStore
+      .getState()
+      .addOverlay({ type: "text", text: "hi", start: 1, end: 3, preset: "boxed" });
+    useEditorStore.getState().setVisualizer({ type: "showwaves", position: "bottom" });
+    useEditorStore.getState().setOffset(-40);
+
+    const patch = buildPersistPatch(useEditorStore.getState(), baseJob);
+    expect(patch.overlays).toEqual([
+      { type: "text", text: "hi", start: 1, end: 3, preset: "boxed" },
+    ]);
+    expect(patch.visualizer).toEqual({ type: "showwaves", position: "bottom" });
+    expect(patch.offsetOverrideMs).toBe(-40);
+  });
+
+  test("defaults overlays/visualizer to empty when none set", () => {
+    useEditorStore.getState().loadJob(meta);
+    const patch = buildPersistPatch(useEditorStore.getState(), baseJob);
+    expect(patch.overlays).toEqual([]);
+    expect(patch.visualizer).toBeNull();
+    expect(patch.offsetOverrideMs).toBe(0);
+  });
+
+  test("loadJob restores overlays + visualizer from opts", () => {
+    useEditorStore.getState().loadJob(meta, {
+      overlays: [{ type: "text", text: "x", start: 0, end: 2 }],
+      visualizer: { type: "showfreqs" },
+    });
+    expect(useEditorStore.getState().overlays).toEqual([
+      { type: "text", text: "x", start: 0, end: 2 },
+    ]);
+    expect(useEditorStore.getState().visualizer).toEqual({ type: "showfreqs" });
+  });
+
   test("does not lose existing video fields when a clip is unknown", () => {
     useEditorStore.getState().loadJob(meta, {
       clips: [

@@ -773,6 +773,8 @@ export default function Editor() {
           arrangement,
           chunks,
           storedPills: j.pills ?? [],
+          overlays: j.overlays ?? [],
+          visualizer: j.visualizer ?? null,
         },
       );
       // E2E hook (dev only) — Playwright reads `arrangementSegments[]`

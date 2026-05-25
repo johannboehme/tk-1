@@ -392,6 +392,22 @@ export interface LocalJob {
    *  validates / ignores fields it doesn't recognise. */
   exportSpec?: unknown;
 
+  /** Text overlays burned into the render. Editor-store-only until the
+   *  Reel feature needed faithful headless renders — persisted here so a
+   *  job renders identically without the editor mounted. Optional /
+   *  undefined → no overlays. */
+  overlays?: TextOverlayRecord[];
+
+  /** Audio-reactive visualizer config, or null/undefined for none.
+   *  Persisted for the same reason as `overlays`. */
+  visualizer?: VisualizerRecord | null;
+
+  /** Job-global sync nudge (ms) — mirrors the editor's
+   *  `offset.userOverrideMs`. Redundant with cam-1's `syncOverrideMs` for
+   *  the editor's own restore, but persisted explicitly so the headless
+   *  render-input factory has a single canonical source. Default 0. */
+  offsetOverrideMs?: number;
+
   // ---- Long-Form Triage Workflow ----
 
   /** Workflow-Pfad. Fehlt bei Pre-Triage-Jobs → wird als `"direct"`
@@ -489,6 +505,34 @@ export interface PunchFxRecord {
     sustain: number;
     releaseS: number;
   };
+}
+
+/** Storage shape for a text overlay. Mirrors `TextOverlay` from the editor
+ *  module — kept duplicated here to keep the storage layer free of
+ *  editor-module imports. Structurally identical so values round-trip. */
+export interface TextOverlayRecord {
+  type: "text";
+  text: string;
+  start: number;
+  end: number;
+  preset?: "plain" | "boxed" | "outline" | "glow" | "gradient";
+  x?: number;
+  y?: number;
+  animation?: "fade" | "pop" | "slide_in" | "word_reveal" | "wobble" | "none";
+  reactive?: {
+    band: "bass" | "low_mids" | "mids" | "highs";
+    param: "scale" | "y" | "rotate";
+    amount: number;
+  };
+}
+
+/** Storage shape for the visualizer config. Mirrors `VisualizerConfig`
+ *  from the editor module (see `TextOverlayRecord`). */
+export interface VisualizerRecord {
+  type: "showcqt" | "showfreqs" | "showwaves" | "showspectrum" | "avectorscope";
+  position?: "top" | "center" | "bottom";
+  height_pct?: number;
+  opacity?: number;
 }
 
 const DB_NAME = "videoaudiosync";

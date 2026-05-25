@@ -373,6 +373,10 @@ interface EditorState {
       arrangement?: ArrangementItem[];
       chunks?: Chunk[];
       storedPills?: Pill[];
+      /** Persisted text overlays to restore (default []). */
+      overlays?: TextOverlay[];
+      /** Persisted visualizer config to restore (default null). */
+      visualizer?: VisualizerConfig | null;
     },
   ): void;
   /** Replace the arrangement-segment list. Empty array reverts to
@@ -1115,8 +1119,8 @@ export const useEditorStore = create<EditorState>()(
           abBypass: false,
         },
         trim: { in: 0, out: meta.duration },
-        overlays: [],
-        visualizer: null,
+        overlays: opts?.overlays ?? [],
+        visualizer: opts?.visualizer ?? null,
         exportSpec: DEFAULT_EXPORT,
         ui: initialUi,
         clips,
