@@ -626,56 +626,123 @@ export function Timeline({
     if (peaks.length > 0 && audioDuration > 0) {
       const wfMid = audioBand.top + audioLaneHeight / 2;
       const peaksPerSec = peaks.length / audioDuration;
-      ctx.fillStyle = "#5C544A";
+      // Padding so the loudest peaks don't kiss the lane edges.
+      const half = audioLaneHeight / 2 - 2;
+      const width = Math.max(1, Math.ceil(canvasWidth));
 
-      const drawColumns = (
-        startIdx: number,
-        endIdx: number,
-        peakIdxToX: (i: number) => number,
-      ) => {
-        let prevX = -1;
-        let colMin = 0;
-        let colMax = 0;
-        for (let i = startIdx; i < endIdx; i++) {
-          const x = Math.round(peakIdxToX(i));
-          const [mn, mx] = peaks[i];
-          if (x !== prevX) {
-            if (prevX >= 0) {
-              const yMax = wfMid - (Math.max(0, colMax) * audioLaneHeight) / 2;
-              const yMin = wfMid + (Math.max(0, -colMin) * audioLaneHeight) / 2;
-              ctx.fillRect(prevX, yMax, 1, Math.max(1, yMin - yMax));
-            }
-            prevX = x;
-            colMin = mn;
-            colMax = mx;
-          } else {
-            if (mn < colMin) colMin = mn;
-            if (mx > colMax) colMax = mx;
-          }
-        }
-        if (prevX >= 0) {
-          const yMax = wfMid - (Math.max(0, colMax) * audioLaneHeight) / 2;
-          const yMin = wfMid + (Math.max(0, -colMin) * audioLaneHeight) / 2;
-          ctx.fillRect(prevX, yMax, 1, Math.max(1, yMin - yMax));
-        }
-      };
+      // Per-pixel-column envelope. We fill EVERY column a segment covers
+      // (x -> arr-T -> peak-index inverse) instead of stamping one 1-px bar
+      // per peak — that's what turns the old scattered ticks into a
+      // continuous filled body. colTop/colBot hold normalized max/min
+      // amplitude; hasData marks which columns a segment actually painted.
+      const colTop = new Float32Array(width);
+      const colBot = new Float32Array(width);
+      const hasData = new Uint8Array(width);
 
-      // Waveform draw: walk segments and project each peak's master-time
-      // into arr-time. Single-take's whole-master segment yields a single
-      // pass with arrT == masterT (the per-segment guard skips no peaks).
       const arrStarts = segmentArrStarts(arrangementSegments);
       for (let segIdx = 0; segIdx < arrangementSegments.length; segIdx++) {
         const seg = arrangementSegments[segIdx];
         const segArrIn = arrStarts[segIdx];
         const segArrOut = segArrIn + Math.max(0, seg.out - seg.in);
         if (segArrOut < viewStart || segArrIn > viewEnd) continue;
-        const startIdx = Math.max(0, Math.floor(seg.in * peaksPerSec));
-        const endIdx = Math.min(peaks.length, Math.ceil(seg.out * peaksPerSec));
-        drawColumns(startIdx, endIdx, (i) => {
-          const masterT = i / peaksPerSec;
-          const arrT = segArrIn + (masterT - seg.in);
-          return arrTToX(arrT);
-        });
+        const xLo = Math.max(0, Math.floor(arrTToX(segArrIn)));
+        const xHi = Math.min(width, Math.ceil(arrTToX(segArrOut)));
+        // Inverse of peakIdxToX within this segment: x -> arr-T (arrTToX is
+        // linear) -> master-T -> fractional peak index.
+        const xToPeakIdx = (x: number) => {
+          const arrT = viewStart + (x / canvasWidth) * visibleDur;
+          return (seg.in + (arrT - segArrIn)) * peaksPerSec;
+        };
+        for (let x = xLo; x < xHi; x++) {
+          const f0 = xToPeakIdx(x);
+          const f1 = xToPeakIdx(x + 1);
+          const lo = Math.min(f0, f1);
+          const hi = Math.max(f0, f1);
+          const i0 = Math.max(0, Math.floor(lo));
+          const i1 = Math.min(peaks.length, Math.ceil(hi));
+          let mx = 0;
+          let mn = 0;
+          if (i1 - i0 >= 1) {
+            // Peak-hold — >= 1 peak per pixel (zoomed out).
+            for (let i = i0; i < i1; i++) {
+              const p = peaks[i];
+              if (p[1] > mx) mx = p[1];
+              if (p[0] < mn) mn = p[0];
+            }
+          } else {
+            // Sub-sample — < 1 peak per pixel (zoomed in): interpolate
+            // between neighbours so the body stays smooth.
+            const fc = (lo + hi) / 2;
+            const j = Math.floor(fc);
+            const frac = fc - j;
+            const a = peaks[Math.max(0, Math.min(peaks.length - 1, j))];
+            const b = peaks[Math.max(0, Math.min(peaks.length - 1, j + 1))];
+            mx = a[1] * (1 - frac) + b[1] * frac;
+            mn = a[0] * (1 - frac) + b[0] * frac;
+          }
+          colTop[x] = mx > 0 ? mx : 0;
+          colBot[x] = mn < 0 ? mn : 0;
+          hasData[x] = 1;
+        }
+      }
+
+      // Vertical gradient: transparent at the lane edges -> warm waveform
+      // ink at the centre. The "glow from the centreline" the Triage
+      // waveform uses, kept inside the existing palette (#5C544A ink).
+      const grad = ctx.createLinearGradient(
+        0,
+        audioBand.top,
+        0,
+        audioBand.bottom,
+      );
+      grad.addColorStop(0, "rgba(92,84,74,0)");
+      grad.addColorStop(0.18, "rgba(92,84,74,0.32)");
+      grad.addColorStop(0.5, "rgba(92,84,74,0.92)");
+      grad.addColorStop(0.82, "rgba(92,84,74,0.32)");
+      grad.addColorStop(1, "rgba(92,84,74,0)");
+
+      const y = (v: number) => wfMid - v * half;
+
+      // Draw each contiguous run of painted columns as its own filled body.
+      // Per-run keeps long-form arrangement gaps as real gaps and stops the
+      // 3-tap smoothing from smearing across them.
+      const drawRun = (s: number, e: number) => {
+        const n = e - s;
+        const top = new Float32Array(n);
+        const bot = new Float32Array(n);
+        // 3-tap smoothing — folds peaks into curves without losing the
+        // silhouette of transients.
+        for (let k = 0; k < n; k++) {
+          const x = s + k;
+          const xl = Math.max(s, x - 1);
+          const xr = Math.min(e - 1, x + 1);
+          top[k] = (colTop[xl] + 2 * colTop[x] + colTop[xr]) * 0.25;
+          bot[k] = (colBot[xl] + 2 * colBot[x] + colBot[xr]) * 0.25;
+        }
+        // Subtle ground line keeps quiet / silent stretches anchored.
+        ctx.strokeStyle = "rgba(92,84,74,0.30)";
+        ctx.lineWidth = 0.5;
+        ctx.beginPath();
+        ctx.moveTo(s, wfMid);
+        ctx.lineTo(e, wfMid);
+        ctx.stroke();
+        // Filled body: top edge along the max envelope, back along the min.
+        ctx.beginPath();
+        ctx.moveTo(s, y(top[0]));
+        for (let k = 1; k < n; k++) ctx.lineTo(s + k, y(top[k]));
+        for (let k = n - 1; k >= 0; k--) ctx.lineTo(s + k, y(bot[k]));
+        ctx.closePath();
+        ctx.fillStyle = grad;
+        ctx.fill();
+      };
+      let runStart = -1;
+      for (let x = 0; x <= width; x++) {
+        const on = x < width && hasData[x] === 1;
+        if (on && runStart < 0) runStart = x;
+        else if (!on && runStart >= 0) {
+          drawRun(runStart, x);
+          runStart = -1;
+        }
       }
     }
 

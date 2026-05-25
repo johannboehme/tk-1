@@ -644,7 +644,7 @@ export default function Editor() {
         const decoded = await decodeAudioToMonoPcm(decodeSrc, 22050);
         studioPcm = decoded.pcm;
         studioSampleRate = decoded.sampleRate;
-        const peaks = computeWaveformPeaks(decoded.pcm, decoded.sampleRate, 1500);
+        const peaks = computeWaveformPeaks(decoded.pcm, decoded.sampleRate, 4000);
         wave = { peaks: peaks.peaks, duration: peaks.duration };
       } catch {
         // Non-fatal — Timeline degrades gracefully without peaks.
