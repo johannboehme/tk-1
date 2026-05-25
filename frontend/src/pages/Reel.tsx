@@ -1,13 +1,12 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { ChunkyButton } from "../editor/components/ChunkyButton";
-import { MonoReadout } from "../editor/components/MonoReadout";
-import { ExportControls } from "../editor/components/ExportPanel";
+import { TrashIcon } from "../editor/components/icons";
 import { formatDuration } from "../components/ProgressBar";
-import { ReelStage } from "../components/reel/ReelStage";
-import { ReelScrubber } from "../components/reel/ReelScrubber";
-import { ReelSequence } from "../components/reel/ReelSequence";
-import { useReelStore } from "../local/reel/reel-store";
+import { ExportControls } from "../editor/components/ExportPanel";
+import { ReelPlayer, reelLayout } from "../components/reel/ReelPlayer";
+import { ReelTimeline } from "../components/reel/ReelTimeline";
+import { useReelStore, type ReelMember } from "../local/reel/reel-store";
 
 export default function Reel() {
   const { id } = useParams<{ id: string }>();
@@ -33,14 +32,10 @@ export default function Reel() {
   const selectMember = useReelStore((s) => s.selectMember);
   const setMemberViewport = useReelStore((s) => s.setMemberViewport);
   const resetMemberViewport = useReelStore((s) => s.resetMemberViewport);
-  const selected = members.find((m) => m.memberId === selectedMemberId) ?? null;
 
-  const [formatOpen, setFormatOpen] = useState(false);
-  const [scrubTime, setScrubTime] = useState(0);
-  // Reset the frame scrubber when switching members.
-  useEffect(() => {
-    setScrubTime(0);
-  }, [selectedMemberId]);
+  const [playheadS, setPlayheadS] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [muted, setMuted] = useState(false);
 
   const stage =
     exportSpec.resolution && typeof exportSpec.resolution === "object"
@@ -48,6 +43,13 @@ export default function Reel() {
       : { w: 1920, h: 1080 };
   const renderable = members.filter((m) => !m.missing).length;
   const rendering = render.status === "running";
+
+  function jumpToMember(memberId: string) {
+    selectMember(memberId);
+    const l = reelLayout(members).find((x) => x.member.memberId === memberId);
+    if (l) setPlayheadS(l.start);
+    setPlaying(false);
+  }
 
   return (
     <div className="h-screen flex flex-col min-h-0 paper-bg overflow-hidden">
@@ -69,18 +71,6 @@ export default function Reel() {
             placeholder="Untitled reel"
             className="flex-1 min-w-0 bg-transparent font-display font-semibold text-lg text-ink outline-none placeholder:text-ink-2/50"
           />
-          <div className="hidden md:flex items-center gap-2 shrink-0">
-            <MonoReadout label="CLIPS" value={String(members.length).padStart(2, "0")} />
-            <MonoReadout label="TOTAL" value={formatDuration(totalDurationS())} />
-            <MonoReadout label="STAGE" value={`${stage.w}×${stage.h}`} />
-          </div>
-          <ChunkyButton
-            variant={formatOpen ? "secondary" : "ghost"}
-            size="sm"
-            onClick={() => setFormatOpen((o) => !o)}
-          >
-            Format {formatOpen ? "▴" : "▾"}
-          </ChunkyButton>
           {render.status === "done" && render.resultUrl ? (
             <a href={render.resultUrl} download={`${title || "reel"}.mp4`}>
               <ChunkyButton variant="primary" size="md">
@@ -100,10 +90,7 @@ export default function Reel() {
         </div>
         {rendering && (
           <div className="h-1 bg-paper-deep">
-            <div
-              className="h-full bg-hot transition-all"
-              style={{ width: `${render.pct}%` }}
-            />
+            <div className="h-full bg-hot transition-all" style={{ width: `${render.pct}%` }} />
           </div>
         )}
         {render.status === "error" && (
@@ -113,71 +100,177 @@ export default function Reel() {
         )}
       </header>
 
-      {/* Collapsible output-format bar */}
-      {formatOpen && (
-        <div className="shrink-0 border-b border-rule bg-paper-hi/70 overflow-y-auto max-h-[60vh]">
-          <div className="max-w-2xl mx-auto p-5">
-            <ExportControls
-              spec={exportSpec}
-              setExport={setExport}
-              source={{ w: stage.w, h: stage.h, durationS: totalDurationS() }}
-            />
-          </div>
-        </div>
-      )}
-
-      {/* Preview + scrubber */}
-      <main className="flex-1 min-h-0 flex flex-col overflow-hidden">
-        <div className="flex-1 min-h-0 overflow-y-auto p-4 sm:p-6 flex flex-col items-center justify-center">
+      {/* 3-column body */}
+      <div className="flex-1 min-h-0 grid grid-cols-[240px_minmax(0,1fr)_340px]">
+        {/* Left: ordered project list */}
+        <aside className="border-r border-rule bg-paper-hi/50 overflow-y-auto p-3 flex flex-col gap-2">
+          <span className="label">Projects · order</span>
           {members.length === 0 ? (
-            <p className="font-mono text-sm text-ink-2">
-              This reel is empty. Add projects from the Library.
-            </p>
-          ) : selected && !selected.missing ? (
-            <div className="w-full max-w-3xl flex flex-col gap-2">
-              <ReelStage
-                stage={stage}
-                videoUrl={selected.videoUrl}
-                seekTime={scrubTime}
-                viewport={selected.viewport}
-                onViewport={(patch) => setMemberViewport(selected.memberId, patch)}
-                onReset={() => resetMemberViewport(selected.memberId)}
-              />
-              <ReelScrubber
-                posterUrl={selected.posterUrl}
-                durationS={selected.fullDurationS}
-                value={scrubTime}
-                onScrub={setScrubTime}
-              />
-              <p className="font-mono text-[11px] text-ink-2 text-center">
-                {selected.title} — scrub to pick a frame · drag to pan · wheel to
-                zoom · double-click to reset
-              </p>
-            </div>
-          ) : selected?.missing ? (
-            <p className="font-mono text-sm text-danger">
-              This project was deleted — remove it from the reel.
+            <p className="font-mono text-[11px] text-ink-2 mt-1">
+              Empty — add projects from the Library.
             </p>
           ) : (
-            <p className="font-mono text-sm text-ink-2">
-              Select a clip below to frame it.
-            </p>
+            <ol className="flex flex-col gap-1.5">
+              {members.map((m, i) => (
+                <MemberRow
+                  key={m.memberId}
+                  member={m}
+                  index={i}
+                  count={members.length}
+                  selected={m.memberId === selectedMemberId}
+                  onSelect={() => jumpToMember(m.memberId)}
+                  onMove={(d) => moveMember(m.memberId, d)}
+                  onRemove={() => removeMember(m.memberId)}
+                />
+              ))}
+            </ol>
+          )}
+        </aside>
+
+        {/* Middle: working player */}
+        <section className="min-w-0 overflow-hidden flex items-center justify-center p-4 bg-paper-deep/40">
+          <ReelPlayer
+            members={members}
+            stage={stage}
+            playheadS={playheadS}
+            playing={playing}
+            muted={muted}
+            onSeek={setPlayheadS}
+            onPlayingChange={setPlaying}
+            onFraming={setMemberViewport}
+            onResetFraming={resetMemberViewport}
+          />
+        </section>
+
+        {/* Right: render panel */}
+        <aside className="border-l border-rule bg-paper-hi/60 overflow-y-auto p-4">
+          <ExportControls
+            spec={exportSpec}
+            setExport={setExport}
+            source={{ w: stage.w, h: stage.h, durationS: totalDurationS() }}
+          />
+        </aside>
+      </div>
+
+      {/* Bottom: full-width reel timeline */}
+      <ReelTimeline
+        members={members}
+        playheadS={playheadS}
+        playing={playing}
+        muted={muted}
+        selectedMemberId={selectedMemberId}
+        onSeek={(s) => {
+          setPlayheadS(s);
+        }}
+        onTogglePlay={() => members.length > 0 && setPlaying((p) => !p)}
+        onToggleMute={() => setMuted((m) => !m)}
+        onSelectMember={jumpToMember}
+      />
+    </div>
+  );
+}
+
+function MemberRow({
+  member,
+  index,
+  count,
+  selected,
+  onSelect,
+  onMove,
+  onRemove,
+}: {
+  member: ReelMember;
+  index: number;
+  count: number;
+  selected: boolean;
+  onSelect: () => void;
+  onMove: (delta: number) => void;
+  onRemove: () => void;
+}) {
+  return (
+    <li
+      onClick={onSelect}
+      className={[
+        "group flex items-center gap-2 rounded-md p-1.5 cursor-pointer border transition-colors",
+        member.missing
+          ? "border-danger/60"
+          : selected
+            ? "border-hot bg-hot/5"
+            : "border-rule hover:border-ink-2",
+      ].join(" ")}
+    >
+      <span className="font-mono text-[10px] tabular text-ink-2 w-4 text-center shrink-0">
+        {index + 1}
+      </span>
+      <div className="h-9 w-14 rounded bg-sunken overflow-hidden shrink-0">
+        {member.posterUrl && (
+          <div
+            className="h-full w-full"
+            style={{
+              backgroundImage: `url(${member.posterUrl})`,
+              backgroundSize: "cover",
+              backgroundPosition: "left center",
+            }}
+          />
+        )}
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="font-display text-[12px] font-semibold text-ink truncate">
+          {member.title}
+        </div>
+        <div className="font-mono text-[10px] tabular text-ink-2">
+          {member.missing ? (
+            <span className="text-danger">missing</span>
+          ) : (
+            formatDuration(member.fullDurationS)
           )}
         </div>
+      </div>
+      <div className="flex flex-col opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+        <RowBtn label="Up" disabled={index === 0} onClick={() => onMove(-1)}>
+          ▲
+        </RowBtn>
+        <RowBtn label="Down" disabled={index === count - 1} onClick={() => onMove(1)}>
+          ▼
+        </RowBtn>
+      </div>
+      <button
+        onClick={(e) => {
+          e.stopPropagation();
+          onRemove();
+        }}
+        aria-label="Remove"
+        className="h-6 w-6 inline-flex items-center justify-center rounded text-ink-2 hover:text-danger shrink-0 opacity-0 group-hover:opacity-100"
+      >
+        <TrashIcon width={13} height={13} />
+      </button>
+    </li>
+  );
+}
 
-        {/* Duration-proportional sequence */}
-        {members.length > 0 && (
-          <div className="shrink-0 border-t border-rule bg-paper-hi/60 p-3 overflow-x-auto">
-            <ReelSequence
-              members={members}
-              selectedMemberId={selectedMemberId}
-              onSelect={selectMember}
-              onMove={moveMember}
-              onRemove={removeMember}
-            />
-          </div>
-        )}
-      </main>
-    </div>
+function RowBtn({
+  children,
+  label,
+  disabled,
+  onClick,
+}: {
+  children: React.ReactNode;
+  label: string;
+  disabled?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      disabled={disabled}
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick();
+      }}
+      className="h-3.5 w-5 inline-flex items-center justify-center text-[8px] text-ink-2 hover:text-ink disabled:opacity-25"
+    >
+      {children}
+    </button>
   );
 }
