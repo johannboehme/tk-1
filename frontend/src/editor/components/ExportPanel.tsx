@@ -42,6 +42,7 @@ interface Props {
   submitting: boolean;
 }
 
+/** Editor wrapper: binds the store to the presentational ExportControls. */
 export function ExportPanel({ onSubmit, submitting }: Props) {
   const exportSpec = useEditorStore((s) => s.exportSpec);
   const setExport = useEditorStore((s) => s.setExport);
@@ -60,6 +61,36 @@ export function ExportPanel({ onSubmit, submitting }: Props) {
     [jobMeta?.width, jobMeta?.height, jobMeta?.duration],
   );
 
+  return (
+    <ExportControls
+      spec={exportSpec}
+      setExport={setExport}
+      source={source}
+      onSubmit={onSubmit}
+      submitting={submitting}
+    />
+  );
+}
+
+interface ControlsProps {
+  spec: ExportSpec;
+  setExport: (patch: Partial<ExportSpec>) => void;
+  source: { w: number; h: number; durationS: number };
+  /** When omitted, the Render button is hidden (host owns its own action). */
+  onSubmit?: () => void;
+  submitting?: boolean;
+  submitLabel?: string;
+}
+
+/** Store-free export controls — reused by the editor and the reel surface. */
+export function ExportControls({
+  spec: exportSpec,
+  setExport,
+  source,
+  onSubmit,
+  submitting,
+  submitLabel,
+}: ControlsProps) {
   const output = useMemo(
     () => resolveResolution(exportSpec.resolution, source),
     [exportSpec.resolution, source],
@@ -278,16 +309,18 @@ export function ExportPanel({ onSubmit, submitting }: Props) {
         />
       </AdvancedDrawer>
 
-      <ChunkyButton
-        variant="primary"
-        size="lg"
-        fullWidth
-        disabled={submitting}
-        iconLeft={<DownloadIcon />}
-        onClick={onSubmit}
-      >
-        {submitting ? "Submitting…" : "Render"}
-      </ChunkyButton>
+      {onSubmit && (
+        <ChunkyButton
+          variant="primary"
+          size="lg"
+          fullWidth
+          disabled={submitting}
+          iconLeft={<DownloadIcon />}
+          onClick={onSubmit}
+        >
+          {submitting ? "Submitting…" : (submitLabel ?? "Render")}
+        </ChunkyButton>
+      )}
     </div>
   );
 }

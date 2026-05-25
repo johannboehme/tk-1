@@ -2,18 +2,12 @@ import { useEffect } from "react";
 import { Link, useParams } from "react-router-dom";
 import { ChunkyButton } from "../editor/components/ChunkyButton";
 import { MonoReadout } from "../editor/components/MonoReadout";
-import { SegmentedControl } from "../editor/components/SegmentedControl";
+import { ExportControls } from "../editor/components/ExportPanel";
 import { RuleStrip } from "../editor/components/RuleStrip";
 import { TrashIcon } from "../editor/components/icons";
 import { formatDuration } from "../components/ProgressBar";
 import { ReelStage } from "../components/reel/ReelStage";
 import { useReelStore } from "../local/reel/reel-store";
-import {
-  ASPECT_RATIO_PRESETS,
-  RESOLUTION_LONG_SIDE_PRESETS,
-  deriveResolution,
-} from "../editor/exportPresets";
-import type { AspectRatio } from "../editor/types";
 
 export default function Reel() {
   const { id } = useParams<{ id: string }>();
@@ -44,21 +38,8 @@ export default function Reel() {
   const stage = exportSpec.resolution && typeof exportSpec.resolution === "object"
     ? exportSpec.resolution
     : { w: 1920, h: 1080 };
-  const aspect = (exportSpec.aspectRatio ?? "16:9") as AspectRatio;
-  const longSide = exportSpec.resolutionLongSide ?? Math.max(stage.w, stage.h);
   const renderable = members.filter((m) => !m.missing).length;
   const rendering = render.status === "running";
-
-  function setAspect(a: AspectRatio) {
-    if (a === "custom") return;
-    const res = deriveResolution(a, longSide);
-    setExport({ aspectRatio: a, resolution: res, resolutionLongSide: longSide });
-  }
-  function setLongSide(ls: number) {
-    if (aspect === "custom") return;
-    const res = deriveResolution(aspect, ls);
-    setExport({ resolution: res, resolutionLongSide: ls });
-  }
 
   return (
     <div className="h-screen flex flex-col min-h-0 paper-bg overflow-hidden">
@@ -189,41 +170,11 @@ export default function Reel() {
 
         {/* Output format + render */}
         <aside className="border-t lg:border-t-0 lg:border-l border-rule bg-paper-hi/60 overflow-y-auto p-4 sm:p-5 flex flex-col gap-5">
-          <div>
-            <span className="label mb-2 block">Output format</span>
-            <div className="flex flex-col gap-3">
-              <SegmentedControl<AspectRatio>
-                label="Aspect"
-                value={aspect}
-                onChange={setAspect}
-                size="sm"
-                fullWidth
-                options={ASPECT_RATIO_PRESETS.map((a) => ({ value: a, label: a }))}
-              />
-              <SegmentedControl<string>
-                label="Resolution"
-                value={String(longSide)}
-                onChange={(v) => setLongSide(Number(v))}
-                size="sm"
-                fullWidth
-                options={RESOLUTION_LONG_SIDE_PRESETS.map((p) => ({
-                  value: String(p),
-                  label: `${p}p`,
-                }))}
-              />
-              <SegmentedControl<"h264" | "h265">
-                label="Codec"
-                value={exportSpec.video_codec ?? "h264"}
-                onChange={(v) => setExport({ video_codec: v })}
-                size="sm"
-                fullWidth
-                options={[
-                  { value: "h264", label: "H.264" },
-                  { value: "h265", label: "H.265" },
-                ]}
-              />
-            </div>
-          </div>
+          <ExportControls
+            spec={exportSpec}
+            setExport={setExport}
+            source={{ w: stage.w, h: stage.h, durationS: totalDurationS() }}
+          />
 
           <RuleStrip count={40} className="text-rule" />
 
