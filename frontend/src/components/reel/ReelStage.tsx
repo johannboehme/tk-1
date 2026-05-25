@@ -18,12 +18,15 @@ const SCALE_MAX = 10;
 export function ReelStage({
   stage,
   videoUrl,
+  seekTime = 0,
   viewport,
   onViewport,
   onReset,
 }: {
   stage: { w: number; h: number };
   videoUrl: string | null;
+  /** Source-time (s) of the frame to show — driven by the frame scrubber. */
+  seekTime?: number;
   viewport: ViewportTransform;
   onViewport: (patch: Partial<ViewportTransform>) => void;
   onReset: () => void;
@@ -42,22 +45,30 @@ export function ReelStage({
     return () => ro.disconnect();
   }, []);
 
-  // Show a real frame: seek a touch in once metadata is known.
   useEffect(() => {
     setNatural(null);
     const v = videoRef.current;
     if (!v) return;
-    const onMeta = () => {
-      setNatural({ w: v.videoWidth, h: v.videoHeight });
-      try {
-        v.currentTime = Math.min(0.1, (v.duration || 1) / 2);
-      } catch {
-        /* seek may be rejected pre-load */
-      }
-    };
+    const onMeta = () => setNatural({ w: v.videoWidth, h: v.videoHeight });
     v.addEventListener("loadedmetadata", onMeta);
     return () => v.removeEventListener("loadedmetadata", onMeta);
   }, [videoUrl]);
+
+  // Seek the preview to the scrubbed frame so framing is judged against
+  // real content, not a fixed poster.
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    const apply = () => {
+      try {
+        v.currentTime = Math.max(0, Math.min(seekTime, v.duration || seekTime));
+      } catch {
+        /* seek rejected pre-load */
+      }
+    };
+    if (v.readyState >= 1) apply();
+    else v.addEventListener("loadedmetadata", apply, { once: true });
+  }, [seekTime, videoUrl]);
 
   const nat = natural ?? { w: stage.w, h: stage.h };
   // Contain-fit (letterbox) the member's native frame into the stage, then

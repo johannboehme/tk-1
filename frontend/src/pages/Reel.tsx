@@ -1,12 +1,12 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { ChunkyButton } from "../editor/components/ChunkyButton";
 import { MonoReadout } from "../editor/components/MonoReadout";
 import { ExportControls } from "../editor/components/ExportPanel";
-import { RuleStrip } from "../editor/components/RuleStrip";
-import { TrashIcon } from "../editor/components/icons";
 import { formatDuration } from "../components/ProgressBar";
 import { ReelStage } from "../components/reel/ReelStage";
+import { ReelScrubber } from "../components/reel/ReelScrubber";
+import { ReelSequence } from "../components/reel/ReelSequence";
 import { useReelStore } from "../local/reel/reel-store";
 
 export default function Reel() {
@@ -35,23 +35,32 @@ export default function Reel() {
   const resetMemberViewport = useReelStore((s) => s.resetMemberViewport);
   const selected = members.find((m) => m.memberId === selectedMemberId) ?? null;
 
-  const stage = exportSpec.resolution && typeof exportSpec.resolution === "object"
-    ? exportSpec.resolution
-    : { w: 1920, h: 1080 };
+  const [formatOpen, setFormatOpen] = useState(false);
+  const [scrubTime, setScrubTime] = useState(0);
+  // Reset the frame scrubber when switching members.
+  useEffect(() => {
+    setScrubTime(0);
+  }, [selectedMemberId]);
+
+  const stage =
+    exportSpec.resolution && typeof exportSpec.resolution === "object"
+      ? exportSpec.resolution
+      : { w: 1920, h: 1080 };
   const renderable = members.filter((m) => !m.missing).length;
   const rendering = render.status === "running";
 
   return (
     <div className="h-screen flex flex-col min-h-0 paper-bg overflow-hidden">
-      <header className="border-b border-rule bg-paper-hi shrink-0">
+      {/* Header */}
+      <header className="shrink-0 border-b border-rule bg-paper-hi">
         <div className="h-14 px-3 sm:px-5 flex items-center gap-3">
           <Link
             to="/jobs"
-            className="font-mono text-[11px] tracking-label uppercase text-ink-2 hover:text-ink"
+            className="font-mono text-[11px] tracking-label uppercase text-ink-2 hover:text-ink shrink-0"
           >
             ← Library
           </Link>
-          <span className="font-display tracking-label uppercase text-[11px] text-ink-2">
+          <span className="font-display tracking-label uppercase text-[11px] text-ink-2 shrink-0">
             REEL
           </span>
           <input
@@ -60,186 +69,115 @@ export default function Reel() {
             placeholder="Untitled reel"
             className="flex-1 min-w-0 bg-transparent font-display font-semibold text-lg text-ink outline-none placeholder:text-ink-2/50"
           />
-          <ChunkyButton
-            variant="primary"
-            size="md"
-            disabled={renderable < 1 || rendering}
-            onClick={() => void startRender()}
-          >
-            {rendering ? "Rendering…" : "Render reel"}
-          </ChunkyButton>
-        </div>
-      </header>
-
-      <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-[1fr_320px] overflow-hidden">
-        {/* Member sequence */}
-        <section className="overflow-y-auto p-4 sm:p-6">
-          <div className="flex items-center gap-3 mb-4">
+          <div className="hidden md:flex items-center gap-2 shrink-0">
             <MonoReadout label="CLIPS" value={String(members.length).padStart(2, "0")} />
             <MonoReadout label="TOTAL" value={formatDuration(totalDurationS())} />
             <MonoReadout label="STAGE" value={`${stage.w}×${stage.h}`} />
-            <RuleStrip count={24} className="text-rule flex-1 max-w-[160px]" />
           </div>
-
-          {selected && !selected.missing && (
-            <div className="mb-4 max-w-[640px]">
-              <ReelStage
-                stage={stage}
-                videoUrl={selected.videoUrl}
-                viewport={selected.viewport}
-                onViewport={(patch) => setMemberViewport(selected.memberId, patch)}
-                onReset={() => resetMemberViewport(selected.memberId)}
-              />
-              <p className="mt-1.5 font-mono text-[11px] text-ink-2">
-                {selected.title} — drag to pan · wheel to zoom · double-click to reset
-              </p>
-            </div>
+          <ChunkyButton
+            variant={formatOpen ? "secondary" : "ghost"}
+            size="sm"
+            onClick={() => setFormatOpen((o) => !o)}
+          >
+            Format {formatOpen ? "▴" : "▾"}
+          </ChunkyButton>
+          {render.status === "done" && render.resultUrl ? (
+            <a href={render.resultUrl} download={`${title || "reel"}.mp4`}>
+              <ChunkyButton variant="primary" size="md">
+                Download MP4
+              </ChunkyButton>
+            </a>
+          ) : (
+            <ChunkyButton
+              variant="primary"
+              size="md"
+              disabled={renderable < 1 || rendering}
+              onClick={() => void startRender()}
+            >
+              {rendering ? `Rendering ${Math.round(render.pct)}%` : "Render reel"}
+            </ChunkyButton>
           )}
+        </div>
+        {rendering && (
+          <div className="h-1 bg-paper-deep">
+            <div
+              className="h-full bg-hot transition-all"
+              style={{ width: `${render.pct}%` }}
+            />
+          </div>
+        )}
+        {render.status === "error" && (
+          <p className="px-5 py-1.5 font-mono text-xs text-danger bg-danger/10">
+            {render.error}
+          </p>
+        )}
+      </header>
 
+      {/* Collapsible output-format bar */}
+      {formatOpen && (
+        <div className="shrink-0 border-b border-rule bg-paper-hi/70 overflow-y-auto max-h-[60vh]">
+          <div className="max-w-2xl mx-auto p-5">
+            <ExportControls
+              spec={exportSpec}
+              setExport={setExport}
+              source={{ w: stage.w, h: stage.h, durationS: totalDurationS() }}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Preview + scrubber */}
+      <main className="flex-1 min-h-0 flex flex-col overflow-hidden">
+        <div className="flex-1 min-h-0 overflow-y-auto p-4 sm:p-6 flex flex-col items-center justify-center">
           {members.length === 0 ? (
             <p className="font-mono text-sm text-ink-2">
               This reel is empty. Add projects from the Library.
             </p>
-          ) : (
-            <ol className="flex flex-col gap-2">
-              {members.map((m, i) => (
-                <li
-                  key={m.memberId}
-                  onClick={() => selectMember(m.memberId)}
-                  className={[
-                    "flex items-center gap-3 bg-paper-hi border rounded-lg p-2 cursor-pointer transition-colors",
-                    m.missing
-                      ? "border-danger/60"
-                      : m.memberId === selectedMemberId
-                        ? "border-hot ring-1 ring-hot/40"
-                        : "border-rule hover:border-ink-2",
-                  ].join(" ")}
-                >
-                  <span className="font-mono text-xs tabular text-ink-2 w-6 text-center shrink-0">
-                    {i + 1}
-                  </span>
-                  <div className="h-12 w-20 rounded-md bg-sunken overflow-hidden shrink-0">
-                    {m.posterUrl && (
-                      <img
-                        src={m.posterUrl}
-                        alt=""
-                        className="h-full w-full object-cover"
-                      />
-                    )}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="font-display font-semibold text-sm text-ink truncate">
-                      {m.title}
-                    </div>
-                    <div className="font-mono text-[11px] tabular text-ink-2">
-                      {m.missing ? (
-                        <span className="text-danger">missing — project deleted</span>
-                      ) : (
-                        formatDuration(m.fullDurationS)
-                      )}
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-1 shrink-0">
-                    <IconBtn
-                      label="Move up"
-                      disabled={i === 0}
-                      onClick={() => moveMember(m.memberId, -1)}
-                    >
-                      ↑
-                    </IconBtn>
-                    <IconBtn
-                      label="Move down"
-                      disabled={i === members.length - 1}
-                      onClick={() => moveMember(m.memberId, 1)}
-                    >
-                      ↓
-                    </IconBtn>
-                    <button
-                      onClick={() => removeMember(m.memberId)}
-                      className="h-7 w-7 inline-flex items-center justify-center rounded-md text-ink-2 hover:text-danger"
-                      aria-label="Remove from reel"
-                    >
-                      <TrashIcon width={14} height={14} />
-                    </button>
-                  </div>
-                </li>
-              ))}
-            </ol>
-          )}
-        </section>
-
-        {/* Output format + render */}
-        <aside className="border-t lg:border-t-0 lg:border-l border-rule bg-paper-hi/60 overflow-y-auto p-4 sm:p-5 flex flex-col gap-5">
-          <ExportControls
-            spec={exportSpec}
-            setExport={setExport}
-            source={{ w: stage.w, h: stage.h, durationS: totalDurationS() }}
-          />
-
-          <RuleStrip count={40} className="text-rule" />
-
-          {render.status === "running" && (
-            <div className="flex flex-col gap-2">
-              <div className="flex items-center justify-between">
-                <span className="font-mono text-[11px] tracking-label uppercase text-ink-2">
-                  {render.stage}
-                </span>
-                <span className="font-mono text-[11px] tabular text-ink-2">
-                  {Math.round(render.pct)}%
-                </span>
-              </div>
-              <div className="h-1.5 bg-paper-deep rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-hot transition-all"
-                  style={{ width: `${render.pct}%` }}
-                />
-              </div>
+          ) : selected && !selected.missing ? (
+            <div className="w-full max-w-3xl flex flex-col gap-2">
+              <ReelStage
+                stage={stage}
+                videoUrl={selected.videoUrl}
+                seekTime={scrubTime}
+                viewport={selected.viewport}
+                onViewport={(patch) => setMemberViewport(selected.memberId, patch)}
+                onReset={() => resetMemberViewport(selected.memberId)}
+              />
+              <ReelScrubber
+                posterUrl={selected.posterUrl}
+                durationS={selected.fullDurationS}
+                value={scrubTime}
+                onScrub={setScrubTime}
+              />
+              <p className="font-mono text-[11px] text-ink-2 text-center">
+                {selected.title} — scrub to pick a frame · drag to pan · wheel to
+                zoom · double-click to reset
+              </p>
             </div>
-          )}
-
-          {render.status === "error" && (
-            <p className="font-mono text-xs text-danger">{render.error}</p>
-          )}
-
-          {render.status === "done" && render.resultUrl && (
-            <a href={render.resultUrl} download={`${title || "reel"}.mp4`}>
-              <ChunkyButton variant="primary" size="md" className="w-full">
-                Download MP4
-              </ChunkyButton>
-            </a>
-          )}
-
-          {renderable < 1 && (
-            <p className="font-mono text-xs text-ink-2">
-              Add at least one renderable project to this reel.
+          ) : selected?.missing ? (
+            <p className="font-mono text-sm text-danger">
+              This project was deleted — remove it from the reel.
+            </p>
+          ) : (
+            <p className="font-mono text-sm text-ink-2">
+              Select a clip below to frame it.
             </p>
           )}
-        </aside>
-      </div>
-    </div>
-  );
-}
+        </div>
 
-function IconBtn({
-  children,
-  label,
-  disabled,
-  onClick,
-}: {
-  children: React.ReactNode;
-  label: string;
-  disabled?: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      aria-label={label}
-      disabled={disabled}
-      onClick={onClick}
-      className="h-7 w-7 inline-flex items-center justify-center rounded-md font-mono text-ink-2 hover:text-ink disabled:opacity-30 disabled:hover:text-ink-2"
-    >
-      {children}
-    </button>
+        {/* Duration-proportional sequence */}
+        {members.length > 0 && (
+          <div className="shrink-0 border-t border-rule bg-paper-hi/60 p-3 overflow-x-auto">
+            <ReelSequence
+              members={members}
+              selectedMemberId={selectedMemberId}
+              onSelect={selectMember}
+              onMove={moveMember}
+              onRemove={removeMember}
+            />
+          </div>
+        )}
+      </main>
+    </div>
   );
 }
