@@ -40,6 +40,26 @@ export default function Reel() {
   // toggle unmutes.
   const [muted, setMuted] = useState(true);
 
+  // Space toggles playback (ignored while typing in the title field).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.code !== "Space") return;
+      const t = e.target as HTMLElement | null;
+      if (
+        t &&
+        (t.tagName === "INPUT" ||
+          t.tagName === "TEXTAREA" ||
+          t.isContentEditable)
+      ) {
+        return;
+      }
+      e.preventDefault();
+      if (members.length > 0) setPlaying((p) => !p);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [members.length]);
+
   const stage =
     exportSpec.resolution && typeof exportSpec.resolution === "object"
       ? exportSpec.resolution

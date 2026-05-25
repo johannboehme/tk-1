@@ -84,16 +84,18 @@ export function ReelPlayer({
     return () => v.removeEventListener("loadedmetadata", onMeta);
   }, [memberId]);
 
-  // Paused: seek the picture to the playhead (external scrub / member select).
-  // Wait for `loadeddata` (a decoded frame is available) so the seeked frame
-  // actually paints instead of staying black.
+  // Seek the picture to the playhead. Paused: exact (any divergence). Playing:
+  // only on a LARGE jump — a user scrub — so the rAF's per-frame playhead
+  // updates don't fight playback (which made scrubbing within the current
+  // clip snap straight back). Waits for `loadeddata` so the frame paints.
   useEffect(() => {
-    if (playing) return;
     const v = vidRef.current;
     if (!v) return;
+    const tol = playing ? 0.35 : 0.05;
     const apply = () => {
       try {
-        v.currentTime = Math.min(localTime, v.duration || localTime);
+        const want = Math.min(localTime, v.duration || localTime);
+        if (Math.abs(v.currentTime - want) > tol) v.currentTime = want;
       } catch {
         /* pre-load */
       }

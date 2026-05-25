@@ -46,7 +46,25 @@ function resolveTrim(
 
 export function buildRenderInputFromJob(job: LocalJob): EditSpecLocal {
   const durationS = job.durationS ?? 0;
-  const { arrangementSegments } = synthesizeJobLoadShape(job, durationS);
+  let { arrangementSegments } = synthesizeJobLoadShape(job, durationS);
+
+  // Longform safety net: if the project was triaged but has no arrangement
+  // (never sequenced, or arrangement not persisted), `synthesizeJobLoadShape`
+  // falls back to the WHOLE recording — which would render the full 30-min
+  // original instead of the kept chunks. Honour triage by rendering the
+  // accepted chunks in recording order. (With a real arrangement this branch
+  // is skipped and the arranged order wins.)
+  if (
+    job.mode === "longform" &&
+    (!job.arrangement || job.arrangement.length === 0) &&
+    Array.isArray(job.chunks)
+  ) {
+    const accepted = job.chunks
+      .filter((c) => c.accepted)
+      .sort((a, b) => a.startMs - b.startMs)
+      .map((c) => ({ in: c.startMs / 1000, out: c.endMs / 1000 }));
+    if (accepted.length > 0) arrangementSegments = accepted;
+  }
 
   // Legacy cut migration (shared with the editor mount). fx is migrated by
   // the same helper but lives on the job, not in EditSpecLocal — the reel

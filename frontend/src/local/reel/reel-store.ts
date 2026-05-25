@@ -105,7 +105,14 @@ function uid(): string {
 async function exportSpecFromFirstJob(jobId: string | undefined): Promise<ExportSpec> {
   if (!jobId) return DEFAULT_REEL_EXPORT;
   const job = await jobsDb.getJob(jobId);
-  if (!job?.width || !job.height) return DEFAULT_REEL_EXPORT;
+  if (!job) return DEFAULT_REEL_EXPORT;
+  // Prefer the project's OWN persisted export settings — that's exactly what
+  // its editor would render (correct aspect incl. rotation, resolution, codec,
+  // bitrate). Falls back to deriving from raw dims only if it was never set.
+  if (job.exportSpec && typeof job.exportSpec === "object") {
+    return job.exportSpec as ExportSpec;
+  }
+  if (!job.width || !job.height) return DEFAULT_REEL_EXPORT;
   const aspect = classifyAspectRatio({ w: job.width, h: job.height });
   if (aspect === "custom") {
     return {
