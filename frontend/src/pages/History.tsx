@@ -312,7 +312,7 @@ function JobCard({
         </button>
         {!selectable && (
           <span className="absolute bottom-2 left-2 font-mono text-[10px] tracking-label uppercase text-ink-2 bg-paper-hi/90 px-1.5 py-0.5 rounded-sm">
-            Render first
+            Sync first
           </span>
         )}
       </li>
