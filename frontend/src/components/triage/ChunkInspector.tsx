@@ -123,12 +123,14 @@ export function ChunkInspector() {
           beatsPerBar={beatsPerBar}
           onExtend={(back, fwd) => extendChunkBars(focused.id, back, fwd)}
           onSplit={() => void splitFocusedGuarded(Math.round(currentTime * 1000))}
+          onCreate={() => insertChunkAtPlayhead()}
           onJoinPrev={() => void joinFocusedGuarded("prev")}
           onJoinNext={() => void joinFocusedGuarded("next")}
           onReset={() => resetChunk(focused.id)}
           onConform={() => conformChunk(focused.id)}
           onRevertConform={() => revertConform(focused.id)}
           canSplit={canSplitAtPlayhead(focused, currentTime)}
+          canCreate={canCreateAtPlayhead(chunks, currentTime)}
           canJoinPrev={hasPrev}
           canJoinNext={hasNext}
           canReset={canReset(focused)}
@@ -142,6 +144,14 @@ export function ChunkInspector() {
 function canSplitAtPlayhead(chunk: Chunk, currentTime: number): boolean {
   const t = currentTime * 1000;
   return t > chunk.startMs + 50 && t < chunk.endMs - 50;
+}
+
+/** A new chunk can be created at the playhead when it sits in empty space
+ *  — i.e. inside no existing chunk. (insertChunkAtPlayhead guards the
+ *  gap-size details.) */
+function canCreateAtPlayhead(chunks: Chunk[], currentTime: number): boolean {
+  const t = currentTime * 1000;
+  return !chunks.some((c) => t > c.startMs && t < c.endMs);
 }
 
 function canReset(chunk: Chunk): boolean {
@@ -179,12 +189,14 @@ interface BodyProps {
   beatsPerBar: number;
   onExtend: (barsBack: number, barsFwd: number) => void;
   onSplit: () => void;
+  onCreate: () => void;
   onJoinPrev: () => void;
   onJoinNext: () => void;
   onReset: () => void;
   onConform: () => ReturnType<ReturnType<typeof useTriageStore.getState>["conformChunk"]>;
   onRevertConform: () => void;
   canSplit: boolean;
+  canCreate: boolean;
   canJoinPrev: boolean;
   canJoinNext: boolean;
   canReset: boolean;
@@ -197,12 +209,14 @@ function ChunkBody({
   beatsPerBar,
   onExtend,
   onSplit,
+  onCreate,
   onJoinPrev,
   onJoinNext,
   onReset,
   onConform,
   onRevertConform,
   canSplit,
+  canCreate,
   canJoinPrev,
   canJoinNext,
   canReset,
@@ -401,19 +415,42 @@ function ChunkBody({
 
       <Section
         title="EDIT"
-        right={canSplit ? "playhead inside" : "playhead outside"}
+        right={
+          canSplit
+            ? "playhead inside"
+            : canCreate
+              ? "empty — new chunk"
+              : "playhead outside"
+        }
       >
         <div className="flex flex-col gap-1.5">
-          <ChunkyButton
-            variant="secondary"
-            size="xs"
-            disabled={!canSplit}
-            onClick={onSplit}
-            title="Split at playhead · S"
-            iconLeft={<ScissorsIcon className="w-3.5 h-3.5" />}
-          >
-            Split here
-          </ChunkyButton>
+          {/* Split when the playhead is inside the focused chunk; in empty
+           *  space the same button creates a fresh chunk instead (so you
+           *  can carve a second part out of an audio region you already
+           *  trimmed away from). Disabled only when the playhead sits
+           *  inside a *different* chunk. */}
+          {canSplit ? (
+            <ChunkyButton
+              variant="secondary"
+              size="xs"
+              onClick={onSplit}
+              title="Split at playhead · S"
+              iconLeft={<ScissorsIcon className="w-3.5 h-3.5" />}
+            >
+              Split here
+            </ChunkyButton>
+          ) : (
+            <ChunkyButton
+              variant="secondary"
+              size="xs"
+              disabled={!canCreate}
+              onClick={onCreate}
+              title="Create a new chunk at the playhead · S"
+              iconLeft={<PlusIcon className="w-3.5 h-3.5" />}
+            >
+              New chunk here
+            </ChunkyButton>
+          )}
           <div className="flex flex-col">
             <div className="grid grid-cols-2 gap-1">
               <ChunkyButton

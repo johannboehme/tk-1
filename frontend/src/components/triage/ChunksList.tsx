@@ -20,14 +20,22 @@ import {
 import type { Chunk } from "../../storage/jobs-db";
 
 const HOT_COLOR = "#FF5722";
+const BRASS_COLOR = "#C9A95A";
 
 export function ChunksList() {
   const chunks = useTriageStore((s) => s.chunks);
   const focusedId = useTriageStore((s) => s.focusedChunkId);
   const focusChunk = useTriageStore((s) => s.focusChunk);
+  const seam = useTriageStore((s) => s.playback.seam);
+  const setSeamB = useTriageStore((s) => s.setSeamB);
+  const openSeam = useTriageStore((s) => s.openSeam);
+  const closeSeam = useTriageStore((s) => s.closeSeam);
   const minChunkBars = useTriageStore((s) => s.minChunkBars);
   const jobBpmValue = useTriageStore((s) => s.jobBpm?.value ?? null);
   const beatsPerBar = useTriageStore((s) => s.beatsPerBar);
+  const sequencePlaying = useTriageStore(
+    (s) => s.playback.mode === "sequence" && s.playback.isPlaying,
+  );
 
   const sorted = [...chunks].sort((a, b) => a.startMs - b.startMs);
   const keptCount = sorted.filter(
@@ -79,9 +87,35 @@ export function ChunksList() {
         <span className="font-display tracking-label uppercase text-[10px] text-ink-2">
           Chunks · {sorted.length}
         </span>
-        <span className="font-mono text-[10px] tabular text-ink-3">
-          {keptCount} kept
-        </span>
+        <div className="flex items-center gap-2">
+          {/* Seam preview — opens the transition editor on the focused
+           *  chunk (= A); then click a row to set B. Lives here so it sits
+           *  next to the list it operates on (not by the snap plate). */}
+          <button
+            type="button"
+            onClick={() =>
+              seam ? closeSeam() : focusedId && openSeam(focusedId)
+            }
+            disabled={!seam && !focusedId}
+            className="font-display tracking-label uppercase text-[9px] px-1.5 py-0.5 rounded border transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+            style={
+              seam
+                ? { background: HOT_COLOR, color: "#1A1612", borderColor: HOT_COLOR }
+                : { borderColor: "rgba(0,0,0,0.2)", color: "#5D5546" }
+            }
+            title={
+              seam
+                ? "Close seam preview · Esc"
+                : "Seam preview — audition the transition from the focused chunk · T"
+            }
+            aria-pressed={seam != null}
+          >
+            Seam
+          </button>
+          <span className="font-mono text-[10px] tabular text-ink-3">
+            {keptCount} kept
+          </span>
+        </div>
       </header>
       <ul ref={listRef} className="flex-1 min-h-0 overflow-y-auto">
         {sorted.map((chunk, i) => {
@@ -97,9 +131,23 @@ export function ChunksList() {
               chunk={chunk}
               index={i}
               focused={chunk.id === focusedId}
+              nowPlaying={sequencePlaying && chunk.id === focusedId}
+              // In seam mode the list picks the in-coming chunk B; A is
+              // the chunk the seam was opened on (seam.aId).
+              seamRole={
+                seam
+                  ? chunk.id === seam.aId
+                    ? "A"
+                    : chunk.id === seam.bId
+                      ? "B"
+                      : null
+                  : null
+              }
               effectivelyAccepted={chunk.accepted && passes}
               filteredOut={chunk.accepted && !passes}
-              onFocus={() => focusChunk(chunk.id)}
+              onFocus={() =>
+                seam ? setSeamB(chunk.id) : focusChunk(chunk.id)
+              }
             />
           );
         })}
@@ -112,6 +160,10 @@ interface RowProps {
   chunk: Chunk;
   index: number;
   focused: boolean;
+  /** Currently sounding in sequence playback (focused + sequence + playing). */
+  nowPlaying: boolean;
+  /** This chunk's role in an active seam preview, if any. */
+  seamRole: "A" | "B" | null;
   effectivelyAccepted: boolean;
   filteredOut: boolean;
   onFocus: () => void;
@@ -121,6 +173,8 @@ function ChunkRow({
   chunk,
   index,
   focused,
+  nowPlaying,
+  seamRole,
   effectivelyAccepted,
   filteredOut,
   onFocus,
@@ -165,6 +219,16 @@ function ChunkRow({
       />
       <div className="min-w-0 flex items-center justify-between gap-2">
         <div className="flex items-baseline gap-2 min-w-0">
+          {nowPlaying && (
+            <span
+              className="shrink-0 self-center text-[8px] leading-none"
+              style={{ color: HOT_COLOR }}
+              aria-label="Now playing"
+              title="Now playing"
+            >
+              ▶
+            </span>
+          )}
           <span className="font-display font-semibold text-[10px] tracking-label uppercase text-ink shrink-0">
             #{(index + 1).toString().padStart(2, "0")}
           </span>
@@ -179,6 +243,18 @@ function ChunkRow({
           </span>
         </div>
         <div className="flex items-center gap-1.5 font-mono text-[10px] tabular text-ink-3 shrink-0">
+          {seamRole && (
+            <span
+              className="font-mono text-[8px] tracking-label uppercase px-1 rounded"
+              style={{
+                background: seamRole === "A" ? HOT_COLOR : BRASS_COLOR,
+                color: "#1A1612",
+              }}
+              aria-label={seamRole === "A" ? "Seam A (out)" : "Seam B (in)"}
+            >
+              {seamRole}
+            </span>
+          )}
           <span>{lengthS.toFixed(1)}s</span>
           {!chunk.accepted && (
             <span

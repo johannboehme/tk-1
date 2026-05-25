@@ -698,3 +698,155 @@ describe("triage-store · snapshot housekeeping", () => {
     expect(useTriageStore.getState().chunks[0].preConformSnapshot).toBeUndefined();
   });
 });
+
+describe("triage-store · setMode", () => {
+  beforeEach(() => useTriageStore.getState().reset());
+
+  it("loop mode with a focused chunk arms the loop region", () => {
+    seed([makeChunk({ id: "c1", startMs: 2000, endMs: 6000 })]);
+    useTriageStore.getState().focusChunk("c1");
+    useTriageStore.getState().setMode("loop");
+    const pb = useTriageStore.getState().playback;
+    expect(pb.mode).toBe("loop");
+    expect(pb.loop).toEqual({ start: 2, end: 6 });
+  });
+
+  it("continue mode clears the loop region", () => {
+    seed([makeChunk({ id: "c1", startMs: 2000, endMs: 6000 })]);
+    useTriageStore.getState().focusChunk("c1");
+    useTriageStore.getState().setMode("continue");
+    const pb = useTriageStore.getState().playback;
+    expect(pb.mode).toBe("continue");
+    expect(pb.loop).toBeNull();
+  });
+
+  it("sequence mode clears the loop region", () => {
+    seed([makeChunk({ id: "c1", startMs: 2000, endMs: 6000 })]);
+    useTriageStore.getState().focusChunk("c1");
+    useTriageStore.getState().setMode("sequence");
+    const pb = useTriageStore.getState().playback;
+    expect(pb.mode).toBe("sequence");
+    expect(pb.loop).toBeNull();
+  });
+
+  it("focusing a chunk in continue mode does not arm a loop", () => {
+    seed([makeChunk({ id: "c1", startMs: 2000, endMs: 6000 })]);
+    useTriageStore.getState().setMode("continue");
+    useTriageStore.getState().focusChunk("c1");
+    const pb = useTriageStore.getState().playback;
+    expect(pb.loop).toBeNull();
+    expect(pb.currentTime).toBe(2);
+  });
+});
+
+describe("triage-store · sequence playback", () => {
+  beforeEach(() => useTriageStore.getState().reset());
+
+  it("sequenceAdvance sets focusedChunkId without touching currentTime", () => {
+    seed([
+      makeChunk({ id: "a", startMs: 0, endMs: 1000 }),
+      makeChunk({ id: "b", startMs: 2000, endMs: 3000 }),
+    ]);
+    useTriageStore.setState((s) => ({
+      playback: { ...s.playback, currentTime: 1.9 },
+    }));
+    useTriageStore.getState().sequenceAdvance("b");
+    expect(useTriageStore.getState().focusedChunkId).toBe("b");
+    expect(useTriageStore.getState().playback.currentTime).toBe(1.9);
+  });
+
+  it("setPlaying(true) in sequence snaps focus + time to the first kept chunk", () => {
+    seed([
+      makeChunk({ id: "b", startMs: 5000, endMs: 6000 }),
+      makeChunk({ id: "a", startMs: 1000, endMs: 2000 }),
+    ]);
+    useTriageStore.getState().setMode("sequence");
+    useTriageStore.getState().setPlaying(true);
+    expect(useTriageStore.getState().focusedChunkId).toBe("a"); // earliest startMs
+    expect(useTriageStore.getState().playback.currentTime).toBe(1);
+    expect(useTriageStore.getState().playback.isPlaying).toBe(true);
+  });
+
+  it("setPlaying(true) in sequence keeps focus if already on a kept chunk", () => {
+    seed([
+      makeChunk({ id: "a", startMs: 1000, endMs: 2000 }),
+      makeChunk({ id: "b", startMs: 5000, endMs: 6000 }),
+    ]);
+    useTriageStore.getState().setMode("sequence");
+    useTriageStore.getState().focusChunk("b");
+    useTriageStore.getState().setPlaying(true);
+    expect(useTriageStore.getState().focusedChunkId).toBe("b");
+  });
+
+  it("setPlaying(true) in sequence with no kept chunks stays paused", () => {
+    seed([makeChunk({ id: "a", startMs: 1000, endMs: 2000, accepted: false })]);
+    useTriageStore.getState().setMode("sequence");
+    useTriageStore.getState().setPlaying(true);
+    expect(useTriageStore.getState().playback.isPlaying).toBe(false);
+  });
+});
+
+describe("triage-store · seam preview", () => {
+  beforeEach(() => useTriageStore.getState().reset());
+
+  it("openSeam sets A, leaves B null, parks at loopIn, clears loop, pauses", () => {
+    seed([makeChunk({ id: "a", startMs: 10000, endMs: 20000 })]);
+    useTriageStore.getState().focusChunk("a");
+    useTriageStore.getState().setPlaying(true);
+    useTriageStore.getState().openSeam("a");
+    const pb = useTriageStore.getState().playback;
+    expect(pb.seam?.aId).toBe("a");
+    expect(pb.seam?.bId).toBeNull();
+    expect(pb.loop).toBeNull();
+    expect(pb.isPlaying).toBe(false);
+    // span = 2 bars @120 BPM = 4s → loopIn = 20 - 4 = 16
+    expect(pb.seam?.loopInS).toBe(16);
+    expect(pb.currentTime).toBe(16);
+  });
+
+  it("setSeamB sets B and a default loopOut bracket", () => {
+    seed([
+      makeChunk({ id: "a", startMs: 10000, endMs: 20000 }),
+      makeChunk({ id: "b", startMs: 50000, endMs: 70000 }),
+    ]);
+    useTriageStore.getState().openSeam("a");
+    useTriageStore.getState().setSeamB("b");
+    const seam = useTriageStore.getState().playback.seam;
+    expect(seam?.bId).toBe("b");
+    // span 4s → loopOut = 50 + 4 = 54
+    expect(seam?.loopOutS).toBe(54);
+  });
+
+  it("updateSeam merges bracket edits", () => {
+    seed([
+      makeChunk({ id: "a", startMs: 10000, endMs: 20000 }),
+      makeChunk({ id: "b", startMs: 50000, endMs: 70000 }),
+    ]);
+    useTriageStore.getState().openSeam("a");
+    useTriageStore.getState().setSeamB("b");
+    useTriageStore.getState().updateSeam({ loopInS: 17, loopOutS: 55 });
+    const seam = useTriageStore.getState().playback.seam;
+    expect(seam?.loopInS).toBe(17);
+    expect(seam?.loopOutS).toBe(55);
+  });
+
+  it("closeSeam clears seam and restores the mode's loop region", () => {
+    seed([makeChunk({ id: "a", startMs: 2000, endMs: 6000 })]);
+    useTriageStore.getState().focusChunk("a"); // loop mode default → loop armed
+    useTriageStore.getState().openSeam("a");
+    expect(useTriageStore.getState().playback.loop).toBeNull();
+    useTriageStore.getState().closeSeam();
+    const pb = useTriageStore.getState().playback;
+    expect(pb.seam).toBeNull();
+    expect(pb.loop).toEqual({ start: 2, end: 6 });
+  });
+
+  it("is orthogonal to mode — closing in continue restores no loop", () => {
+    seed([makeChunk({ id: "a", startMs: 2000, endMs: 6000 })]);
+    useTriageStore.getState().focusChunk("a");
+    useTriageStore.getState().setMode("continue");
+    useTriageStore.getState().openSeam("a");
+    useTriageStore.getState().closeSeam();
+    expect(useTriageStore.getState().playback.loop).toBeNull();
+  });
+});

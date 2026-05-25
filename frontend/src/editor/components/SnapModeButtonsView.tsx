@@ -43,7 +43,10 @@ const MODE_BUTTONS: { mode: SnapMode; label: string; needsBpm: boolean }[] = [
   { mode: "1/16", label: "1/16", needsBpm: true },
 ];
 
-const PLATE_STYLE: React.CSSProperties = {
+/** Brass cassette plate that hosts a row of CassetteKeys. Exported so
+ *  other transport surfaces (e.g. the Triage playback-mode switch) share
+ *  the exact deck chrome. */
+export const PLATE_STYLE: React.CSSProperties = {
   background:
     "linear-gradient(180deg, #FAF6EC 0%, #E8E1D0 50%, #C9BFA6 100%)",
   boxShadow: [
@@ -99,7 +102,9 @@ interface KeyProps {
   children: React.ReactNode;
 }
 
-function CassetteKey({
+/** One recessed deck key with an orange LED pip when active. Exported so
+ *  other transport plates reuse the identical key chrome. */
+export function CassetteKey({
   active,
   disabled,
   testId,

@@ -13,6 +13,12 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTriageStore } from "../../local/triage/triage-store";
+import {
+  buildSequence,
+  nextSequenceId,
+  resolveSeamWindow,
+  seamHopTarget,
+} from "../../local/triage/triage-sequence";
 import { resolveJobAssetUrl } from "../../local/jobs";
 
 /** Seconds before the loop wrap point at which the crossfade is
@@ -37,8 +43,21 @@ interface AudioGraph {
 
 interface PingPongState {
   active: "A" | "B";
-  armed: { fireAtCtxTime: number; fromSide: "A" | "B" } | null;
+  armed: {
+    fireAtCtxTime: number;
+    fromSide: "A" | "B";
+    /** Sequence walker: chunk id to advance focus to when the crossfade
+     *  fires. null = current chunk was the last one (just stop, no swap).
+     *  Absent for plain loop wraps. */
+    seqNextId?: string | null;
+    /** Seam loop: which window to switch to when the crossfade fires. */
+    seamNextPhase?: "A" | "B";
+  } | null;
+  /** Seam loop: which window is currently playing (A-tail or B-head). */
+  seamPhase: "A" | "B";
 }
+
+type Branch = "continue" | "loop" | "sequence" | "seam";
 
 // MediaElementAudioSourceNode permanently captures its source element
 // — calling createMediaElementSource twice for the same element throws.
@@ -73,7 +92,8 @@ function Driver({
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [isReady, setIsReady] = useState(false);
   const graphRef = useRef<AudioGraph | null>(null);
-  const stateRef = useRef<PingPongState>({ active: "A", armed: null });
+  const stateRef = useRef<PingPongState>({ active: "A", armed: null, seamPhase: "A" });
+  const branchRef = useRef<Branch>("continue");
   const rafRef = useRef<number | null>(null);
 
   // Resolve URL.
@@ -159,7 +179,7 @@ function Driver({
     const graph: AudioGraph = { ctx, srcA, srcB, gainA, gainB, master };
     graphCache.set(a, graph);
     graphRef.current = graph;
-    stateRef.current = { active: "A", armed: null };
+    stateRef.current = { active: "A", armed: null, seamPhase: "A" };
   }, [aRef, bRef, isReady]);
 
   // Resume the AudioContext on the first interaction (browser
@@ -241,53 +261,201 @@ function Driver({
         const idle = cur.active === "A" ? b : a;
         const t = active.currentTime;
         const state = useTriageStore.getState();
-        // Push time to store (throttled by ~10 ms).
-        if (Math.abs(state.playback.currentTime - t) > 0.01) {
+        const pb = state.playback;
+        // Push time to store (throttled by ~10 ms) — all modes.
+        if (Math.abs(pb.currentTime - t) > 0.01) {
           tickTime(t);
         }
-        // Loop arming.
-        const lp = state.playback.loop;
-        if (lp && cur.armed === null && state.playback.isPlaying) {
-          const remaining = lp.end - t;
-          if (remaining > 0 && remaining < LEAD_TIME_S) {
-            // Park idle at loop.start and play it; schedule the
-            // crossfade to fire at ctx-time = now + remaining.
+
+        // Pick the active branch. When it changes (mode cycled mid-play)
+        // cancel any armed crossfade so it can't fire into the new
+        // geometry.
+        const branch: Branch = pb.seam
+          ? "seam"
+          : pb.mode === "sequence"
+            ? "sequence"
+            : pb.mode === "loop" && pb.loop
+              ? "loop"
+              : "continue";
+        if (branchRef.current !== branch) {
+          cancelArmed(g, cur);
+          // Entering seam always starts in the A-tail window.
+          if (branch === "seam") cur.seamPhase = "A";
+          branchRef.current = branch;
+        }
+
+        if (branch === "seam") {
+          // Loop a window straddling the A→B cut:
+          //   [loopIn → A.end] (A) → hop → [B.start → loopOut] (B) → wrap.
+          // A.end / B.start are read fresh (live trims); loopIn / loopOut
+          // are the ephemeral brackets. Same crossfade for both hops.
+          const win = pb.seam ? resolveSeamWindow(pb.seam, state.chunks) : null;
+          if (win && cur.armed === null) {
+            // Derive the audition window from the playhead so a user seek
+            // into either lane updates which side we're on. Disjoint
+            // windows are unambiguous; on overlap keep the tracked phase.
+            const inA = t >= win.loopInS - 0.01 && t <= win.aEndS + 0.05;
+            const inB = t >= win.bStartS - 0.05 && t <= win.loopOutS + 0.01;
+            if (inA && !inB) cur.seamPhase = "A";
+            else if (inB && !inA) cur.seamPhase = "B";
+          }
+          if (win && pb.isPlaying && cur.armed === null) {
+            const { armAtS, seekToS, nextPhase } = seamHopTarget(
+              win,
+              cur.seamPhase,
+            );
+            const remaining = armAtS - t;
+            if (remaining > 0 && remaining < LEAD_TIME_S) {
+              try {
+                idle.currentTime = clampSeek(seekToS, idle.duration);
+              } catch {
+                /* ignore */
+              }
+              void idle.play().catch(() => undefined);
+              const fireCtxT = g.ctx.currentTime + remaining;
+              scheduleCrossfade(g, cur.active, fireCtxT);
+              cur.armed = {
+                fireAtCtxTime: fireCtxT,
+                fromSide: cur.active,
+                seamNextPhase: nextPhase,
+              };
+            } else if (t >= armAtS + 0.05) {
+              // Missed the lead window (dropped frame, or a live trim
+              // moved the boundary behind the playhead) — hard-jump +
+              // flip phase so the loop recovers.
+              try {
+                active.currentTime = clampSeek(seekToS, active.duration);
+              } catch {
+                /* ignore */
+              }
+              cur.seamPhase = nextPhase;
+            }
+          }
+          // Crossfade fired — swap active + flip window. Runs regardless
+          // of isPlaying so a stale armed flag clears on pause.
+          if (
+            cur.armed &&
+            cur.armed.seamNextPhase &&
+            g.ctx.currentTime >= cur.armed.fireAtCtxTime + CROSSFADE_S
+          ) {
+            active.pause();
+            cur.active = cur.active === "A" ? "B" : "A";
+            cur.seamPhase = cur.armed.seamNextPhase;
+            cur.armed = null;
+          }
+        } else if (branch === "loop") {
+          const lp = pb.loop!;
+          // Loop arming.
+          if (cur.armed === null && pb.isPlaying) {
+            const remaining = lp.end - t;
+            if (remaining > 0 && remaining < LEAD_TIME_S) {
+              // Park idle at loop.start and play it; schedule the
+              // crossfade to fire at ctx-time = now + remaining.
+              try {
+                idle.currentTime = clampSeek(lp.start, idle.duration);
+              } catch {
+                /* ignore */
+              }
+              void idle.play().catch(() => undefined);
+              const fireCtxT = g.ctx.currentTime + remaining;
+              scheduleCrossfade(g, cur.active, fireCtxT);
+              cur.armed = { fireAtCtxTime: fireCtxT, fromSide: cur.active };
+            }
+          }
+          // Crossfade has fired — swap active + re-park old active at
+          // loop.start for the next wrap.
+          if (cur.armed && g.ctx.currentTime >= cur.armed.fireAtCtxTime + CROSSFADE_S) {
+            active.pause();
             try {
-              idle.currentTime = clampSeek(lp.start, idle.duration);
+              active.currentTime = clampSeek(lp.start, active.duration);
             } catch {
               /* ignore */
             }
-            void idle.play().catch(() => undefined);
-            const fireCtxT = g.ctx.currentTime + remaining;
-            scheduleCrossfade(g, cur.active, fireCtxT);
-            cur.armed = { fireAtCtxTime: fireCtxT, fromSide: cur.active };
+            cur.active = cur.active === "A" ? "B" : "A";
+            cur.armed = null;
           }
-        }
-        // Crossfade has fired — swap active.
-        if (cur.armed && g.ctx.currentTime >= cur.armed.fireAtCtxTime + CROSSFADE_S) {
-          // Old active becomes idle; pause it + park back at loop.start
-          // for the next wrap.
-          active.pause();
-          if (lp) {
+          // Out-of-loop safety net: if the active element ran past
+          // loop.end without an armed crossfade (e.g. dropped frame),
+          // emergency hard-seek back to start.
+          if (t >= lp.end + 0.05 && pb.isPlaying) {
             try {
               active.currentTime = clampSeek(lp.start, active.duration);
             } catch {
               /* ignore */
             }
           }
-          cur.active = cur.active === "A" ? "B" : "A";
-          cur.armed = null;
-        }
-        // Out-of-loop user-seek safety net: if the active element ran
-        // past loop.end without an armed crossfade (e.g. dropped frame),
-        // do an emergency hard-seek back to start.
-        if (lp && t >= lp.end + 0.05 && state.playback.isPlaying) {
-          try {
-            active.currentTime = clampSeek(lp.start, active.duration);
-          } catch {
-            /* ignore */
+        } else if (branch === "sequence") {
+          // Walk the kept chunks chronologically, hopping from each
+          // chunk's endMs to the next chunk's startMs with the same
+          // gapless crossfade. Identity is `focusedChunkId` (not time),
+          // so duplicate master-times can't collapse the walker.
+          const seq = buildSequence(
+            state.chunks,
+            state.minChunkBars,
+            state.jobBpm?.value ?? null,
+            state.beatsPerBar,
+          );
+          const curId = state.focusedChunkId;
+          const curIdx = curId ? seq.findIndex((c) => c.id === curId) : -1;
+          if (pb.isPlaying && cur.armed === null) {
+            if (curIdx === -1) {
+              // Focus drifted off the kept set mid-play → stop. (Start
+              // positioning is handled synchronously in setPlaying.)
+              state.setPlaying(false);
+            } else {
+              const curChunk = seq[curIdx];
+              const remaining = curChunk.endMs / 1000 - t;
+              if (remaining > 0 && remaining < LEAD_TIME_S) {
+                const nextId = nextSequenceId(seq, curId);
+                const fireCtxT = g.ctx.currentTime + remaining;
+                if (nextId) {
+                  const nextChunk = seq[curIdx + 1];
+                  try {
+                    idle.currentTime = clampSeek(
+                      nextChunk.startMs / 1000,
+                      idle.duration,
+                    );
+                  } catch {
+                    /* ignore */
+                  }
+                  void idle.play().catch(() => undefined);
+                  scheduleCrossfade(g, cur.active, fireCtxT);
+                  cur.armed = {
+                    fireAtCtxTime: fireCtxT,
+                    fromSide: cur.active,
+                    seqNextId: nextId,
+                  };
+                } else {
+                  // Last kept chunk — stop at its end (no loop in
+                  // sequence). Arm with a null target to block re-arming;
+                  // a timer does the actual pause at the chunk end.
+                  cur.armed = {
+                    fireAtCtxTime: fireCtxT,
+                    fromSide: cur.active,
+                    seqNextId: null,
+                  };
+                  window.setTimeout(
+                    () => useTriageStore.getState().setPlaying(false),
+                    Math.max(0, remaining * 1000),
+                  );
+                }
+              }
+            }
+          }
+          // Crossfade fired — swap + advance the walker (no currentTime
+          // write; the idle element already carried the playhead to the
+          // next chunk's start). Runs regardless of isPlaying so a
+          // last-chunk armed flag clears.
+          if (cur.armed && g.ctx.currentTime >= cur.armed.fireAtCtxTime + CROSSFADE_S) {
+            if (cur.armed.seqNextId != null) {
+              active.pause();
+              cur.active = cur.active === "A" ? "B" : "A";
+              state.sequenceAdvance(cur.armed.seqNextId);
+            }
+            cur.armed = null;
           }
         }
+        // continue: time broadcast only — no arming, no wrap.
       }
       rafRef.current = window.requestAnimationFrame(tick);
     }

@@ -22,17 +22,31 @@ import type { SnapMode } from "../../editor/snap";
 import { analyzeAudio } from "../render/audio-analysis/analyze";
 import type { Chunk, SilenceConfig, VideoAsset } from "../../storage/jobs-db";
 import { snapChunkEndToBar } from "./chunk-bar-grid";
+import {
+  buildSequence,
+  loopForMode,
+  seamSpanS,
+  type TriageMode,
+  type TriageSeam,
+} from "./triage-sequence";
+
+export type { TriageMode, TriageSeam };
 
 export interface TriagePlayback {
   currentTime: number;
   isPlaying: boolean;
-  /** Loop region (master-audio time, seconds). When set AND
-   *  `loopEnabled` is true, the playback hook keeps the playhead
-   *  between [start, end]. */
+  /** Loop region (master-audio time, seconds). Set only while
+   *  `mode === "loop"`; the playback hook keeps the playhead between
+   *  [start, end]. */
   loop: { start: number; end: number } | null;
-  /** When false, focusing a chunk no longer arms loop playback —
-   *  audio plays linearly through chunks. Default true. */
-  loopEnabled: boolean;
+  /** Transport mode. `continue` plays the master audio linearly,
+   *  `loop` bounces the focused chunk, `sequence` walks all kept chunks
+   *  gaplessly. Default `loop`. */
+  mode: TriageMode;
+  /** Seam-preview sub-mode. When non-null the playback hook loops a
+   *  window straddling the A→B cut (overrides `mode`). Ephemeral —
+   *  cleared on closeSeam; only the chunk trims it tunes persist. */
+  seam: TriageSeam | null;
 }
 
 export interface TriageView {
@@ -104,7 +118,7 @@ export interface TriageState {
     beatPhaseS: number;
     snapMode: SnapMode;
     minChunkBars: number;
-    loopEnabled: boolean;
+    mode: TriageMode;
     pcm: Float32Array;
     pcmSampleRate: number;
     envelope: Float32Array;
@@ -177,6 +191,11 @@ export interface TriageState {
   setMinChunkBars(bars: number): void;
 
   focusChunk(id: string | null): void;
+  /** Sequence-walker advance: move focus to the next chunk WITHOUT
+   *  writing currentTime — the audio crossfade already carried the
+   *  playhead to the next chunk's start, and a seek here would fight it.
+   *  Auto-scroll/auto-follow still fire (they key on focusedChunkId). */
+  sequenceAdvance(nextId: string): void;
   acceptFocused(autoAdvance?: boolean): void;
   rejectFocused(autoAdvance?: boolean): void;
   /** Move focus to the previous/next chunk (chronological). */
@@ -189,7 +208,20 @@ export interface TriageState {
   setPlaying(p: boolean): void;
   seek(t: number): void;
   setLoop(loop: TriagePlayback["loop"]): void;
-  setLoopEnabled(enabled: boolean): void;
+  /** Switch transport mode. Recomputes the loop region from the focused
+   *  chunk (set only in `loop` mode; cleared otherwise). */
+  setMode(mode: TriageMode): void;
+  /** Enter seam-preview on chunk A (the out-going chunk). B is chosen
+   *  afterwards via setSeamB. Parks the playhead at the default loop-in,
+   *  clears the loop region, and pauses. */
+  openSeam(aId: string): void;
+  /** Pick the in-coming chunk B (any chunk, including A itself) and seed
+   *  a default loop-out bracket. */
+  setSeamB(bId: string): void;
+  /** Adjust the ephemeral audition brackets (loopIn / loopOut). */
+  updateSeam(patch: Partial<Pick<TriageSeam, "loopInS" | "loopOutS">>): void;
+  /** Leave seam-preview; restore the loop region implied by the mode. */
+  closeSeam(): void;
   tickTime(t: number): void;
 
   // View actions.
@@ -201,7 +233,8 @@ const INITIAL_PLAYBACK: TriagePlayback = {
   currentTime: 0,
   isPlaying: false,
   loop: null,
-  loopEnabled: true,
+  mode: "loop",
+  seam: null,
 };
 
 const INITIAL_VIEW: TriageView = {
@@ -260,7 +293,7 @@ export const useTriageStore = create<TriageState>((set, get) => ({
       envelopeHz: args.envelopeHz,
       selectedCamId: args.cams[0]?.id ?? null,
       focusedChunkId: null,
-      playback: { ...INITIAL_PLAYBACK, loopEnabled: args.loopEnabled },
+      playback: { ...INITIAL_PLAYBACK, mode: args.mode },
       view: INITIAL_VIEW,
     });
   },
@@ -337,7 +370,7 @@ export const useTriageStore = create<TriageState>((set, get) => ({
       trimMode: "bar",
       preConformSnapshot: undefined,
     });
-    if (s.focusedChunkId === id) {
+    if (s.focusedChunkId === id && s.playback.mode === "loop") {
       set({
         playback: {
           ...s.playback,
@@ -614,7 +647,7 @@ export const useTriageStore = create<TriageState>((set, get) => ({
       // snapshot was scoped to bounds that no longer exist.
       preConformSnapshot: undefined,
     });
-    if (s.focusedChunkId === id && s.playback.loopEnabled) {
+    if (s.focusedChunkId === id && s.playback.mode === "loop") {
       set({
         playback: {
           ...s.playback,
@@ -657,6 +690,10 @@ export const useTriageStore = create<TriageState>((set, get) => ({
     set({ minChunkBars: safe });
   },
 
+  sequenceAdvance(nextId) {
+    set({ focusedChunkId: nextId });
+  },
+
   focusChunk(id) {
     const s = get();
     if (id === null) {
@@ -669,11 +706,9 @@ export const useTriageStore = create<TriageState>((set, get) => ({
       focusedChunkId: id,
       playback: {
         ...s.playback,
-        // Loop arms only when the user wants it. Off → linear playback,
-        // playhead jumps to chunk start but doesn't bounce.
-        loop: s.playback.loopEnabled
-          ? { start: chunk.startMs / 1000, end: chunk.endMs / 1000 }
-          : null,
+        // Loop arms only in loop mode. Otherwise the playhead jumps to
+        // the chunk start but doesn't bounce.
+        loop: loopForMode(s.playback.mode, chunk),
         currentTime: chunk.startMs / 1000,
       },
     });
@@ -702,11 +737,12 @@ export const useTriageStore = create<TriageState>((set, get) => ({
     // the filter threshold), find the nearest accepted chunk in the
     // requested direction by master-time.
     const jobBpmValue = s.jobBpm?.value ?? null;
-    const accepted = [...s.chunks]
-      .filter((c) =>
-        isChunkEffectivelyAccepted(c, s.minChunkBars, jobBpmValue, s.beatsPerBar),
-      )
-      .sort((a, b) => a.startMs - b.startMs);
+    const accepted = buildSequence(
+      s.chunks,
+      s.minChunkBars,
+      jobBpmValue,
+      s.beatsPerBar,
+    );
     if (accepted.length === 0) return;
     const focused = s.focusedChunkId
       ? s.chunks.find((c) => c.id === s.focusedChunkId) ?? null
@@ -753,7 +789,38 @@ export const useTriageStore = create<TriageState>((set, get) => ({
   },
 
   setPlaying(p) {
-    set((s) => ({ playback: { ...s.playback, isPlaying: p } }));
+    set((s) => {
+      // Sequence start: pressing play with focus off the kept set snaps
+      // to the first kept chunk (or stays paused if there are none).
+      // Already-on-a-kept-chunk → play from there (lets the user jump
+      // into the sequence mid-way).
+      if (p && s.playback.mode === "sequence") {
+        const seq = buildSequence(
+          s.chunks,
+          s.minChunkBars,
+          s.jobBpm?.value ?? null,
+          s.beatsPerBar,
+        );
+        const onKept =
+          s.focusedChunkId != null &&
+          seq.some((c) => c.id === s.focusedChunkId);
+        if (!onKept) {
+          if (seq.length === 0) {
+            return { playback: { ...s.playback, isPlaying: false } };
+          }
+          const first = seq[0];
+          return {
+            focusedChunkId: first.id,
+            playback: {
+              ...s.playback,
+              isPlaying: true,
+              currentTime: first.startMs / 1000,
+            },
+          };
+        }
+      }
+      return { playback: { ...s.playback, isPlaying: p } };
+    });
   },
 
   seek(t) {
@@ -769,26 +836,69 @@ export const useTriageStore = create<TriageState>((set, get) => ({
     set((s) => ({ playback: { ...s.playback, loop } }));
   },
 
-  setLoopEnabled(enabled) {
+  setMode(mode) {
     set((s) => {
-      // Turning loop off while a chunk is focused clears the active
-      // loop region so playback continues linearly. Turning it back on
-      // re-arms loop on the focused chunk if any.
-      if (!enabled) {
-        return { playback: { ...s.playback, loopEnabled: false, loop: null } };
-      }
+      // Recompute the loop region for the new mode: armed only in loop
+      // mode on the focused chunk, cleared otherwise so continue/sequence
+      // play through without bouncing.
       const focused = s.focusedChunkId
-        ? s.chunks.find((c) => c.id === s.focusedChunkId)
+        ? s.chunks.find((c) => c.id === s.focusedChunkId) ?? null
         : null;
       return {
-        playback: {
-          ...s.playback,
-          loopEnabled: true,
-          loop: focused
-            ? { start: focused.startMs / 1000, end: focused.endMs / 1000 }
-            : null,
-        },
+        playback: { ...s.playback, mode, loop: loopForMode(mode, focused) },
       };
+    });
+  },
+
+  openSeam(aId) {
+    const s = get();
+    const a = s.chunks.find((c) => c.id === aId);
+    if (!a) return;
+    const span = seamSpanS(a, s.jobBpm?.value ?? null, s.beatsPerBar);
+    const loopInS = Math.max(a.startMs / 1000, a.endMs / 1000 - span);
+    set({
+      playback: {
+        ...s.playback,
+        // Seam supersedes the mode's loop region while active. Start
+        // paused so the playhead doesn't run off before B is picked.
+        seam: { aId, bId: null, loopInS, loopOutS: 0 },
+        loop: null,
+        currentTime: loopInS,
+        isPlaying: false,
+      },
+    });
+  },
+
+  setSeamB(bId) {
+    const s = get();
+    const seam = s.playback.seam;
+    if (!seam) return;
+    const b = s.chunks.find((c) => c.id === bId);
+    if (!b) return;
+    const span = seamSpanS(b, s.jobBpm?.value ?? null, s.beatsPerBar);
+    const loopOutS = Math.min(b.endMs / 1000, b.startMs / 1000 + span);
+    set({ playback: { ...s.playback, seam: { ...seam, bId, loopOutS } } });
+  },
+
+  updateSeam(patch) {
+    const s = get();
+    const seam = s.playback.seam;
+    if (!seam) return;
+    set({ playback: { ...s.playback, seam: { ...seam, ...patch } } });
+  },
+
+  closeSeam() {
+    const s = get();
+    if (!s.playback.seam) return;
+    const focused = s.focusedChunkId
+      ? s.chunks.find((c) => c.id === s.focusedChunkId) ?? null
+      : null;
+    set({
+      playback: {
+        ...s.playback,
+        seam: null,
+        loop: loopForMode(s.playback.mode, focused),
+      },
     });
   },
 
