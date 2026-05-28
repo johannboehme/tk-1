@@ -288,8 +288,12 @@ export async function editRender(input: EditRenderInput): Promise<EditRenderResu
   const keptDurationS = intervals.reduce((acc, s) => acc + (s.out - s.in), 0);
   const framesTotal = Math.max(1, Math.round(keptDurationS * fps));
 
+  // Force a keyframe every ~2s so players can scrub without decoding
+  // thousands of P-frames from the segment start.
+  const KEYFRAME_INTERVAL_FRAMES = Math.max(1, Math.round(fps * 2));
   let nextIntervalIdx = 0;
   let firstFrameInGop = true;
+  let framesSinceKeyframe = 0;
   let framesEmitted = 0;
   let pendingError: Error | null = null;
   // The compositor's compositeImage() is async (WebGPU readback is
@@ -317,6 +321,7 @@ export async function editRender(input: EditRenderInput): Promise<EditRenderResu
               if (i !== nextIntervalIdx) {
                 nextIntervalIdx = i;
                 firstFrameInGop = true;
+                framesSinceKeyframe = 0;
               }
               break;
             }
@@ -338,10 +343,13 @@ export async function editRender(input: EditRenderInput): Promise<EditRenderResu
             // master time (single-cam pipeline = master time).
             tS,
           );
-          encoder.pushFrame(composed, { keyFrame: firstFrameInGop });
+          const keyFrame =
+            firstFrameInGop || framesSinceKeyframe >= KEYFRAME_INTERVAL_FRAMES;
+          encoder.pushFrame(composed, { keyFrame });
           composed.close();
           frame.close();
           firstFrameInGop = false;
+          framesSinceKeyframe = keyFrame ? 1 : framesSinceKeyframe + 1;
           framesEmitted++;
           if (framesEmitted % 30 === 0 || framesEmitted === framesTotal) {
             input.onProgress?.({
@@ -832,6 +840,9 @@ export async function editRenderMulti(
   const totalKept = intervals.reduce((acc, s) => acc + (s.out - s.in), 0);
   const totalFrames = Math.max(1, Math.round(totalKept * fps));
   const frameDurationUs = Math.round(1_000_000 / fps);
+  // Force a keyframe every ~2s so players can scrub without decoding
+  // thousands of P-frames from the segment start.
+  const KEYFRAME_INTERVAL_FRAMES = Math.max(1, Math.round(fps * 2));
 
   // Arrangement-mode pill table. When present, the renderer dispatches
   // each frame's active cam through `activeCamAtArr` so per-pill trim
@@ -842,6 +853,7 @@ export async function editRenderMulti(
   const pillMode = pillsForRender.length > 0 && input.segments.length > 0;
 
   let framesEmitted = 0;
+  let framesSinceKeyframe = 0;
   let pendingError: Error | null = null;
   // Pipeline parallelisation: the main loop awaits frameAtOrBefore (the
   // decoder runs ahead inside CamFrameStream), then queues compositor +
@@ -857,6 +869,7 @@ export async function editRenderMulti(
     let arrCursorPerSeg = 0;
     for (const seg of intervals) {
       const segStartFrame = framesEmitted;
+      framesSinceKeyframe = 0;
       const segFrames = Math.max(0, Math.round((seg.out - seg.in) * fps));
       for (let i = 0; i < segFrames; i++) {
         if (pendingError) throw pendingError;
@@ -1022,11 +1035,14 @@ export async function editRenderMulti(
         }
         const outTimestampUs = framesEmitted * frameDurationUs;
         const isFirstInSeg = framesEmitted === segStartFrame;
+        const isKeyframe =
+          isFirstInSeg || framesSinceKeyframe >= KEYFRAME_INTERVAL_FRAMES;
+        framesSinceKeyframe = isKeyframe ? 1 : framesSinceKeyframe + 1;
         const myFrameNum = framesEmitted;
         const captured = {
           src,
           outTs: outTimestampUs,
-          isFirstInSeg,
+          isKeyframe,
           tArr,
         };
         framesEmitted++;
@@ -1049,7 +1065,7 @@ export async function editRenderMulti(
               // at the duplicate-pill slot fires there and only there.
               captured.tArr,
             );
-            encoder.pushFrame(composed, { keyFrame: captured.isFirstInSeg });
+            encoder.pushFrame(composed, { keyFrame: captured.isKeyframe });
             composed.close();
             const done = myFrameNum + 1;
             if (done % 30 === 0 || done === totalFrames) {
