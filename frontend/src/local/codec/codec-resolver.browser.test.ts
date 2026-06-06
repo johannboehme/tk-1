@@ -16,7 +16,10 @@ async function opfsFixture(name: string): Promise<File> {
 }
 
 describe("codec resolver: decodeAudioToMonoPcm (real Chromium)", () => {
-  it("default path picks WebCodecs (decodeAudioData) for a standard MP4", async () => {
+  it("default path decodes a standard MP4 Blob via WebCodecs (now the streaming sub-decoder)", async () => {
+    // A streamable Blob auto-routes to the streaming decoder regardless of
+    // size; both streaming and the whole-file path report backend "webcodecs",
+    // so we only assert the decode succeeded with the right shape.
     const blob = await fetchFixture();
     const result = await decodeAudioToMonoPcm(blob, 22050);
     expect(result.backend).toBe("webcodecs");

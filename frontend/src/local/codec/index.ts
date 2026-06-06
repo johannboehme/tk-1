@@ -3,14 +3,21 @@
  * operation. Callers (sync, render) don't know whether WebCodecs or
  * ffmpeg.wasm did the work — they only see PCM / chunks coming out.
  *
- * Routing strategy:
- *   1. **Big files (≥ STREAMING_THRESHOLD)**: route to the streaming
- *      decoder for the detected container (mp4 / mp3 / wav). The
- *      whole-file paths (`decodeAudioData`, ffmpeg.wasm MEMFS) blow up
- *      past Chromium's ~2 GiB ArrayBuffer cap; streaming reads in 4 MiB
- *      batches and feeds WebCodecs `AudioDecoder` chunks at a time.
- *   2. **Small files**: keep the existing behaviour — try WebCodecs
- *      `decodeAudioData` first, fall back to ffmpeg.wasm on failure.
+ * Routing strategy (capability-based, not size-based):
+ *   1. **Streamable Blobs** (source is a `Blob`/`File` that sniffs as
+ *      mp4 / mp3 / wav): route to the streaming decoder for that
+ *      container — regardless of file size. The whole-file paths
+ *      (`decodeAudioData`, ffmpeg.wasm MEMFS) decode into a single
+ *      ArrayBuffer and blow up on long recordings: a 45 MB MP3 expands to
+ *      ~1 GB of PCM and overflows Chromium's allocator long before the
+ *      ~2 GiB ArrayBuffer cap. Streaming reads in 4 MiB batches and feeds
+ *      WebCodecs `AudioDecoder` chunks at a time, so memory stays bounded.
+ *      If streaming fails on a small file, we fall back to the whole-file
+ *      path below.
+ *   2. **Everything else** (non-streamable containers like ogg/flac/opus,
+ *      or `ArrayBuffer` sources that can't be sliced incrementally): try
+ *      WebCodecs `decodeAudioData` first, fall back to ffmpeg.wasm on
+ *      failure.
  *
  * The result reports which backend won (`.backend`) so the UI can show it
  * to the user — that's the "Mechanismus-Indikator" requirement from the
@@ -23,12 +30,12 @@ import {
 } from "./webcodecs/audio-decode";
 import { sniffContainer } from "./streaming/sniff-container";
 
-/** Files at or above this size go through the streaming decoder path.
- *  Files below it stay on the existing whole-file fast path. The
- *  threshold is well below Chromium's ArrayBuffer cap (~2 GiB) so we
- *  never let the fast path try a file it cannot handle. 500 MiB also
- *  exercises the streaming path in normal-usage testing — not just
- *  pathological huge files. */
+/** Fallback ceiling for streamable files. Streamable Blobs always try
+ *  the streaming decoder first (see routing strategy above); if streaming
+ *  *fails*, a file below this size falls back to the whole-file path,
+ *  while a file at or above it surfaces the streaming error directly — a
+ *  whole-file retry on something this large would only OOM. Well below
+ *  Chromium's ArrayBuffer cap (~2 GiB). */
 const STREAMING_THRESHOLD = 500 * 1024 * 1024;
 
 let ffmpegAudioDecodeImpl:
@@ -83,14 +90,26 @@ export async function decodeAudioToMonoPcm(
     return runStreamingDecode(source, targetSampleRate, opts.onProgress);
   }
 
-  // Auto-route by file size.
-  const isBlob = source instanceof Blob;
-  const tooBigForFastPath = isBlob && source.size >= STREAMING_THRESHOLD;
-  if (tooBigForFastPath) {
-    return runStreamingDecode(source, targetSampleRate, opts.onProgress);
+  // Auto-route. Prefer the streaming decoder whenever the source is a Blob
+  // whose container we can stream (mp3 / mp4 / wav) — independent of size.
+  // The whole-file paths choke on long recordings, so streaming is the safe
+  // default; non-streamable containers and ArrayBuffer sources drop through
+  // to the whole-file path below.
+  let streamingErr: unknown;
+  if (source instanceof Blob && (await sniffContainer(source)) !== null) {
+    try {
+      return await runStreamingDecode(source, targetSampleRate, opts.onProgress);
+    } catch (err) {
+      // Above the fallback ceiling a whole-file retry would only OOM, so
+      // surface the streaming failure directly.
+      if (source.size >= STREAMING_THRESHOLD) throw err;
+      streamingErr = err;
+    }
   }
 
-  // Small file: try WebCodecs / decodeAudioData first, fall back on failure.
+  // Whole-file path: ArrayBuffer source, non-streamable container, or a small
+  // streamable file whose streaming decode failed. Try WebCodecs /
+  // decodeAudioData first, fall back to ffmpeg.wasm on failure.
   opts.onProgress?.(0);
   let webcodecsErr: unknown;
   try {
@@ -121,7 +140,13 @@ export async function decodeAudioToMonoPcm(
         ? webcodecsErr.message
         : String(webcodecsErr);
     const ffMsg = ffErr instanceof Error ? ffErr.message : String(ffErr);
-    throw new Error(`Audio decode failed (ffmpeg: ${ffMsg}; webcodecs: ${webMsg})`);
+    const streamMsg =
+      streamingErr !== undefined
+        ? `; streaming: ${streamingErr instanceof Error ? streamingErr.message : String(streamingErr)}`
+        : "";
+    throw new Error(
+      `Audio decode failed (ffmpeg: ${ffMsg}; webcodecs: ${webMsg}${streamMsg})`,
+    );
   }
 }
 
