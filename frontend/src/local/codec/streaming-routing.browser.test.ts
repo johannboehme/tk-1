@@ -43,4 +43,35 @@ describe("codec resolver: streaming-routing", () => {
       decodeAudioToMonoPcm(blob, 22050, { forceBackend: "streaming" }),
     ).rejects.toThrow(/streamable/i);
   });
+
+  it("auto-routes a small MP3 Blob through the streaming path (sub-progress emitted)", async () => {
+    // Regression for the [decoding-studio-audio] OOM: a long (~45 MB) MP3
+    // expands to ~1 GB of PCM and blows up the whole-file decodeAudioData /
+    // ffmpeg paths. Streamable Blobs must take the memory-safe streaming path
+    // regardless of file size — not only when they cross the old 500 MB gate.
+    // We can't tell streaming from whole-file by `backend` (both report
+    // "webcodecs"), so we use the progress signature instead: streaming emits
+    // a fraction after each read batch (0 < f < 1); the whole-file path only
+    // ever emits 0 then 1.
+    if (typeof AudioDecoder === "undefined") return;
+    const blob = await fetchBlob(MP3_FIXTURE);
+    const fracs: number[] = [];
+    const result = await decodeAudioToMonoPcm(blob, 22050, {
+      onProgress: (f) => fracs.push(f),
+    });
+    expect(result.pcm.length).toBeGreaterThan(0);
+    expect(fracs.some((f) => f > 0 && f < 1)).toBe(true);
+  });
+
+  it("auto-routes an ArrayBuffer source through the whole-file path (no sub-progress)", async () => {
+    // ArrayBuffer sources can't be streamed (no incremental slicing), so they
+    // must fall through to decodeAudioData -> ffmpeg, which reports only 0/1.
+    const ab = await (await fetchBlob(MP4_FIXTURE)).arrayBuffer();
+    const fracs: number[] = [];
+    const result = await decodeAudioToMonoPcm(ab, 22050, {
+      onProgress: (f) => fracs.push(f),
+    });
+    expect(result.pcm.length).toBeGreaterThan(0);
+    expect(fracs.some((f) => f > 0 && f < 1)).toBe(false);
+  });
 });
