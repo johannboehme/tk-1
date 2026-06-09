@@ -10,11 +10,11 @@
 import { useEffect, useRef } from "react";
 import { useEditorStore } from "../../store";
 import {
-  effectiveBeatPhaseS,
+  arrBeatPhaseS,
   effectiveBeatsPerBar,
   effectiveBarOffsetBeats,
 } from "../../selectors/timing";
-import { arrToMaster, masterToArr } from "../../arrangement-time";
+import { arrToMaster } from "../../arrangement-time";
 import { buildRulerTicks } from "./beat-ruler-ticks";
 
 interface BeatRulerProps {
@@ -43,15 +43,15 @@ export function BeatRuler({
 }: BeatRulerProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const bpm = useEditorStore((s) => s.jobMeta?.bpm?.value ?? null);
-  // The selectors return master-time. The ruler renders against the
-  // arr-time canvas (`viewStartS`/`viewEndS` are arr-time), so project
-  // master-bar phase into arr-time once. With single-take's
-  // whole-master segment this is Identity; long-form gets one master-
-  // bar grid running continuously across the song instead of a
-  // separate phase per chunk.
+  // The ruler renders against the arr-time canvas (`viewStartS`/`viewEndS`
+  // are arr-time), so the master beat grid is anchored into arr-time via
+  // `arrBeatPhaseS` (beat 0 relative to the first played segment). With
+  // single-take's whole-master `[0, dur]` segment this is Identity;
+  // long-form gets one master-bar grid running continuously from the
+  // start of the song instead of a separate phase per chunk.
   const arrSegments = useEditorStore((s) => s.arrangementSegments);
   const beatPhase = useEditorStore((s) =>
-    masterToArr(effectiveBeatPhaseS(s.jobMeta), arrSegments),
+    arrBeatPhaseS(s.jobMeta, arrSegments),
   );
   const beatsPerBar = useEditorStore((s) => effectiveBeatsPerBar(s.jobMeta));
   const barOffsetBeats = useEditorStore((s) =>

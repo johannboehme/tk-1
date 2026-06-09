@@ -44,6 +44,7 @@ import {
   effectiveBeatPhaseS,
   effectiveBeatsPerBar,
   effectiveBarOffsetBeats,
+  arrBeatPhaseS,
 } from "./selectors/timing";
 import type { Cut } from "../storage/jobs-db";
 import type { FxKind, PunchFx } from "./fx/types";
@@ -2325,14 +2326,11 @@ export const useEditorStore = create<EditorState>()(
       const s = get();
       const mode = s.ui.snapMode;
       if (mode === "off" || mode === "match") return t;
-      // beatPhase is the master-time of beat 0. For the snap result to
-      // land on the bar marker the BeatRuler renders, the anchor must
-      // be projected into the same axis as `t`. `masterToArr` is the
-      // bijection the BeatRuler itself uses.
-      const beatPhase = masterToArr(
-        effectiveBeatPhaseS(s.jobMeta),
-        s.arrangementSegments,
-      );
+      // For the snap result to land on the bar marker the BeatRuler
+      // renders, the beat-grid anchor must be in the same arr-time axis
+      // as `t`. `arrBeatPhaseS` is the exact anchor the BeatRuler uses
+      // (beat 0 relative to the first played segment).
+      const beatPhase = arrBeatPhaseS(s.jobMeta, s.arrangementSegments);
       return snapTime(t, mode, {
         bpm: s.jobMeta?.bpm?.value ?? null,
         beatPhase,

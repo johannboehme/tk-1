@@ -5,8 +5,10 @@ import {
   effectiveBeatsPerBar,
   effectiveBarOffsetBeats,
   effectiveBarPhaseS,
+  arrBeatPhaseS,
 } from "./timing";
 import type { JobMeta } from "../store";
+import type { Segment } from "../types";
 
 const baseMeta: JobMeta = {
   id: "j",
@@ -157,6 +159,49 @@ describe("effectiveBarOffsetBeats", () => {
         barOffsetBeats: -1,
       }),
     ).toBe(3);
+  });
+});
+
+describe("arrBeatPhaseS", () => {
+  const meta148: JobMeta = {
+    ...baseMeta,
+    bpm: { value: 148, confidence: 1, phase: 0.3, manualOverride: false },
+  };
+
+  it("returns the raw master phase when there are no segments", () => {
+    expect(arrBeatPhaseS(meta148, [])).toBeCloseTo(0.3, 6);
+  });
+
+  it("is identity for single-take's whole-master [0, dur] segment", () => {
+    // seg0.in === 0 → arr-anchor equals the master phase, exactly as the
+    // pre-projection direct-mode path behaved.
+    const segs: Segment[] = [{ in: 0, out: 275 }];
+    expect(arrBeatPhaseS(meta148, segs)).toBeCloseTo(0.3, 6);
+  });
+
+  it("anchors the grid to the first PLAYED segment, not where master-0 lands", () => {
+    // Long-form regression: the arrangement plays a mid-song chunk first
+    // (master 200..275) and the chunk covering master-0 last (0..50).
+    // The OLD `masterToArr(beatPhase)` projection mapped beat-0 (master
+    // ~0.3 s) into the LAST segment, anchoring bar 1 at arr ~75 s — "way
+    // back in the song". The correct anchor is relative to seg0.in (200),
+    // i.e. a large negative arr-time so the grid fills from arr 0 onward.
+    const segs: Segment[] = [
+      { in: 200, out: 275 },
+      { in: 50, out: 100 },
+      { in: 0, out: 50 },
+    ];
+    expect(arrBeatPhaseS(meta148, segs)).toBeCloseTo(0.3 - 200, 6);
+    // It must NOT be a large positive arr-time (the buggy behaviour).
+    expect(arrBeatPhaseS(meta148, segs)).toBeLessThan(0);
+  });
+
+  it("a first chunk that is the true song start still anchors bar 1 near arr 0", () => {
+    const segs: Segment[] = [
+      { in: 0, out: 60 },
+      { in: 120, out: 180 },
+    ];
+    expect(arrBeatPhaseS(meta148, segs)).toBeCloseTo(0.3, 6);
   });
 });
 
