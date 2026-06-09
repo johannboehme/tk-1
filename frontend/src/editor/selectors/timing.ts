@@ -12,6 +12,7 @@
  * arr-time project the result through `masterToArr` at the call site.
  */
 import type { JobMeta } from "../store";
+import type { Segment } from "../types";
 
 const DEFAULT_BEATS_PER_BAR = 4;
 
@@ -23,6 +24,37 @@ export function effectiveBeatPhaseS(
   const nudge = meta?.audioStartNudgeS ?? 0;
   const phase = meta?.bpm?.phase ?? 0;
   return phase + nudge;
+}
+
+/** Arrangement-time anchor of the master beat grid (beat 0 in arr-time).
+ *
+ *  The editor keeps ONE master bar grid for every job (see
+ *  `effectiveBeatPhaseS`). Consumers that draw the grid or snap to it on
+ *  the arr-time canvas need beat 0 expressed in arr-time. Arr-time 0 is
+ *  the start of the first PLAYED segment, where `arr = master - seg0.in`,
+ *  so the anchor is simply `beatPhaseMaster - seg0.in`. That keeps the
+ *  grid continuous from the start of the song the user assembled,
+ *  whatever order the chunks play in and wherever the first one sits in
+ *  the source recording.
+ *
+ *  Do NOT project beat 0 through `masterToArr`: beat 0 is a single master
+ *  instant (~0.3 s into the source). `masterToArr` returns the arr-time
+ *  at which that instant is *played*, which is wherever the chunk
+ *  covering master ~0 lands in the playback order. For a long-form
+ *  arrangement whose first chunk starts late in the source (or whose
+ *  master-0 chunk plays last), that anchors bar 1 far down the timeline —
+ *  the "bar ruler starts way back in the song" bug.
+ *
+ *  Empty `segments` → the raw master phase unchanged (single-take supplies
+ *  a whole-master `[0, dur]` segment, so this only hits the pre-load case).
+ */
+export function arrBeatPhaseS(
+  meta: JobMeta | null | undefined,
+  segments: readonly Segment[],
+): number {
+  const phase = effectiveBeatPhaseS(meta);
+  if (segments.length === 0) return phase;
+  return phase - segments[0].in;
 }
 
 /** Master-time of the audio-onset (where audible material begins). */

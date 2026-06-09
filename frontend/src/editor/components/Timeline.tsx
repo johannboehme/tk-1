@@ -45,7 +45,7 @@ import {
   candidateIdxNearestStart,
 } from "../match-snap";
 import {
-  effectiveBeatPhaseS,
+  arrBeatPhaseS,
   effectiveBeatsPerBar,
   effectiveBarOffsetBeats,
 } from "../selectors/timing";
@@ -241,7 +241,12 @@ export function Timeline({
   const snapMode = useEditorStore((s) => s.ui.snapMode);
   const lanesLocked = useEditorStore((s) => s.ui.lanesLocked);
   const bpm = useEditorStore((s) => s.jobMeta?.bpm?.value ?? null);
-  const beatPhase = useEditorStore((s) => effectiveBeatPhaseS(s.jobMeta));
+  // Master beat grid anchored into the arr-time canvas axis (beat 0
+  // relative to the first played segment) — the same anchor the BeatRuler
+  // draws, so drag/loop snapping lands on the visible bar lines.
+  const arrBeatPhase = useEditorStore((s) =>
+    arrBeatPhaseS(s.jobMeta, s.arrangementSegments),
+  );
   const beatsPerBar = useEditorStore((s) => effectiveBeatsPerBar(s.jobMeta));
   const barOffsetBeats = useEditorStore((s) =>
     effectiveBarOffsetBeats(s.jobMeta),
@@ -1101,8 +1106,8 @@ export function Timeline({
 
   // Build the snap context for this drag. `extraCandidates` is set during
   // a clip-move so MATCH mode can snap the cam to its alternative offsets.
-  // `beatPhase` is master-time (per `effectiveBeatPhaseS`); the snap
-  // routines work in whichever time-domain the caller projects it into.
+  // Callers pass `arrBeatPhase` (already in the arr-time canvas axis), so
+  // the snap routines match the BeatRuler's bar lines directly.
   function buildSnapCtx(
     phaseDomainPhase: number,
     extraCandidates?: number[],
@@ -1127,8 +1132,7 @@ export function Timeline({
   function snapped(t: number, e: { shiftKey: boolean }, candPositions?: number[]): number {
     if (e.shiftKey || snapMode === "off") return t;
     const arrT = masterToView(t);
-    const arrPhase = masterToArr(beatPhase, arrangementSegments);
-    const snappedT = snapTime(arrT, snapMode, buildSnapCtx(arrPhase, candPositions));
+    const snappedT = snapTime(arrT, snapMode, buildSnapCtx(arrBeatPhase, candPositions));
     return viewToMaster(snappedT);
   }
 
@@ -1142,8 +1146,7 @@ export function Timeline({
     candPositions?: number[],
   ): number {
     if (e.shiftKey || snapMode === "off") return arrT;
-    const arrPhase = masterToArr(beatPhase, arrangementSegments);
-    return snapTime(arrT, snapMode, buildSnapCtx(arrPhase, candPositions));
+    return snapTime(arrT, snapMode, buildSnapCtx(arrBeatPhase, candPositions));
   }
 
   // ─── Multi-touch pinch-zoom + 2-finger pan ─────────────────────────
@@ -1444,13 +1447,12 @@ export function Timeline({
         Math.min(trimOutArr - len, arrAtPointer - drag.offset),
       );
       // Loop bounds live in arr-time; snap against the master-bar-grid
-      // projected into arr-time so a long-form arrangement still snaps
+      // anchored into arr-time so a long-form arrangement still snaps
       // to the song's bar lines.
-      const arrPhase = masterToArr(beatPhase, arrangementSegments);
       const newStart =
         e.shiftKey || snapMode === "off"
           ? newStartRaw
-          : snapTime(newStartRaw, snapMode, buildSnapCtx(arrPhase));
+          : snapTime(newStartRaw, snapMode, buildSnapCtx(arrBeatPhase));
       // OP-1 tape feel: don't yank the playhead while dragging — the
       // store defers the wrap to the OLD loop.end. The active element
       // keeps playing through that point and wraps to the new loop's
