@@ -588,7 +588,18 @@ export const useTriageStore = create<TriageState>((set, get) => ({
     for (let i = 0; i < boundaries.length - 1; i++) {
       const pieceStart = boundaries[i];
       const pieceEnd = boundaries[i + 1];
-      const anchor = anchorInRange(originalAnchor, bpm, beatsPerBar, pieceStart);
+      // Interior pieces start exactly on a cut, which IS a downbeat of the
+      // original grid by construction — so the piece's own bar-1 anchor is
+      // its start. Don't round-trip through anchorInRange: cuts are rounded
+      // to whole ms, and with a fractional msPerBar a cut can land a hair
+      // past its grid line, making the strict ceil overshoot by a full bar
+      // (the anchor lands a bar into the piece, so its ruler reads bar 0 at
+      // the edge instead of 1). The leading partial (i === 0) may start
+      // mid-bar, so it keeps the original grid anchor.
+      const anchor =
+        i === 0
+          ? anchorInRange(originalAnchor, bpm, beatsPerBar, pieceStart)
+          : pieceStart;
       const pieceId =
         i === 0 ? chunk.id : `${chunk.id}-s${i}-${Date.now().toString(36)}`;
       if (i > 0) newIds.push(pieceId);

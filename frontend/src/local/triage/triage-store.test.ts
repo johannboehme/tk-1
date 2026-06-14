@@ -320,6 +320,31 @@ describe("triage-store · sliceChunkIntoBars", () => {
     for (const p of pieces) expect((p.audioStartMs! - 1000) % 2000).toBe(0);
   });
 
+  it("anchors each piece on its OWN downbeat even when msPerBar is fractional", () => {
+    // 130 BPM 4/4 → msPerBar 1846.15… (non-integer). Cuts get rounded to
+    // whole ms, so a cut can land a hair past its exact grid line; a strict
+    // ceil-based anchor search then overshoots by a full bar, putting the
+    // piece's bar-1 a bar into the piece (ruler shows bar 0 at the edge).
+    // Each interior piece must anchor exactly on its own start downbeat.
+    seed([
+      makeChunk({
+        id: "c1",
+        startMs: 0,
+        endMs: 20000,
+        audioStartMs: 0,
+        effectiveBpm: 130,
+        beatsPerBar: 4,
+      }),
+    ]);
+    useTriageStore.getState().sliceChunkIntoBars("c1", 1);
+    const pieces = useTriageStore
+      .getState()
+      .chunks.sort((a, b) => a.startMs - b.startMs);
+    expect(pieces.length).toBeGreaterThan(2);
+    // Every piece's grid anchor sits at its own start — no full-bar overshoot.
+    for (const p of pieces) expect(p.audioStartMs).toBe(p.startMs);
+  });
+
   it("is a no-op when the chunk is shorter than one interval", () => {
     seed([
       makeChunk({
