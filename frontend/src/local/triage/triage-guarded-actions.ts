@@ -28,6 +28,7 @@ import {
 } from "../edits-impact";
 import {
   applyMergeToArrangement,
+  applySliceToArrangement,
   applySplitToArrangement,
 } from "./triage-arrangement-ops";
 import { useTriageStore } from "./triage-store";
@@ -111,6 +112,45 @@ export async function splitFocusedGuarded(atMs: number): Promise<void> {
       newRightId,
       mode,
     );
+    if (next !== currentArrangement) {
+      await jobsDb.updateJob(state.jobId, { arrangement: next });
+    }
+  }
+}
+
+/**
+ * Slice the focused chunk into fixed `intervalBars`-bar pieces. If the
+ * chunk is in the arrangement, confirm first (the single occurrence is
+ * replaced by all pieces back-to-back, so the take still plays through
+ * — but the user should know N items are about to appear). The
+ * arrangement is mutated in IDB directly so the next Arrange / Editor
+ * mount picks up the change.
+ */
+export async function sliceFocusedGuarded(intervalBars: number): Promise<void> {
+  const state = useTriageStore.getState();
+  const focusedId = state.focusedChunkId;
+  if (!focusedId || !state.jobId) return;
+
+  const job = await jobsDb.getJob(state.jobId);
+  const arrangement = job?.arrangement ?? [];
+  const usageCount = arrangement.filter((a) => a.chunkId === focusedId).length;
+
+  if (usageCount > 0) {
+    const ok = await confirmDestructive({
+      title: "Slice chunk in arrangement?",
+      body: `This chunk appears ${pluralize(usageCount, "time", "times")} in the arrangement. Slicing replaces each occurrence with the new pieces back-to-back.`,
+      destructiveLabel: "Slice chunk",
+    });
+    if (!ok) return;
+  }
+
+  const newIds = state.sliceChunkIntoBars(focusedId, intervalBars);
+  if (newIds.length === 0) return; // nothing to cut (too short / no BPM)
+
+  if (usageCount > 0 && state.jobId) {
+    const fresh = await jobsDb.getJob(state.jobId);
+    const currentArrangement = fresh?.arrangement ?? [];
+    const next = applySliceToArrangement(currentArrangement, focusedId, newIds);
     if (next !== currentArrangement) {
       await jobsDb.updateJob(state.jobId, { arrangement: next });
     }

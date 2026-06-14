@@ -57,6 +57,18 @@ export interface TriageView {
   scrollX: number;
 }
 
+/** Transient marker published by `sliceChunkIntoBars` so the timeline
+ *  can play its "downbeat guillotine" reveal: which pieces are brand
+ *  new (every slice of the just-cut chunk, including the kept-id one)
+ *  and where the cuts landed (master-audio seconds). `gen` is a
+ *  monotonic id so a re-slice re-triggers the animation even when the
+ *  same chunk id reappears. Cleared via `clearSliceReveal`. */
+export interface SliceReveal {
+  pieceIds: string[];
+  cutTimesS: number[];
+  gen: number;
+}
+
 export interface TriageState {
   // ─── Inputs / cached data ─────────────────────────────────────────────
   jobId: string | null;
@@ -98,6 +110,13 @@ export interface TriageState {
    *  dropdown — short blips below the threshold get auto-rejected so
    *  the arrangement isn't polluted with sample-test fragments. */
   minChunkBars: number;
+  /** Interval length (in bars at the chunk's bar grid) used by the
+   *  inspector's "slice into fixed intervals" action. Own value,
+   *  independent of `minChunkBars`. Default 4. */
+  sliceIntervalBars: number;
+  /** Transient reveal marker for the slice animation. Null except in
+   *  the moments after a slice. Not persisted. */
+  sliceReveal: SliceReveal | null;
   focusedChunkId: string | null;
   selectedCamId: string | null;
 
@@ -155,6 +174,15 @@ export interface TriageState {
    *  either edge or outside the chunk). The left half keeps the
    *  original ID so persistent references survive. */
   splitChunkAt(id: string, atMs: number): string | null;
+  /** Slice a chunk into back-to-back pieces of `intervalBars` bars each,
+   *  cutting on downbeats of the chunk's own bar grid. The remainder
+   *  (when the chunk isn't a clean multiple) stays as a shorter final
+   *  piece. The first piece keeps the original id (so persistent
+   *  references survive); the rest get fresh ids, returned in playback
+   *  order. No-op (returns []) when the id is unknown, `intervalBars < 1`,
+   *  no BPM is available, or the chunk is shorter than one interval.
+   *  Publishes a `sliceReveal` marker for the timeline animation. */
+  sliceChunkIntoBars(id: string, intervalBars: number): string[];
   /** Re-fit a chunk's bar-grid phase from its current audio range,
    *  holding the song-global BPM as the period. Snaps `startMs` and
    *  `endMs` onto bar boundaries of the new grid so two conformed
@@ -201,6 +229,11 @@ export interface TriageState {
    *  many bars at the song-global tempo are immediately marked
    *  accepted=false. Subsequent re-detections re-apply the filter. */
   setMinChunkBars(bars: number): void;
+  /** Set the slice interval (bars). Clamped to >= 1. */
+  setSliceIntervalBars(bars: number): void;
+  /** Clear the transient slice-reveal marker once the animation has
+   *  played (called from the timeline on a timer). */
+  clearSliceReveal(): void;
 
   focusChunk(id: string | null): void;
   /** Sequence-walker advance: move focus to the next chunk WITHOUT
@@ -264,6 +297,11 @@ export const DEFAULT_SILENCE_CONFIG_STORE: SilenceConfig = {
   minPauseMs: 1500,
 };
 
+/** Monotonic generation counter for slice-reveal markers. Module-level
+ *  (not `Date.now()`) so it stays deterministic in tests and re-triggers
+ *  the animation on every slice even when a chunk id reappears. */
+let sliceRevealGen = 0;
+
 export const useTriageStore = create<TriageState>((set, get) => ({
   jobId: null,
   audioDuration: 0,
@@ -284,6 +322,8 @@ export const useTriageStore = create<TriageState>((set, get) => ({
   beatPhaseS: 0,
   snapMode: "1",
   minChunkBars: 0,
+  sliceIntervalBars: 4,
+  sliceReveal: null,
   focusedChunkId: null,
   selectedCamId: null,
 
@@ -310,6 +350,7 @@ export const useTriageStore = create<TriageState>((set, get) => ({
       envelopeHz: args.envelopeHz,
       selectedCamId: args.cams[0]?.id ?? null,
       focusedChunkId: null,
+      sliceReveal: null,
       playback: { ...INITIAL_PLAYBACK, mode: args.mode },
       view: INITIAL_VIEW,
     });
@@ -332,6 +373,8 @@ export const useTriageStore = create<TriageState>((set, get) => ({
       beatPhaseS: 0,
       snapMode: "1",
       minChunkBars: 0,
+      sliceIntervalBars: 4,
+      sliceReveal: null,
       focusedChunkId: null,
       selectedCamId: null,
       playback: INITIAL_PLAYBACK,
@@ -504,6 +547,79 @@ export const useTriageStore = create<TriageState>((set, get) => ({
       next.focusChunk(newId);
     }
     return newId;
+  },
+
+  sliceChunkIntoBars(id, intervalBars) {
+    const s = get();
+    const chunk = s.chunks.find((c) => c.id === id);
+    if (!chunk) return [];
+    if (!Number.isFinite(intervalBars) || intervalBars < 1) return [];
+    const bpm = effectiveChunkBpm(chunk, s.jobBpm?.value ?? null);
+    const beatsPerBar = chunk.beatsPerBar > 0 ? chunk.beatsPerBar : s.beatsPerBar;
+    if (bpm <= 0 || beatsPerBar <= 0) return [];
+    const msPerBar = (60_000 / bpm) * beatsPerBar;
+    if (!Number.isFinite(msPerBar) || msPerBar <= 0) return [];
+    const step = Math.floor(intervalBars) * msPerBar;
+
+    // Cuts land on downbeats of the chunk's OWN grid, every `intervalBars`
+    // bars from the anchor — so the pieces share the same phase as the
+    // source take (same philosophy as splitChunkAt). The leading partial
+    // (start→first downbeat) and the trailing remainder both survive as
+    // their own shorter pieces; nothing is dropped.
+    const minGap = 50;
+    const originalAnchor = chunk.audioStartMs ?? chunk.startMs;
+    const lo = chunk.startMs + minGap;
+    const hi = chunk.endMs - minGap;
+    const cuts: number[] = [];
+    // First multiple of `step` past the anchor that clears the start edge.
+    let n = Math.floor((lo - originalAnchor) / step) + 1;
+    for (let cut = originalAnchor + n * step; cut < hi; cut += step, n++) {
+      cuts.push(Math.round(cut));
+    }
+    if (cuts.length === 0) return [];
+
+    // Boundaries → ordered pieces. First piece keeps the original id; the
+    // rest get fresh ids in playback order. Each piece is self-contained:
+    // its own grid anchor (a downbeat of the original grid inside its
+    // range) and its own origin snapshot for Reset.
+    const boundaries = [chunk.startMs, ...cuts, chunk.endMs];
+    const pieces: Chunk[] = [];
+    const newIds: string[] = [];
+    for (let i = 0; i < boundaries.length - 1; i++) {
+      const pieceStart = boundaries[i];
+      const pieceEnd = boundaries[i + 1];
+      const anchor = anchorInRange(originalAnchor, bpm, beatsPerBar, pieceStart);
+      const pieceId =
+        i === 0 ? chunk.id : `${chunk.id}-s${i}-${Date.now().toString(36)}`;
+      if (i > 0) newIds.push(pieceId);
+      pieces.push({
+        ...chunk,
+        id: pieceId,
+        startMs: pieceStart,
+        endMs: pieceEnd,
+        audioStartMs: anchor,
+        trimMode: "free",
+        originalStartMs: pieceStart,
+        originalEndMs: pieceEnd,
+        originalAudioStartMs: anchor,
+        preConformSnapshot: undefined,
+      });
+    }
+
+    const others = s.chunks.filter((c) => c.id !== id);
+    set({
+      chunks: [...others, ...pieces],
+      sliceReveal: {
+        pieceIds: pieces.map((p) => p.id),
+        cutTimesS: cuts.map((c) => c / 1000),
+        gen: ++sliceRevealGen,
+      },
+    });
+    // Focus stays on the first piece (which kept the original id).
+    if (s.focusedChunkId === id) {
+      useTriageStore.getState().focusChunk(chunk.id);
+    }
+    return newIds;
   },
 
   conformChunk(id) {
@@ -748,6 +864,15 @@ export const useTriageStore = create<TriageState>((set, get) => ({
   setMinChunkBars(bars) {
     const safe = Number.isFinite(bars) ? Math.max(0, bars) : 0;
     set({ minChunkBars: safe });
+  },
+
+  setSliceIntervalBars(bars) {
+    const safe = Number.isFinite(bars) ? Math.max(1, Math.floor(bars)) : 1;
+    set({ sliceIntervalBars: safe });
+  },
+
+  clearSliceReveal() {
+    set({ sliceReveal: null });
   },
 
   sequenceAdvance(nextId) {

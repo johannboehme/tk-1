@@ -15,6 +15,7 @@
  * Plus a playhead overlay and zoom/pan affordances.
  */
 import { useEffect, useMemo, useRef, useState } from "react";
+import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import {
   chunkBeatPhaseS,
   chunkPassesFilter,
@@ -71,6 +72,35 @@ export function TriageTimeline() {
   const updateChunk = useTriageStore((s) => s.updateChunk);
   const currentTime = useTriageStore((s) => s.playback.currentTime);
   const playbackMode = useTriageStore((s) => s.playback.mode);
+  const sliceReveal = useTriageStore((s) => s.sliceReveal);
+  const clearSliceReveal = useTriageStore((s) => s.clearSliceReveal);
+  const reducedMotion = useReducedMotion();
+
+  // Map each freshly-sliced piece to its left-to-right index so the
+  // "downbeat guillotine" reveal staggers across the new pieces. Keyed
+  // on the chunk list so it follows the pieces once they're in state.
+  const revealOrder = useMemo(() => {
+    if (!sliceReveal) return null;
+    const ids = new Set(sliceReveal.pieceIds);
+    const sorted = chunks
+      .filter((c) => ids.has(c.id))
+      .sort((a, b) => a.startMs - b.startMs);
+    const index = new Map<string, number>();
+    sorted.forEach((c, i) => index.set(c.id, i));
+    return { index, gen: sliceReveal.gen };
+  }, [sliceReveal, chunks]);
+
+  // Tear the reveal marker down once the animation has played so it
+  // doesn't re-fire on unrelated re-renders. Reduced-motion clears
+  // immediately (the pieces are already in their final state).
+  useEffect(() => {
+    if (!sliceReveal) return;
+    const ms = reducedMotion
+      ? 0
+      : Math.min(1200, 500 + sliceReveal.cutTimesS.length * 60);
+    const t = window.setTimeout(() => clearSliceReveal(), ms);
+    return () => window.clearTimeout(t);
+  }, [sliceReveal, reducedMotion, clearSliceReveal]);
 
   // Track wrapper width AND height so the waveform breathes vertically
   // when the user gives the timeline column more room.
@@ -820,14 +850,24 @@ export function TriageTimeline() {
           height: CHUNK_LANE_HEIGHT,
         }}
       >
-        {chunks.map((chunk) => (
+        {chunks.map((chunk) => {
+          const revealIndex = revealOrder?.index.get(chunk.id) ?? null;
+          return (
           <ChunkBlock
-            key={chunk.id}
+            // Remount sliced pieces (incl. the kept-id first piece) so the
+            // reveal animation fires on every slice, keyed on the gen.
+            key={
+              revealIndex != null
+                ? `${chunk.id}-rev${revealOrder!.gen}`
+                : chunk.id
+            }
             chunk={chunk}
             timeToX={timeToX}
             visibleStart={viewStartS}
             visibleEnd={viewEndS}
             focused={chunk.id === focusedChunkId}
+            revealIndex={revealIndex}
+            reducedMotion={!!reducedMotion}
             // Filter is a view concern — chunks below the threshold
             // render as effectively-rejected without touching their
             // .accepted flag, so toggling the filter back off restores
@@ -838,8 +878,41 @@ export function TriageTimeline() {
             }
             onTrimStart={(edge, e) => startTrimDrag(e, chunk, edge)}
           />
-        ))}
+          );
+        })}
       </div>
+
+      {/* Downbeat-guillotine blades — a phosphor line drops on every cut,
+       *  staggered left→right, when a chunk is sliced. Spans waveform +
+       *  chunk lane so the cut reads as a clean vertical incision. */}
+      <AnimatePresence>
+        {sliceReveal && !reducedMotion &&
+          sliceReveal.cutTimesS.map((t, i) => {
+            const x = timeToX(t);
+            if (x < -2 || x > size.width + 2) return null;
+            return (
+              <motion.div
+                key={`blade-${sliceReveal.gen}-${i}`}
+                aria-hidden
+                className="absolute pointer-events-none"
+                style={{
+                  left: x - 1,
+                  top: TIME_RULER_HEIGHT + BAR_RULER_HEIGHT,
+                  height: waveformHeight + CHUNK_LANE_HEIGHT,
+                  width: 2,
+                  background: HOT_COLOR,
+                  boxShadow:
+                    "0 0 6px rgba(255,87,34,0.85), 0 0 2px rgba(255,87,34,1)",
+                  transformOrigin: "top",
+                }}
+                initial={{ opacity: 0, scaleY: 0.2 }}
+                animate={{ opacity: [0, 1, 0], scaleY: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.4, delay: i * 0.05, times: [0, 0.35, 1] }}
+              />
+            );
+          })}
+      </AnimatePresence>
 
       {currentTime >= viewStartS && currentTime <= viewEndS && (
         <div
@@ -867,6 +940,11 @@ interface ChunkBlockProps {
    *  visual treatment (hot vs muted, strikethrough). The chunk's own
    *  accepted flag stays the user's manual decision. */
   effectivelyAccepted: boolean;
+  /** Left-to-right position among freshly-sliced pieces, or null when
+   *  this block isn't part of an in-flight slice reveal. Drives the
+   *  staggered "deal" animation. */
+  revealIndex: number | null;
+  reducedMotion: boolean;
   onTrimStart: (edge: "left" | "right", e: React.MouseEvent) => void;
 }
 
@@ -877,6 +955,8 @@ function ChunkBlock({
   visibleEnd,
   focused,
   effectivelyAccepted,
+  revealIndex,
+  reducedMotion,
   onTrimStart,
 }: ChunkBlockProps) {
   const startS = chunk.startMs / 1000;
@@ -899,6 +979,35 @@ function ChunkBlock({
   const bg = effectivelyAccepted ? HOT_COLOR : "#5D5546";
   const fg = effectivelyAccepted ? "#FAF6EC" : "#A89F8B";
 
+  // Slice-reveal "deal": each new piece grows from its left seam and
+  // settles, staggered left→right, with a one-shot phosphor flash. The
+  // flash is a transient animation overlay — not a status layer — so it
+  // fades fully and never marks state. Skipped under reduced-motion.
+  const dealing = revealIndex != null && !reducedMotion;
+  const dealDelay = revealIndex != null ? revealIndex * 0.06 : 0;
+  const flashColor = effectivelyAccepted ? "#FFD7A8" : "#9C8F73";
+  const dealProps = dealing
+    ? {
+        initial: { scaleX: 0.9, y: -3 },
+        animate: { scaleX: 1, y: 0 },
+        transition: {
+          duration: 0.34,
+          delay: dealDelay,
+          ease: [0.22, 1, 0.36, 1] as [number, number, number, number],
+        },
+      }
+    : {};
+  const flash = dealing ? (
+    <motion.div
+      aria-hidden
+      className="absolute inset-0 pointer-events-none"
+      style={{ background: flashColor }}
+      initial={{ opacity: 0.8 }}
+      animate={{ opacity: 0 }}
+      transition={{ duration: 0.5, delay: dealDelay, ease: "easeOut" }}
+    />
+  ) : null;
+
   const showLabel = !tooNarrow && widthPx >= 120;
   const showHandles = !tooNarrow && widthPx >= HANDLES_MIN_PX;
   // Shrink the hit-area on small blocks so the two handles don't cover
@@ -915,32 +1024,37 @@ function ChunkBlock({
   // as proportionally tiny next to the rest of the lane.
   if (tooNarrow) {
     return (
-      <div
-        className="absolute top-1 bottom-1 rounded-[2px]"
+      <motion.div
+        className="absolute top-1 bottom-1 rounded-[2px] overflow-hidden"
         style={{
           left: renderLeft,
           width: widthPx,
           background: bg,
+          transformOrigin: "left center",
           outline: focused ? `1.5px solid ${HOT_COLOR}` : undefined,
           outlineOffset: focused ? 1 : undefined,
           boxShadow: focused
             ? "0 0 4px rgba(255,87,34,0.65)"
             : "inset 0 1px 0 rgba(255,255,255,0.18)",
-          zIndex: focused ? 2 : 1,
+          zIndex: focused || dealing ? 2 : 1,
         }}
         title={tooltip}
-      />
+        {...dealProps}
+      >
+        {flash}
+      </motion.div>
     );
   }
 
   return (
-    <div
+    <motion.div
       className="absolute top-0 bottom-0 flex items-center px-1 overflow-hidden"
       style={{
         left: renderLeft,
         width: widthPx,
         background: bg,
         color: fg,
+        transformOrigin: "left center",
         // Hot-orange ring + inner brass hairline = the 3-fach Tell
         // shared with Arrange's Frame component. Keeps the whole
         // selection language coherent across screens.
@@ -949,10 +1063,12 @@ function ChunkBlock({
         boxShadow: focused
           ? "inset 0 0 0 1px rgba(255,255,255,0.35), 0 0 6px rgba(255,87,34,0.45)"
           : undefined,
-        zIndex: focused ? 2 : 1,
+        zIndex: focused || dealing ? 2 : 1,
       }}
       title={tooltip}
+      {...dealProps}
     >
+      {flash}
       {!effectivelyAccepted && (
         // Soft diagonal hatch instead of the old hard 1-px white line —
         // reads as "set aside" without screaming "deleted".
@@ -1014,7 +1130,7 @@ function ChunkBlock({
           </div>
         </>
       )}
-    </div>
+    </motion.div>
   );
 }
 

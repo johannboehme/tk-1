@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   applySplitToArrangement,
   applyMergeToArrangement,
+  applySliceToArrangement,
 } from "./triage-arrangement-ops";
 import type { ArrangementItem } from "../../storage/jobs-db";
 
@@ -123,5 +124,56 @@ describe("applyMergeToArrangement", () => {
     const arr: ArrangementItem[] = [item("a1", "c3"), item("a2", "c4")];
     const out = applyMergeToArrangement(arr, "c1", "c2");
     expect(out).toBe(arr);
+  });
+});
+
+describe("applySliceToArrangement", () => {
+  it("returns identity when no piece ids are produced", () => {
+    const arr: ArrangementItem[] = [item("a1", "c1"), item("a2", "c2")];
+    const out = applySliceToArrangement(arr, "c1", []);
+    expect(out).toBe(arr);
+  });
+
+  it("returns identity when the sliced chunk isn't in the arrangement", () => {
+    const arr: ArrangementItem[] = [item("a1", "c2"), item("a2", "c3")];
+    const out = applySliceToArrangement(arr, "c1", ["c1-s1", "c1-s2"]);
+    expect(out).toBe(arr);
+  });
+
+  it("expands a single occurrence into the original followed by every new piece", () => {
+    // Convention: after sliceChunkIntoBars the FIRST piece keeps the
+    // original id; the rest are the returned new ids in playback order.
+    const arr: ArrangementItem[] = [
+      item("a1", "c1"),
+      item("a2", "c2"),
+    ];
+    const out = applySliceToArrangement(arr, "c1", ["c1-s1", "c1-s2"]);
+    expect(out).toHaveLength(4);
+    expect(out[0]).toEqual(item("a1", "c1")); // original item untouched
+    expect(out[1].chunkId).toBe("c1-s1");
+    expect(out[2].chunkId).toBe("c1-s2");
+    expect(out[3]).toEqual(item("a2", "c2"));
+    // Fresh ids for the inserted pieces, distinct from each other.
+    expect(out[1].id).not.toBe("a1");
+    expect(out[2].id).not.toBe("a1");
+    expect(out[1].id).not.toBe(out[2].id);
+  });
+
+  it("expands every occurrence and gives each inserted piece a distinct id", () => {
+    const arr: ArrangementItem[] = [
+      item("a1", "c1"),
+      item("a2", "c2"),
+      item("a3", "c1"),
+    ];
+    const out = applySliceToArrangement(arr, "c1", ["c1-s1"]);
+    expect(out.map((i) => i.chunkId)).toEqual([
+      "c1",
+      "c1-s1",
+      "c2",
+      "c1",
+      "c1-s1",
+    ]);
+    // The two inserted "c1-s1" items must not collide on arrangement id.
+    expect(out[1].id).not.toBe(out[4].id);
   });
 });
