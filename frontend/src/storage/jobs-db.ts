@@ -226,6 +226,15 @@ export interface Chunk {
    *  Fragmenten — daher detect pro Chunk und aggregiere zum
    *  Song-globalen `job.bpm` (Mode der per-Chunk-Werte). */
   detectedBpm?: number;
+  /** Autocorrelation confidence of `detectedBpm` (0..1). Feeds the
+   *  song-global BPM vote so an ambiguous chunk counts for less than a
+   *  clearly-periodic one. Optional — absent on legacy / manually-created
+   *  chunks. */
+  detectedBpmConfidence?: number;
+  /** Tempo steadiness of the chunk (0..1, from the local-tempo curve).
+   *  1 ≈ metronome-tight, low ≈ free-played / drifting. Down-weights
+   *  rubato passages in the song-global BPM vote. Optional. */
+  detectedBpmStability?: number;
   /** User-Override für Half/Double-Time. -1 → ÷2, 0 → unverändert,
    *  1 → ×2. Wird auf `detectedBpm` angewendet, ergibt `effectiveBpm`. */
   bpmOctaveShift: -1 | 0 | 1;

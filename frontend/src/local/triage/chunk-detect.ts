@@ -134,6 +134,8 @@ export async function detectChunksFromEnvelope(
       startMs: seg.start_ms,
       endMs: snappedEndMs,
       detectedBpm: chunkAnalysis?.bpm,
+      detectedBpmConfidence: chunkAnalysis?.bpmConfidence,
+      detectedBpmStability: chunkAnalysis?.bpmStability,
       bpmOctaveShift: 0,
       effectiveBpm: chunkAnalysis?.bpm ?? 0,
       audioStartMs,
@@ -161,6 +163,10 @@ export async function detectChunksFromEnvelope(
 
 interface ChunkAnalysis {
   bpm: number | undefined;
+  /** Autocorrelation confidence of `bpm` (0..1), undefined when no tempo. */
+  bpmConfidence: number | undefined;
+  /** Tempo steadiness of the chunk (0..1), undefined when no tempo. */
+  bpmStability: number | undefined;
   /** Absolute master-audio time (ms) of the chunk's first detected
    *  onset. Used to anchor the chunk's bar grid in the UI. */
   audioStartMs: number;
@@ -182,55 +188,125 @@ function analyzeChunk(
   const slice = pcm.subarray(startSample, endSample);
   try {
     const analysis = analyzeAudio(slice, sampleRate);
-    const bpm =
-      analysis.tempo && analysis.tempo.confidence >= MIN_TEMPO_CONFIDENCE
-        ? analysis.tempo.bpm
-        : undefined;
+    const hasTempo =
+      analysis.tempo != null && analysis.tempo.confidence >= MIN_TEMPO_CONFIDENCE;
+    const bpm = hasTempo ? analysis.tempo!.bpm : undefined;
+    const bpmConfidence = hasTempo ? analysis.tempo!.confidence : undefined;
+    const bpmStability = hasTempo ? analysis.tempo!.stability : undefined;
     // analysis.audioStartS is relative to the slice; convert back to
     // master-audio time by adding the chunk's startMs.
     const audioStartMs = startMs + analysis.audioStartS * 1000;
-    return { bpm, audioStartMs };
+    return { bpm, bpmConfidence, bpmStability, audioStartMs };
   } catch {
     return null;
   }
 }
 
-/** Aggregate the per-chunk detected BPMs into a single song-global
- *  value. Picks the BPM that the most chunks agree on (rounded to the
- *  nearest integer); ties broken by total confidence (sum of
- *  contributing chunks' confidence). Returns null when no chunk had a
- *  detectable tempo. */
+/** Half-open canonical octave for tempo folding: most music sits here, so
+ *  folding into it lets octave-flipped detections (91 vs 182) vote for the
+ *  same pulse. Only used to GROUP chunks — the reported value is computed
+ *  in whatever octave the winning cluster actually detected. */
+const FOLD_LO_BPM = 70;
+
+/** Tempo cluster tolerance (BPM). Two chunks within this of each other are
+ *  the same tempo with detection noise; beyond it they're different
+ *  tempi. ±2.5 covers the ~±1 BPM jitter of short-chunk autocorrelation
+ *  with margin, without merging genuinely distinct tempi like 90 and 96. */
+const CLUSTER_TOL_BPM = 2.5;
+
+function foldToOctave(bpm: number, lo = FOLD_LO_BPM): number {
+  if (!(bpm > 0)) return bpm;
+  let b = bpm;
+  while (b < lo) b *= 2;
+  while (b >= lo * 2) b /= 2;
+  return b;
+}
+
+interface BpmVote {
+  /** Octave-folded tempo used for clustering. */
+  folded: number;
+  /** Vote weight = duration × confidence × stability. */
+  weight: number;
+}
+
+/**
+ * Aggregate per-chunk tempi into one song-global BPM, oriented on the
+ * biggest *coherent* part of the session rather than a raw majority.
+ *
+ * Three things the old mode-of-rounded-BPM vote got wrong on long-form
+ * material:
+ *   1. Rounding each chunk to an integer before bucketing threw away the
+ *      sub-BPM precision the detector now produces, and split one tempo
+ *      across two buckets whenever it straddled an x.5 boundary.
+ *   2. Counting chunks equally let a swarm of short free-played fragments
+ *      outvote a long, rock-steady core.
+ *   3. No octave awareness: a chunk that octave-flipped to 182 competed
+ *      against the 91 it should have reinforced.
+ *
+ * The fix: fold every tempo into a canonical octave, weight each chunk by
+ * duration × confidence × stability (so a long steady chunk dominates a
+ * short rubato one), then greedily cluster the folded tempi within a
+ * tolerance and pick the heaviest cluster. The reported value is the
+ * weighted average of that cluster's members, mapped back into the octave
+ * the cluster's heaviest member actually detected — so a genuinely slow or
+ * fast track still reports in its own octave. Confidence is the winning
+ * cluster's share of total vote weight.
+ *
+ * Returns null when no chunk had a detectable tempo.
+ */
 export function pickGlobalBpm(
-  chunks: ReadonlyArray<{ detectedBpm?: number; endMs: number; startMs: number }>,
+  chunks: ReadonlyArray<{
+    detectedBpm?: number;
+    detectedBpmConfidence?: number;
+    detectedBpmStability?: number;
+    endMs: number;
+    startMs: number;
+  }>,
 ): { value: number; confidence: number } | null {
-  // Bucket by rounded BPM; track the source confidences (use chunk
-  // duration as a soft confidence proxy when nothing better — longer
-  // chunks vote louder).
-  const buckets = new Map<number, { count: number; weight: number }>();
+  // Build weighted votes. Missing confidence/stability (legacy chunks)
+  // default to a neutral 0.5 so they still count, just not as loudly as a
+  // chunk we know is clean and steady.
+  const votes: BpmVote[] = [];
+  let totalWeight = 0;
   for (const c of chunks) {
     if (!c.detectedBpm || c.detectedBpm <= 0) continue;
-    const key = Math.round(c.detectedBpm);
-    const weight = Math.max(1, (c.endMs - c.startMs) / 1000);
-    const bucket = buckets.get(key) ?? { count: 0, weight: 0 };
-    bucket.count += 1;
-    bucket.weight += weight;
-    buckets.set(key, bucket);
+    const durationS = Math.max(1, (c.endMs - c.startMs) / 1000);
+    const conf = c.detectedBpmConfidence ?? 0.5;
+    const stab = c.detectedBpmStability ?? 0.5;
+    const weight = durationS * Math.max(0.05, conf) * Math.max(0.05, stab);
+    votes.push({ folded: foldToOctave(c.detectedBpm), weight });
+    totalWeight += weight;
   }
-  if (buckets.size === 0) return null;
-  let bestKey = 0;
-  let bestCount = 0;
-  let bestWeight = 0;
-  for (const [key, b] of buckets) {
-    if (
-      b.count > bestCount ||
-      (b.count === bestCount && b.weight > bestWeight)
-    ) {
-      bestKey = key;
-      bestCount = b.count;
-      bestWeight = b.weight;
+  if (votes.length === 0) return null;
+
+  // Greedy weighted clustering on the folded tempi. Process heaviest-first
+  // so cluster centers anchor on the most trustworthy chunks.
+  votes.sort((a, b) => b.weight - a.weight);
+  interface Cluster { center: number; weight: number; sum: number }
+  const clusters: Cluster[] = [];
+  for (const v of votes) {
+    let target: Cluster | undefined;
+    for (const cl of clusters) {
+      if (Math.abs(cl.center - v.folded) <= CLUSTER_TOL_BPM) {
+        target = cl;
+        break;
+      }
+    }
+    if (target) {
+      target.weight += v.weight;
+      target.sum += v.folded * v.weight;
+      target.center = target.sum / target.weight;
+    } else {
+      clusters.push({ center: v.folded, weight: v.weight, sum: v.folded * v.weight });
     }
   }
-  // Confidence = fraction of voting chunks that agreed on the winner.
-  const totalCount = Array.from(buckets.values()).reduce((a, b) => a + b.count, 0);
-  return { value: bestKey, confidence: bestCount / totalCount };
+
+  // Heaviest cluster wins.
+  let best = clusters[0];
+  for (const cl of clusters) if (cl.weight > best.weight) best = cl;
+
+  return {
+    value: best.center,
+    confidence: totalWeight > 0 ? best.weight / totalWeight : 0,
+  };
 }

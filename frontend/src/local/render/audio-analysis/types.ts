@@ -23,14 +23,23 @@ export interface Tempo {
   confidence: number;
   /** Phase of beat 0 in seconds (i.e. when the first beat occurs). */
   phase: number;
+  /** How steadily the beats hold a single tempo, 0..1. Derived from the
+   *  spread of adjacent-beat intervals: 1 ≈ metronome-tight, low ≈ rubato
+   *  or a tempo change mid-segment. Used to down-weight free-played /
+   *  drifting regions when voting on a song-global BPM. Optional — absent
+   *  on a seed tempo that has no beat track yet. */
+  stability?: number;
 }
 
 /**
  * Bump when the analysis algorithm changes in a way that should invalidate
  * cached results (e.g. v1→v2: phase + bpm now derived from least-squares
- * regression through detected beats; window-center frame timing).
+ * regression through detected beats; window-center frame timing;
+ * v3→v4: bpm now from a long-baseline Theil-Sen slope through the beats
+ * instead of the median adjacent interval, removing frame-grid quantization
+ * bias; tempo.stability added).
  */
-export const ANALYSIS_VERSION = 3;
+export const ANALYSIS_VERSION = 4;
 export type AnalysisVersion = typeof ANALYSIS_VERSION;
 
 export interface AudioAnalysis {
