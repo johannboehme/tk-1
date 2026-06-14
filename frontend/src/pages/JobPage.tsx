@@ -11,6 +11,7 @@ import {
   jobsDb,
   resolveJobAssetUrl,
   runQuickRender,
+  type EditSpecLocal,
   type LocalJob,
 } from "../local/jobs";
 import { jobRoutePath, nextRouteForJob } from "../local/jobs-routing";
@@ -35,6 +36,15 @@ export default function JobPage() {
   const isSyncing = Boolean(syncOp) && !syncOp?.error;
   const syncFailed = Boolean(syncOp?.error);
   const hasOutput = Boolean(job?.lastRender);
+
+  // Download filename: prefer the custom name the user set in the export panel
+  // (persisted on the last render's editSpec), falling back to the project title.
+  const downloadName = useMemo(() => {
+    const custom = (job?.editSpec as EditSpecLocal | undefined)?.outputFilename
+      ?.trim();
+    const base = custom || job?.title || job?.id || "export";
+    return `${base}.mp4`;
+  }, [job?.editSpec, job?.title, job?.id]);
 
   useEffect(() => {
     if (!id) return;
@@ -188,7 +198,7 @@ export default function JobPage() {
           {downloadUrl && (
             <a
               href={downloadUrl}
-              download={`${job.title || job.id}.mp4`}
+              download={downloadName}
               className="inline-flex items-center gap-2 h-12 px-5 rounded-md bg-cobalt text-paper-hi font-display tracking-label uppercase text-xs hover:bg-cobalt/90"
             >
               <DownloadIcon className="w-4 h-4" />
