@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { analyzeAudio, analyzeAudioFixedBpm } from "./analyze";
+import {
+  analyzeAudio,
+  analyzeAudioFixedBpm,
+  localTempoCurve,
+  segmentTempo,
+  dominantTempo,
+} from "./analyze";
 
 const SR = 22050;
 
@@ -32,7 +38,7 @@ describe("analyzeAudio — pure pipeline", () => {
   it("populates the basic shape and bands for a normal-length track", () => {
     const pcm = buildClickTrack(120, 8); // 8 seconds, 120 BPM
     const a = analyzeAudio(pcm, SR);
-    expect(a.version).toBe(3);
+    expect(a.version).toBe(4);
     expect(a.sampleRate).toBe(SR);
     expect(a.duration).toBeCloseTo(8, 1);
     expect(a.bands.bass.length).toBeGreaterThan(0);
@@ -247,6 +253,132 @@ describe("analyzeAudio — pure pipeline", () => {
       if (r > maxResid) maxResid = r;
     }
     expect(maxResid).toBeLessThan(tol);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Sub-BPM precision.
+//
+// The DP beat-tracker quantizes beats to the analysis frame grid (~33 ms at
+// 30 fps). A naive median-of-adjacent-intervals period estimate inherits that
+// quantization: near the grid "magnets" (90 BPM = exactly 20 frames, 120 BPM =
+// 15 frames) the error is tiny, but a true 91 BPM (19.78 frames) snaps toward
+// 20 → ~90.6, and rounding then reports 90. The long-baseline Theil-Sen slope
+// in refineTempoFromBeats removes that bias: the endpoint quantization error is
+// divided across the whole span, so a clean click track lands within ±0.15 BPM
+// of truth regardless of where it sits relative to the grid.
+// ────────────────────────────────────────────────────────────────────────────
+
+describe("analyzeAudio — sub-BPM precision", () => {
+  // Tempi chosen to sit OFF the 30 fps frame grid, where the old median
+  // estimator biased hardest. 90 and 120 sit (near-)exactly on the grid and
+  // were already fine — kept as regression guards.
+  for (const bpm of [90, 90.5, 91, 91.5, 92, 120, 121]) {
+    it(`recovers ${bpm} BPM within ±0.15 from a clean click track`, () => {
+      const a = analyzeAudio(buildClickTrack(bpm, 20), SR);
+      expect(a.tempo).not.toBeNull();
+      expect(Math.abs(a.tempo!.bpm - bpm)).toBeLessThan(0.15);
+    });
+  }
+
+  it("a steady click track reports high tempo stability", () => {
+    const a = analyzeAudio(buildClickTrack(91, 20), SR);
+    expect(a.tempo!.stability).toBeGreaterThan(0.8);
+  });
+
+  it("a rubato (accelerating) track reports low tempo stability", () => {
+    // Build a click train whose period shrinks linearly: starts ~80 BPM,
+    // ends ~110 BPM. No single tempo fits — stability must drop.
+    const seconds = 20;
+    const total = Math.round(SR * seconds);
+    const pcm = new Float32Array(total);
+    for (let i = 0; i < total; i++) pcm[i] = (Math.random() - 0.5) * 0.01;
+    const clickLen = Math.round(0.005 * SR);
+    let t = 0;
+    while (t * SR + clickLen < total) {
+      const frac = (t * SR) / total; // 0..1 over the track
+      const bpm = 80 + 30 * frac;
+      const start = Math.round(t * SR);
+      for (let k = 0; k < clickLen; k++) {
+        const env = Math.exp((-k / clickLen) * 4);
+        pcm[start + k] += 0.8 * env * Math.sin((2 * Math.PI * 200 * k) / SR);
+      }
+      t += 60 / bpm;
+    }
+    const a = analyzeAudio(pcm, SR);
+    expect(a.tempo).not.toBeNull();
+    expect(a.tempo!.stability).toBeLessThan(0.6);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Tempo segmentation (long-form: tempo changes & free passages).
+// ────────────────────────────────────────────────────────────────────────────
+
+/** Click track whose tempo steps from `bpm1` to `bpm2` at the midpoint. */
+function buildSteppedTrack(bpm1: number, bpm2: number, seconds: number): Float32Array {
+  const total = Math.round(SR * seconds);
+  const pcm = new Float32Array(total);
+  for (let i = 0; i < total; i++) pcm[i] = (Math.random() - 0.5) * 0.01;
+  const clickLen = Math.round(0.005 * SR);
+  let t = 0;
+  while (t * SR + clickLen < total) {
+    const bpm = t < seconds / 2 ? bpm1 : bpm2;
+    const start = Math.round(t * SR);
+    for (let k = 0; k < clickLen; k++) {
+      const env = Math.exp((-k / clickLen) * 4);
+      pcm[start + k] += 0.8 * env * Math.sin((2 * Math.PI * 200 * k) / SR);
+    }
+    t += 60 / bpm;
+  }
+  return pcm;
+}
+
+describe("tempo segmentation", () => {
+  it("a steady track yields a single region at its tempo", () => {
+    const a = analyzeAudio(buildClickTrack(100, 20), SR);
+    const curve = localTempoCurve(a.onsetStrength, a.framesPerSec);
+    const regions = segmentTempo(curve);
+    expect(regions.length).toBeGreaterThanOrEqual(1);
+    const dom = dominantTempo(regions);
+    expect(dom).not.toBeNull();
+    expect(Math.abs(dom!.bpm - 100)).toBeLessThan(3);
+  });
+
+  it("splits a mid-song tempo change into separate regions", () => {
+    // 90 BPM for the first half, 120 for the second.
+    const a = analyzeAudio(buildSteppedTrack(90, 120, 32), SR);
+    const curve = localTempoCurve(a.onsetStrength, a.framesPerSec);
+    const regions = segmentTempo(curve);
+    expect(regions.length).toBeGreaterThanOrEqual(2);
+    // Both tempi should be represented among the regions.
+    const has = (bpm: number) =>
+      regions.some((r) => Math.abs(r.bpm - bpm) < 4);
+    expect(has(90)).toBe(true);
+    expect(has(120)).toBe(true);
+  });
+
+  it("the dominant region is the longer-held tempo", () => {
+    // 100 BPM for ~6 s, then 80 BPM for ~24 s — 80 should dominate.
+    const total = Math.round(SR * 30);
+    const pcm = new Float32Array(total);
+    for (let i = 0; i < total; i++) pcm[i] = (Math.random() - 0.5) * 0.01;
+    const clickLen = Math.round(0.005 * SR);
+    let t = 0;
+    while (t * SR + clickLen < total) {
+      const bpm = t < 6 ? 100 : 80;
+      const start = Math.round(t * SR);
+      for (let k = 0; k < clickLen; k++) {
+        const env = Math.exp((-k / clickLen) * 4);
+        pcm[start + k] += 0.8 * env * Math.sin((2 * Math.PI * 200 * k) / SR);
+      }
+      t += 60 / bpm;
+    }
+    const a = analyzeAudio(pcm, SR);
+    const curve = localTempoCurve(a.onsetStrength, a.framesPerSec);
+    const dom = dominantTempo(segmentTempo(curve));
+    expect(dom).not.toBeNull();
+    expect(Math.abs(dom!.bpm - 80)).toBeLessThan(4);
   });
 });
 

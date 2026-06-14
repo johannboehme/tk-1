@@ -69,11 +69,18 @@ describe("detectChunks", () => {
     const c0 = result.chunks[0];
     const c1 = result.chunks[1];
     expect(c0.startMs).toBeLessThanOrEqual(200);
-    expect(c0.endMs).toBeGreaterThan(5_500);
-    expect(c0.endMs).toBeLessThanOrEqual(6_500);
+    // The first tone's clicks span 0..5.5 s (≈2.78 bars at 120 BPM), so the
+    // bar-snapped chunk end lands on the last WHOLE bar that fits — 2 bars
+    // (≈4046 ms incl. the window-center anchor offset) — not the raw 6 s
+    // segment boundary. Snapping DOWN to whole bars is the contract; assert
+    // a bar-aligned end that covers ≥2 bars and doesn't exceed the content.
+    const barMs = (60_000 / 120) * 4; // 2000 ms
+    expect(c0.endMs).toBeGreaterThan(barMs * 2 - 200);
+    expect(c0.endMs).toBeLessThanOrEqual(5_700);
     expect(c1.startMs).toBeGreaterThanOrEqual(7_500);
     expect(c1.startMs).toBeLessThanOrEqual(8_500);
-    expect(c1.endMs).toBeGreaterThan(13_500);
+    // Second chunk: 8..13.6 s of content → bar-snapped end well past 11 s.
+    expect(c1.endMs).toBeGreaterThan(11_000);
   }, 30_000);
 
   it("does not split when the gap is shorter than min-pause", async () => {
@@ -175,33 +182,35 @@ describe("pickGlobalBpm", () => {
     ).toBeNull();
   });
 
-  it("picks the most-common BPM (mode)", () => {
+  it("picks the dominant tempo, folding octave-related detections together", () => {
+    // 120 and 60 are octave-related (60 folds to 120), so all three chunks
+    // vote for the same pulse — the global tempo is 120 with full agreement.
     const result = pickGlobalBpm([
       { detectedBpm: 120, startMs: 0, endMs: 5_000 },
       { detectedBpm: 120, startMs: 6_000, endMs: 11_000 },
       { detectedBpm: 60, startMs: 12_000, endMs: 17_000 },
     ]);
     expect(result).not.toBeNull();
-    expect(result!.value).toBe(120);
-    // 2 of 3 chunks agree → 0.66 confidence.
-    expect(result!.confidence).toBeCloseTo(2 / 3, 2);
+    expect(result!.value).toBeCloseTo(120, 0);
+    expect(result!.confidence).toBe(1);
   });
 
-  it("rounds before bucketing — 119.7 and 120.3 vote for 120", () => {
+  it("clusters near-equal tempi — 119.7 and 120.3 are one cluster ≈ 120", () => {
     const result = pickGlobalBpm([
       { detectedBpm: 119.7, startMs: 0, endMs: 5_000 },
       { detectedBpm: 120.3, startMs: 6_000, endMs: 11_000 },
     ]);
-    expect(result!.value).toBe(120);
+    expect(result!.value).toBeCloseTo(120, 1);
+    expect(result!.confidence).toBe(1);
   });
 
-  it("breaks ties by total chunk-duration weight", () => {
+  it("weights by chunk duration — the longer chunk's tempo wins", () => {
     const result = pickGlobalBpm([
-      { detectedBpm: 120, startMs: 0, endMs: 5_000 }, // 5s
+      { detectedBpm: 96, startMs: 0, endMs: 5_000 }, // 5s
       { detectedBpm: 90, startMs: 6_000, endMs: 36_000 }, // 30s
     ]);
-    // Same count (1 each), so the longer chunk wins.
-    expect(result!.value).toBe(90);
+    // Distinct tempi (>2.5 apart), so two clusters; the 30s chunk dominates.
+    expect(result!.value).toBeCloseTo(90, 0);
   });
 });
 

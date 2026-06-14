@@ -188,6 +188,15 @@ export function analyzeAudio(
     tempo = { ...tempo, phase: p };
   }
 
+  // Tempo steadiness from the pre-tracking local-tempo curve (the beat
+  // tracker regularizes its own output, so steadiness has to be measured
+  // before it). Attaches a 0..1 stability the global-BPM vote uses to
+  // down-weight free-played / drifting regions.
+  if (tempo) {
+    const curve = localTempoCurve(onsetStrength, framesPerSec);
+    tempo = { ...tempo, stability: tempoStability(curve) };
+  }
+
   // Time signature isn't part of the analysis output — the user picks it
   // (BpmReadout time-sig chip). This `downbeats` field is a 4/4 best-effort
   // for downstream consumers that don't read JobMeta.beatsPerBar; the
@@ -643,43 +652,53 @@ function trackBeatFrames(
 // ────────────────────────────────────────────────────────────────────────────
 
 /**
- * Recover the true (period, phase) from the detected beats. Naive
- * least-squares through every beat is sensitive to a single bad
- * detection — if the DP-tracker drops or doubles a beat anywhere in the
- * chain (its ±25% period window allows that) the slope absorbs the gap
- * and biases BPM by ~0.2 across the rest of the track, compounding into
- * ≈100 ms of cut-vs-beat drift over a minute.
+ * Recover the true (period, phase) from the detected beats.
  *
- * The interval distribution on real music isn't symmetric either — it
- * has a long right tail (~3-5 % of intervals land 1 frame late because
- * the onset peak ekes one window further than the true beat). The mean
- * picks that bias up; the **median** ignores it. So: period = median of
- * consecutive-beat intervals; phase = mean residual of (beats[k] − k·period)
- * so phase noise still averages out across all beats.
+ * The DP tracker quantizes every beat to an integer analysis frame, and
+ * `refineBeatFrame` only nudges it ±0.5 frame. The period estimator must
+ * therefore not amplify that residual quantization. Two earlier approaches
+ * both failed on slow tempi:
+ *
+ *   - Naive least-squares through every beat: one dropped/doubled beat
+ *     (the DP's ±25 % window allows it) lets the slope absorb the gap and
+ *     biases BPM across the rest of the track.
+ *   - Median of *adjacent* intervals: robust to bad beats, but each
+ *     interval still carries the full ±½-frame endpoint quantization. At
+ *     30 fps that quantization snaps a true 91 BPM (19.78 frames/beat)
+ *     toward the nearest whole-frame magnet (20 frames = 90 BPM), so the
+ *     estimate reads ~90.6 and rounds to the wrong integer.
+ *
+ * We use a **long-baseline Theil-Sen slope** instead: the median of the
+ * pairwise slopes (beats[j] − beats[i]) / (j − i) taken over pairs with a
+ * long span. The ±½-frame endpoint error is divided by the span (j − i),
+ * so a 20-beat baseline shrinks it ~20× — recovering sub-0.1-BPM accuracy
+ * regardless of where the tempo sits relative to the frame grid. Taking
+ * the median over many pairs keeps the robustness that made us pick the
+ * median in the first place: a single bad beat only corrupts the pairs
+ * that touch it, and they're outvoted.
+ *
+ * Stability is NOT derived here: the DP beat-tracker regularizes its
+ * output (it fits a near-constant grid even to a rubato performance), so
+ * the tracked intervals look steady regardless. Tempo steadiness is
+ * measured separately from the pre-tracking local-tempo curve — see
+ * `localTempoCurve` / `tempoStability`, attached to the result in
+ * `analyzeAudio`.
  */
 function refineTempoFromBeats(beats: number[], seed: Tempo): Tempo {
   if (beats.length < 2) return seed;
 
-  const intervals: number[] = [];
-  for (let i = 1; i < beats.length; i++) intervals.push(beats[i] - beats[i - 1]);
-  const sorted = [...intervals].sort((a, b) => a - b);
-  // Median for an even-length list: average of the two middle values.
-  const mid = sorted.length >> 1;
-  const period =
-    sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
-
+  const period = theilSenPeriod(beats);
   if (!isFinite(period) || period <= 0) return seed;
   const bpm = 60 / period;
 
   // Phase: mean of residuals (beats[k] - k·period). Robust phase given a
-  // robust period — averaging over all beats keeps the noise floor low
-  // even though we trimmed when computing the period.
+  // robust period — averaging over all beats keeps the noise floor low.
   let phaseSum = 0;
   for (let k = 0; k < beats.length; k++) phaseSum += beats[k] - k * period;
   const phase = phaseSum / beats.length;
 
-  // Sanity check: if the trimmed mean lands somewhere absurd, keep the
-  // seed BPM but still adopt the new phase from the actual beats.
+  // Sanity check: if the slope lands somewhere absurd, keep the seed BPM
+  // but still adopt the new phase from the actual beats.
   if (bpm < 30 || bpm > 240) {
     return { ...seed, phase: beats[0] };
   }
@@ -689,6 +708,180 @@ function refineTempoFromBeats(beats: number[], seed: Tempo): Tempo {
     confidence: seed.confidence,
     phase,
   };
+}
+
+/**
+ * Median of long-baseline pairwise slopes (Theil-Sen) through the beat
+ * times. Restricting to pairs spanning at least a quarter of the track
+ * both sharpens precision (longer baseline → smaller relative endpoint
+ * error) and bounds the pair count to O(N²) with a small constant. Falls
+ * back to all pairs when the track is too short for a meaningful quarter.
+ */
+function theilSenPeriod(beats: number[]): number {
+  const n = beats.length;
+  if (n < 2) return NaN;
+  const minSpan = Math.max(1, Math.floor(n / 4));
+  // For very long beat lists (whole-song analysis) the O(N²) pair set gets
+  // large; stride the start index so the work stays bounded without losing
+  // the long baselines that carry the precision.
+  const stride = n > 400 ? Math.ceil(n / 400) : 1;
+  const slopes: number[] = [];
+  for (let i = 0; i < n; i += stride) {
+    for (let j = i + minSpan; j < n; j++) {
+      slopes.push((beats[j] - beats[i]) / (j - i));
+    }
+  }
+  if (slopes.length === 0) {
+    return (beats[n - 1] - beats[0]) / (n - 1);
+  }
+  slopes.sort((a, b) => a - b);
+  const mid = slopes.length >> 1;
+  return slopes.length % 2 === 0
+    ? (slopes[mid - 1] + slopes[mid]) / 2
+    : slopes[mid];
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Local tempo curve, stability, and tempo-segmentation.
+//
+// The single global BPM is the wrong model for long-form material: a
+// session can start, stop, be played freely (rubato), or genuinely change
+// tempo mid-take. To "orient on the biggest coherent part" we first need a
+// tempo-vs-time view that the beat-tracker can't flatten. We get it by
+// running the same onset-autocorrelation as the seed detector, but in a
+// sliding window — each window reports its own local tempo. From that
+// curve we derive (a) a stability scalar and (b) a segmentation into
+// maximal stable-tempo runs.
+// ────────────────────────────────────────────────────────────────────────────
+
+/** Fold a BPM into the canonical [lo, 2·lo) octave so tempo-octave aliases
+ *  (a window that autocorrelates at 182 instead of 91) don't masquerade as
+ *  a different tempo when we measure spread. */
+function foldOctave(bpm: number, lo = 70): number {
+  if (!(bpm > 0)) return bpm;
+  let b = bpm;
+  while (b < lo) b *= 2;
+  while (b >= lo * 2) b /= 2;
+  return b;
+}
+
+export interface LocalTempoPoint {
+  /** Window-center time in seconds. */
+  timeS: number;
+  /** Local tempo (BPM), octave-folded into [70, 140). */
+  bpm: number;
+  /** Autocorrelation confidence of this window, 0..1. */
+  confidence: number;
+}
+
+/**
+ * Sliding-window local tempo. Window/hop default to 8 s / 2 s — long
+ * enough for a stable autocorrelation peak at 60 BPM (8 beats), short
+ * enough to resolve a tempo change. Windows below the confidence floor
+ * (near-silence, no periodicity) are dropped rather than emitting noise.
+ */
+export function localTempoCurve(
+  strength: number[],
+  framesPerSec: number,
+  windowS = 8,
+  hopS = 2,
+): LocalTempoPoint[] {
+  const winFrames = Math.round(windowS * framesPerSec);
+  const hopFrames = Math.max(1, Math.round(hopS * framesPerSec));
+  if (strength.length < winFrames) {
+    const t = detectTempo(strength, framesPerSec);
+    if (!t) return [];
+    return [{ timeS: strength.length / (2 * framesPerSec), bpm: foldOctave(t.bpm), confidence: t.confidence }];
+  }
+  const out: LocalTempoPoint[] = [];
+  for (let f0 = 0; f0 + winFrames <= strength.length; f0 += hopFrames) {
+    const slice = strength.slice(f0, f0 + winFrames);
+    const t = detectTempo(slice, framesPerSec);
+    if (!t || t.confidence < 0.1) continue;
+    out.push({
+      timeS: (f0 + winFrames / 2) / framesPerSec,
+      bpm: foldOctave(t.bpm),
+      confidence: t.confidence,
+    });
+  }
+  return out;
+}
+
+/**
+ * Steadiness of the tempo over the whole track in [0, 1], from the local
+ * tempo curve. 1 = the curve is flat (one tempo throughout); a rubato or a
+ * tempo change spreads the curve and pushes this toward 0. Uses the
+ * median-absolute-deviation of the (octave-folded) curve normalized by its
+ * median, so it's tempo-independent and a single bad window can't tank it.
+ */
+export function tempoStability(curve: LocalTempoPoint[]): number {
+  if (curve.length < 2) return curve.length === 1 ? 1 : 0;
+  const bpms = curve.map((p) => p.bpm).sort((a, b) => a - b);
+  const median = bpms[bpms.length >> 1];
+  if (!(median > 0)) return 0;
+  const devs = curve.map((p) => Math.abs(p.bpm - median)).sort((a, b) => a - b);
+  const mad = devs[devs.length >> 1];
+  const cv = mad / median;
+  // ~10 % spread (cv 0.1) maps to ~0 stability; a clean click sits near 0.
+  return Math.max(0, Math.min(1, 1 - cv / 0.1));
+}
+
+export interface TempoRegion {
+  startS: number;
+  endS: number;
+  bpm: number;
+}
+
+/**
+ * Split the local tempo curve into maximal runs that hold one tempo
+ * (within `tolBpm`). Consecutive points whose folded BPM stays within
+ * tolerance of the run's running-median extend the run; a point outside
+ * tolerance starts a new run. Returns one region per run with the
+ * run-median BPM. The dominant region (longest `endS − startS`) is what a
+ * caller should treat as the song-global tempo; the rest let the bar grid
+ * follow a real mid-song change or skip a free-played passage.
+ */
+export function segmentTempo(curve: LocalTempoPoint[], tolBpm = 2.5): TempoRegion[] {
+  if (curve.length === 0) return [];
+  const regions: TempoRegion[] = [];
+  let runStart = 0;
+  const runBpms: number[] = [curve[0].bpm];
+  const median = (xs: number[]): number => {
+    const s = [...xs].sort((a, b) => a - b);
+    return s[s.length >> 1];
+  };
+  const flush = (endIdx: number): void => {
+    const a = curve[runStart];
+    const b = curve[endIdx];
+    regions.push({
+      startS: a.timeS,
+      endS: b.timeS,
+      bpm: median(runBpms),
+    });
+  };
+  for (let i = 1; i < curve.length; i++) {
+    if (Math.abs(curve[i].bpm - median(runBpms)) <= tolBpm) {
+      runBpms.push(curve[i].bpm);
+    } else {
+      flush(i - 1);
+      runStart = i;
+      runBpms.length = 0;
+      runBpms.push(curve[i].bpm);
+    }
+  }
+  flush(curve.length - 1);
+  return regions;
+}
+
+/** The tempo of the longest stable region — the song-global BPM that
+ *  ignores short free / off-tempo passages. Returns null for an empty
+ *  curve. */
+export function dominantTempo(regions: TempoRegion[]): TempoRegion | null {
+  let best: TempoRegion | null = null;
+  for (const r of regions) {
+    if (!best || r.endS - r.startS > best.endS - best.startS) best = r;
+  }
+  return best;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
