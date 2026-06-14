@@ -40,8 +40,10 @@ import {
 } from "../../local/triage/triage-store";
 import {
   joinFocusedGuarded,
+  sliceFocusedGuarded,
   splitFocusedGuarded,
 } from "../../local/triage/triage-guarded-actions";
+import { BarCountLcd } from "./BarCountLcd";
 import type { Chunk } from "../../storage/jobs-db";
 
 const CONFORM_STATUS_LABEL: Record<string, string> = {
@@ -63,6 +65,8 @@ export function ChunkInspector() {
   const resetBpm = useTriageStore((s) => s.resetBpmToDetected);
   const setBeatsPerBar = useTriageStore((s) => s.setBeatsPerBar);
   const extendChunkBars = useTriageStore((s) => s.extendChunkBars);
+  const sliceIntervalBars = useTriageStore((s) => s.sliceIntervalBars);
+  const setSliceIntervalBars = useTriageStore((s) => s.setSliceIntervalBars);
   const resetChunk = useTriageStore((s) => s.resetChunk);
   const conformChunk = useTriageStore((s) => s.conformChunk);
   const revertConform = useTriageStore((s) => s.revertConform);
@@ -129,6 +133,9 @@ export function ChunkInspector() {
           jobBpmValue={jobBpm?.value ?? null}
           beatsPerBar={beatsPerBar}
           onExtend={(back, fwd) => extendChunkBars(focused.id, back, fwd)}
+          sliceIntervalBars={sliceIntervalBars}
+          onSliceIntervalChange={setSliceIntervalBars}
+          onSlice={() => void sliceFocusedGuarded(sliceIntervalBars)}
           onSplit={() => void splitFocusedGuarded(Math.round(currentTime * 1000))}
           onCreate={() => insertChunkAtPlayhead()}
           onJoinPrev={() => void joinFocusedGuarded("prev")}
@@ -195,6 +202,9 @@ interface BodyProps {
   jobBpmValue: number | null;
   beatsPerBar: number;
   onExtend: (barsBack: number, barsFwd: number) => void;
+  sliceIntervalBars: number;
+  onSliceIntervalChange: (n: number) => void;
+  onSlice: () => void;
   onSplit: () => void;
   onCreate: () => void;
   onJoinPrev: () => void;
@@ -215,6 +225,9 @@ function ChunkBody({
   jobBpmValue,
   beatsPerBar,
   onExtend,
+  sliceIntervalBars,
+  onSliceIntervalChange,
+  onSlice,
   onSplit,
   onCreate,
   onJoinPrev,
@@ -234,6 +247,16 @@ function ChunkBody({
   const effBpm = effectiveChunkBpm(chunk, jobBpmValue);
   const bars = effBpm > 0 ? (lengthS * effBpm) / 60 / beatsPerBar : 0;
   const canExtend = effBpm > 0;
+  // Slice preview — how many pieces `intervalBars` would carve this chunk
+  // into (incl. a shorter trailing remainder). Mirrors the count the
+  // store action produces so the hint never lies.
+  const msPerBar = effBpm > 0 ? (60_000 / effBpm) * beatsPerBar : 0;
+  const sliceStepMs = sliceIntervalBars * msPerBar;
+  const slicePieces =
+    sliceStepMs > 0 && lengthMs > sliceStepMs
+      ? Math.ceil(lengthMs / sliceStepMs)
+      : 1;
+  const canSlice = effBpm > 0 && slicePieces > 1;
   const phaseS = chunkBeatPhaseS(chunk);
   const phaseDeltaMs = phaseS * 1000 - chunk.startMs;
 
@@ -417,6 +440,44 @@ function ChunkBody({
               out ⟹
             </ChunkyButton>
           </div>
+        </div>
+      </Section>
+
+      {/* Slice into fixed N-bar intervals in one shot — for a long take
+       *  that's really many repeated phrases. Cuts land on downbeats of
+       *  the chunk's own grid; the remainder stays as a shorter final
+       *  piece. */}
+      <Section
+        title="SLICE TO BARS"
+        right={
+          canExtend
+            ? `→ ${slicePieces} ${slicePieces === 1 ? "piece" : "pieces"}`
+            : "needs BPM"
+        }
+      >
+        <div className="flex items-center gap-2">
+          <BarCountLcd
+            label="BARS"
+            value={sliceIntervalBars}
+            onChange={onSliceIntervalChange}
+            min={1}
+            max={999}
+            isOff={() => false}
+            format={(v) => String(v)}
+            title="Interval length in bars for the slice action"
+            ariaLabel={`Slice interval ${sliceIntervalBars} bars — click to change`}
+          />
+          <ChunkyButton
+            variant="secondary"
+            size="xs"
+            disabled={!canSlice}
+            onClick={onSlice}
+            title={`Cut this chunk into ${sliceIntervalBars}-bar pieces`}
+            iconLeft={<ScissorsIcon className="w-3.5 h-3.5" />}
+            className="flex-1"
+          >
+            Cut into {sliceIntervalBars}b
+          </ChunkyButton>
         </div>
       </Section>
 

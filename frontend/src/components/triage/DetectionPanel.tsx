@@ -12,35 +12,23 @@
  * BPM lives on the brass plate inside ChunkInspector — this panel
  * is purely about "where do chunks begin and end".
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useRef } from "react";
 import { detectChunksFromEnvelope } from "../../local/triage/chunk-detect";
 import { jobsDb } from "../../local/jobs";
 import {
   isChunkEffectivelyAccepted,
   useTriageStore,
 } from "../../local/triage/triage-store";
+import {
+  BarCountLcd,
+  LCD_BG,
+  LCD_SHADOW,
+  LCD_GREEN,
+  LCD_AMBER,
+  GLOW_GREEN,
+  GLOW_AMBER,
+} from "./BarCountLcd";
 import type { SilenceConfig } from "../../storage/jobs-db";
-
-const MIN_BARS_FILTER_MAX = 999;
-
-const LCD_BG = `
-  repeating-linear-gradient(0deg, rgba(255,255,255,0.04) 0 1px, transparent 1px 3px),
-  repeating-linear-gradient(90deg, rgba(0,0,0,0.10) 0 1px, transparent 1px 3px),
-  radial-gradient(120% 80% at 50% 0%, rgba(255,255,255,0.06), rgba(0,0,0,0) 60%),
-  linear-gradient(180deg, #0E1311 0%, #0A0E0C 100%)
-`;
-const LCD_SHADOW = [
-  "inset 0 1px 0 rgba(255,255,255,0.05)",
-  "inset 0 -1px 0 rgba(0,0,0,0.5)",
-  "inset 0 0 18px rgba(0,0,0,0.55)",
-  "0 1px 0 rgba(255,255,255,0.5)",
-].join(", ");
-const LCD_GREEN = "#9DEFD0";
-const LCD_AMBER = "#FFB347";
-const GLOW_GREEN =
-  "0 0 5px rgba(157,239,208,0.4), 0 0 1px rgba(157,239,208,0.8)";
-const GLOW_AMBER =
-  "0 0 6px rgba(255,179,71,0.55), 0 0 1px rgba(255,179,71,0.9)";
 
 export function DetectionPanel() {
   const silenceConfig = useTriageStore((s) => s.silenceConfig);
@@ -158,142 +146,18 @@ export function DetectionPanel() {
           onChange={(v) => onChange({ minPauseMs: v })}
         />
       </div>
-      <MinBarsFilter
+      <BarCountLcd
+        label="MIN"
         value={minChunkBars}
         onChange={setMinChunkBars}
+        title="Hide chunks shorter than this many bars (0 = off)"
+        ariaLabel={`Min bars filter ${minChunkBars === 0 ? "OFF" : `≥${minChunkBars}`} — click to change`}
       />
       <KeptCounter
         chunkCount={chunks.length}
         keptCount={acceptedCount}
         totalMs={acceptedDurationMs}
       />
-    </div>
-  );
-}
-
-/** Brass-bezel LCD with click-to-edit number input — same edit
- *  pattern as the BpmReadout. User can type any positive integer
- *  (no power-of-2 restriction); 0 or empty turns the filter off.
- *  LCD reads mint-green when off, amber when engaged. */
-function MinBarsFilter({
-  value,
-  onChange,
-}: {
-  value: number;
-  onChange: (n: number) => void;
-}) {
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState("");
-  const inputRef = useRef<HTMLInputElement | null>(null);
-
-  useEffect(() => {
-    if (editing) {
-      inputRef.current?.focus();
-      inputRef.current?.select();
-    }
-  }, [editing]);
-
-  function startEdit() {
-    setDraft(value > 0 ? String(value) : "");
-    setEditing(true);
-  }
-  function commit() {
-    const trimmed = draft.trim();
-    if (trimmed === "") {
-      onChange(0);
-    } else {
-      const n = Math.floor(Number(trimmed));
-      if (Number.isFinite(n) && n >= 0 && n <= MIN_BARS_FILTER_MAX) {
-        onChange(n);
-      }
-    }
-    setEditing(false);
-  }
-  function cancel() {
-    setEditing(false);
-  }
-
-  const isDefault = value === 0;
-  const lcdColor = isDefault ? LCD_GREEN : LCD_AMBER;
-  const lcdGlow = isDefault ? GLOW_GREEN : GLOW_AMBER;
-  const display = isDefault ? "OFF" : `≥${value}`;
-
-  const bezel: React.CSSProperties = {
-    background:
-      "linear-gradient(180deg, #FAF6EC 0%, #E8E1D0 50%, #C9BFA6 100%)",
-    boxShadow: [
-      "inset 0 1px 0 rgba(255,255,255,0.85)",
-      "inset 0 -1px 0 rgba(0,0,0,0.18)",
-      "0 1px 2px rgba(0,0,0,0.18)",
-    ].join(", "),
-    borderRadius: 6,
-    padding: "5px 6px",
-  };
-
-  const lcdShared: React.CSSProperties = {
-    height: 28,
-    background: LCD_BG,
-    boxShadow: LCD_SHADOW,
-    color: lcdColor,
-    textShadow: lcdGlow,
-  };
-  const lcdClass = [
-    "font-mono tabular tracking-[0.05em]",
-    "text-base px-2 rounded-[3px] w-[68px]",
-    "border border-black/40",
-    "inline-flex items-center justify-center leading-none",
-  ].join(" ");
-
-  return (
-    <div
-      className="inline-flex items-center gap-2 self-center shrink-0"
-      style={bezel}
-    >
-      <span
-        aria-hidden
-        className="font-display text-[8px] tracking-[0.18em] text-ink-2 leading-tight uppercase"
-        style={{
-          writingMode: "vertical-rl",
-          transform: "rotate(180deg)",
-          letterSpacing: "0.18em",
-        }}
-      >
-        MIN
-      </span>
-      {editing ? (
-        <input
-          ref={inputRef}
-          type="number"
-          min={0}
-          max={MIN_BARS_FILTER_MAX}
-          step={1}
-          value={draft}
-          placeholder="0"
-          onChange={(e) => setDraft(e.target.value)}
-          onBlur={commit}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") commit();
-            else if (e.key === "Escape") cancel();
-          }}
-          className={`${lcdClass} text-right outline-none focus:border-hot`}
-          style={{
-            ...lcdShared,
-            paddingTop: 0,
-            paddingBottom: 0,
-          }}
-        />
-      ) : (
-        <button
-          type="button"
-          onClick={startEdit}
-          aria-label={`Min bars filter ${display} — click to change`}
-          title="Hide chunks shorter than this many bars (0 = off)"
-          className={`${lcdClass} cursor-pointer transition hover:brightness-110`}
-          style={lcdShared}
-        >
-          {display}
-        </button>
-      )}
     </div>
   );
 }

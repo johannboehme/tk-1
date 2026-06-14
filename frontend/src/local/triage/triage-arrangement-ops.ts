@@ -65,6 +65,37 @@ export function applySplitToArrangement(
 }
 
 /**
+ * Apply a Triage fixed-interval slice to the arrangement.
+ *
+ * Convention (mirrors `splitChunkAt` / `sliceChunkIntoBars`): the FIRST
+ * piece keeps `originalChunkId`; `newPieceIds` are the remaining pieces
+ * in playback order. Each occurrence of the original chunk expands into
+ * `[original, ...pieces]` back-to-back, so wherever the take used to
+ * play, the slices now play in sequence — the N-way generalisation of
+ * the split `"both"` branch.
+ */
+export function applySliceToArrangement(
+  arrangement: readonly ArrangementItem[],
+  originalChunkId: string,
+  newPieceIds: readonly string[],
+): ArrangementItem[] {
+  if (newPieceIds.length === 0) return arrangement as ArrangementItem[];
+  if (!arrangement.some((it) => it.chunkId === originalChunkId)) {
+    return arrangement as ArrangementItem[];
+  }
+  const out: ArrangementItem[] = [];
+  for (const it of arrangement) {
+    out.push(it);
+    if (it.chunkId === originalChunkId) {
+      for (const pieceId of newPieceIds) {
+        out.push({ id: freshArrId(pieceId), chunkId: pieceId });
+      }
+    }
+  }
+  return out;
+}
+
+/**
  * Apply a Triage merge to the arrangement.
  *
  * Convention: `joinChunks(focusedId, direction)` keeps `focusedId` as

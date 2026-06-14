@@ -190,6 +190,215 @@ describe("triage-store · splitChunkAt", () => {
   });
 });
 
+describe("triage-store · sliceChunkIntoBars", () => {
+  beforeEach(() => useTriageStore.getState().reset());
+
+  it("slices an exact multiple into equal bar-length pieces on the grid", () => {
+    // anchor 0, 120 BPM 4/4 → msPerBar 2000. interval 2 bars → step 4000.
+    // chunk [0, 12000] → cuts at 4000, 8000 → three 2-bar pieces.
+    seed([
+      makeChunk({
+        id: "c1",
+        startMs: 0,
+        endMs: 12000,
+        audioStartMs: 0,
+        effectiveBpm: 120,
+        beatsPerBar: 4,
+      }),
+    ]);
+    const newIds = useTriageStore.getState().sliceChunkIntoBars("c1", 2);
+    expect(newIds).toHaveLength(2);
+    const pieces = useTriageStore
+      .getState()
+      .chunks.sort((a, b) => a.startMs - b.startMs);
+    expect(pieces.map((p) => [p.startMs, p.endMs])).toEqual([
+      [0, 4000],
+      [4000, 8000],
+      [8000, 12000],
+    ]);
+    // First piece keeps the original id; the others are the returned ids.
+    expect(pieces[0].id).toBe("c1");
+    expect(newIds).toEqual([pieces[1].id, pieces[2].id]);
+    // Every piece anchors on a bar boundary of the original grid.
+    for (const p of pieces) expect(p.audioStartMs! % 2000).toBe(0);
+  });
+
+  it("keeps the remainder as a shorter final piece (14 bars @ 4 → 4+4+4+2)", () => {
+    // msPerBar 2000. interval 4 bars → step 8000. chunk [0, 28000] = 14 bars.
+    // cuts at 8000, 16000, 24000 → pieces of 4,4,4,2 bars.
+    seed([
+      makeChunk({
+        id: "c1",
+        startMs: 0,
+        endMs: 28000,
+        audioStartMs: 0,
+        effectiveBpm: 120,
+        beatsPerBar: 4,
+      }),
+    ]);
+    useTriageStore.getState().sliceChunkIntoBars("c1", 4);
+    const pieces = useTriageStore
+      .getState()
+      .chunks.sort((a, b) => a.startMs - b.startMs);
+    expect(pieces.map((p) => p.endMs - p.startMs)).toEqual([
+      8000, 8000, 8000, 4000,
+    ]);
+  });
+
+  it("inherits accept-flag and BPM metadata to every piece", () => {
+    seed([
+      makeChunk({
+        id: "c1",
+        startMs: 0,
+        endMs: 8000,
+        audioStartMs: 0,
+        accepted: false,
+        bpmOctaveShift: 1,
+        detectedBpm: 90,
+        effectiveBpm: 180,
+        beatsPerBar: 4,
+      }),
+    ]);
+    useTriageStore.getState().sliceChunkIntoBars("c1", 1);
+    const pieces = useTriageStore.getState().chunks;
+    expect(pieces.length).toBeGreaterThan(1);
+    for (const p of pieces) {
+      expect(p.accepted).toBe(false);
+      expect(p.bpmOctaveShift).toBe(1);
+      expect(p.detectedBpm).toBe(90);
+      expect(p.effectiveBpm).toBe(180);
+    }
+  });
+
+  it("snapshots each piece's own bounds as its origin and clears stale snapshot", () => {
+    seed([
+      makeChunk({
+        id: "c1",
+        startMs: 0,
+        endMs: 8000,
+        audioStartMs: 0,
+        effectiveBpm: 120,
+        beatsPerBar: 4,
+        preConformSnapshot: { startMs: 0, endMs: 8000, audioStartMs: 0 },
+      }),
+    ]);
+    useTriageStore.getState().sliceChunkIntoBars("c1", 2);
+    const pieces = useTriageStore
+      .getState()
+      .chunks.sort((a, b) => a.startMs - b.startMs);
+    for (const p of pieces) {
+      expect(p.originalStartMs).toBe(p.startMs);
+      expect(p.originalEndMs).toBe(p.endMs);
+      expect(p.originalAudioStartMs).toBe(p.audioStartMs);
+      expect(p.trimMode).toBe("free");
+      expect(p.preConformSnapshot).toBeUndefined();
+    }
+  });
+
+  it("uses the song-global BPM grid when set, anchoring pieces on it", () => {
+    // anchor offset from a non-round start; assert pieces stay on grid.
+    seed(
+      [
+        makeChunk({
+          id: "c1",
+          startMs: 1000,
+          endMs: 9000,
+          audioStartMs: 1000,
+          effectiveBpm: 0,
+          detectedBpm: undefined,
+          beatsPerBar: 4,
+        }),
+      ],
+      { jobBpm: 120 },
+    );
+    const newIds = useTriageStore.getState().sliceChunkIntoBars("c1", 1);
+    expect(newIds.length).toBeGreaterThan(0);
+    const pieces = useTriageStore
+      .getState()
+      .chunks.sort((a, b) => a.startMs - b.startMs);
+    // grid = 1000 + k*2000 → every anchor congruent to 1000 mod 2000.
+    for (const p of pieces) expect((p.audioStartMs! - 1000) % 2000).toBe(0);
+  });
+
+  it("is a no-op when the chunk is shorter than one interval", () => {
+    seed([
+      makeChunk({
+        id: "c1",
+        startMs: 0,
+        endMs: 3000,
+        audioStartMs: 0,
+        effectiveBpm: 120,
+        beatsPerBar: 4,
+      }),
+    ]);
+    const newIds = useTriageStore.getState().sliceChunkIntoBars("c1", 2);
+    expect(newIds).toEqual([]);
+    expect(useTriageStore.getState().chunks).toHaveLength(1);
+  });
+
+  it("is a no-op when no BPM is available", () => {
+    seed([
+      makeChunk({
+        id: "c1",
+        startMs: 0,
+        endMs: 30000,
+        audioStartMs: 0,
+        effectiveBpm: 0,
+        detectedBpm: undefined,
+        beatsPerBar: 4,
+      }),
+    ]);
+    const newIds = useTriageStore.getState().sliceChunkIntoBars("c1", 1);
+    expect(newIds).toEqual([]);
+    expect(useTriageStore.getState().chunks).toHaveLength(1);
+  });
+
+  it("is a no-op for intervalBars < 1 and for an unknown id", () => {
+    seed([makeChunk({ id: "c1", startMs: 0, endMs: 8000, effectiveBpm: 120 })]);
+    expect(useTriageStore.getState().sliceChunkIntoBars("c1", 0)).toEqual([]);
+    expect(useTriageStore.getState().sliceChunkIntoBars("nope", 1)).toEqual([]);
+    expect(useTriageStore.getState().chunks).toHaveLength(1);
+  });
+
+  it("publishes a sliceReveal marker with the cut times and every piece id", () => {
+    seed([
+      makeChunk({
+        id: "c1",
+        startMs: 0,
+        endMs: 12000,
+        audioStartMs: 0,
+        effectiveBpm: 120,
+        beatsPerBar: 4,
+      }),
+    ]);
+    const before = useTriageStore.getState().sliceReveal?.gen ?? 0;
+    useTriageStore.getState().sliceChunkIntoBars("c1", 2);
+    const reveal = useTriageStore.getState().sliceReveal;
+    expect(reveal).not.toBeNull();
+    expect(reveal!.cutTimesS).toEqual([4, 8]);
+    // pieceIds cover all three resulting pieces (incl. the kept original).
+    expect(reveal!.pieceIds).toHaveLength(3);
+    expect(reveal!.pieceIds).toContain("c1");
+    expect(reveal!.gen).toBeGreaterThan(before);
+  });
+
+  it("focuses the (kept-id) first piece after slicing", () => {
+    seed([
+      makeChunk({
+        id: "c1",
+        startMs: 0,
+        endMs: 12000,
+        audioStartMs: 0,
+        effectiveBpm: 120,
+        beatsPerBar: 4,
+      }),
+    ]);
+    useTriageStore.getState().focusChunk("c1");
+    useTriageStore.getState().sliceChunkIntoBars("c1", 2);
+    expect(useTriageStore.getState().focusedChunkId).toBe("c1");
+  });
+});
+
 describe("triage-store · joinChunks", () => {
   beforeEach(() => useTriageStore.getState().reset());
 
