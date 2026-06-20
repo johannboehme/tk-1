@@ -1,46 +1,54 @@
 /**
- * Build a normalized master-loudness envelope from decoded mono PCM.
+ * Build a normalized master-amplitude envelope from decoded mono PCM.
  *
- * This is the signal the sidechain follower reads (and the sidechain widget
- * draws): a windowed RMS over time, normalized to 0..1, indexed by
- * master-audio seconds. Computed ONCE at load (the editor already decodes
- * the master PCM for the timeline waveform) and stored, so the live
- * renderer, the export worker, and the widget all sample the same curve.
+ * This is the signal the sidechain follower reads AND the sidechain widget
+ * draws — so it must line up with the timeline's audio lane. The timeline
+ * draws a min/max PEAK waveform, so we use a PEAK (max-abs) envelope here
+ * too (not RMS): the envelope's peaks then sit exactly on the loudest
+ * samples — i.e. on the kick transients — at the same time the timeline
+ * shows them. RMS smeared the energy into the note body and read off from
+ * the transient, which made the scope's peaks land a beat-fraction away
+ * from the timeline's.
  *
- * RMS (not peak) because it tracks perceived loudness — kicks and sustained
- * energy read sensibly, isolated sample spikes don't dominate.
+ * Each bucket is CENTRED on its timestamp (window [center-½hop, center+½hop])
+ * rather than starting at it, so a transient lands on its own column instead
+ * of leading by up to a full window. Sampled per master-audio second;
+ * computed once at load and shared by the live renderer, export worker, and
+ * the widget.
  */
 import type { AudioEnvelope } from "./modulation";
 
 /**
  * @param pcm Mono samples (e.g. the editor's 22.05 kHz decode).
  * @param sampleRate Samples per second of `pcm`.
- * @param fps Output frames per second (curve resolution). 60 keeps
- *            transients crisp while staying cheap.
+ * @param fps Output frames per second (curve resolution). 120 keeps the
+ *            transient within ~one column of the timeline's peak.
  */
 export function buildLoudnessEnvelope(
   pcm: Float32Array,
   sampleRate: number,
-  fps = 60,
+  fps = 120,
 ): AudioEnvelope {
   if (pcm.length === 0 || sampleRate <= 0) {
     return { data: new Float32Array(0), fps };
   }
   const hop = Math.max(1, Math.round(sampleRate / fps));
-  const n = Math.max(1, Math.floor(pcm.length / hop));
+  const half = Math.floor(hop / 2);
+  const n = Math.max(1, Math.ceil(pcm.length / hop));
   const data = new Float32Array(n);
   let maxV = 0;
   for (let i = 0; i < n; i++) {
-    const start = i * hop;
-    const end = Math.min(pcm.length, start + hop);
-    let sum = 0;
+    // Window CENTRED on this bucket's timestamp (i*hop) so peaks don't lead.
+    const center = i * hop;
+    const start = Math.max(0, center - half);
+    const end = Math.min(pcm.length, center + half);
+    let peak = 0;
     for (let j = start; j < end; j++) {
-      const v = pcm[j];
-      sum += v * v;
+      const a = pcm[j] < 0 ? -pcm[j] : pcm[j];
+      if (a > peak) peak = a;
     }
-    const rms = Math.sqrt(sum / Math.max(1, end - start));
-    data[i] = rms;
-    if (rms > maxV) maxV = rms;
+    data[i] = peak;
+    if (peak > maxV) maxV = peak;
   }
   // Normalize so the loudest moment maps to 1 — thresholds then read in
   // intuitive 0..1 terms regardless of the master's absolute level.

@@ -963,7 +963,7 @@ export async function runEditRender(
     let audioEnv: ReturnType<typeof buildLoudnessEnvelope> | null = null;
     if ((job.fx ?? []).some((f) => f.modulation?.timeMod === "sidechain")) {
       const pcm = monoPcm ?? (await decodeAudioToMonoPcm(audioFile, 22050)).pcm;
-      audioEnv = buildLoudnessEnvelope(pcm, 22050, 60);
+      audioEnv = buildLoudnessEnvelope(pcm, 22050);
     }
 
     reportRenderProgress(jobId, { pct: 25, stage: "encoding" });

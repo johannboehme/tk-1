@@ -789,7 +789,7 @@ export default function Editor() {
       if (studioPcm) {
         useEditorStore
           .getState()
-          .setAudioEnv(buildLoudnessEnvelope(studioPcm, studioSampleRate, 60));
+          .setAudioEnv(buildLoudnessEnvelope(studioPcm, studioSampleRate));
       }
 
       // E2E hook (dev only) — Playwright reads `arrangementSegments[]`
