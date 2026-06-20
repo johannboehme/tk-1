@@ -37,6 +37,13 @@ import { useEditorStore } from "../store";
 import { fxCatalog, defaultTapLengthS } from "../fx/catalog";
 import type { FxKind, FxParamDef } from "../fx/types";
 import { INSTANT_ENVELOPE, type ADSREnvelope } from "../fx/envelope";
+import {
+  bipolarRateLabel,
+  DEFAULT_MOD_CONFIG,
+  type LfoShape,
+} from "../fx/modulation";
+import { SidechainScope } from "./SidechainScope";
+import { SegmentedControl } from "./SegmentedControl";
 import { useIsNarrowViewport } from "../use-is-narrow";
 
 interface PadDef {
@@ -61,6 +68,8 @@ const BEAT_STOPS = ["1/16", "1/8", "1/4", "1/2", "1", "2", "4"] as const;
 
 const TAB_H = 12;
 const PAD_BODY_H = 110;
+/** Extra panel height for the sidechain scope strip (mod-screen, SIDE). */
+const SIDECHAIN_STRIP_H = 92;
 // Mobile pad layout pieces — used to compute panel height per-viewport
 // so the bottom padding under the pad row matches the top padding
 // above the LCD (`py-1.5` = 6 px). At fold-folded (280 px wide) we get
@@ -142,8 +151,18 @@ export function FxHardwarePanel() {
     ro.observe(el);
     return () => ro.disconnect();
   }, [isNarrow]);
+  // Screen mode is lifted here (was local to PadBody) because the panel
+  // HEIGHT depends on it: the sidechain scope strip grows the panel only in
+  // mod-screen + SIDE. All other states stay pixel-identical.
+  const [screenMode, setScreenMode] = useState<ScreenMode>("params");
+  const selectedFxKind = useEditorStore((s) => s.selectedFxKind);
+  const timeMod = useEditorStore(
+    (s) => s.fxModulations[selectedFxKind]?.timeMod ?? "lfo",
+  );
+  const sidechainExpanded = screenMode === "mod" && timeMod === "sidechain";
   const padRowsNarrow = Math.ceil(PADS.length / padsPerRowNarrow(containerW || 280));
-  const padBodyH = isNarrow ? padBodyHeightNarrow(padRowsNarrow) : PAD_BODY_H;
+  const baseBodyH = isNarrow ? padBodyHeightNarrow(padRowsNarrow) : PAD_BODY_H;
+  const padBodyH = baseBodyH + (sidechainExpanded ? SIDECHAIN_STRIP_H : 0);
   const expandedH = TAB_H + padBodyH;
 
   // Margin strategy:
@@ -190,7 +209,12 @@ export function FxHardwarePanel() {
             height: padBodyH,
           }}
         >
-          <PadBody narrow={isNarrow} />
+          <PadBody
+            narrow={isNarrow}
+            screenMode={screenMode}
+            setScreenMode={setScreenMode}
+            sidechainExpanded={sidechainExpanded}
+          />
         </div>
       </div>
       <Tab
@@ -270,13 +294,37 @@ function Tab({
   );
 }
 
-function PadBody({ narrow = false }: { narrow?: boolean }) {
+function PadBody({
+  narrow = false,
+  screenMode,
+  setScreenMode,
+  sidechainExpanded = false,
+}: {
+  narrow?: boolean;
+  screenMode: ScreenMode;
+  setScreenMode: (m: ScreenMode) => void;
+  sidechainExpanded?: boolean;
+}) {
   const selectedFxKind = useEditorStore((s) => s.selectedFxKind);
   const def = fxCatalog[selectedFxKind];
-  // Local-only state — no persistence and no need for cross-component
-  // sync, so we keep it out of the Zustand store. Re-mounted with the
-  // panel itself, which is fine.
-  const [screenMode, setScreenMode] = useState<ScreenMode>("params");
+
+  // The encoder cluster (P/E) or the modulation controls (M) share the
+  // same slot between the LCD and the pad bank.
+  const controls =
+    screenMode === "mod" ? (
+      <ModControls kind={selectedFxKind} narrow={narrow} />
+    ) : def.params ? (
+      <div
+        className={
+          narrow
+            ? "flex items-end gap-2"
+            : "flex items-end gap-3 self-center ml-1"
+        }
+      >
+        <Encoder kind={selectedFxKind} param={def.params[0]} tint={ENCODER_HOT} />
+        <Encoder kind={selectedFxKind} param={def.params[1]} tint={ENCODER_COBALT} />
+      </div>
+    ) : null;
 
   return (
     <div className="relative w-full h-full" style={MECHANISM_BODY}>
@@ -292,35 +340,17 @@ function PadBody({ narrow = false }: { narrow?: boolean }) {
       />
 
       {narrow ? (
-        // Narrow phones: the LCD gets its own full-width row so the
-        // ENV-mode plot and finger-friendly knot hit-targets have real
-        // estate to live in. Mode-buttons + encoders sit horizontally
-        // below the LCD, then the pad bank wraps underneath. This trades
-        // a few extra vertical pixels for a usable envelope editor on
-        // mobile.
         <div className="relative h-full flex flex-col gap-1.5 px-2 py-1.5">
           <Lcd kind={selectedFxKind} mode={screenMode} narrow />
           <div className="flex items-center justify-center gap-3 shrink-0">
-            <ScreenModeColumn
-              mode={screenMode}
-              setMode={setScreenMode}
-              narrow
-            />
-            {def.params && (
-              <div className="flex items-end gap-2">
-                <Encoder
-                  kind={selectedFxKind}
-                  param={def.params[0]}
-                  tint={ENCODER_HOT}
-                />
-                <Encoder
-                  kind={selectedFxKind}
-                  param={def.params[1]}
-                  tint={ENCODER_COBALT}
-                />
-              </div>
-            )}
+            <ScreenModeColumn mode={screenMode} setMode={setScreenMode} narrow />
+            {controls}
           </div>
+          {sidechainExpanded && (
+            <div className="shrink-0">
+              <SidechainScope kind={selectedFxKind} />
+            </div>
+          )}
           <div className="flex flex-wrap gap-1 justify-center">
             {PADS.map((p) => (
               <FxPad key={p.slotKey} pad={p} />
@@ -328,36 +358,33 @@ function PadBody({ narrow = false }: { narrow?: boolean }) {
           </div>
         </div>
       ) : (
-        <div className="relative h-full flex items-center gap-2 pl-2 pr-5">
-          <ScreenModeColumn mode={screenMode} setMode={setScreenMode} />
-          <Lcd kind={selectedFxKind} mode={screenMode} />
-          {def.params && (
-            <div className="flex items-end gap-3 self-center ml-1">
-              <Encoder
-                kind={selectedFxKind}
-                param={def.params[0]}
-                tint={ENCODER_HOT}
-              />
-              <Encoder
-                kind={selectedFxKind}
-                param={def.params[1]}
-                tint={ENCODER_COBALT}
-              />
+        <div className="relative h-full flex flex-col">
+          <div
+            className="flex items-center gap-2 pl-2 pr-5"
+            style={{ flex: 1, minHeight: 0 }}
+          >
+            <ScreenModeColumn mode={screenMode} setMode={setScreenMode} />
+            <Lcd kind={selectedFxKind} mode={screenMode} />
+            {controls}
+            <Divider />
+            <div className="flex items-center gap-2">
+              {PADS.map((p) => (
+                <FxPad key={p.slotKey} pad={p} />
+              ))}
+            </div>
+          </div>
+          {sidechainExpanded && (
+            <div className="px-3 pb-2 pt-0.5">
+              <SidechainScope kind={selectedFxKind} />
             </div>
           )}
-          <Divider />
-          <div className="flex items-center gap-2">
-            {PADS.map((p) => (
-              <FxPad key={p.slotKey} pad={p} />
-            ))}
-          </div>
         </div>
       )}
     </div>
   );
 }
 
-type ScreenMode = "params" | "env";
+type ScreenMode = "params" | "env" | "mod";
 
 // — Pad ————————————————————————————————————————————————————
 
@@ -596,6 +623,8 @@ function Lcd({
       >
         {mode === "params" ? (
           <LcdParamsView kind={kind} />
+        ) : mode === "mod" ? (
+          <LcdModView kind={kind} />
         ) : (
           <LcdEnvelopeView kind={kind} narrow={narrow} />
         )}
@@ -1250,6 +1279,12 @@ function ScreenModeColumn({
         onClick={() => setMode("env")}
         ariaLabel="Show envelope"
       />
+      <ScreenModeButton
+        active={mode === "mod"}
+        label="M"
+        onClick={() => setMode("mod")}
+        ariaLabel="Show modulation"
+      />
     </div>
   );
 }
@@ -1261,7 +1296,7 @@ function ScreenModeButton({
   ariaLabel,
 }: {
   active: boolean;
-  label: "P" | "E";
+  label: string;
   onClick: () => void;
   ariaLabel: string;
 }) {
@@ -1326,6 +1361,404 @@ function ScreenModeButton({
         {label}
       </span>
     </button>
+  );
+}
+
+// — LCD MOD mode (modulation readout) ————————————————————————
+
+const SHAPE_GLYPH: Record<LfoShape, string> = {
+  sine: "∿",
+  triangle: "△",
+  saw: "◺",
+  ramp: "◹",
+  square: "⊓",
+};
+const SHAPE_ORDER: readonly LfoShape[] = [
+  "sine",
+  "triangle",
+  "saw",
+  "ramp",
+  "square",
+];
+
+/** Compact phosphor readout for the modulation screen — the physical
+ *  controls live in <ModControls> beside it (like real hardware). */
+function LcdModView({ kind }: { kind: FxKind }) {
+  const mc = useEditorStore((s) => s.fxModulations[kind]) ?? DEFAULT_MOD_CONFIG;
+  const bpm = useEditorStore((s) => s.jobMeta?.bpm?.value ?? null);
+  const isLfo = mc.timeMod === "lfo";
+  const headline = isLfo
+    ? `${SHAPE_GLYPH[mc.lfo.shape]} ${bipolarRateLabel(mc.lfo.rate, bpm)}`
+    : `THR ${Math.round(mc.side.threshold * 100)}`;
+  const sub = isLfo
+    ? mc.lfo.beatSync
+      ? "SYNC"
+      : "FREE"
+    : mc.side.invert
+      ? "DUCK"
+      : "GATE";
+  return (
+    <div className="flex flex-col h-full justify-between px-2 py-1.5">
+      <div
+        className="flex items-baseline justify-between"
+        style={{ ...LCD_TEXT_DIM, fontSize: 7, letterSpacing: 1.4 }}
+      >
+        <span>VAS · MOD</span>
+        <span>{isLfo ? "LFO" : "SIDE"}</span>
+      </div>
+      <div
+        style={{
+          fontFamily: '"JetBrains Mono Variable", ui-monospace, monospace',
+          fontSize: 20,
+          letterSpacing: 1,
+          lineHeight: 1,
+          fontWeight: 700,
+          ...LCD_TEXT,
+        }}
+      >
+        {headline}
+      </div>
+      <div
+        className="flex justify-between items-baseline"
+        style={{
+          fontFamily: '"JetBrains Mono Variable", ui-monospace, monospace',
+          fontSize: 9,
+          letterSpacing: 0.5,
+          ...LCD_TEXT,
+        }}
+      >
+        <span>DEPTH {Math.round(mc.depth * 100)}</span>
+        <span style={LCD_TEXT_DIM}>{sub}</span>
+      </div>
+    </div>
+  );
+}
+
+// — MOD controls (knobs + toggles beside the LCD) ————————————
+
+function ModControls({ kind, narrow }: { kind: FxKind; narrow: boolean }) {
+  const mc = useEditorStore((s) => s.fxModulations[kind]) ?? DEFAULT_MOD_CONFIG;
+  const bpm = useEditorStore((s) => s.jobMeta?.bpm?.value ?? null);
+  const setFxTimeMod = useEditorStore((s) => s.setFxTimeMod);
+  const setFxModDepth = useEditorStore((s) => s.setFxModDepth);
+  const setFxLfo = useEditorStore((s) => s.setFxLfo);
+  const setFxSidechain = useEditorStore((s) => s.setFxSidechain);
+
+  const cycleShape = () => {
+    const i = SHAPE_ORDER.indexOf(mc.lfo.shape);
+    setFxLfo(kind, { shape: SHAPE_ORDER[(i + 1) % SHAPE_ORDER.length] });
+  };
+
+  return (
+    <div
+      className={
+        (narrow ? "flex items-center gap-2" : "flex items-center gap-2 ml-1") +
+        " self-center"
+      }
+    >
+      <SegmentedControl
+        value={mc.timeMod}
+        onChange={(v) => setFxTimeMod(kind, v)}
+        size="sm"
+        options={[
+          { value: "lfo", label: "LFO" },
+          { value: "sidechain", label: "SIDE" },
+        ]}
+      />
+      {mc.timeMod === "lfo" ? (
+        <>
+          <ShapeButton glyph={SHAPE_GLYPH[mc.lfo.shape]} onClick={cycleShape} />
+          <MiniKnob
+            label="RATE"
+            value={mc.lfo.rate}
+            min={0}
+            max={1}
+            display={bipolarRateLabel(mc.lfo.rate, bpm)}
+            tint={ENCODER_HOT}
+            onChange={(v) => setFxLfo(kind, { rate: v })}
+          />
+          <MiniKnob
+            label="DEPTH"
+            value={mc.depth}
+            min={0}
+            max={1}
+            display={String(Math.round(mc.depth * 100))}
+            tint={ENCODER_COBALT}
+            onChange={(v) => setFxModDepth(kind, v)}
+          />
+          <MiniToggle
+            active={mc.lfo.beatSync}
+            label="SYNC"
+            onClick={() => setFxLfo(kind, { beatSync: !mc.lfo.beatSync })}
+          />
+        </>
+      ) : (
+        <>
+          <MiniKnob
+            label="ATK"
+            value={mc.side.attackS}
+            min={0}
+            max={0.5}
+            display={`${Math.round(mc.side.attackS * 1000)}`}
+            tint={ENCODER_HOT}
+            onChange={(v) => setFxSidechain(kind, { attackS: v })}
+          />
+          <MiniKnob
+            label="REL"
+            value={mc.side.releaseS}
+            min={0}
+            max={1}
+            display={`${Math.round(mc.side.releaseS * 1000)}`}
+            tint={ENCODER_HOT}
+            onChange={(v) => setFxSidechain(kind, { releaseS: v })}
+          />
+          <MiniKnob
+            label="DEPTH"
+            value={mc.depth}
+            min={0}
+            max={1}
+            display={String(Math.round(mc.depth * 100))}
+            tint={ENCODER_COBALT}
+            onChange={(v) => setFxModDepth(kind, v)}
+          />
+          <MiniToggle
+            active={mc.side.invert}
+            label="INV"
+            onClick={() => setFxSidechain(kind, { invert: !mc.side.invert })}
+          />
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Small matte knob with a tint indicator — value/onChange driven (the
+ *  Encoder is bound to fxDefaults, so the M-screen uses this generic one).
+ *  Drag vertically (200 px = full sweep, Shift = fine); off-window guard. */
+function MiniKnob({
+  label,
+  value,
+  min,
+  max,
+  display,
+  tint,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  display: string;
+  tint: string;
+  onChange: (v: number) => void;
+}) {
+  const startY = useRef(0);
+  const startVal = useRef(0);
+  const [dragging, setDragging] = useState(false);
+  const range = max - min;
+  const ratio = range > 0 ? Math.max(0, Math.min(1, (value - min) / range)) : 0;
+  const angle = -135 + ratio * 270;
+
+  const onMove = useCallback(
+    (e: PointerEvent) => {
+      if (e.buttons === 0) {
+        setDragging(false);
+        return;
+      }
+      const dy = startY.current - e.clientY;
+      const sens = e.shiftKey ? 1200 : 200;
+      let next = startVal.current + (dy / sens) * range;
+      next = Math.max(min, Math.min(max, next));
+      onChange(next);
+    },
+    [min, max, range, onChange],
+  );
+
+  useEffect(() => {
+    if (!dragging) return;
+    const up = () => setDragging(false);
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
+    window.addEventListener("blur", up);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
+      window.removeEventListener("blur", up);
+    };
+  }, [dragging, onMove]);
+
+  const SIZE = 36;
+  return (
+    <div className="flex flex-col items-center" style={{ gap: 2 }}>
+      <div
+        role="slider"
+        aria-valuemin={min}
+        aria-valuemax={max}
+        aria-valuenow={value}
+        aria-label={label}
+        tabIndex={0}
+        onPointerDown={(e) => {
+          e.preventDefault();
+          startY.current = e.clientY;
+          startVal.current = value;
+          setDragging(true);
+        }}
+        className="relative touch-none cursor-grab active:cursor-grabbing"
+        style={{ width: SIZE, height: SIZE }}
+      >
+        <div
+          aria-hidden
+          className="absolute inset-0 rounded-full"
+          style={{
+            background:
+              "radial-gradient(circle at 32% 22%, #2C2A26 0%, #16140F 65%, #050402 100%)",
+            boxShadow:
+              "0 2px 3px -1px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.10), inset 0 -2px 4px rgba(0,0,0,0.55)",
+          }}
+        />
+        <div
+          aria-hidden
+          className="absolute pointer-events-none"
+          style={{
+            left: "50%",
+            top: "50%",
+            width: 0,
+            height: 0,
+            transform: `translate(-50%, -50%) rotate(${angle}deg)`,
+            transition: dragging ? "none" : "transform 80ms ease-out",
+          }}
+        >
+          <span
+            className="absolute"
+            style={{
+              left: "50%",
+              top: -SIZE / 2 + 3,
+              transform: "translate(-50%, 0)",
+              width: 2,
+              height: 6,
+              borderRadius: 1,
+              background: tint,
+              boxShadow: `0 0 3px ${tint}cc`,
+            }}
+          />
+        </div>
+      </div>
+      <span
+        style={{
+          fontFamily: '"JetBrains Mono Variable", ui-monospace, monospace',
+          fontSize: 7,
+          letterSpacing: 0.5,
+          lineHeight: 1,
+          ...LCD_TEXT,
+        }}
+      >
+        {display}
+      </span>
+      <span
+        style={{
+          fontSize: 6.5,
+          letterSpacing: 1,
+          color: "rgba(245,240,225,0.5)",
+          textShadow: "0 1px 0 rgba(0,0,0,0.55)",
+          fontWeight: 700,
+          textTransform: "uppercase",
+          fontFamily: '"JetBrains Mono Variable", ui-monospace, monospace',
+          lineHeight: 1,
+        }}
+      >
+        {label}
+      </span>
+    </div>
+  );
+}
+
+/** Small latching toggle (SYNC / INV) styled like the screen-mode keys. */
+function MiniToggle({
+  active,
+  label,
+  onClick,
+}: {
+  active: boolean;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      aria-label={label}
+      className="relative focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hot/40"
+      style={{
+        minWidth: 26,
+        height: 16,
+        padding: "0 4px",
+        borderRadius: 2.5,
+        background: "linear-gradient(180deg,#2C2925 0%,#1A1815 100%)",
+        border: "1px solid rgba(0,0,0,0.7)",
+        boxShadow: active
+          ? "inset 0 2px 3px rgba(0,0,0,0.6)"
+          : "inset 0 1px 0 rgba(255,255,255,0.07), inset 0 -1px 1px rgba(0,0,0,0.55), 0 1px 1px rgba(0,0,0,0.4)",
+        transform: active ? "translateY(1px)" : "translateY(0)",
+        transition: "transform 50ms, box-shadow 80ms",
+        cursor: "pointer",
+        color: active ? "#9FE08E" : "rgba(245,240,225,0.5)",
+        textShadow: active
+          ? "0 0 4px rgba(159,224,142,0.7)"
+          : "0 1px 0 rgba(0,0,0,0.6)",
+        fontFamily: '"JetBrains Mono Variable", ui-monospace, monospace',
+        fontSize: 7,
+        fontWeight: 700,
+        letterSpacing: 0.6,
+      }}
+    >
+      {label}
+    </button>
+  );
+}
+
+/** Click-to-cycle LFO shape button showing the current glyph. */
+function ShapeButton({ glyph, onClick }: { glyph: string; onClick: () => void }) {
+  return (
+    <div className="flex flex-col items-center" style={{ gap: 2 }}>
+      <button
+        type="button"
+        onClick={onClick}
+        aria-label="LFO shape"
+        className="relative focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hot/40"
+        style={{
+          width: 26,
+          height: 26,
+          borderRadius: 4,
+          background: "linear-gradient(180deg,#2C2925 0%,#1A1815 100%)",
+          border: "1px solid rgba(0,0,0,0.7)",
+          boxShadow:
+            "inset 0 1px 0 rgba(255,255,255,0.07), inset 0 -1px 1px rgba(0,0,0,0.55), 0 1px 1px rgba(0,0,0,0.4)",
+          cursor: "pointer",
+          color: "#9FE08E",
+          textShadow: "0 0 4px rgba(159,224,142,0.6)",
+          fontSize: 14,
+          lineHeight: 1,
+        }}
+      >
+        {glyph}
+      </button>
+      <span
+        style={{
+          fontSize: 6.5,
+          letterSpacing: 1,
+          color: "rgba(245,240,225,0.5)",
+          textShadow: "0 1px 0 rgba(0,0,0,0.55)",
+          fontWeight: 700,
+          fontFamily: '"JetBrains Mono Variable", ui-monospace, monospace',
+          lineHeight: 1,
+        }}
+      >
+        SHAPE
+      </span>
+    </div>
   );
 }
 
