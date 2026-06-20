@@ -85,6 +85,19 @@ describe("buildPersistPatch", () => {
     expect(patch.bpm?.phase).toBe(0.05);
   });
 
+  test("persists the color grade + filter stack round-trip", () => {
+    useEditorStore.getState().loadJob(meta);
+    useEditorStore.getState().setColorGrade({ exposure: 0.3 });
+    const id = useEditorStore.getState().addFilterSlot("vhs");
+    useEditorStore.getState().setFilterParam(id, "tracking", 0.7);
+
+    const patch = buildPersistPatch(useEditorStore.getState(), baseJob);
+    expect(patch.colorGrade?.exposure).toBe(0.3);
+    expect(patch.filterSlots).toHaveLength(1);
+    expect(patch.filterSlots?.[0].kind).toBe("vhs");
+    expect(patch.filterSlots?.[0].params.tracking).toBe(0.7);
+  });
+
   test("leaves bpm undefined when none has been detected/set yet", () => {
     useEditorStore.getState().loadJob(meta);
     const patch = buildPersistPatch(useEditorStore.getState(), baseJob);

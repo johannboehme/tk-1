@@ -389,6 +389,13 @@ export interface LocalJob {
    *  feature. The renderer reads this verbatim. */
   fx?: PunchFxRecord[];
 
+  /** The single global color grade (a flat GradeParams vector). Optional;
+   *  absent on jobs that pre-date the feature → loads as the identity. */
+  colorGrade?: ColorGradeRecord;
+  /** The opinionated filter stack (VHS / Super-8 / …). Optional; absent on
+   *  jobs that pre-date the feature → loads empty. */
+  filterSlots?: FilterSlotRecord[];
+
   /** Master-audio playback gain (linear). 1.0 = source level (default),
    *  0 = muted, 2.0 = +6 dB. Applied at preview time and baked into the
    *  rendered output. Optional / undefined → default 1.0. */
@@ -482,7 +489,18 @@ export type PunchFxKindRecord =
   | "rgb"
   | "tape"
   | "zoom"
-  | "uv";
+  | "uv"
+  // Mirrors `FxKind`. `grade` + the filter kinds are global, not punch-in
+  // accents: they never land in the persisted `fx[]` array (their state
+  // lives in colorGrade / filterSlots), but are mirrored here to keep this
+  // union a faithful superset of `FxKind`.
+  | "grade"
+  | "vhs"
+  | "super8"
+  | "decay"
+  | "noir"
+  | "sepia"
+  | "polaroid";
 
 export interface PunchFxRecord {
   id: string;
@@ -500,7 +518,24 @@ export interface PunchFxRecord {
   };
 }
 
-const DB_NAME = "videoaudiosync";
+/** Storage shape for the global color grade — a flat `GradeParams` vector
+ *  (editor/fx/looks). Kept as an open numeric map so the storage layer stays
+ *  free of editor imports and unknown/future params round-trip harmlessly. */
+export type ColorGradeRecord = Record<string, number>;
+
+/** Storage shape for one opinionated filter slot. Mirrors `FilterSlot` from
+ *  the editor module (a filter kind + that kind's own param values). */
+export interface FilterSlotRecord {
+  id: string;
+  kind: PunchFxKindRecord;
+  params: Record<string, number>;
+}
+
+// DB name is overridable via VITE_DB_NAME so an isolated dev instance (e.g. a
+// git-worktree branch under review) can use its own IndexedDB instead of
+// sharing — and risking a version clash with — the real "videoaudiosync" DB.
+// Production builds set nothing → the canonical name.
+const DB_NAME = import.meta.env.VITE_DB_NAME || "videoaudiosync";
 // v9 added the waveform-pyramid store; the bump landed at 11 after dev
 // iteration. The store is (re)created whenever missing in `upgrade`, so the
 // exact number doesn't matter — any 8→11 upgrade creates it.

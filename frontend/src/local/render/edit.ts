@@ -51,6 +51,8 @@ import { activeCamAt } from "../../editor/cuts";
 import { activeCamAtArr as activeCamAtArrLocal } from "../../editor/arrangement-pills";
 import type { Cut } from "../../storage/jobs-db";
 import type { PunchFx } from "../../editor/fx/types";
+import type { GradeParams } from "../../editor/fx/looks";
+import type { FilterSlot } from "../../editor/fx/types";
 import type { TextOverlay, EnergyCurves } from "./ass-builder";
 import type { Visualizer } from "./visualizer/types";
 import { camSourceTimeUs } from "../timing/cam-time";
@@ -83,6 +85,11 @@ export interface EditRenderInput {
   /** Punch-in FX (visual effects with in/out spans). Same data the live
    *  preview reads — passed through to the compositor verbatim. */
   fx?: PunchFx[];
+  /** The single global color grade. Same data the live preview reads. */
+  colorGrade?: GradeParams;
+  /** The opinionated filter stack. Same data the live preview reads; applied
+   *  under the punch-in accents so export == preview. */
+  filterSlots?: FilterSlot[];
   offsetMs: number;
   driftRatio: number;
   videoBitrateBps?: number;
@@ -265,6 +272,8 @@ export async function editRender(input: EditRenderInput): Promise<EditRenderResu
       energy: input.energy ?? null,
       visualizers: input.visualizers ?? [],
       fx: input.fx ?? [],
+      colorGrade: input.colorGrade,
+      filterSlots: input.filterSlots ?? [],
     },
     input.capabilities ?? { webgl2: false, webgpu: false },
   );
@@ -732,6 +741,8 @@ export async function editRenderMulti(
       energy: input.energy ?? null,
       visualizers: input.visualizers ?? [],
       fx: input.fx ?? [],
+      colorGrade: input.colorGrade,
+      filterSlots: input.filterSlots ?? [],
     },
     input.capabilities ?? { webgl2: false, webgpu: false },
   );

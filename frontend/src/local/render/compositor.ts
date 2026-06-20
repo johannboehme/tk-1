@@ -34,6 +34,12 @@ import type { ViewportTransform } from "../../editor/types";
 import { activeFxAt } from "../../editor/fx/active";
 import { fxCatalog } from "../../editor/fx/catalog";
 import { envelopeAt, INSTANT_ENVELOPE } from "../../editor/fx/envelope";
+import type { GradeParams } from "../../editor/fx/looks";
+import type { FilterSlot } from "../../editor/fx/types";
+import {
+  colorGradeFrameFx,
+  filterFrameFx,
+} from "../../editor/render/build-descriptor";
 import {
   createBackend,
   type BackendCapabilities,
@@ -72,6 +78,12 @@ export interface CompositorOptions {
    *  visualizers and text overlays. Same `fxCatalog[kind]` impl as the
    *  live preview — single source of truth per kind. */
   fx?: readonly PunchFx[];
+  /** The single global color grade. Applied to every frame under everything,
+   *  so the export matches the preview. */
+  colorGrade?: GradeParams;
+  /** The opinionated filter stack. Applied above the grade, under the
+   *  punch-in accents, every frame. */
+  filterSlots?: readonly FilterSlot[];
 }
 
 // Per-element placement is shared with the live preview via
@@ -217,7 +229,10 @@ export class Compositor {
       displayH: dispH,
     };
 
-    const fxFrame: FrameFx[] = this.opts.fx
+    // Global grades FIRST (the "film stock" layer), then the punch-in
+    // accents on top — identical order + resolution to the live preview's
+    // buildFx, so the exported look matches what the user dialled in.
+    const punchFx: FrameFx[] = this.opts.fx
       ? activeFxAt(this.opts.fx, tFx)
           .map((fx) => {
             const def = fxCatalog[fx.kind];
@@ -232,6 +247,11 @@ export class Compositor {
           })
           .filter((f) => f.wetness > 0)
       : [];
+    const fxFrame: FrameFx[] = [
+      ...colorGradeFrameFx(this.opts.colorGrade),
+      ...filterFrameFx(this.opts.filterSlots),
+      ...punchFx,
+    ];
 
     const descriptor: FrameDescriptor = {
       tMaster: tFx,

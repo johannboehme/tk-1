@@ -18,6 +18,8 @@ import { activeCamAtArr } from "../arrangement-pills";
 import { masterToArr } from "../arrangement-time";
 import { activeFxAt } from "../fx/active";
 import { fxCatalog } from "../fx/catalog";
+import { gradeIsIdentity, type GradeParams } from "../fx/looks";
+import type { FilterSlot } from "../fx/types";
 import { envelopeAt, INSTANT_ENVELOPE, type ADSREnvelope } from "../fx/envelope";
 import { resolveOutputDims } from "../output-frame";
 import {
@@ -71,6 +73,14 @@ export interface EditorStoreSnapshot {
   /** Per-kind live ADSR envelope values. Same override scope as
    *  fxDefaults — only the selected kind's envelope is overridden. */
   fxEnvelopes?: Readonly<Partial<Record<FxKind, ADSREnvelope>>>;
+  /** Single global color grade — the corrective/creative pass. Emitted as
+   *  one `grade` FrameFx prepended ahead of everything (skipped when it's the
+   *  identity). Optional so test stubs / the export compositor can omit it. */
+  colorGrade?: GradeParams;
+  /** Opinionated filter stack — each active slot becomes one FrameFx of its
+   *  own kind, emitted AFTER the grade and BEFORE the punch-in accents, so
+   *  the order is: grade → filters → accents. Optional. */
+  filterSlots?: readonly FilterSlot[];
 }
 
 /**
@@ -196,11 +206,60 @@ function buildPreviewLayersFromPill(
   ];
 }
 
+/**
+ * The single global color grade → at most one `grade` FrameFx (inS 0,
+ * wetness 1). Skipped entirely when the grade is the identity. Shared by the
+ * live preview (buildFx) AND the export compositor so preview == render.
+ */
+export function colorGradeFrameFx(grade: GradeParams | undefined): FrameFx[] {
+  if (!grade || gradeIsIdentity(grade)) return [];
+  return [
+    {
+      id: "grade",
+      kind: "grade",
+      inS: 0,
+      // GradeParams is structurally all-number; FrameFx.params is a plain
+      // Record the backends read by key.
+      params: grade as unknown as Record<string, number>,
+      wetness: 1,
+    },
+  ];
+}
+
+/**
+ * The opinionated filter stack → one FrameFx per active slot (amount>0), in
+ * slot order. Each filter is a replace-blend source-FX, so slots compose
+ * serially top→bottom (each filters the previous one's output) — reordering
+ * genuinely changes the result. Params are merged with the kind's defaults.
+ * Shared by preview + export.
+ */
+export function filterFrameFx(
+  slots: readonly FilterSlot[] | undefined,
+): FrameFx[] {
+  if (!slots) return [];
+  const out: FrameFx[] = [];
+  for (const slot of slots) {
+    const def = fxCatalog[slot.kind];
+    if (!def) continue;
+    const params = { ...def.defaultParams, ...slot.params };
+    if ((params.amount ?? 1) <= 0) continue;
+    out.push({ id: slot.id, kind: slot.kind, inS: 0, params, wetness: 1 });
+  }
+  return out;
+}
+
 function buildFx(
   snapshot: EditorStoreSnapshot,
   tTimeline: number,
 ): FrameFx[] {
-  const out: FrameFx[] = [];
+  // Order: color grade (corrective pass) → opinionated filters (the looks) →
+  // punch-in accents on top. All replace-blend, re-snapshotted per FX, so
+  // they compose serially.
+  const out: FrameFx[] = [
+    ...colorGradeFrameFx(snapshot.colorGrade),
+    ...filterFrameFx(snapshot.filterSlots),
+  ];
+
   const selectedKind = snapshot.selectedFxKind ?? null;
   const overrideParams =
     selectedKind != null ? snapshot.fxDefaults?.[selectedKind] : undefined;

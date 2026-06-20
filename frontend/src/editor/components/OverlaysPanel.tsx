@@ -3,6 +3,8 @@ import { TextOverlay, VisualizerConfig } from "../types";
 import { useEditorStore } from "../store";
 import { ChunkyButton } from "./ChunkyButton";
 import { SegmentedControl } from "./SegmentedControl";
+import { FilterStack } from "./FilterStack";
+import { ColorGradePanel } from "./ColorGradePanel";
 import { PlusIcon, TrashIcon } from "./icons";
 
 const VIS_OPTIONS: { value: VisualizerConfig["type"] | ""; label: string }[] = [
@@ -53,7 +55,9 @@ export function OverlaysPanel() {
     <div className="flex flex-col gap-5">
       <header>
         <h2 className="font-display text-lg leading-none">Overlays & FX</h2>
-        <p className="text-xs text-ink-2 mt-1">Text overlays + audio visualizer.</p>
+        <p className="text-xs text-ink-2 mt-1">
+          Filters · text overlays · audio visualizer.
+        </p>
       </header>
 
       <div className="flex flex-col gap-2">
@@ -82,6 +86,10 @@ export function OverlaysPanel() {
           ))}
         </select>
       </div>
+
+      <ColorGradePanel />
+
+      <FilterStack />
 
       <div className="flex items-center justify-between">
         <span className="label">Text overlays · {overlays.length}</span>

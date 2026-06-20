@@ -47,7 +47,8 @@ import {
   arrBeatPhaseS,
 } from "./selectors/timing";
 import type { Cut } from "../storage/jobs-db";
-import type { FxKind, PunchFx } from "./fx/types";
+import type { FilterSlot, FxKind, PunchFx } from "./fx/types";
+import { defaultColorGrade, type GradeParams } from "./fx/looks";
 import { defaultTapLengthS, fxCatalog } from "./fx/catalog";
 import type { ADSREnvelope } from "./fx/envelope";
 import { INSTANT_ENVELOPE } from "./fx/envelope";
@@ -313,6 +314,18 @@ interface EditorState {
   /** Punch-in FX (visual effects with in/out spans, freely overlapping). */
   fx: PunchFx[];
 
+  /** The single global color grade — the corrective/creative pass applied
+   *  under everything. One `GradeParams` vector (not a stack); the descriptor
+   *  builder emits one `grade` FrameFx unless it's the identity. Edited in the
+   *  Overlays "Color grade" section, persisted per-job. */
+  colorGrade: GradeParams;
+
+  /** Opinionated filter stack — VHS / Super-8 / Sepia / … . Each slot picks a
+   *  filter kind and carries that kind's own params; they compose serially
+   *  top→bottom, applied above the grade and under the punch-in accents.
+   *  Edited in the Overlays "Filters" section, persisted per-job. */
+  filterSlots: FilterSlot[];
+
   /** Live punch-in holds keyed by slotKey (e.g. "key:F", "pad:0"). Multiple
    *  may be active simultaneously. Plain object so zustand reference-equality
    *  selectors work cleanly (a Map would mutate-in-place under naive use). */
@@ -362,6 +375,10 @@ interface EditorState {
       clips?: ClipInit[];
       cuts?: Cut[];
       fx?: PunchFx[];
+      /** Persisted global color grade. Absent on legacy jobs → identity. */
+      colorGrade?: GradeParams;
+      /** Persisted opinionated filter stack. Absent on legacy jobs → []. */
+      filterSlots?: FilterSlot[];
       audioVolume?: number;
       /** Long-form arrangement segments (master-time {in, out}). When
        *  passed, the editor walks them sequentially during playback +
@@ -648,6 +665,26 @@ interface EditorState {
    *  gesture on the FX strip. Live recordings (`fxHolds`) are left
    *  untouched — `cancelAllFxHolds()` is the right call for those. */
   clearAllFx(): void;
+
+  // ---- Color grade (one single global grade) ----
+  /** Patch the global color grade (one or more GradeParams). */
+  setColorGrade(patch: Partial<GradeParams>): void;
+  /** Reset the color grade to the neutral identity. */
+  resetColorGrade(): void;
+
+  // ---- Filter stack (opinionated looks) ----
+  /** Append a filter slot of `kind`, seeded with that kind's tasteful
+   *  defaults. Returns its id. */
+  addFilterSlot(kind: FxKind): string;
+  /** Set one param of a filter slot (e.g. "tracking", "amount"). */
+  setFilterParam(id: string, key: string, value: number): void;
+  /** Switch a filter slot to a different kind (reseeds its params). */
+  setFilterKind(id: string, kind: FxKind): void;
+  /** Remove a filter slot by id. */
+  removeFilterSlot(id: string): void;
+  /** Nudge a filter slot up (-1) or down (+1) — order is the serial compose
+   *  order, so this changes the result. Clamped at ends. */
+  moveFilterSlot(id: string, dir: -1 | 1): void;
   /** Begin a live punch-in. Creates a fx with default-tap-length and
    *  records a hold under `slotKey`. `startS` should already be snapped. */
   beginFxHold(slotKey: string, kind: FxKind, startS: number): void;
@@ -1040,6 +1077,8 @@ export const useEditorStore = create<EditorState>()(
     notice: null,
     preparingCamIds: new Set<string>(),
     fx: [],
+    colorGrade: defaultColorGrade(),
+    filterSlots: [],
     fxHolds: {},
     selectedFxKind: "vignette",
     fxDefaults: {},
@@ -1067,6 +1106,8 @@ export const useEditorStore = create<EditorState>()(
         notice: null,
         preparingCamIds: new Set<string>(),
         fx: [],
+        colorGrade: defaultColorGrade(),
+        filterSlots: [],
         fxHolds: {},
         selectedFxKind: "vignette",
         fxDefaults: {},
@@ -1136,6 +1177,10 @@ export const useEditorStore = create<EditorState>()(
         ),
         selectedPillId: null,
         fx: opts?.fx ?? [],
+        // Merge over defaults so a grade persisted before a param existed
+        // still loads with every key present.
+        colorGrade: { ...defaultColorGrade(), ...(opts?.colorGrade ?? {}) },
+        filterSlots: opts?.filterSlots ?? [],
         fxHolds: {},
         selectedFxKind: "vignette",
         fxDefaults: {},
@@ -2406,6 +2451,51 @@ export const useEditorStore = create<EditorState>()(
       const liveIds = new Set<string>();
       for (const h of Object.values(get().fxHolds)) liveIds.add(h.fxId);
       set({ fx: get().fx.filter((f) => liveIds.has(f.id)) });
+    },
+
+    // ---- Color grade (one single global grade) ----
+    setColorGrade(patch) {
+      set({ colorGrade: { ...get().colorGrade, ...patch } });
+    },
+    resetColorGrade() {
+      set({ colorGrade: defaultColorGrade() });
+    },
+
+    // ---- Filter stack (opinionated looks) ----
+    addFilterSlot(kind) {
+      const id = makeFxId();
+      const def = fxCatalog[kind];
+      const slot: FilterSlot = { id, kind, params: { ...def.defaultParams } };
+      set({ filterSlots: [...get().filterSlots, slot] });
+      return id;
+    },
+    setFilterParam(id, key, value) {
+      set({
+        filterSlots: get().filterSlots.map((s) =>
+          s.id === id ? { ...s, params: { ...s.params, [key]: value } } : s,
+        ),
+      });
+    },
+    setFilterKind(id, kind) {
+      const def = fxCatalog[kind];
+      set({
+        filterSlots: get().filterSlots.map((s) =>
+          s.id === id ? { ...s, kind, params: { ...def.defaultParams } } : s,
+        ),
+      });
+    },
+    removeFilterSlot(id) {
+      set({ filterSlots: get().filterSlots.filter((s) => s.id !== id) });
+    },
+    moveFilterSlot(id, dir) {
+      const slots = get().filterSlots;
+      const i = slots.findIndex((s) => s.id === id);
+      if (i < 0) return;
+      const j = i + dir;
+      if (j < 0 || j >= slots.length) return;
+      const next = slots.slice();
+      [next[i], next[j]] = [next[j], next[i]];
+      set({ filterSlots: next });
     },
     beginFxHold(slotKey, kind, startS) {
       // Single set() per keypress — cuts subscriber-fanout cost (13 field

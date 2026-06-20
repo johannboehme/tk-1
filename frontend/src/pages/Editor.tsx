@@ -19,6 +19,7 @@ import {
 } from "../editor/components/icons";
 import { useEditorStore } from "../editor/store";
 import type { FxKind } from "../editor/fx/types";
+import type { GradeParams } from "../editor/fx/looks";
 import { useRegisterShortcut } from "../editor/shortcuts/useRegisterShortcut";
 import {
   jobEvents,
@@ -773,6 +774,10 @@ export default function Editor() {
           clips: clipInits,
           cuts: cutsForLoad,
           fx: fxForLoad,
+          // Color grade + filters are master-time-agnostic (no inS/outS), so
+          // they need no schema migration — read straight back from the job.
+          colorGrade: j.colorGrade as GradeParams | undefined,
+          filterSlots: j.filterSlots ?? [],
           audioVolume: j.audioVolume,
           arrangementSegments,
           arrangement,
