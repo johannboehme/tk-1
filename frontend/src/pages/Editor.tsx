@@ -768,6 +768,9 @@ export default function Editor() {
           clips: clipInits,
           cuts: cutsForLoad,
           fx: fxForLoad,
+          // Global grades are master-time-agnostic (no inS/outS), so they
+          // need no schema migration — read straight back from the job.
+          grades: j.grades ?? [],
           audioVolume: j.audioVolume,
           arrangementSegments,
           arrangement,

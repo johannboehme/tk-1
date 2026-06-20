@@ -389,6 +389,11 @@ export interface LocalJob {
    *  feature. The renderer reads this verbatim. */
   fx?: PunchFxRecord[];
 
+  /** Global color-grade stack — the "film stock" layer applied under the
+   *  punch-in accents (look + strength + macros per slot). Optional; absent
+   *  on jobs that pre-date the feature → loads as an empty stack. */
+  grades?: GradeSlotRecord[];
+
   /** Master-audio playback gain (linear). 1.0 = source level (default),
    *  0 = muted, 2.0 = +6 dB. Applied at preview time and baked into the
    *  rendered output. Optional / undefined → default 1.0. */
@@ -503,6 +508,34 @@ export interface PunchFxRecord {
     sustain: number;
     releaseS: number;
   };
+}
+
+/** Mirror of `GradeLookId` (editor/fx/looks). Kept duplicated to keep the
+ *  storage layer free of editor imports; new looks added there should be
+ *  mirrored here. Unknown ids still load (the editor degrades them to RAW). */
+export type GradeLookIdRecord =
+  | "raw"
+  | "clear"
+  | "frost"
+  | "ember"
+  | "haze"
+  | "blush"
+  | "dusk"
+  | "volt"
+  | "mono"
+  | "gold"
+  | "super8";
+
+/** Storage shape for a single global color-grade slot. Mirrors `GradeSlot`
+ *  from the editor module (look + strength BLEND + four macro nudges). */
+export interface GradeSlotRecord {
+  id: string;
+  lookId: GradeLookIdRecord;
+  strength: number;
+  warmth: number;
+  fade: number;
+  punch: number;
+  grain: number;
 }
 
 const DB_NAME = "videoaudiosync";

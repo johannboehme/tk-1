@@ -85,6 +85,17 @@ describe("buildPersistPatch", () => {
     expect(patch.bpm?.phase).toBe(0.05);
   });
 
+  test("persists the global grade stack round-trip", () => {
+    useEditorStore.getState().loadJob(meta);
+    const id = useEditorStore.getState().addGradeSlot();
+    useEditorStore.getState().updateGradeSlot(id, { lookId: "ember", punch: 0.4 });
+
+    const patch = buildPersistPatch(useEditorStore.getState(), baseJob);
+    expect(patch.grades).toHaveLength(1);
+    expect(patch.grades?.[0].lookId).toBe("ember");
+    expect(patch.grades?.[0].punch).toBe(0.4);
+  });
+
   test("leaves bpm undefined when none has been detected/set yet", () => {
     useEditorStore.getState().loadJob(meta);
     const patch = buildPersistPatch(useEditorStore.getState(), baseJob);

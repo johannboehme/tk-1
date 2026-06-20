@@ -48,6 +48,7 @@ import {
 } from "./selectors/timing";
 import type { Cut } from "../storage/jobs-db";
 import type { FxKind, PunchFx } from "./fx/types";
+import { defaultGradeSlot, type GradeSlot } from "./fx/looks";
 import { defaultTapLengthS, fxCatalog } from "./fx/catalog";
 import type { ADSREnvelope } from "./fx/envelope";
 import { INSTANT_ENVELOPE } from "./fx/envelope";
@@ -313,6 +314,13 @@ interface EditorState {
   /** Punch-in FX (visual effects with in/out spans, freely overlapping). */
   fx: PunchFx[];
 
+  /** Global color-grade stack — the "film stock" layer applied UNDER the
+   *  punch-in accents. Each slot is one look + strength (BLEND) + four macro
+   *  nudges; the descriptor builder prepends them ahead of `fx` and they
+   *  compose serially top→bottom. Edited in the Overlays panel, persisted
+   *  per-job alongside `fx`. */
+  gradeSlots: GradeSlot[];
+
   /** Live punch-in holds keyed by slotKey (e.g. "key:F", "pad:0"). Multiple
    *  may be active simultaneously. Plain object so zustand reference-equality
    *  selectors work cleanly (a Map would mutate-in-place under naive use). */
@@ -362,6 +370,8 @@ interface EditorState {
       clips?: ClipInit[];
       cuts?: Cut[];
       fx?: PunchFx[];
+      /** Persisted global color-grade stack. Absent on legacy jobs → []. */
+      grades?: GradeSlot[];
       audioVolume?: number;
       /** Long-form arrangement segments (master-time {in, out}). When
        *  passed, the editor walks them sequentially during playback +
@@ -648,6 +658,17 @@ interface EditorState {
    *  gesture on the FX strip. Live recordings (`fxHolds`) are left
    *  untouched — `cancelAllFxHolds()` is the right call for those. */
   clearAllFx(): void;
+
+  // ---- Global color-grade slots (Overlays panel) ----
+  /** Append a fresh neutral grade slot to the stack. Returns its id. */
+  addGradeSlot(): string;
+  /** Patch a grade slot by id (look / strength / macros). No-op on miss. */
+  updateGradeSlot(id: string, patch: Partial<GradeSlot>): void;
+  /** Remove a grade slot by id. */
+  removeGradeSlot(id: string): void;
+  /** Nudge a slot up (-1) or down (+1) in the stack — order is the serial
+   *  compose order, so this changes the resulting look. Clamped at ends. */
+  moveGradeSlot(id: string, dir: -1 | 1): void;
   /** Begin a live punch-in. Creates a fx with default-tap-length and
    *  records a hold under `slotKey`. `startS` should already be snapped. */
   beginFxHold(slotKey: string, kind: FxKind, startS: number): void;
@@ -1040,6 +1061,7 @@ export const useEditorStore = create<EditorState>()(
     notice: null,
     preparingCamIds: new Set<string>(),
     fx: [],
+    gradeSlots: [],
     fxHolds: {},
     selectedFxKind: "vignette",
     fxDefaults: {},
@@ -1067,6 +1089,7 @@ export const useEditorStore = create<EditorState>()(
         notice: null,
         preparingCamIds: new Set<string>(),
         fx: [],
+        gradeSlots: [],
         fxHolds: {},
         selectedFxKind: "vignette",
         fxDefaults: {},
@@ -1136,6 +1159,7 @@ export const useEditorStore = create<EditorState>()(
         ),
         selectedPillId: null,
         fx: opts?.fx ?? [],
+        gradeSlots: opts?.grades ?? [],
         fxHolds: {},
         selectedFxKind: "vignette",
         fxDefaults: {},
@@ -2406,6 +2430,33 @@ export const useEditorStore = create<EditorState>()(
       const liveIds = new Set<string>();
       for (const h of Object.values(get().fxHolds)) liveIds.add(h.fxId);
       set({ fx: get().fx.filter((f) => liveIds.has(f.id)) });
+    },
+
+    // ---- Global color-grade slots ----
+    addGradeSlot() {
+      const id = makeFxId();
+      set({ gradeSlots: [...get().gradeSlots, defaultGradeSlot(id)] });
+      return id;
+    },
+    updateGradeSlot(id, patch) {
+      set({
+        gradeSlots: get().gradeSlots.map((s) =>
+          s.id === id ? { ...s, ...patch, id: s.id } : s,
+        ),
+      });
+    },
+    removeGradeSlot(id) {
+      set({ gradeSlots: get().gradeSlots.filter((s) => s.id !== id) });
+    },
+    moveGradeSlot(id, dir) {
+      const slots = get().gradeSlots;
+      const i = slots.findIndex((s) => s.id === id);
+      if (i < 0) return;
+      const j = i + dir;
+      if (j < 0 || j >= slots.length) return;
+      const next = slots.slice();
+      [next[i], next[j]] = [next[j], next[i]];
+      set({ gradeSlots: next });
     },
     beginFxHold(slotKey, kind, startS) {
       // Single set() per keypress — cuts subscriber-fanout cost (13 field

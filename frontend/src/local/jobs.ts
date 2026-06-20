@@ -1027,6 +1027,7 @@ export async function runEditRender(
       visualizers: visualizerDescs,
       energy,
       fx: job.fx,
+      grades: job.grades,
       offsetMs: totalOffsetMs,
       driftRatio: job.sync.driftRatio,
       outputWidth: spec.exportOpts?.width,
