@@ -15,6 +15,21 @@ interface Props {
   disabled?: boolean;
 }
 
+// SVG arc path between two value-angles (the same -135..+135 the indicator
+// uses, 0° = pointing up) at a given radius. The -90° offset maps that onto
+// SVG space (0° = right), so the arc tracks the needle exactly. Round-capped.
+function arcPath(startDeg: number, endDeg: number, r: number): string {
+  const pt = (deg: number): [number, number] => {
+    const rad = ((deg - 90) * Math.PI) / 180;
+    return [Math.cos(rad) * r, Math.sin(rad) * r];
+  };
+  const [x1, y1] = pt(startDeg);
+  const [x2, y2] = pt(endDeg);
+  const large = Math.abs(endDeg - startDeg) > 180 ? 1 : 0;
+  const sweep = endDeg >= startDeg ? 1 : 0;
+  return `M ${x1} ${y1} A ${r} ${r} 0 ${large} ${sweep} ${x2} ${y2}`;
+}
+
 export function Knob({
   value,
   min,
@@ -35,6 +50,13 @@ export function Knob({
   // Map value to angle: -135° at min, +135° at max — leaves a "dead zone" at the bottom.
   const ratio = Math.max(0, Math.min(1, (value - min) / range));
   const angle = -135 + ratio * 270;
+  // Active-range arc: grows from min for one-sided ranges, or from the
+  // zero-crossing for bipolar ranges (e.g. PILL OFFSET), so it reads like
+  // an Ableton knob — fill always starts where "neutral" is.
+  const bipolar = min < 0 && max > 0;
+  const centerRatio = bipolar ? (0 - min) / range : 0;
+  const arcStart = -135 + centerRatio * 270;
+  const arcEnd = angle;
 
   const onPointerDown = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
@@ -138,14 +160,20 @@ export function Knob({
         >
           {Array.from({ length: 25 }).map((_, i) => {
             const t = i / 24;
-            const a = (-135 + t * 270) * (Math.PI / 180);
+            // -90° puts the scale's dead-zone at the bottom and lines the
+            // ticks up with the indicator (same convention as the FX encoder).
+            const a = (-135 + t * 270 - 90) * (Math.PI / 180);
             const r1 = 47;
             const r2 = i % 6 === 0 ? 41 : 44;
             const x1 = Math.cos(a) * r1;
             const y1 = Math.sin(a) * r1;
             const x2 = Math.cos(a) * r2;
             const y2 = Math.sin(a) * r2;
-            const filled = t <= ratio;
+            // Bipolar ranges light from the centre detent outward (matching
+            // the arc); one-sided ranges fill from the minimum.
+            const filled = bipolar
+              ? t >= Math.min(centerRatio, ratio) && t <= Math.max(centerRatio, ratio)
+              : t <= ratio;
             return (
               <line
                 key={i}
@@ -159,6 +187,35 @@ export function Knob({
               />
             );
           })}
+          {/* active-range arc — Ableton-style, sits just outside the ticks.
+              Faint full-sweep track shows the unused range; the hot arc
+              traces from neutral to the current value. */}
+          <path
+            d={arcPath(-135, 135, 48.2)}
+            fill="none"
+            stroke="#C9BFA6"
+            strokeWidth={2}
+            strokeLinecap="round"
+          />
+          {Math.abs(arcEnd - arcStart) > 0.5 && (
+            <>
+              <path
+                d={arcPath(arcStart, arcEnd, 48.2)}
+                fill="none"
+                stroke="#FF5722"
+                strokeWidth={3.6}
+                strokeLinecap="round"
+                opacity={0.22}
+              />
+              <path
+                d={arcPath(arcStart, arcEnd, 48.2)}
+                fill="none"
+                stroke="#FF5722"
+                strokeWidth={2}
+                strokeLinecap="round"
+              />
+            </>
+          )}
         </svg>
         {/* inner knob */}
         <div
