@@ -26,7 +26,12 @@ import {
 } from "../../local/triage/triage-store";
 import { snapTime } from "../../editor/snap";
 import type { Chunk } from "../../storage/jobs-db";
-import { buildMips, drawEnvelopeWindow } from "./timeline-waveform";
+import {
+  buildPyramidFromEnvelope,
+  type PeakPyramid,
+} from "../../local/waveform/peak-pyramid";
+import { buildPeakPyramidAsync } from "../../local/waveform/build-pyramid-async";
+import { drawWaveform, TRIAGE_STYLE } from "../../local/waveform/draw-waveform";
 
 const HOT = "#FF5722";
 const BRASS = "#C9A95A";
@@ -47,6 +52,8 @@ export function SeamStrip() {
   const beatsPerBar = useTriageStore((s) => s.beatsPerBar);
   const envelope = useTriageStore((s) => s.envelope);
   const envelopeHz = useTriageStore((s) => s.envelopeHz);
+  const pcm = useTriageStore((s) => s.pcm);
+  const pcmSampleRate = useTriageStore((s) => s.pcmSampleRate);
   const audioDuration = useTriageStore((s) => s.audioDuration);
   const currentTime = useTriageStore((s) => s.playback.currentTime);
   const updateSeam = useTriageStore((s) => s.updateSeam);
@@ -54,7 +61,32 @@ export function SeamStrip() {
   const closeSeam = useTriageStore((s) => s.closeSeam);
   const seek = useTriageStore((s) => s.seek);
 
-  const { mips, peak } = useMemo(() => buildMips(envelope), [envelope]);
+  // Shared transient-accurate pyramid for both seam lanes. Crisp PCM build
+  // (chunked) with an immediate envelope-derived fallback while PCM decodes.
+  const [pcmPyramid, setPcmPyramid] = useState<PeakPyramid | null>(null);
+  useEffect(() => {
+    if (!pcm || pcm.length === 0) {
+      setPcmPyramid(null);
+      return;
+    }
+    let cancelled = false;
+    void buildPeakPyramidAsync(pcm, pcmSampleRate, {
+      baseSamplesPerBucket: 64,
+    }).then((p) => {
+      if (!cancelled) setPcmPyramid(p);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [pcm, pcmSampleRate]);
+  const envelopePyramid = useMemo(
+    () =>
+      envelope && envelope.length > 0
+        ? buildPyramidFromEnvelope(envelope, envelopeHz, pcmSampleRate)
+        : null,
+    [envelope, envelopeHz, pcmSampleRate],
+  );
+  const pyramid = pcmPyramid ?? envelopePyramid;
 
   const a = seam ? chunks.find((c) => c.id === seam.aId) ?? null : null;
   const b = seam?.bId ? chunks.find((c) => c.id === seam.bId) ?? null : null;
@@ -148,9 +180,8 @@ export function SeamStrip() {
         width={width}
         rulerH={RULER_H}
         laneH={laneH}
-        mips={mips}
-        peak={peak}
-        envelopeHz={envelopeHz}
+        pyramid={pyramid}
+        pcm={pcm}
         jobBpm={jobBpm}
         beatsPerBar={beatsPerBar}
         snapMode={snapMode}
@@ -169,9 +200,8 @@ export function SeamStrip() {
           width={width}
           rulerH={RULER_H}
           laneH={laneH}
-          mips={mips}
-          peak={peak}
-          envelopeHz={envelopeHz}
+          pyramid={pyramid}
+          pcm={pcm}
           jobBpm={jobBpm}
           beatsPerBar={beatsPerBar}
           snapMode={snapMode}
@@ -212,9 +242,8 @@ interface SeamLaneProps {
   width: number;
   rulerH: number;
   laneH: number;
-  mips: Float32Array[];
-  peak: number;
-  envelopeHz: number;
+  pyramid: PeakPyramid | null;
+  pcm: Float32Array | null;
   jobBpm: number | null;
   beatsPerBar: number;
   snapMode: ReturnType<typeof useTriageStore.getState>["snapMode"];
@@ -232,9 +261,8 @@ function SeamLane({
   width,
   rulerH,
   laneH,
-  mips,
-  peak,
-  envelopeHz,
+  pyramid,
+  pcm,
   jobBpm,
   beatsPerBar,
   snapMode,
@@ -315,16 +343,19 @@ function SeamLane({
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, width, laneH);
-    drawEnvelopeWindow(ctx, {
-      mips,
-      envelopeHz,
-      peak,
+    if (!pyramid || pyramid.levels.length === 0) return;
+    drawWaveform(ctx, {
+      pyramid,
+      pcm,
       t0S: startS,
       t1S: winEndS,
-      w: width,
-      h: laneH,
+      cssW: width,
+      cssH: laneH,
+      dpr,
+      style: TRIAGE_STYLE,
+      normalize: "peak",
     });
-  }, [mips, peak, envelopeHz, startS, winEndS, width, laneH]);
+  }, [pyramid, pcm, startS, winEndS, width, laneH]);
 
   const ticks = useMemo(
     () => barTicks(chunk, jobBpm, beatsPerBar, startS, winEndS, pxPerSec),

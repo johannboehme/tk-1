@@ -45,7 +45,8 @@ function masterToArrFirst(t: number, segments: readonly Segment[]): number {
 import { decodeAudioToMonoPcm } from "../local/codec";
 import { confirmDestructive } from "../lib/confirm";
 import { countEditsAffectedByCamRemoval } from "../local/edits-impact";
-import { computeWaveformPeaks } from "../local/waveform-peaks";
+import { buildPeakPyramidAsync } from "../local/waveform/build-pyramid-async";
+import type { PeakPyramid } from "../local/waveform/peak-pyramid";
 import { exportSpecToRenderOpts } from "../editor/exportPresets";
 import { loadAssetFile } from "../local/asset-source";
 import type { ClipInit } from "../editor/store";
@@ -64,7 +65,7 @@ import {
 } from "../editor/perf/marks";
 
 interface WaveformData {
-  peaks: [number, number][];
+  pyramid: PeakPyramid;
   duration: number;
 }
 
@@ -621,8 +622,8 @@ export default function Editor() {
       }
       if (cancelled) return;
 
-      // Compute waveform peaks locally from the studio audio. Cache the
-      // decoded PCM so the audio-analysis fallback below can reuse it
+      // Build a transient-accurate min/max peak pyramid from the studio audio.
+      // Cache the decoded PCM so the audio-analysis fallback below can reuse it
       // without a second decode pass.
       let wave: WaveformData | null = null;
       let studioPcm: Float32Array | null = null;
@@ -644,8 +645,12 @@ export default function Editor() {
         const decoded = await decodeAudioToMonoPcm(decodeSrc, 22050);
         studioPcm = decoded.pcm;
         studioSampleRate = decoded.sampleRate;
-        const peaks = computeWaveformPeaks(decoded.pcm, decoded.sampleRate, 4000);
-        wave = { peaks: peaks.peaks, duration: peaks.duration };
+        const pyramid = await buildPeakPyramidAsync(
+          decoded.pcm,
+          decoded.sampleRate,
+          { baseSamplesPerBucket: 64 },
+        );
+        wave = { pyramid, duration: pyramid.durationS };
       } catch {
         // Non-fatal — Timeline degrades gracefully without peaks.
       }
@@ -1143,7 +1148,7 @@ export default function Editor() {
                   ];
                 }),
               )}
-              peaks={assets.wave.peaks}
+              pyramid={assets.wave.pyramid}
               audioDuration={assets.wave.duration}
               onDeleteClip={(camId) => {
                 void (async () => {
