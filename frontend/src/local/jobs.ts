@@ -42,6 +42,7 @@ import {
 } from "./asset-source";
 import { syncAudio } from "./sync";
 import { getOrComputeAnalysis } from "./render/audio-analysis";
+import { getOrComputePyramid } from "./waveform/pyramid-cache";
 import { detectChunks, pickGlobalBpm } from "./triage/chunk-detect";
 import {
   DEFAULT_SILENCE_CONFIG,
@@ -555,6 +556,20 @@ async function runSync(jobId: string, audioExt: string): Promise<void> {
     await getOrComputeAnalysis(jobId, studioMonoPcm.pcm, studioMonoPcm.sampleRate);
   } catch (err) {
     console.warn(`Audio analysis failed for ${jobId} (non-fatal):`, err);
+  }
+
+  // Waveform peak-pyramid: precompute + persist here, where the master PCM is
+  // already decoded, so Triage shows the high-res waveform instantly instead of
+  // rebuilding it on every open. Non-blocking — jobs synced before this existed
+  // fall back to the lazy in-memory build in the timeline.
+  try {
+    await getOrComputePyramid(
+      jobId,
+      studioMonoPcm.pcm,
+      studioMonoPcm.sampleRate,
+    );
+  } catch (err) {
+    console.warn(`Waveform pyramid build failed for ${jobId} (non-fatal):`, err);
   }
 
   // Long-form chunk detection — only for `mode: "longform"` jobs.
