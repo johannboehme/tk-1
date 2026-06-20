@@ -46,8 +46,12 @@ function masterToArrFirst(t: number, segments: readonly Segment[]): number {
 import { decodeAudioToMonoPcm } from "../local/codec";
 import { confirmDestructive } from "../lib/confirm";
 import { countEditsAffectedByCamRemoval } from "../local/edits-impact";
-import { buildPeakPyramidAsync } from "../local/waveform/build-pyramid-async";
 import type { PeakPyramid } from "../local/waveform/peak-pyramid";
+import {
+  getCachedPyramid,
+  getOrComputePyramid,
+} from "../local/waveform/pyramid-cache";
+import { loadMasterAudio } from "../editor/load-master-audio";
 import { buildLoudnessEnvelope } from "../editor/fx/audio-envelope";
 import { exportSpecToRenderOpts } from "../editor/exportPresets";
 import { loadAssetFile } from "../local/asset-source";
@@ -601,89 +605,111 @@ export default function Editor() {
     const camUrls: Record<string, CamAssets> = {};
 
     (async () => {
+      // Per-phase load timing. Enable with `?perf=1` (or localStorage
+      // vasPerf=1). Logs cumulative ms from effect start so we can see which
+      // phase actually holds the "Loading editor…" screen on real jobs.
+      const loadT0 = performance.now();
+      const lap = (label: string) => {
+        if (!PERF_ENABLED) return;
+        // eslint-disable-next-line no-console
+        console.log(
+          `[editor-load] ${label.padEnd(24)} +${(performance.now() - loadT0).toFixed(0)}ms`,
+        );
+      };
+
       const j = await jobsDb.getJob(id);
       if (cancelled || !j) return;
       setJob(j);
+      lap(`getJob (${(j.videos ?? []).length} cams)`);
 
       // Resolve audio (singular master).
       audioUrl = await resolveJobAssetUrl(id, "audio");
       if (cancelled || !audioUrl) return;
+      lap("resolve audioUrl");
 
       // Resolve every cam's video + frames URL up front. Cams are
       // optional — the editor opens audio-only when there are none, and
       // also when cams haven't finished prep yet (live-job-update will
-      // inject them later via jobEvents).
+      // inject them later via jobEvents). Resolve all cams in parallel:
+      // each is an independent OPFS read + blob-URL creation, so a serial
+      // loop multiplied the wait by the cam count (and let a single slow
+      // cam block the whole editor).
       const videos = j.videos ?? [];
-      for (const cam of videos) {
-        const videoUrl = await resolveCamAssetUrl(id, cam.id, "video");
-        const framesUrl = await resolveCamAssetUrl(id, cam.id, "frames");
-        if (cancelled) return;
-        if (videoUrl) {
-          camUrls[cam.id] = { videoUrl, framesUrl };
-        }
-      }
+      const resolvedCams = await Promise.all(
+        videos.map(async (cam) => {
+          const [videoUrl, framesUrl] = await Promise.all([
+            resolveCamAssetUrl(id, cam.id, "video"),
+            resolveCamAssetUrl(id, cam.id, "frames"),
+          ]);
+          return { camId: cam.id, videoUrl, framesUrl };
+        }),
+      );
       if (cancelled) return;
-
-      // Build a transient-accurate min/max peak pyramid from the studio audio.
-      // Cache the decoded PCM so the audio-analysis fallback below can reuse it
-      // without a second decode pass.
-      let wave: WaveformData | null = null;
-      let studioPcm: Float32Array | null = null;
-      let studioSampleRate = 22050;
-      try {
-        // Decode the master audio. v3+ jobs may hold a
-        // FileSystemFileHandle source; v2 jobs read from OPFS. As a
-        // last-ditch fallback we re-fetch the blob URL we already
-        // created for the <audio> element.
-        let decodeSrc: Blob;
-        try {
-          decodeSrc = await loadAssetFile({
-            source: j.audioSource,
-            opfsPath: `jobs/${id}/audio.${audioUrl.split("?")[0].split(".").pop() || "wav"}`,
-          });
-        } catch {
-          decodeSrc = await fetch(audioUrl).then((r) => r.blob());
-        }
-        const decoded = await decodeAudioToMonoPcm(decodeSrc, 22050);
-        studioPcm = decoded.pcm;
-        studioSampleRate = decoded.sampleRate;
-        const pyramid = await buildPeakPyramidAsync(
-          decoded.pcm,
-          decoded.sampleRate,
-          { baseSamplesPerBucket: 64 },
-        );
-        wave = { pyramid, duration: pyramid.durationS };
-      } catch {
-        // Non-fatal — Timeline degrades gracefully without peaks.
+      for (const { camId, videoUrl, framesUrl } of resolvedCams) {
+        if (videoUrl) camUrls[camId] = { videoUrl, framesUrl };
       }
-      if (cancelled) return;
+      lap(`resolve ${videos.length} cams`);
 
+      // Prepare the master waveform decode-free when possible. The sync step
+      // already persisted the peak-pyramid (and it carries the true master
+      // duration), so on a synced job we hand the timeline its waveform — and
+      // `loadJob` its duration — without decoding a single sample. The decode
+      // (1–3 s) then only happens lazily, in the background, for the sidechain
+      // loudness envelope. `getPcm()` is that memoized decode, shared with the
+      // analysis fallback below so it never runs twice.
+      const SR = 22050;
+      const { wave, getPcm } = await loadMasterAudio(id, SR, {
+        getCachedPyramid,
+        decode: async () => {
+          // v3+ jobs may hold a FileSystemFileHandle source; v2 jobs read
+          // from OPFS. As a last-ditch fallback we re-fetch the blob URL we
+          // already created for the <audio> element.
+          let decodeSrc: Blob;
+          try {
+            decodeSrc = await loadAssetFile({
+              source: j.audioSource,
+              opfsPath: `jobs/${id}/audio.${audioUrl!.split("?")[0].split(".").pop() || "wav"}`,
+            });
+          } catch {
+            decodeSrc = await fetch(audioUrl!).then((r) => r.blob());
+          }
+          return decodeAudioToMonoPcm(decodeSrc, SR);
+        },
+        buildPyramid: getOrComputePyramid,
+      });
+      if (cancelled) return;
+      lap(wave ? "waveform ready" : "waveform NULL (decode failed)");
+
+      // First paint: the editor shell + timeline appear here. On a synced job
+      // this is reached after just IDB reads + (parallel) cam-URL resolution —
+      // no decode blocks the "Loading editor…" screen.
       setAssets({
         audioUrl,
         wave,
         cams: camUrls,
       });
+      lap("setAssets → EDITOR PAINTS");
 
       const clipInits: ClipInit[] = videos.map((v) => assetToClipInit(v));
 
-      // Pull cached audio analysis (BPM / beats / downbeats). If the
-      // cache is empty (older job, analysis failed in runSync, version
-      // bump) and we have decoded studio PCM in hand, compute it now —
-      // otherwise the BPM readout reads "———" and grid-snap modes stay
-      // disabled forever for this job.
+      // Pull cached audio analysis (BPM / beats / downbeats). The sync step
+      // pre-warms this cache, so the common path is a cheap IDB read. Only on
+      // a miss (older job, analysis failed in runSync, version bump) do we
+      // decode the PCM (memoized via getPcm) and compute now — otherwise the
+      // BPM readout reads "———" and grid-snap modes stay disabled forever.
       let analysis = await getCachedAnalysis(j.id).catch(() => undefined);
-      if (!analysis && studioPcm) {
-        try {
-          analysis = await getOrComputeAnalysis(
-            j.id,
-            studioPcm,
-            studioSampleRate,
-          );
-        } catch {
-          // ignore — leaves BPM null
+      if (!analysis) {
+        const dec = await getPcm();
+        if (dec) {
+          try {
+            analysis = await getOrComputeAnalysis(j.id, dec.pcm, dec.sampleRate);
+          } catch {
+            // ignore — leaves BPM null
+          }
         }
       }
       if (cancelled) return;
+      lap(analysis ? "analysis ready" : "analysis (none)");
       const persistedBpm = j.bpm;
       const detectedTempo = analysis?.tempo;
       const detectedBpmInfo = detectedTempo
@@ -786,16 +812,23 @@ export default function Editor() {
           storedPills: j.pills ?? [],
         },
       );
+      lap("loadJob done → INTERACTIVE");
 
       // Master-loudness envelope for sidechain modulation (+ the sidechain
-      // widget). MUST run AFTER loadJob — loadJob resets per-job state
-      // including audioEnv, so setting it earlier gets clobbered (that's
-      // why the sidechain showed "NO AUDIO"). Reuses the decoded PCM.
-      if (studioPcm) {
+      // widget). Needs the decoded PCM — but not for first paint — so decode
+      // lazily in the background (getPcm is memoized) and set it once ready.
+      // MUST land AFTER loadJob, which resets per-job state including audioEnv;
+      // this .then runs after the synchronous effect body, so loadJob has
+      // already executed (eager setting before loadJob is what showed the
+      // sidechain "NO AUDIO"). On a synced job the envelope arrives a beat
+      // after the editor is already interactive.
+      void getPcm().then((dec) => {
+        if (cancelled || !dec) return;
         useEditorStore
           .getState()
-          .setAudioEnv(buildLoudnessEnvelope(studioPcm, studioSampleRate));
-      }
+          .setAudioEnv(buildLoudnessEnvelope(dec.pcm, dec.sampleRate));
+        lap("bg decode + loudness done");
+      });
 
       // E2E hook (dev only) — Playwright reads `arrangementSegments[]`
       // length via `window.__editorTestHooks` so the screenshot script
