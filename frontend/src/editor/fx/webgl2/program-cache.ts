@@ -12,6 +12,7 @@ import { ZOOM_FRAG } from "./zoom.frag";
 import { UV_FRAG } from "./uv.frag";
 import { ECHO_FRAG } from "./echo.frag";
 import { TAPE_FRAG } from "./tape.frag";
+import { GRADE_FRAG } from "./grade.frag";
 import { emit, PERF_ENABLED } from "../../perf/marks";
 
 const FRAGMENTS: Record<string, string> = {
@@ -22,6 +23,7 @@ const FRAGMENTS: Record<string, string> = {
   uv: UV_FRAG,
   echo: ECHO_FRAG,
   tape: TAPE_FRAG,
+  grade: GRADE_FRAG,
 };
 
 /** Names of all registered fragment shaders — exposed so callers (e.g.

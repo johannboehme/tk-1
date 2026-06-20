@@ -18,6 +18,11 @@ import { activeCamAtArr } from "../arrangement-pills";
 import { masterToArr } from "../arrangement-time";
 import { activeFxAt } from "../fx/active";
 import { fxCatalog } from "../fx/catalog";
+import {
+  gradeSlotIsActive,
+  mergeGradeParams,
+  type GradeSlot,
+} from "../fx/looks";
 import { envelopeAt, INSTANT_ENVELOPE, type ADSREnvelope } from "../fx/envelope";
 import { resolveOutputDims } from "../output-frame";
 import {
@@ -71,6 +76,11 @@ export interface EditorStoreSnapshot {
   /** Per-kind live ADSR envelope values. Same override scope as
    *  fxDefaults — only the selected kind's envelope is overridden. */
   fxEnvelopes?: Readonly<Partial<Record<FxKind, ADSREnvelope>>>;
+  /** Global color-grade stack — the "film stock" layer. Each active slot
+   *  becomes one `grade` FrameFx prepended ahead of the punch-in accents so
+   *  the whole frame is graded first, then the accents composite on top.
+   *  Optional so test stubs / the export compositor can omit it. */
+  gradeSlots?: readonly GradeSlot[];
 }
 
 /**
@@ -201,6 +211,29 @@ function buildFx(
   tTimeline: number,
 ): FrameFx[] {
   const out: FrameFx[] = [];
+
+  // Global grade stack FIRST — the "film stock" layer. Each active slot
+  // emits one `grade` FrameFx (inS 0, wetness 1; the dry/wet lives in the
+  // `strength` param mixed inside the shader). Prepended so all three
+  // backends — which iterate `fx` in array order and re-snapshot the
+  // backbuffer before each FX — grade the whole frame before the punch-in
+  // accents composite on top. Slots compose serially A→B→C (each grades the
+  // previous slot's output), so reordering genuinely changes the result.
+  if (snapshot.gradeSlots) {
+    for (const slot of snapshot.gradeSlots) {
+      if (!gradeSlotIsActive(slot)) continue;
+      out.push({
+        id: slot.id,
+        kind: "grade",
+        inS: 0,
+        // GradeParams is structurally all-number; the FrameFx contract is a
+        // plain Record the backends read by key.
+        params: mergeGradeParams(slot) as unknown as Record<string, number>,
+        wetness: 1,
+      });
+    }
+  }
+
   const selectedKind = snapshot.selectedFxKind ?? null;
   const overrideParams =
     selectedKind != null ? snapshot.fxDefaults?.[selectedKind] : undefined;

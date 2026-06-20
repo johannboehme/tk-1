@@ -12,6 +12,7 @@ import { UV_SPEC } from "./uv.wgsl";
 import { VIGNETTE_SPEC } from "./vignette.wgsl";
 import { WEAR_SPEC } from "./wear.wgsl";
 import { ZOOM_SPEC } from "./zoom.wgsl";
+import { GRADE_SPEC } from "./grade.wgsl";
 
 export const FX_WEBGPU_SPECS: readonly FxWebGPUSpec[] = [
   VIGNETTE_SPEC,
@@ -21,4 +22,5 @@ export const FX_WEBGPU_SPECS: readonly FxWebGPUSpec[] = [
   WEAR_SPEC,
   ECHO_SPEC,
   TAPE_SPEC,
+  GRADE_SPEC,
 ];

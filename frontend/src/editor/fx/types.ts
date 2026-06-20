@@ -16,7 +16,14 @@ export type FxKind =
   | "rgb"
   | "tape"
   | "zoom"
-  | "uv";
+  | "uv"
+  /** Global color-grade pass (the "film stock" layer). Unlike the other
+   *  kinds it is NOT a momentary punch-in accent: the descriptor builder
+   *  emits one `grade` FrameFx per active GradeSlot, prepended ahead of the
+   *  accents so they composite on top of the graded frame. Its params are
+   *  the full `GradeParams` vector (see ./looks), not a 2-knob pair, so its
+   *  catalog entry exposes no `params` tuple. */
+  | "grade";
 
 /** Encoder-Verhalten eines Param.
  *

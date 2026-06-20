@@ -12,6 +12,7 @@ import type {
 } from "./renderer-context";
 import type { ADSREnvelope } from "./envelope";
 import type { FxKind, FxParamDef, PunchFx } from "./types";
+import { ENGINE_DEFAULTS, GRADE_PARAM_KEYS, type GradeParams } from "./looks";
 
 export interface FxDefinition {
   kind: FxKind;
@@ -904,6 +905,104 @@ function pseudoRand(seed: number): number {
   return Math.abs(Math.sin(seed * 91.345) * 43758.5453) % 1;
 }
 
+// — GRADE — Global color-grade (the "film stock" layer) ————————————
+//
+// Unlike the punch-in kinds, GRADE is not a momentary accent: the
+// descriptor builder emits one `grade` FrameFx per active GradeSlot with
+// the full `GradeParams` vector already merged in (look + macros + the
+// STRENGTH blend), prepended ahead of the accents so they composite on the
+// graded frame. So this entry exposes no 2-knob `params` tuple (its editing
+// surface is the Overlays panel), and no `applyWetness` (its dry/wet IS the
+// `strength` param, mixed inside the shader as `mix(source, graded,
+// strength)`). Source-sampling REPLACE effect — same backend contract as
+// RGB/ZOOM: bindSourceTexture + setBlendMode("replace").
+
+function gradeParamsOf(fx: PunchFx): GradeParams {
+  return { ...ENGINE_DEFAULTS, ...(fx.params ?? {}) } as GradeParams;
+}
+
+const GRADE: FxDefinition = {
+  kind: "grade",
+  label: "GRAD",
+  capsuleColor: "#8C7BE0",
+  defaultParams: { ...ENGINE_DEFAULTS },
+  defaultLengthBeats: 0,
+  defaultLengthS: 0,
+
+  // Canvas2D fallback / export: a reduced approximation built from the same
+  // idiom as the other source-FX (drawImage + ctx.filter + overlay passes).
+  // Covers the dominant perceptual ops (exposure / contrast / saturation /
+  // temperature / fade / vignette); grain, halation and split-tone are
+  // GPU-only — the documented WEAR/UV-style fallback. Drawing the graded
+  // source at alpha=strength over the (identical) backbuffer realises the
+  // `mix(source, graded, strength)` blend without a second buffer.
+  drawCanvas2D(ctx, fx, w, h, _t, source) {
+    if (!source) return;
+    const p = gradeParamsOf(fx);
+    const strength = clamp01(p.strength);
+    if (strength <= 0) return;
+    const brightness = Math.pow(2, p.exposure);
+    const contrast = Math.max(0, 1 + p.contrast);
+    const saturate = Math.max(0, p.saturation);
+    ctx.save();
+    ctx.globalAlpha = strength;
+    ctx.filter = `brightness(${brightness}) contrast(${contrast}) saturate(${saturate})`;
+    ctx.drawImage(source, 0, 0, w, h);
+    ctx.filter = "none";
+    if (p.temp !== 0) {
+      ctx.globalCompositeOperation = "overlay";
+      ctx.globalAlpha = strength * Math.min(Math.abs(p.temp) * 0.5, 0.4);
+      ctx.fillStyle = p.temp > 0 ? "#ff9b3d" : "#3da6ff";
+      ctx.fillRect(0, 0, w, h);
+    }
+    if (p.fade > 0) {
+      ctx.globalCompositeOperation = "lighten";
+      ctx.globalAlpha = strength * p.fade * 0.25;
+      ctx.fillStyle = "#8c8c8c";
+      ctx.fillRect(0, 0, w, h);
+    }
+    if (p.vignette > 0) {
+      ctx.globalCompositeOperation = "source-over";
+      ctx.globalAlpha = strength * p.vignette;
+      const cx = w / 2;
+      const cy = h / 2;
+      const outer = Math.hypot(cx, cy);
+      const grad = ctx.createRadialGradient(cx, cy, outer * 0.5, cx, cy, outer);
+      grad.addColorStop(0, "rgba(0,0,0,0)");
+      grad.addColorStop(1, "rgba(0,0,0,1)");
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, w, h);
+    }
+    ctx.restore();
+  },
+
+  drawWebGL2(ctx, fx, _w, _h, t) {
+    const p = gradeParamsOf(fx);
+    if (clamp01(p.strength) <= 0) return;
+    ctx.setBlendMode("replace");
+    ctx.useProgram("grade");
+    ctx.bindSourceTexture("u_source");
+    for (const key of GRADE_PARAM_KEYS) {
+      ctx.setUniform1f(`u_${key}`, p[key]);
+    }
+    ctx.setUniform1f("u_time", t);
+    ctx.drawFullscreenQuad();
+  },
+
+  drawWebGPU(ctx, fx, _w, _h, t) {
+    const p = gradeParamsOf(fx);
+    if (clamp01(p.strength) <= 0) return;
+    ctx.setBlendMode("replace");
+    ctx.useProgram("grade");
+    ctx.bindSourceTexture();
+    for (const key of GRADE_PARAM_KEYS) {
+      ctx.setUniform1f(key, p[key]);
+    }
+    ctx.setUniform1f("time", t);
+    ctx.drawFullscreenQuad();
+  },
+};
+
 export const fxCatalog: Readonly<Record<FxKind, FxDefinition>> = {
   vignette: VIGNETTE,
   wear: WEAR,
@@ -912,6 +1011,7 @@ export const fxCatalog: Readonly<Record<FxKind, FxDefinition>> = {
   tape: TAPE,
   zoom: ZOOM,
   uv: UV,
+  grade: GRADE,
 };
 
 export function getFxDefinition(kind: FxKind): FxDefinition {
