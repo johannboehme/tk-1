@@ -33,6 +33,12 @@ export function buildLoudnessEnvelope(
     return { data: new Float32Array(0), fps };
   }
   const hop = Math.max(1, Math.round(sampleRate / fps));
+  // The TRUE frame rate is sampleRate/hop, not the requested fps: hop is
+  // rounded to whole samples (22050/120 = 183.75 → 184). Storing the
+  // requested fps mis-times every sample by that rounding ratio (~0.14%),
+  // which accumulates to hundreds of ms deep into a long track — the
+  // sidechain peaks drifted off the timeline the further in you went.
+  const outFps = sampleRate / hop;
   const half = Math.floor(hop / 2);
   const n = Math.max(1, Math.ceil(pcm.length / hop));
   const data = new Float32Array(n);
@@ -55,5 +61,5 @@ export function buildLoudnessEnvelope(
   if (maxV > 0) {
     for (let i = 0; i < n; i++) data[i] /= maxV;
   }
-  return { data, fps };
+  return { data, fps: outFps };
 }

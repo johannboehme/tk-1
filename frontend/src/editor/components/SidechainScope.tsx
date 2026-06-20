@@ -20,11 +20,15 @@ import { fxCatalog } from "../fx/catalog";
 import type { FxKind } from "../fx/types";
 import {
   followerFor,
+  sampleEnv,
   DEFAULT_SIDECHAIN,
-  type AudioEnvelope,
 } from "../fx/modulation";
 import { arrBeatPhaseS, effectiveBeatsPerBar } from "../selectors/timing";
-import { arrToMaster, totalArrDuration } from "../arrangement-time";
+import {
+  arrToMaster,
+  timelineVisibleWindow,
+  totalArrDuration,
+} from "../arrangement-time";
 
 const LCD_GREEN = "#9FE08E";
 const RENDER_W = 280; // logical px (SVG viewBox); scales to container
@@ -36,20 +40,6 @@ const FALLBACK_BEATS = 8;
 
 function clamp01(v: number): number {
   return v < 0 ? 0 : v > 1 ? 1 : v;
-}
-
-/** Linear-interpolated sample of a 0..1 envelope at master-time `tSec`. */
-function sampleEnv(env: AudioEnvelope, tSec: number): number {
-  const data = env.data;
-  const n = data.length;
-  if (n === 0) return 0;
-  const fps = env.fps > 0 ? env.fps : 60;
-  const x = tSec * fps;
-  if (x <= 0) return data[0] ?? 0;
-  if (x >= n - 1) return data[n - 1] ?? 0;
-  const i = Math.floor(x);
-  const f = x - i;
-  return data[i] * (1 - f) + data[i + 1] * f;
 }
 
 /**
@@ -146,14 +136,15 @@ export function SidechainScope({ kind }: { kind: FxKind }) {
     [hasAudio, audioEnv, side],
   );
 
-  // Reconstruct the timeline's exact visible arr-time window.
+  // Reconstruct the timeline's EXACT visible arr-time window (shared helper
+  // → can't drift from Timeline.tsx).
   const arrTotal = totalArrDuration(segments);
   let spanS: number;
   let winStart: number;
   if (arrTotal > 0) {
-    spanS = arrTotal / Math.max(1, zoom);
-    const maxScroll = Math.max(0, arrTotal - spanS);
-    winStart = Math.max(0, Math.min(maxScroll, scrollX));
+    const win = timelineVisibleWindow(arrTotal, zoom, scrollX);
+    winStart = win.startS;
+    spanS = win.spanS;
   } else {
     // No arrangement → centre a fallback window on the playhead.
     spanS = bpm && bpm > 0 ? Math.min(8, Math.max(2, (FALLBACK_BEATS * 60) / bpm)) : 4;

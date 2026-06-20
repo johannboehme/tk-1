@@ -211,7 +211,11 @@ export function lfoShapeAt(shape: LfoShape, phase: number): number {
 
 // ── Sidechain follower curve (one source of truth) ───────────────────
 
-function sampleEnv(env: AudioEnvelope, tSeconds: number): number {
+/** Linear-interpolated sample of a 0..1 envelope at master-time `tSeconds`.
+ *  `env.fps` is the TRUE frame rate (see buildLoudnessEnvelope), so
+ *  data[i] sits at master-time i/fps and this stays accurate deep into
+ *  long tracks. Shared by the follower, the renderer, and the scope. */
+export function sampleEnv(env: AudioEnvelope, tSeconds: number): number {
   const data = env.data;
   const n = data.length;
   if (n === 0) return 0;

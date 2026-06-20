@@ -41,6 +41,23 @@ export function totalArrDuration(segments: readonly Segment[]): number {
   return sum;
 }
 
+/** The timeline's visible arr-time window for a given zoom + horizontal
+ *  scroll. Mirrors Timeline.tsx exactly — its range is always
+ *  `[0, arrTotal]`, so `visibleDur = arrTotal / zoom` and the start is the
+ *  scroll offset clamped into `[0, arrTotal − visibleDur]`. The sidechain
+ *  scope reuses this so its window can never drift from the timeline's. */
+export function timelineVisibleWindow(
+  arrTotal: number,
+  zoom: number,
+  scrollX: number,
+): { startS: number; spanS: number } {
+  const z = zoom > 1 ? zoom : 1;
+  const spanS = arrTotal > 0 ? arrTotal / z : 0;
+  const maxScroll = Math.max(0, arrTotal - spanS);
+  const startS = Math.max(0, Math.min(maxScroll, scrollX));
+  return { startS, spanS };
+}
+
 /** Convert a master-time to arrangement-time.
  *
  *  Walks segments in playback order, accumulating their lengths. Returns
