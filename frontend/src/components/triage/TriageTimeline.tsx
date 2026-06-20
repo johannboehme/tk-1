@@ -31,6 +31,10 @@ import {
 } from "../../local/waveform/peak-pyramid";
 import { buildPeakPyramidAsync } from "../../local/waveform/build-pyramid-async";
 import { drawWaveform, TRIAGE_STYLE } from "../../local/waveform/draw-waveform";
+import {
+  getCachedPyramid,
+  savePyramid,
+} from "../../local/waveform/pyramid-cache";
 
 // Visual hierarchy (top to bottom):
 //   Time ruler — secondary, MM:SS for absolute reference, faint
@@ -65,6 +69,7 @@ export function TriageTimeline() {
   const envelopeHz = useTriageStore((s) => s.envelopeHz);
   const pcm = useTriageStore((s) => s.pcm);
   const pcmSampleRate = useTriageStore((s) => s.pcmSampleRate);
+  const jobId = useTriageStore((s) => s.jobId);
   const chunks = useTriageStore((s) => s.chunks);
   const jobBpm = useTriageStore((s) => s.jobBpm);
   const beatsPerBar = useTriageStore((s) => s.beatsPerBar);
@@ -473,28 +478,50 @@ export function TriageTimeline() {
     pxPerSec,
   );
   // ─── Waveform ──────────────────────────────────────────────────────────
-  // Source the silhouette from a transient-preserving min/max peak pyramid
-  // built off the full PCM — Ableton-grade detail that holds up at any zoom.
-  // While the PCM is still decoding (cached-open path) we paint immediately
-  // from a degenerate pyramid derived from the 10 Hz RMS envelope, then swap to
-  // the crisp PCM pyramid once it's ready. The build is chunked so an hour-long
-  // recording doesn't jank the main thread.
-  const [pcmPyramid, setPcmPyramid] = useState<PeakPyramid | null>(null);
+  // Source the silhouette from a transient-preserving min/max peak pyramid —
+  // Ableton-grade detail that holds up at any zoom. Preference order:
+  //   1. The pyramid precomputed + persisted in the sync step (instant, no pop).
+  //   2. A lazy in-memory build from the store PCM (jobs synced before the
+  //      cache existed).
+  //   3. A degenerate pyramid from the 10 Hz RMS envelope, painted immediately
+  //      while 1/2 are still loading/building.
+  const [cachedPyramid, setCachedPyramid] = useState<PeakPyramid | null>(null);
   useEffect(() => {
-    // Keep an already-built pyramid if `pcm` later empties — the store detaches
-    // its PCM buffer after load (BPM re-detection / worker transfer), and we'd
-    // otherwise drop back to the coarse 10 Hz envelope.
-    if (!pcm || pcm.length === 0) return;
+    if (!jobId) return;
     let cancelled = false;
-    void buildPeakPyramidAsync(pcm, pcmSampleRate, {
-      baseSamplesPerBucket: 64,
-    }).then((p) => {
-      if (!cancelled) setPcmPyramid(p);
+    void getCachedPyramid(jobId, pcmSampleRate).then((p) => {
+      if (!cancelled && p) setCachedPyramid(p);
     });
     return () => {
       cancelled = true;
     };
-  }, [pcm, pcmSampleRate]);
+  }, [jobId, pcmSampleRate]);
+
+  const [pcmPyramid, setPcmPyramid] = useState<PeakPyramid | null>(null);
+  useEffect(() => {
+    // Fallback build only when there's no persisted pyramid. Keep an
+    // already-built pyramid if `pcm` later empties — the store detaches its PCM
+    // buffer after load (BPM re-detection / worker transfer).
+    if (cachedPyramid || !pcm || pcm.length === 0) return;
+    let cancelled = false;
+    void buildPeakPyramidAsync(pcm, pcmSampleRate, {
+      baseSamplesPerBucket: 64,
+    }).then((p) => {
+      if (cancelled) return;
+      setPcmPyramid(p);
+      // Backfill the cache so jobs synced before the pyramid was persisted
+      // become instant on the next open. Only persist if the source PCM
+      // survived the whole build — the store may detach its buffer mid-build,
+      // which would leave the tail of the pyramid zeroed; saving that would
+      // bake a half-flat waveform into the cache.
+      if (jobId && pcm.length > 0 && p.levels.length > 0) {
+        void savePyramid(jobId, p).catch(() => {});
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [pcm, pcmSampleRate, cachedPyramid, jobId]);
   const envelopePyramid = useMemo(
     () =>
       envelope && envelope.length > 0
@@ -502,7 +529,7 @@ export function TriageTimeline() {
         : null,
     [envelope, envelopeHz, pcmSampleRate],
   );
-  const pyramid = pcmPyramid ?? envelopePyramid;
+  const pyramid = cachedPyramid ?? pcmPyramid ?? envelopePyramid;
 
   const waveformCanvasRef = useRef<HTMLCanvasElement | null>(null);
   useEffect(() => {

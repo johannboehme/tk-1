@@ -32,6 +32,7 @@ import {
 } from "../../local/waveform/peak-pyramid";
 import { buildPeakPyramidAsync } from "../../local/waveform/build-pyramid-async";
 import { drawWaveform, TRIAGE_STYLE } from "../../local/waveform/draw-waveform";
+import { getCachedPyramid } from "../../local/waveform/pyramid-cache";
 
 const HOT = "#FF5722";
 const BRASS = "#C9A95A";
@@ -54,6 +55,7 @@ export function SeamStrip() {
   const envelopeHz = useTriageStore((s) => s.envelopeHz);
   const pcm = useTriageStore((s) => s.pcm);
   const pcmSampleRate = useTriageStore((s) => s.pcmSampleRate);
+  const jobId = useTriageStore((s) => s.jobId);
   const audioDuration = useTriageStore((s) => s.audioDuration);
   const currentTime = useTriageStore((s) => s.playback.currentTime);
   const updateSeam = useTriageStore((s) => s.updateSeam);
@@ -61,13 +63,27 @@ export function SeamStrip() {
   const closeSeam = useTriageStore((s) => s.closeSeam);
   const seek = useTriageStore((s) => s.seek);
 
-  // Shared transient-accurate pyramid for both seam lanes. Crisp PCM build
-  // (chunked) with an immediate envelope-derived fallback while PCM decodes.
+  // Shared transient-accurate pyramid for both seam lanes. Prefer the pyramid
+  // persisted in the sync step (instant); fall back to a lazy PCM build, then to
+  // an envelope-derived silhouette while those load.
+  const [cachedPyramid, setCachedPyramid] = useState<PeakPyramid | null>(null);
+  useEffect(() => {
+    if (!jobId) return;
+    let cancelled = false;
+    void getCachedPyramid(jobId, pcmSampleRate).then((p) => {
+      if (!cancelled && p) setCachedPyramid(p);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [jobId, pcmSampleRate]);
+
   const [pcmPyramid, setPcmPyramid] = useState<PeakPyramid | null>(null);
   useEffect(() => {
-    // Keep an already-built pyramid if `pcm` later empties (the store detaches
-    // its PCM buffer after load) so the lanes stay on the crisp PCM pyramid.
-    if (!pcm || pcm.length === 0) return;
+    // Fallback build only when there's no persisted pyramid. Keep an
+    // already-built pyramid if `pcm` later empties (the store detaches its PCM
+    // buffer after load).
+    if (cachedPyramid || !pcm || pcm.length === 0) return;
     let cancelled = false;
     void buildPeakPyramidAsync(pcm, pcmSampleRate, {
       baseSamplesPerBucket: 64,
@@ -77,7 +93,7 @@ export function SeamStrip() {
     return () => {
       cancelled = true;
     };
-  }, [pcm, pcmSampleRate]);
+  }, [pcm, pcmSampleRate, cachedPyramid]);
   const envelopePyramid = useMemo(
     () =>
       envelope && envelope.length > 0
@@ -85,7 +101,7 @@ export function SeamStrip() {
         : null,
     [envelope, envelopeHz, pcmSampleRate],
   );
-  const pyramid = pcmPyramid ?? envelopePyramid;
+  const pyramid = cachedPyramid ?? pcmPyramid ?? envelopePyramid;
 
   const a = seam ? chunks.find((c) => c.id === seam.aId) ?? null : null;
   const b = seam?.bId ? chunks.find((c) => c.id === seam.bId) ?? null : null;

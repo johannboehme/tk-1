@@ -501,7 +501,10 @@ export interface PunchFxRecord {
 }
 
 const DB_NAME = "videoaudiosync";
-const DB_VERSION = 8;
+// v9 added the waveform-pyramid store; the bump landed at 11 after dev
+// iteration. The store is (re)created whenever missing in `upgrade`, so the
+// exact number doesn't matter — any 8→11 upgrade creates it.
+const DB_VERSION = 11;
 const STORE = "jobs";
 const ANALYSIS_STORE = "audio-analysis";
 /** Per-chunk thumbnail JPEG bytes, keyed by `${jobId}::${camId}::${chunkId}`.
@@ -514,6 +517,10 @@ const CHUNK_THUMBS_STORE = "chunk-thumbnails";
  *  Arrange for a job and cached so re-mounts don't re-decode the
  *  master audio. */
 const CHUNK_MELS_STORE = "chunk-mel-specs";
+/** Persisted waveform peak-pyramid, keyed by jobId. Precomputed in the sync
+ *  step so Triage shows the high-res waveform instantly instead of rebuilding
+ *  it on every open. The payload carries its own version + sampleRate. */
+const WAVEFORM_PYRAMID_STORE = "waveform-pyramid";
 
 let dbPromise: Promise<IDBPDatabase> | null = null;
 let dbInstance: IDBPDatabase | null = null;
@@ -562,6 +569,18 @@ function db(): Promise<IDBPDatabase> {
         // Editor-Open eine frische Analyse.
         if (oldVersion < 3 && !database.objectStoreNames.contains(ANALYSIS_STORE)) {
           database.createObjectStore(ANALYSIS_STORE, { keyPath: "jobId" });
+        }
+
+        // Persisted waveform peak-pyramid (added v9) so Triage shows the
+        // high-res waveform instantly instead of rebuilding it on every open.
+        // Created whenever missing (not gated on a version delta) so it
+        // self-heals if an earlier upgrade landed without it. Additive, no data
+        // migration — precomputed in the sync step; jobs synced earlier fall
+        // back to the lazy in-memory build.
+        if (!database.objectStoreNames.contains(WAVEFORM_PYRAMID_STORE)) {
+          database.createObjectStore(WAVEFORM_PYRAMID_STORE, {
+            keyPath: "jobId",
+          });
         }
 
         // V3 → V4: chunk-thumbnail cache so the Arrange page doesn't
@@ -741,6 +760,9 @@ async function deleteJob(id: string): Promise<void> {
   if (d.objectStoreNames.contains(ANALYSIS_STORE)) {
     await d.delete(ANALYSIS_STORE, id);
   }
+  if (d.objectStoreNames.contains(WAVEFORM_PYRAMID_STORE)) {
+    await d.delete(WAVEFORM_PYRAMID_STORE, id);
+  }
   await deleteChunkThumbnailsForJob(id);
   await deleteChunkMelSpecsForJob(id);
 }
@@ -756,6 +778,9 @@ async function wipeAll(): Promise<void> {
   }
   if (d.objectStoreNames.contains(CHUNK_MELS_STORE)) {
     await d.clear(CHUNK_MELS_STORE);
+  }
+  if (d.objectStoreNames.contains(WAVEFORM_PYRAMID_STORE)) {
+    await d.clear(WAVEFORM_PYRAMID_STORE);
   }
 }
 
@@ -782,6 +807,29 @@ async function deleteAudioAnalysis(jobId: string): Promise<void> {
   const d = await db();
   if (d.objectStoreNames.contains(ANALYSIS_STORE)) {
     await d.delete(ANALYSIS_STORE, jobId);
+  }
+}
+
+async function getWaveformPyramid<T>(jobId: string): Promise<T | undefined> {
+  const d = await db();
+  if (!d.objectStoreNames.contains(WAVEFORM_PYRAMID_STORE)) return undefined;
+  const rec = (await d.get(WAVEFORM_PYRAMID_STORE, jobId)) as
+    | AnalysisRecord<T>
+    | undefined;
+  return rec?.payload;
+}
+
+async function saveWaveformPyramid<T>(jobId: string, payload: T): Promise<void> {
+  const d = await db();
+  if (!d.objectStoreNames.contains(WAVEFORM_PYRAMID_STORE)) return;
+  const rec: AnalysisRecord<T> = { jobId, payload };
+  await d.put(WAVEFORM_PYRAMID_STORE, rec);
+}
+
+async function deleteWaveformPyramid(jobId: string): Promise<void> {
+  const d = await db();
+  if (d.objectStoreNames.contains(WAVEFORM_PYRAMID_STORE)) {
+    await d.delete(WAVEFORM_PYRAMID_STORE, jobId);
   }
 }
 
@@ -921,6 +969,9 @@ export const jobsDb = {
   getAudioAnalysis,
   saveAudioAnalysis,
   deleteAudioAnalysis,
+  getWaveformPyramid,
+  saveWaveformPyramid,
+  deleteWaveformPyramid,
   getChunkThumbnail,
   saveChunkThumbnail,
   deleteChunkThumbnailsForJob,
