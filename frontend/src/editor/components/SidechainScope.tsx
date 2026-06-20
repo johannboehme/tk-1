@@ -1,52 +1,77 @@
 /**
  * Sidechain scope — the Ableton-style marquee widget.
  *
- * Phosphor-LCD field that draws the master-loudness envelope, a draggable
- * threshold line, and a preview band of the resulting effect-strength
- * (the follower curve) tinted with the effect's colour. Renderer and this
- * widget sample the SAME `buildFollowerCurve`, so what you see is what plays.
+ * A phosphor-LCD field that shows a ZOOMED, playhead-centred window of the
+ * master-loudness envelope (~8 beats wide) so individual hits — the kick,
+ * the snare — are legible. Faint beat grid-lines mark where the beats fall,
+ * a draggable threshold line sets the level above which the effect engages,
+ * and a tinted band shows the resulting effect-strength (the follower
+ * curve) responding in real time. Renderer and this widget sample the SAME
+ * follower curve, so what you see is what plays.
+ *
+ * Drawing the whole song squashed into the width (the old behaviour) made
+ * the peaks unreadable — you couldn't tell a kick from a hi-hat, let alone
+ * tune a threshold to it. The window scrolls with the playhead instead.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useEditorStore } from "../store";
 import { fxCatalog } from "../fx/catalog";
 import type { FxKind } from "../fx/types";
 import {
-  buildFollowerCurve,
+  followerFor,
   DEFAULT_SIDECHAIN,
   type AudioEnvelope,
 } from "../fx/modulation";
+import {
+  effectiveBeatPhaseS,
+  effectiveBeatsPerBar,
+} from "../selectors/timing";
 
 const LCD_GREEN = "#9FE08E";
 const RENDER_W = 280; // logical px (SVG viewBox); scales to container
 const RENDER_H = 80;
 const PAD_X = 4;
 const PAD_Y = 5;
+/** How many beats the window spans — wide enough for context, tight enough
+ *  that a single kick is a clear, separate peak. Clamped to a seconds range
+ *  for very slow / very fast tempos (and when BPM is unknown). */
+const BEATS_VISIBLE = 8;
+const MIN_SPAN_S = 2;
+const MAX_SPAN_S = 8;
 
-/** Downsample a 0..1 envelope to `n` peak buckets for a compact SVG path. */
-function bucketize(data: readonly number[] | Float32Array, n: number): number[] {
-  const out = new Array(n).fill(0);
-  if (data.length === 0) return out;
-  const per = data.length / n;
-  for (let i = 0; i < n; i++) {
-    const lo = Math.floor(i * per);
-    const hi = Math.min(data.length, Math.floor((i + 1) * per) + 1);
-    let m = 0;
-    for (let j = lo; j < hi; j++) if (data[j] > m) m = data[j];
-    out[i] = m;
-  }
-  return out;
+/** Linear-interpolated sample of a 0..1 envelope at master-time `tSec`. */
+function sampleEnv(env: AudioEnvelope, tSec: number): number {
+  const data = env.data;
+  const n = data.length;
+  if (n === 0) return 0;
+  const fps = env.fps > 0 ? env.fps : 60;
+  const x = tSec * fps;
+  if (x <= 0) return data[0] ?? 0;
+  if (x >= n - 1) return data[n - 1] ?? 0;
+  const i = Math.floor(x);
+  const f = x - i;
+  return data[i] * (1 - f) + data[i + 1] * f;
 }
 
-/** Build a filled area path (baseline at bottom) for a 0..1 bucket list. */
-function areaPath(buckets: number[], w: number, h: number): string {
-  const n = buckets.length;
-  if (n === 0) return "";
+/** Filled area path sampled per-pixel across the visible window. */
+function windowAreaPath(
+  sampleAt: (t: number) => number,
+  winStart: number,
+  spanS: number,
+  w: number,
+  h: number,
+): string {
   const innerW = w - 2 * PAD_X;
   const innerH = h - 2 * PAD_Y;
-  const x = (i: number) => PAD_X + (i / (n - 1)) * innerW;
-  const y = (v: number) => PAD_Y + (1 - v) * innerH;
+  const steps = Math.max(2, Math.round(innerW));
   let d = `M${PAD_X.toFixed(1)},${(h - PAD_Y).toFixed(1)}`;
-  for (let i = 0; i < n; i++) d += ` L${x(i).toFixed(1)},${y(buckets[i]).toFixed(1)}`;
+  for (let i = 0; i <= steps; i++) {
+    const x = PAD_X + (i / steps) * innerW;
+    const t = winStart + (i / steps) * spanS;
+    const v = Math.max(0, Math.min(1, sampleAt(t)));
+    const y = PAD_Y + (1 - v) * innerH;
+    d += ` L${x.toFixed(1)},${y.toFixed(1)}`;
+  }
   d += ` L${(w - PAD_X).toFixed(1)},${(h - PAD_Y).toFixed(1)} Z`;
   return d;
 }
@@ -57,6 +82,9 @@ export function SidechainScope({ kind }: { kind: FxKind }) {
     useEditorStore((s) => s.fxModulations[kind]?.side) ?? DEFAULT_SIDECHAIN;
   const setFxSidechain = useEditorStore((s) => s.setFxSidechain);
   const currentTime = useEditorStore((s) => s.playback.currentTime);
+  const bpm = useEditorStore((s) => s.jobMeta?.bpm?.value ?? null);
+  const beatPhaseS = useEditorStore((s) => effectiveBeatPhaseS(s.jobMeta));
+  const beatsPerBar = useEditorStore((s) => effectiveBeatsPerBar(s.jobMeta));
   const tint = fxCatalog[kind]?.capsuleColor ?? LCD_GREEN;
 
   const svgRef = useRef<SVGSVGElement | null>(null);
@@ -96,21 +124,55 @@ export function SidechainScope({ kind }: { kind: FxKind }) {
 
   const hasAudio = !!audioEnv && audioEnv.data.length > 0;
 
+  // Full follower curve (memoized by audio-env + config), sampled in the
+  // window below — never rebuilt per frame.
+  const follower = useMemo(
+    () => (hasAudio && audioEnv ? followerFor(audioEnv, side) : null),
+    [hasAudio, audioEnv, side],
+  );
+
+  const spanS =
+    bpm && bpm > 0
+      ? Math.min(MAX_SPAN_S, Math.max(MIN_SPAN_S, (BEATS_VISIBLE * 60) / bpm))
+      : 4;
+  const winStart = currentTime - spanS / 2; // playhead centred
+  const innerW = RENDER_W - 2 * PAD_X;
+
   let masterPath = "";
   let followerPath = "";
-  let playheadX = -1;
+  const beatLines: { x: number; down: boolean }[] = [];
   if (hasAudio && audioEnv) {
-    const n = RENDER_W - 2 * PAD_X;
-    masterPath = areaPath(bucketize(audioEnv.data, n), RENDER_W, RENDER_H);
-    const follower: AudioEnvelope = buildFollowerCurve(audioEnv, side);
-    followerPath = areaPath(bucketize(follower.data, n), RENDER_W, RENDER_H);
-    const durS = audioEnv.data.length / (audioEnv.fps || 60);
-    if (durS > 0) {
-      const frac = Math.max(0, Math.min(1, currentTime / durS));
-      playheadX = PAD_X + frac * (RENDER_W - 2 * PAD_X);
+    masterPath = windowAreaPath(
+      (t) => sampleEnv(audioEnv, t),
+      winStart,
+      spanS,
+      RENDER_W,
+      RENDER_H,
+    );
+    if (follower) {
+      followerPath = windowAreaPath(
+        (t) => sampleEnv(follower, t),
+        winStart,
+        spanS,
+        RENDER_W,
+        RENDER_H,
+      );
+    }
+    if (bpm && bpm > 0) {
+      const period = 60 / bpm;
+      const firstK = Math.ceil((winStart - beatPhaseS) / period);
+      for (let k = firstK; ; k++) {
+        const t = beatPhaseS + k * period;
+        if (t > winStart + spanS) break;
+        if (t < winStart) continue;
+        const x = PAD_X + ((t - winStart) / spanS) * innerW;
+        const down = ((k % beatsPerBar) + beatsPerBar) % beatsPerBar === 0;
+        beatLines.push({ x, down });
+      }
     }
   }
 
+  const playheadX = PAD_X + 0.5 * innerW; // centred
   const threshY = PAD_Y + (1 - side.threshold) * (RENDER_H - 2 * PAD_Y);
 
   return (
@@ -146,17 +208,50 @@ export function SidechainScope({ kind }: { kind: FxKind }) {
           width="100%"
           height="100%"
           preserveAspectRatio="none"
-          style={{ display: "block", touchAction: "none", position: "relative", zIndex: 1 }}
+          style={{
+            display: "block",
+            touchAction: "none",
+            position: "relative",
+            zIndex: 1,
+          }}
           onPointerDown={(e) => {
             e.preventDefault();
             setDragging(true);
             setThresholdFromClientY(e.clientY);
           }}
         >
+          {/* beat grid — faint; downbeats brighter. Behind the waveform so
+              the hits read on top but you can still see where beats fall. */}
+          {beatLines.map((b, i) => (
+            <line
+              key={i}
+              x1={b.x}
+              x2={b.x}
+              y1={PAD_Y}
+              y2={RENDER_H - PAD_Y}
+              stroke={LCD_GREEN}
+              strokeOpacity={b.down ? 0.22 : 0.1}
+              strokeWidth={b.down ? 0.8 : 0.5}
+            />
+          ))}
           {/* master loudness — dim phosphor fill */}
-          <path d={masterPath} fill={LCD_GREEN} fillOpacity={0.16} stroke={LCD_GREEN} strokeOpacity={0.4} strokeWidth={0.7} />
-          {/* effect-strength preview band — tinted with the effect colour */}
-          <path d={followerPath} fill={tint} fillOpacity={0.5} stroke={tint} strokeOpacity={0.9} strokeWidth={0.8} />
+          <path
+            d={masterPath}
+            fill={LCD_GREEN}
+            fillOpacity={0.16}
+            stroke={LCD_GREEN}
+            strokeOpacity={0.45}
+            strokeWidth={0.7}
+          />
+          {/* effect-strength band — tinted with the effect colour */}
+          <path
+            d={followerPath}
+            fill={tint}
+            fillOpacity={0.5}
+            stroke={tint}
+            strokeOpacity={0.9}
+            strokeWidth={0.8}
+          />
           {/* threshold line */}
           <line
             x1={PAD_X}
@@ -167,18 +262,16 @@ export function SidechainScope({ kind }: { kind: FxKind }) {
             strokeWidth={dragging ? 1.6 : 1}
             strokeDasharray="3 2"
           />
-          {/* playhead */}
-          {playheadX >= 0 && (
-            <line
-              x1={playheadX}
-              x2={playheadX}
-              y1={PAD_Y}
-              y2={RENDER_H - PAD_Y}
-              stroke="#FFFFFF"
-              strokeOpacity={0.5}
-              strokeWidth={0.8}
-            />
-          )}
+          {/* playhead (centred "now") */}
+          <line
+            x1={playheadX}
+            x2={playheadX}
+            y1={PAD_Y}
+            y2={RENDER_H - PAD_Y}
+            stroke="#FFFFFF"
+            strokeOpacity={0.55}
+            strokeWidth={0.8}
+          />
         </svg>
       ) : (
         <div

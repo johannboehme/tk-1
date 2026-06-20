@@ -1519,7 +1519,13 @@ function LcdModView({ kind }: { kind: FxKind }) {
           ...LCD_TEXT,
         }}
       >
-        <span>DEPTH {Math.round(mc.depth * 100)}</span>
+        <span>
+          {isLfo
+            ? `DEPTH ${Math.round(mc.depth * 100)}`
+            : `DEP ${Math.round(mc.depth * 100)} · A ${Math.round(
+                mc.side.attackS * 1000,
+              )} · R ${Math.round(mc.side.releaseS * 1000)}`}
+        </span>
         <span style={LCD_TEXT_DIM}>{sub}</span>
       </div>
     </div>
