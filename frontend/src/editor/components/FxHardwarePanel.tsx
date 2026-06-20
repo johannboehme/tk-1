@@ -728,26 +728,42 @@ interface EncoderProps {
  *  (6×). Doppelklick reset auf catalog-Default. Shift+Pfeile auf Tastatur
  *  nudgen feiner (vgl. existing Knob.tsx).
  */
-function Encoder({ kind, param, tint }: EncoderProps) {
-  const fxDefaults = useEditorStore((s) => s.fxDefaults[kind]);
-  const setFxDefault = useEditorStore((s) => s.setFxDefault);
-  const value = fxDefaults?.[param.id] ?? param.defaultValue;
-
+function EncoderKnob({
+  value,
+  min,
+  max,
+  kind,
+  tint,
+  label,
+  onChange,
+  onReset,
+  size = ENC_OUTER,
+}: {
+  value: number;
+  min: number;
+  max: number;
+  kind: FxParamDef["kind"];
+  tint: string;
+  label: string;
+  onChange: (v: number) => void;
+  onReset?: () => void;
+  size?: number;
+}) {
   const startY = useRef(0);
   const startVal = useRef(0);
   const [dragging, setDragging] = useState(false);
 
-  const range = param.max - param.min;
+  const range = max - min;
   // Display sweep is 0..1 regardless of storage range; angle -135..+135.
-  const ratio = Math.max(
-    0,
-    Math.min(1, range > 0 ? (value - param.min) / range : 0),
-  );
+  const ratio = Math.max(0, Math.min(1, range > 0 ? (value - min) / range : 0));
   const angle = -135 + ratio * 270;
-  // Active-range arc: bipolar params grow from the centre detent (top),
-  // linear params from the scale start.
-  const arcStart = param.kind === "bipolar" ? 0 : -135;
+  // Active-range arc: bipolar grows from the centre detent (top), linear
+  // from the scale start.
+  const arcStart = kind === "bipolar" ? 0 : -135;
   const arcEnd = angle;
+  // Uniform scale so smaller panels reuse the identical look without
+  // re-deriving any geometry constant.
+  const scale = size / ENC_OUTER;
 
   const onPointerDown = useCallback(
     (e: ReactPointerEvent<HTMLDivElement>) => {
@@ -766,7 +782,7 @@ function Encoder({ kind, param, tint }: EncoderProps) {
       const dy = e.clientY - cy;
       const r = Math.hypot(dx, dy);
       // Knob-Body-Radius mit 1 px Toleranz; Klicks außerhalb → Skala.
-      const KNOB_HIT_R = ENC_BODY / 2 + 1;
+      const KNOB_HIT_R = (ENC_BODY / 2 + 1) * scale;
       let baseline = value;
       if (r > KNOB_HIT_R) {
         // Click angle: top = 0, right-half positive, left-half negative.
@@ -774,30 +790,21 @@ function Encoder({ kind, param, tint }: EncoderProps) {
         const aDeg = (Math.atan2(dx, -dy) * 180) / Math.PI;
         const clamped = Math.max(-135, Math.min(135, aDeg));
         const ratioFromClick = (clamped + 135) / 270;
-        let next = param.min + ratioFromClick * range;
-        if (param.kind === "bipolar") {
-          next = snapBipolar(next, param.min, param.max);
+        let next = min + ratioFromClick * range;
+        if (kind === "bipolar") {
+          next = snapBipolar(next, min, max);
         } else {
           const decimals = range <= 1.5 ? 2 : 0;
           next = roundTo(next, decimals);
         }
-        setFxDefault(kind, param.id, next);
+        onChange(next);
         baseline = next;
       }
       startY.current = e.clientY;
       startVal.current = baseline;
       setDragging(true);
     },
-    [
-      value,
-      kind,
-      param.id,
-      param.kind,
-      param.min,
-      param.max,
-      range,
-      setFxDefault,
-    ],
+    [value, kind, min, max, range, onChange, scale],
   );
 
   const onPointerMove = useCallback(
@@ -816,9 +823,9 @@ function Encoder({ kind, param, tint }: EncoderProps) {
       const dy = startY.current - e.clientY;
       const sensitivity = e.shiftKey ? 1200 : 200;
       let next = startVal.current + (dy / sensitivity) * range;
-      next = Math.max(param.min, Math.min(param.max, next));
-      if (param.kind === "bipolar") {
-        next = snapBipolar(next, param.min, param.max);
+      next = Math.max(min, Math.min(max, next));
+      if (kind === "bipolar") {
+        next = snapBipolar(next, min, max);
       } else {
         // Round to a sensible step. For 0..1 ranges, two decimals; for
         // 0..100 ranges, integers; pick whichever makes sense from the
@@ -826,9 +833,9 @@ function Encoder({ kind, param, tint }: EncoderProps) {
         const decimals = range <= 1.5 ? 2 : 0;
         next = roundTo(next, decimals);
       }
-      setFxDefault(kind, param.id, next);
+      onChange(next);
     },
-    [dragging, kind, param.id, param.kind, param.min, param.max, range, setFxDefault],
+    [dragging, kind, min, max, range, onChange],
   );
 
   const onPointerUp = useCallback(() => setDragging(false), []);
@@ -852,17 +859,17 @@ function Encoder({ kind, param, tint }: EncoderProps) {
   }, [dragging]);
 
   const onDoubleClick = useCallback(() => {
-    setFxDefault(kind, param.id, param.defaultValue);
-  }, [kind, param.id, param.defaultValue, setFxDefault]);
+    onReset?.();
+  }, [onReset]);
 
-  return (
+  const knob = (
     <div className="flex flex-col items-center" style={{ gap: 3 }}>
       <div
         role="slider"
-        aria-valuemin={param.min}
-        aria-valuemax={param.max}
+        aria-valuemin={min}
+        aria-valuemax={max}
         aria-valuenow={value}
-        aria-label={param.label}
+        aria-label={label}
         tabIndex={0}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
@@ -880,9 +887,9 @@ function Encoder({ kind, param, tint }: EncoderProps) {
           width={ENC_OUTER}
           height={ENC_OUTER}
         >
-          {param.kind === "linear"
+          {kind === "linear"
             ? linearTicks(ratio, tint)
-            : bipolarTicks(value, param.min, param.max, tint)}
+            : bipolarTicks(value, min, max, tint)}
           {/* active-range arc hugging the knob body — faint track shows the
               unused range, the tinted arc traces from neutral to value. */}
           <path
@@ -1050,9 +1057,47 @@ function Encoder({ kind, param, tint }: EncoderProps) {
           lineHeight: 1,
         }}
       >
-        {param.label}
+        {label}
       </span>
     </div>
+  );
+
+  if (scale === 1) return knob;
+  // Scale the whole native (ENC_OUTER-based) knob uniformly. The outer box
+  // reserves the scaled footprint so siblings lay out correctly; the inner
+  // transform keeps every gradient / arc / tick pixel-proportional.
+  return (
+    <div style={{ width: ENC_OUTER * scale, height: (ENC_OUTER + 3 + 9) * scale }}>
+      <div
+        style={{
+          width: ENC_OUTER,
+          transform: `scale(${scale})`,
+          transformOrigin: "top left",
+        }}
+      >
+        {knob}
+      </div>
+    </div>
+  );
+}
+
+/** Store-bound FX macro encoder — reads/writes `fxDefaults[kind][param.id]`
+ *  and renders the shared `EncoderKnob` look. */
+function Encoder({ kind, param, tint }: EncoderProps) {
+  const fxDefaults = useEditorStore((s) => s.fxDefaults[kind]);
+  const setFxDefault = useEditorStore((s) => s.setFxDefault);
+  const value = fxDefaults?.[param.id] ?? param.defaultValue;
+  return (
+    <EncoderKnob
+      value={value}
+      min={param.min}
+      max={param.max}
+      kind={param.kind}
+      tint={tint}
+      label={param.label}
+      onChange={(v) => setFxDefault(kind, param.id, v)}
+      onReset={() => setFxDefault(kind, param.id, param.defaultValue)}
+    />
   );
 }
 
@@ -1485,11 +1530,12 @@ function LcdModView({ kind }: { kind: FxKind }) {
 
 function ModControls({ kind, narrow }: { kind: FxKind; narrow: boolean }) {
   const mc = useEditorStore((s) => s.fxModulations[kind]) ?? DEFAULT_MOD_CONFIG;
-  const bpm = useEditorStore((s) => s.jobMeta?.bpm?.value ?? null);
   const setFxTimeMod = useEditorStore((s) => s.setFxTimeMod);
   const setFxModDepth = useEditorStore((s) => s.setFxModDepth);
   const setFxLfo = useEditorStore((s) => s.setFxLfo);
   const setFxSidechain = useEditorStore((s) => s.setFxSidechain);
+  // The M-screen knobs reuse the macro Encoder look at a compact size.
+  const KNOB = 36;
 
   const cycleShape = () => {
     const i = SHAPE_ORDER.indexOf(mc.lfo.shape);
@@ -1515,23 +1561,27 @@ function ModControls({ kind, narrow }: { kind: FxKind; narrow: boolean }) {
       {mc.timeMod === "lfo" ? (
         <>
           <ShapeButton glyph={SHAPE_GLYPH[mc.lfo.shape]} onClick={cycleShape} />
-          <MiniKnob
+          <EncoderKnob
             label="RATE"
+            kind="bipolar"
             value={mc.lfo.rate}
             min={0}
             max={1}
-            display={bipolarRateLabel(mc.lfo.rate, bpm)}
+            size={KNOB}
             tint={ENCODER_HOT}
             onChange={(v) => setFxLfo(kind, { rate: v })}
+            onReset={() => setFxLfo(kind, { rate: DEFAULT_MOD_CONFIG.lfo.rate })}
           />
-          <MiniKnob
+          <EncoderKnob
             label="DEPTH"
+            kind="linear"
             value={mc.depth}
             min={0}
             max={1}
-            display={String(Math.round(mc.depth * 100))}
+            size={KNOB}
             tint={ENCODER_COBALT}
             onChange={(v) => setFxModDepth(kind, v)}
+            onReset={() => setFxModDepth(kind, DEFAULT_MOD_CONFIG.depth)}
           />
           <MiniToggle
             active={mc.lfo.beatSync}
@@ -1541,32 +1591,42 @@ function ModControls({ kind, narrow }: { kind: FxKind; narrow: boolean }) {
         </>
       ) : (
         <>
-          <MiniKnob
+          <EncoderKnob
             label="ATK"
+            kind="linear"
             value={mc.side.attackS}
             min={0}
             max={0.5}
-            display={`${Math.round(mc.side.attackS * 1000)}`}
+            size={KNOB}
             tint={ENCODER_HOT}
             onChange={(v) => setFxSidechain(kind, { attackS: v })}
+            onReset={() =>
+              setFxSidechain(kind, { attackS: DEFAULT_MOD_CONFIG.side.attackS })
+            }
           />
-          <MiniKnob
+          <EncoderKnob
             label="REL"
+            kind="linear"
             value={mc.side.releaseS}
             min={0}
-            max={1}
-            display={`${Math.round(mc.side.releaseS * 1000)}`}
+            max={1.5}
+            size={KNOB}
             tint={ENCODER_HOT}
             onChange={(v) => setFxSidechain(kind, { releaseS: v })}
+            onReset={() =>
+              setFxSidechain(kind, { releaseS: DEFAULT_MOD_CONFIG.side.releaseS })
+            }
           />
-          <MiniKnob
+          <EncoderKnob
             label="DEPTH"
+            kind="linear"
             value={mc.depth}
             min={0}
             max={1}
-            display={String(Math.round(mc.depth * 100))}
+            size={KNOB}
             tint={ENCODER_COBALT}
             onChange={(v) => setFxModDepth(kind, v)}
+            onReset={() => setFxModDepth(kind, DEFAULT_MOD_CONFIG.depth)}
           />
           <MiniToggle
             active={mc.side.invert}
@@ -1579,147 +1639,6 @@ function ModControls({ kind, narrow }: { kind: FxKind; narrow: boolean }) {
   );
 }
 
-/** Small matte knob with a tint indicator — value/onChange driven (the
- *  Encoder is bound to fxDefaults, so the M-screen uses this generic one).
- *  Drag vertically (200 px = full sweep, Shift = fine); off-window guard. */
-function MiniKnob({
-  label,
-  value,
-  min,
-  max,
-  display,
-  tint,
-  onChange,
-}: {
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-  display: string;
-  tint: string;
-  onChange: (v: number) => void;
-}) {
-  const startY = useRef(0);
-  const startVal = useRef(0);
-  const [dragging, setDragging] = useState(false);
-  const range = max - min;
-  const ratio = range > 0 ? Math.max(0, Math.min(1, (value - min) / range)) : 0;
-  const angle = -135 + ratio * 270;
-
-  const onMove = useCallback(
-    (e: PointerEvent) => {
-      if (e.buttons === 0) {
-        setDragging(false);
-        return;
-      }
-      const dy = startY.current - e.clientY;
-      const sens = e.shiftKey ? 1200 : 200;
-      let next = startVal.current + (dy / sens) * range;
-      next = Math.max(min, Math.min(max, next));
-      onChange(next);
-    },
-    [min, max, range, onChange],
-  );
-
-  useEffect(() => {
-    if (!dragging) return;
-    const up = () => setDragging(false);
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", up);
-    window.addEventListener("pointercancel", up);
-    window.addEventListener("blur", up);
-    return () => {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", up);
-      window.removeEventListener("pointercancel", up);
-      window.removeEventListener("blur", up);
-    };
-  }, [dragging, onMove]);
-
-  const SIZE = 36;
-  return (
-    <div className="flex flex-col items-center" style={{ gap: 2 }}>
-      <div
-        role="slider"
-        aria-valuemin={min}
-        aria-valuemax={max}
-        aria-valuenow={value}
-        aria-label={label}
-        tabIndex={0}
-        onPointerDown={(e) => {
-          e.preventDefault();
-          startY.current = e.clientY;
-          startVal.current = value;
-          setDragging(true);
-        }}
-        className="relative touch-none cursor-grab active:cursor-grabbing"
-        style={{ width: SIZE, height: SIZE }}
-      >
-        <div
-          aria-hidden
-          className="absolute inset-0 rounded-full"
-          style={{
-            background:
-              "radial-gradient(circle at 32% 22%, #2C2A26 0%, #16140F 65%, #050402 100%)",
-            boxShadow:
-              "0 2px 3px -1px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.10), inset 0 -2px 4px rgba(0,0,0,0.55)",
-          }}
-        />
-        <div
-          aria-hidden
-          className="absolute pointer-events-none"
-          style={{
-            left: "50%",
-            top: "50%",
-            width: 0,
-            height: 0,
-            transform: `translate(-50%, -50%) rotate(${angle}deg)`,
-            transition: dragging ? "none" : "transform 80ms ease-out",
-          }}
-        >
-          <span
-            className="absolute"
-            style={{
-              left: "50%",
-              top: -SIZE / 2 + 3,
-              transform: "translate(-50%, 0)",
-              width: 2,
-              height: 6,
-              borderRadius: 1,
-              background: tint,
-              boxShadow: `0 0 3px ${tint}cc`,
-            }}
-          />
-        </div>
-      </div>
-      <span
-        style={{
-          fontFamily: '"JetBrains Mono Variable", ui-monospace, monospace',
-          fontSize: 7,
-          letterSpacing: 0.5,
-          lineHeight: 1,
-          ...LCD_TEXT,
-        }}
-      >
-        {display}
-      </span>
-      <span
-        style={{
-          fontSize: 6.5,
-          letterSpacing: 1,
-          color: "rgba(245,240,225,0.5)",
-          textShadow: "0 1px 0 rgba(0,0,0,0.55)",
-          fontWeight: 700,
-          textTransform: "uppercase",
-          fontFamily: '"JetBrains Mono Variable", ui-monospace, monospace',
-          lineHeight: 1,
-        }}
-      >
-        {label}
-      </span>
-    </div>
-  );
-}
 
 /** Small latching toggle (SYNC / INV) styled like the screen-mode keys. */
 function MiniToggle({
