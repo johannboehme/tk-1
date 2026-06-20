@@ -19,11 +19,21 @@ export type FxKind =
   | "uv"
   /** Global color-grade pass (the "film stock" layer). Unlike the other
    *  kinds it is NOT a momentary punch-in accent: the descriptor builder
-   *  emits one `grade` FrameFx per active GradeSlot, prepended ahead of the
-   *  accents so they composite on top of the graded frame. Its params are
-   *  the full `GradeParams` vector (see ./looks), not a 2-knob pair, so its
-   *  catalog entry exposes no `params` tuple. */
-  | "grade";
+   *  emits one `grade` FrameFx, prepended ahead of the accents so they
+   *  composite on top of the graded frame. Its params are the full
+   *  `GradeParams` vector (see ./looks), not a 2-knob pair, so its catalog
+   *  entry exposes no `params` tuple. Edited via the Color-grade surface. */
+  | "grade"
+  /** Global "filter" looks — opinionated, recognizable, each its OWN effect
+   *  with its OWN controls (see FxDefinition.filterParams). Applied as a
+   *  stack UNDER the punch-in accents (above the grade), edited in the
+   *  Overlays panel's Filters section. */
+  | "vhs"
+  | "super8"
+  | "decay"
+  | "noir"
+  | "sepia"
+  | "polaroid";
 
 /** Encoder-Verhalten eines Param.
  *

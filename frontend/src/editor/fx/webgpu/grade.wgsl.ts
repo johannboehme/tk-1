@@ -32,6 +32,8 @@ struct Uniforms {
   grain: f32,
   halation: f32,
   strength: f32,
+  shadowsLift: f32,
+  highlightsGain: f32,
   time: f32,
 };
 
@@ -75,6 +77,10 @@ fn grade(cin: vec3f, uv: vec2f) -> vec3f {
   let floorLift = u.fade * 0.18 + max(u.blackPoint, 0.0) * 0.5;
   c = c * (1.0 - floorLift) + vec3f(floorLift);
   c = c - vec3f(max(-u.blackPoint, 0.0) * 0.3);
+  // shadows lift (luminance, shadow-masked)
+  let lLift = dot(c, W);
+  let sWl = 1.0 - smoothstep(0.0, 0.5, lLift);
+  c = c + vec3f(u.shadowsLift * 0.15 * sWl);
   // contrast
   c = (c - vec3f(0.5)) * (1.0 + u.contrast) + vec3f(0.5);
   // gamma
@@ -90,6 +96,8 @@ fn grade(cin: vec3f, uv: vec2f) -> vec3f {
   c.r = c.r + u.highlightTone * 0.10 * hW; c.b = c.b - u.highlightTone * 0.10 * hW;
   c.r = c.r - u.splitWarm * 0.08 * sW;     c.b = c.b + u.splitWarm * 0.10 * sW;
   c.r = c.r + u.splitWarm * 0.10 * hW;     c.b = c.b - u.splitWarm * 0.08 * hW;
+  // highlights gain (luminance, highlight-masked)
+  c = c * (1.0 + u.highlightsGain * 0.25 * hW);
   // saturation + vibrance
   let l2 = dot(c, W);
   c = mix(vec3f(l2), c, u.saturation);
@@ -137,6 +145,8 @@ export const GRADE_SPEC: FxWebGPUSpec = {
     { name: "grain", type: "f1" },
     { name: "halation", type: "f1" },
     { name: "strength", type: "f1" },
+    { name: "shadowsLift", type: "f1" },
+    { name: "highlightsGain", type: "f1" },
     { name: "time", type: "f1" },
   ],
 };

@@ -13,6 +13,12 @@ import { UV_FRAG } from "./uv.frag";
 import { ECHO_FRAG } from "./echo.frag";
 import { TAPE_FRAG } from "./tape.frag";
 import { GRADE_FRAG } from "./grade.frag";
+import { VHS_FRAG } from "./vhs.frag";
+import { SUPER8_FRAG } from "./super8.frag";
+import { DECAY_FRAG } from "./decay.frag";
+import { NOIR_FRAG } from "./noir.frag";
+import { SEPIA_FRAG } from "./sepia.frag";
+import { POLAROID_FRAG } from "./polaroid.frag";
 import { emit, PERF_ENABLED } from "../../perf/marks";
 
 const FRAGMENTS: Record<string, string> = {
@@ -24,6 +30,12 @@ const FRAGMENTS: Record<string, string> = {
   echo: ECHO_FRAG,
   tape: TAPE_FRAG,
   grade: GRADE_FRAG,
+  vhs: VHS_FRAG,
+  super8: SUPER8_FRAG,
+  decay: DECAY_FRAG,
+  noir: NOIR_FRAG,
+  sepia: SEPIA_FRAG,
+  polaroid: POLAROID_FRAG,
 };
 
 /** Names of all registered fragment shaders — exposed so callers (e.g.

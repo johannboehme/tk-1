@@ -58,6 +58,12 @@ export interface GradeParams {
   halation: number;
   /** Master dry/wet — mix(source, graded, strength). Also the BLEND. */
   strength: number;
+  /** Lift the shadows toward grey (luminance, shadow-masked) — the
+   *  "Shadows" wheel of a lift/gamma/gain grade. */
+  shadowsLift: number;
+  /** Gain the highlights (luminance, highlight-masked) — the "Highlights"
+   *  wheel of a lift/gamma/gain grade. */
+  highlightsGain: number;
 }
 
 /** Canonical param order — drives shader uniform iteration + WGSL struct
@@ -79,6 +85,8 @@ export const GRADE_PARAM_KEYS = [
   "grain",
   "halation",
   "strength",
+  "shadowsLift",
+  "highlightsGain",
 ] as const satisfies readonly (keyof GradeParams)[];
 
 /** Storage range per param. Used to validate look recipes + clamp merges. */
@@ -99,6 +107,8 @@ export const GRADE_PARAM_RANGES: Record<keyof GradeParams, readonly [number, num
   grain: [0, 1],
   halation: [0, 1],
   strength: [0, 1],
+  shadowsLift: [-1, 1],
+  highlightsGain: [-1, 1],
 };
 
 /** Identity grade — every param a no-op (strength=1 = full wet of a no-op,
@@ -120,6 +130,8 @@ export const ENGINE_DEFAULTS: GradeParams = {
   grain: 0,
   halation: 0,
   strength: 1,
+  shadowsLift: 0,
+  highlightsGain: 0,
 };
 
 export type GradeLookId =
@@ -423,6 +435,11 @@ export function gradeColor(
   cb = cb * (1 - floorLift) + floorLift;
   const crush = Math.max(-p.blackPoint, 0) * 0.3;
   cr -= crush; cg -= crush; cb -= crush;
+  // shadows lift (luminance, shadow-masked) — lift-before-curve
+  const lLift = cr * 0.299 + cg * 0.587 + cb * 0.114;
+  const sWl = 1 - smoothstep(0, 0.5, lLift);
+  const lift = p.shadowsLift * 0.15 * sWl;
+  cr += lift; cg += lift; cb += lift;
   // contrast
   cr = (cr - 0.5) * (1 + p.contrast) + 0.5;
   cg = (cg - 0.5) * (1 + p.contrast) + 0.5;
@@ -443,6 +460,9 @@ export function gradeColor(
   cr += p.highlightTone * 0.1 * hW; cb -= p.highlightTone * 0.1 * hW;
   cr -= p.splitWarm * 0.08 * sW; cb += p.splitWarm * 0.1 * sW;
   cr += p.splitWarm * 0.1 * hW; cb -= p.splitWarm * 0.08 * hW;
+  // highlights gain (luminance, highlight-masked)
+  const gain = 1 + p.highlightsGain * 0.25 * hW;
+  cr *= gain; cg *= gain; cb *= gain;
   // saturation + vibrance
   const l2 = cr * 0.299 + cg * 0.587 + cb * 0.114;
   cr = l2 + (cr - l2) * p.saturation;

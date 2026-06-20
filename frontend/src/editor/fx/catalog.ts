@@ -26,6 +26,12 @@ export interface FxDefinition {
    *  und schreibt in `fxDefaults` im Store. Optional damit alte Tests, die
    *  ad-hoc FxDefinition-Stubs bauen, nicht brechen. */
   params?: readonly [FxParamDef, FxParamDef];
+  /** Per-FILTER control schema (variable length, 2-6 entries). Distinct
+   *  from `params` (the fixed 2-knob hardware-encoder pair): this drives the
+   *  Overlays "Filters" card, which renders one slider per entry — so each
+   *  filter shows ITS OWN controls (VHS: TRACK/BLEED/SNOW/WOBBLE; Sepia:
+   *  TONE/CONTRAST/FADE/GRAIN; …). Must include a master "amount". */
+  filterParams?: readonly FxParamDef[];
   /** ADSR-Default für neue Regionen. Wird beim `beginFxHold` in die
    *  PunchFx eingefroren (modulo User-Override via `fxEnvelopes[kind]`).
    *  Optional damit alte Tests Stubs ohne Envelope bauen können —
@@ -1003,6 +1009,151 @@ const GRADE: FxDefinition = {
   },
 };
 
+// — FILTERS — opinionated global looks ————————————————————————
+//
+// Each filter is a source-sampling REPLACE effect (same backend contract as
+// RGB / GRADE): bindSourceTexture + setBlendMode("replace") + one uniform
+// per param (u_<id> WebGL2 / <id> WebGPU) + u_time/time for the animated
+// ones. The shader lives in webgl2/<kind>.frag.ts + webgpu/<kind>.wgsl.ts
+// and outputs mix(source, effect, amount), so amount=0 is identity. Unlike
+// the punch-ins, filters expose a VARIABLE-LENGTH `filterParams` schema
+// (their OWN controls) instead of the 2-knob `params` tuple, and seed a
+// tasteful non-zero default so a freshly-added filter immediately looks like
+// the thing. All draws share one factory — the look lives entirely in the
+// shader + the param schema.
+
+interface FilterParamInit {
+  id: string;
+  label: string;
+  default: number;
+  min: number;
+  max: number;
+}
+
+function makeFilterDef(
+  kind: FxKind,
+  label: string,
+  capsuleColor: string,
+  cssFilter: string,
+  paramsInit: readonly FilterParamInit[],
+): FxDefinition {
+  const filterParams: FxParamDef[] = paramsInit.map((p) => ({
+    id: p.id,
+    label: p.label,
+    kind: "linear",
+    defaultValue: p.default,
+    min: p.min,
+    max: p.max,
+  }));
+  const ids = filterParams.map((p) => p.id);
+  const defaultParams: Record<string, number> = {};
+  for (const p of filterParams) defaultParams[p.id] = p.defaultValue;
+  const read = (fx: PunchFx): Record<string, number> => ({
+    ...defaultParams,
+    ...(fx.params ?? {}),
+  });
+
+  return {
+    kind,
+    label,
+    capsuleColor,
+    defaultParams,
+    filterParams,
+    defaultLengthS: 0,
+
+    // Reduced fallback — Canvas2D is the rare no-GPU live path (export uses
+    // WebGPU). A CSS filter approximates the look; grain/texture/temporal
+    // detail is GPU-only, per the WEAR/UV reduced-fidelity contract.
+    drawCanvas2D(ctx, fx, w, h, _t, source) {
+      if (!source) return;
+      const amount = clamp01(read(fx).amount ?? 1);
+      if (amount <= 0) return;
+      ctx.save();
+      ctx.globalAlpha = amount;
+      ctx.filter = cssFilter;
+      ctx.drawImage(source, 0, 0, w, h);
+      ctx.filter = "none";
+      ctx.restore();
+    },
+
+    drawWebGL2(ctx, fx, _w, _h, t) {
+      const p = read(fx);
+      if ((p.amount ?? 1) <= 0) return;
+      ctx.setBlendMode("replace");
+      ctx.useProgram(kind);
+      ctx.bindSourceTexture("u_source");
+      for (const id of ids) ctx.setUniform1f(`u_${id}`, p[id]);
+      ctx.setUniform1f("u_time", t);
+      ctx.drawFullscreenQuad();
+    },
+
+    drawWebGPU(ctx, fx, _w, _h, t) {
+      const p = read(fx);
+      if ((p.amount ?? 1) <= 0) return;
+      ctx.setBlendMode("replace");
+      ctx.useProgram(kind);
+      ctx.bindSourceTexture();
+      for (const id of ids) ctx.setUniform1f(id, p[id]);
+      ctx.setUniform1f("time", t);
+      ctx.drawFullscreenQuad();
+    },
+
+    // The master amount is the dry/wet — fold the ADSR wetness into it.
+    applyWetness(params, wetness) {
+      return { ...params, amount: (params.amount ?? 1) * wetness };
+    },
+  };
+}
+
+const VHS = makeFilterDef("vhs", "VHS", "#3CC3C3", "saturate(1.15) contrast(1.05)", [
+  { id: "tracking", label: "TRACK", default: 0.35, min: 0, max: 1 },
+  { id: "bleed", label: "BLEED", default: 0.5, min: 0, max: 1 },
+  { id: "noise", label: "SNOW", default: 0.35, min: 0, max: 1 },
+  { id: "wobble", label: "WOBBLE", default: 0.3, min: 0, max: 1 },
+  { id: "amount", label: "AMOUNT", default: 0.85, min: 0, max: 1 },
+]);
+
+const SUPER8 = makeFilterDef("super8", "SUPER-8", "#C98A3A", "sepia(0.35) saturate(0.9) brightness(1.05)", [
+  { id: "grain", label: "GRAIN", default: 0.5, min: 0, max: 1 },
+  { id: "weave", label: "WEAVE", default: 0.4, min: 0, max: 1 },
+  { id: "flicker", label: "FLICKER", default: 0.3, min: 0, max: 1 },
+  { id: "warmth", label: "WARMTH", default: 0.5, min: 0, max: 1 },
+  { id: "amount", label: "AMOUNT", default: 0.8, min: 0, max: 1 },
+]);
+
+const DECAY = makeFilterDef("decay", "DECAY", "#8A6A4A", "sepia(0.2) contrast(1.1) brightness(0.97)", [
+  { id: "dust", label: "DUST", default: 0.4, min: 0, max: 1 },
+  { id: "scratches", label: "SCRATCH", default: 0.4, min: 0, max: 1 },
+  { id: "flicker", label: "FLICKER", default: 0.35, min: 0, max: 1 },
+  { id: "leak", label: "LEAK", default: 0.3, min: 0, max: 1 },
+  { id: "amount", label: "AMOUNT", default: 0.8, min: 0, max: 1 },
+]);
+
+const NOIR = makeFilterDef("noir", "NOIR", "#4A4A52", "grayscale(1) contrast(1.4)", [
+  { id: "filter", label: "FILTER", default: 0.3, min: -1, max: 1 },
+  { id: "contrast", label: "CONTRAST", default: 0.5, min: 0, max: 1 },
+  { id: "grain", label: "GRAIN", default: 0.3, min: 0, max: 1 },
+  { id: "vignette", label: "VIGN", default: 0.5, min: 0, max: 1 },
+  { id: "amount", label: "AMOUNT", default: 0.9, min: 0, max: 1 },
+]);
+
+const SEPIA = makeFilterDef("sepia", "SEPIA", "#A87B45", "sepia(0.85) contrast(1.1)", [
+  { id: "tone", label: "TONE", default: 0.3, min: -1, max: 1 },
+  { id: "contrast", label: "CONTRAST", default: 0.4, min: 0, max: 1 },
+  { id: "fade", label: "FADE", default: 0.3, min: 0, max: 1 },
+  { id: "grain", label: "GRAIN", default: 0.3, min: 0, max: 1 },
+  { id: "amount", label: "AMOUNT", default: 0.9, min: 0, max: 1 },
+]);
+
+const POLAROID = makeFilterDef("polaroid", "INSTANT", "#E8E0D0", "saturate(0.95) brightness(1.08) contrast(0.92)", [
+  { id: "fade", label: "FADE", default: 0.4, min: 0, max: 1 },
+  { id: "bloom", label: "BLOOM", default: 0.4, min: 0, max: 1 },
+  { id: "chem", label: "CAST", default: 0.4, min: 0, max: 1 },
+  { id: "vignette", label: "VIGN", default: 0.5, min: 0, max: 1 },
+  { id: "border", label: "FRAME", default: 0, min: 0, max: 1 },
+  { id: "amount", label: "AMOUNT", default: 0.85, min: 0, max: 1 },
+]);
+
 export const fxCatalog: Readonly<Record<FxKind, FxDefinition>> = {
   vignette: VIGNETTE,
   wear: WEAR,
@@ -1012,6 +1163,12 @@ export const fxCatalog: Readonly<Record<FxKind, FxDefinition>> = {
   zoom: ZOOM,
   uv: UV,
   grade: GRADE,
+  vhs: VHS,
+  super8: SUPER8,
+  decay: DECAY,
+  noir: NOIR,
+  sepia: SEPIA,
+  polaroid: POLAROID,
 };
 
 export function getFxDefinition(kind: FxKind): FxDefinition {

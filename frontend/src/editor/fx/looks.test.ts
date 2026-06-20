@@ -184,6 +184,29 @@ describe("gradeColor — canonical CPU reference (mirrors the shaders)", () => {
     expect(centre[0]).toBeCloseTo(0.7, 5);
   });
 
+  it("shadowsLift opens the darks but barely touches the brights", () => {
+    const p = { ...ENGINE_DEFAULTS, shadowsLift: 1 };
+    const darkLift = gradeColor(0.1, 0.1, 0.1, p, 0)[0] - 0.1;
+    const brightLift = gradeColor(0.9, 0.9, 0.9, p, 0)[0] - 0.9;
+    expect(darkLift).toBeGreaterThan(0.05);
+    expect(brightLift).toBeLessThan(darkLift * 0.5);
+  });
+
+  it("highlightsGain boosts the brights but barely touches the darks", () => {
+    const p = { ...ENGINE_DEFAULTS, highlightsGain: 1 };
+    const brightGain = gradeColor(0.9, 0.9, 0.9, p, 0)[0] - 0.9;
+    const darkGain = gradeColor(0.1, 0.1, 0.1, p, 0)[0] - 0.1;
+    expect(brightGain).toBeGreaterThan(0.02);
+    expect(Math.abs(darkGain)).toBeLessThan(brightGain * 0.5);
+  });
+
+  it("lift + gain are both no-ops at 0 (identity preserved)", () => {
+    const [r, g, b] = gradeColor(0.5, 0.4, 0.3, { ...ENGINE_DEFAULTS, shadowsLift: 0, highlightsGain: 0 }, 0);
+    expect(r).toBeCloseTo(0.5, 5);
+    expect(g).toBeCloseTo(0.4, 5);
+    expect(b).toBeCloseTo(0.3, 5);
+  });
+
   it("output is clamped to [0,1]", () => {
     const [r, g, b] = gradeColor(1, 1, 1, { ...ENGINE_DEFAULTS, exposure: 1, contrast: 1 }, 0);
     for (const v of [r, g, b]) {

@@ -488,11 +488,17 @@ export type PunchFxKindRecord =
   | "tape"
   | "zoom"
   | "uv"
-  // Mirrors `FxKind`. `grade` is a global color-grade kind: in practice it
-  // never lands in the persisted `fx[]` punch-in array (grade state lives in
-  // its own `grades[]` slot list), but it is mirrored here to keep this
+  // Mirrors `FxKind`. `grade` + the filter kinds are global, not punch-in
+  // accents: they never land in the persisted `fx[]` array (their state
+  // lives in colorGrade / filterSlots), but are mirrored here to keep this
   // union a faithful superset of `FxKind`.
-  | "grade";
+  | "grade"
+  | "vhs"
+  | "super8"
+  | "decay"
+  | "noir"
+  | "sepia"
+  | "polaroid";
 
 export interface PunchFxRecord {
   id: string;

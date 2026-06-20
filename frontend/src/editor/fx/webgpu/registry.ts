@@ -13,6 +13,12 @@ import { VIGNETTE_SPEC } from "./vignette.wgsl";
 import { WEAR_SPEC } from "./wear.wgsl";
 import { ZOOM_SPEC } from "./zoom.wgsl";
 import { GRADE_SPEC } from "./grade.wgsl";
+import { VHS_SPEC } from "./vhs.wgsl";
+import { SUPER8_SPEC } from "./super8.wgsl";
+import { DECAY_SPEC } from "./decay.wgsl";
+import { NOIR_SPEC } from "./noir.wgsl";
+import { SEPIA_SPEC } from "./sepia.wgsl";
+import { POLAROID_SPEC } from "./polaroid.wgsl";
 
 export const FX_WEBGPU_SPECS: readonly FxWebGPUSpec[] = [
   VIGNETTE_SPEC,
@@ -23,4 +29,10 @@ export const FX_WEBGPU_SPECS: readonly FxWebGPUSpec[] = [
   ECHO_SPEC,
   TAPE_SPEC,
   GRADE_SPEC,
+  VHS_SPEC,
+  SUPER8_SPEC,
+  DECAY_SPEC,
+  NOIR_SPEC,
+  SEPIA_SPEC,
+  POLAROID_SPEC,
 ];

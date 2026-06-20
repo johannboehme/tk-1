@@ -36,6 +36,8 @@ uniform float u_vignette;
 uniform float u_grain;
 uniform float u_halation;
 uniform float u_strength;
+uniform float u_shadowsLift;
+uniform float u_highlightsGain;
 uniform float u_time;
 out vec4 fragColor;
 
@@ -52,6 +54,10 @@ vec3 grade(vec3 c, vec2 uv) {
   float floorLift = u_fade * 0.18 + max(u_blackPoint, 0.0) * 0.5;
   c = c * (1.0 - floorLift) + floorLift;
   c = c - max(-u_blackPoint, 0.0) * 0.3;
+  // shadows lift (luminance, shadow-masked) — lift before the curve
+  float lLift = dot(c, W);
+  float sWl = 1.0 - smoothstep(0.0, 0.5, lLift);
+  c += u_shadowsLift * 0.15 * sWl;
   // contrast about mid-grey
   c = (c - 0.5) * (1.0 + u_contrast) + 0.5;
   // gamma (midtone bend)
@@ -67,6 +73,8 @@ vec3 grade(vec3 c, vec2 uv) {
   c.r += u_highlightTone * 0.10 * hW; c.b -= u_highlightTone * 0.10 * hW;
   c.r -= u_splitWarm * 0.08 * sW;     c.b += u_splitWarm * 0.10 * sW;
   c.r += u_splitWarm * 0.10 * hW;     c.b -= u_splitWarm * 0.08 * hW;
+  // highlights gain (luminance, highlight-masked)
+  c *= 1.0 + u_highlightsGain * 0.25 * hW;
   // saturation + vibrance (luma-weighted, no HSV)
   float l2 = dot(c, W);
   c = mix(vec3(l2), c, u_saturation);
