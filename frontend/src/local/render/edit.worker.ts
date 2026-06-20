@@ -95,6 +95,14 @@ export interface EditWorkerInput {
   /** Punch-in FX (visual effects with in/out spans). Same shape the
    *  editor store holds; passed through verbatim to the compositor. */
   fx?: PunchFx[];
+  /** Real song tempo + beat grid for beat-synced FX modulation. null bpm
+   *  disables beat-sync. */
+  bpm?: number | null;
+  beatPhaseS?: number;
+  beatsPerBar?: number;
+  /** Normalized master-loudness curve (0..1 over master seconds) for
+   *  sidechain FX modulation. Transferred (Float32Array) from the host. */
+  audioEnv?: import("../../editor/fx/modulation").AudioEnvelope | null;
   offsetMs: number;
   driftRatio: number;
   /** Output codec/dimension/bitrate overrides. Optional — the renderer

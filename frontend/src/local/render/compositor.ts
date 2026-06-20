@@ -33,7 +33,13 @@ import type { PunchFx } from "../../editor/fx/types";
 import type { ViewportTransform } from "../../editor/types";
 import { activeFxAt } from "../../editor/fx/active";
 import { fxCatalog } from "../../editor/fx/catalog";
-import { envelopeAt, INSTANT_ENVELOPE } from "../../editor/fx/envelope";
+import { INSTANT_ENVELOPE } from "../../editor/fx/envelope";
+import {
+  computeIntensity,
+  followerFor,
+  legacyModulation,
+  type AudioEnvelope,
+} from "../../editor/fx/modulation";
 import {
   createBackend,
   type BackendCapabilities,
@@ -72,6 +78,13 @@ export interface CompositorOptions {
    *  visualizers and text overlays. Same `fxCatalog[kind]` impl as the
    *  live preview — single source of truth per kind. */
   fx?: readonly PunchFx[];
+  /** Real song tempo for beat-synced LFO modulation. null → no beat-sync. */
+  bpm?: number | null;
+  /** Master-time of beat 0 (grid anchor for beat-synced LFO). */
+  beatPhaseS?: number;
+  beatsPerBar?: number;
+  /** Normalized master-loudness curve for sidechain modulation. */
+  audioEnv?: AudioEnvelope | null;
 }
 
 // Per-element placement is shared with the live preview via
@@ -217,18 +230,40 @@ export class Compositor {
       displayH: dispH,
     };
 
+    // Same uniform engine as the live preview (single source of truth).
+    // Export uses `tFx` for both the envelope (region-local) and the
+    // audio/beat-sync axes; for whole-video renders tFx == master-audio
+    // time, so beat-sync + sidechain line up. (Segmented exports map
+    // timeline→master elsewhere; audio-sync there follows tFx.)
+    const bpm = this.opts.bpm ?? null;
+    const beatPhaseS = this.opts.beatPhaseS ?? 0;
+    const beatsPerBar = this.opts.beatsPerBar ?? 4;
+    const audioEnv = this.opts.audioEnv ?? null;
     const fxFrame: FrameFx[] = this.opts.fx
       ? activeFxAt(this.opts.fx, tFx)
           .map((fx) => {
             const def = fxCatalog[fx.kind];
-            const env = fx.envelope ?? INSTANT_ENVELOPE;
-            const wetness = envelopeAt(env, fx.outS - fx.inS, tFx - fx.inS);
+            const env = fx.modulation?.envelope ?? fx.envelope ?? INSTANT_ENVELOPE;
+            const mod = fx.modulation ?? legacyModulation(env);
+            const sidechainCurve =
+              mod.timeMod === "sidechain" ? followerFor(audioEnv, mod.side) : null;
+            const { level, phase } = computeIntensity(mod, {
+              tMasterS: tFx,
+              tTimelineS: tFx,
+              regionInS: fx.inS,
+              regionDurS: fx.outS - fx.inS,
+              holding: false,
+              bpm,
+              beatPhaseS,
+              beatsPerBar,
+              sidechainCurve,
+            });
             const merged = { ...def.defaultParams, ...(fx.params ?? {}) };
             const params =
-              def.applyWetness && wetness < 1
-                ? def.applyWetness(merged, wetness)
+              def.applyWetness && level < 1
+                ? def.applyWetness(merged, level)
                 : merged;
-            return { id: fx.id, kind: fx.kind, inS: fx.inS, params, wetness };
+            return { id: fx.id, kind: fx.kind, inS: fx.inS, params, wetness: level, phase };
           })
           .filter((f) => f.wetness > 0)
       : [];

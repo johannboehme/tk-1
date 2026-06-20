@@ -498,6 +498,30 @@ export interface PunchFxRecord {
     sustain: number;
     releaseS: number;
   };
+  /** Uniforme Modulation (Envelope ⊗ LFO|Sidechain). Shape gespiegelt von
+   *  `Modulation` im editor-Modul (Storage bleibt import-frei). Optional —
+   *  Pre-Modulation-Records tragen nur `envelope` und rendern envelope-only. */
+  modulation?: {
+    envelope: {
+      attackS: number;
+      decayS: number;
+      sustain: number;
+      releaseS: number;
+    };
+    timeMod: "lfo" | "sidechain";
+    depth: number;
+    lfo: {
+      shape: "sine" | "triangle" | "saw" | "ramp" | "square";
+      rate: number;
+      beatSync: boolean;
+    };
+    side: {
+      threshold: number;
+      attackS: number;
+      releaseS: number;
+      invert: boolean;
+    };
+  };
 }
 
 const DB_NAME = "videoaudiosync";

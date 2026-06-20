@@ -46,6 +46,7 @@ import { decodeAudioToMonoPcm } from "../local/codec";
 import { confirmDestructive } from "../lib/confirm";
 import { countEditsAffectedByCamRemoval } from "../local/edits-impact";
 import { computeWaveformPeaks } from "../local/waveform-peaks";
+import { buildLoudnessEnvelope } from "../editor/fx/audio-envelope";
 import { exportSpecToRenderOpts } from "../editor/exportPresets";
 import { loadAssetFile } from "../local/asset-source";
 import type { ClipInit } from "../editor/store";
@@ -656,6 +657,14 @@ export default function Editor() {
         wave,
         cams: camUrls,
       });
+
+      // Master-loudness envelope for sidechain modulation (+ the sidechain
+      // widget). Reuses the PCM we just decoded; null stays if decode failed.
+      if (studioPcm) {
+        useEditorStore
+          .getState()
+          .setAudioEnv(buildLoudnessEnvelope(studioPcm, studioSampleRate, 60));
+      }
 
       const clipInits: ClipInit[] = videos.map((v) => assetToClipInit(v));
 

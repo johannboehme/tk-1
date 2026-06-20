@@ -94,7 +94,21 @@ export const DEFAULT_SIDECHAIN: SidechainConfig = Object.freeze({
 export const DEFAULT_MODULATION: Modulation = Object.freeze({
   envelope: { attackS: 0.04, decayS: 0, sustain: 1, releaseS: 0.25 },
   timeMod: "lfo",
-  depth: 1,
+  // depth 0 → new fx behave envelope-only (no surprise pumping) until the
+  // user engages the modulator in the M-screen.
+  depth: 0,
+  lfo: DEFAULT_LFO,
+  side: DEFAULT_SIDECHAIN,
+});
+
+/** The modulator config WITHOUT the envelope. The envelope lives in the
+ *  store's `fxEnvelopes` (edited by the ADSR screen) and is composed in at
+ *  bake / live-preview time, so there's a single source of truth for it. */
+export type ModConfig = Omit<Modulation, "envelope">;
+
+export const DEFAULT_MOD_CONFIG: ModConfig = Object.freeze({
+  timeMod: "lfo",
+  depth: 0,
   lfo: DEFAULT_LFO,
   side: DEFAULT_SIDECHAIN,
 });
@@ -326,4 +340,45 @@ export function computeIntensity(mod: Modulation, ctx: ModContext): ModResult {
   const depth = clamp01(mod.depth);
   const modLevel = 1 - depth + depth * clamp01(raw);
   return { level: clamp01(envLevel * modLevel), phase };
+}
+
+// ── Render-path helpers (shared by live descriptor + export compositor) ──
+
+/** Wrap a legacy envelope-only FX as a uniform Modulation with the
+ *  modulator disabled (depth 0). `computeIntensity` then reduces to a pure
+ *  envelope sample → bit-identical to the pre-modulation render path. */
+export function legacyModulation(envelope: ADSREnvelope): Modulation {
+  return {
+    envelope,
+    timeMod: "lfo",
+    depth: 0,
+    lfo: DEFAULT_LFO,
+    side: DEFAULT_SIDECHAIN,
+  };
+}
+
+// Memoize sidechain follower curves so an active sidechain FX doesn't
+// rebuild the whole curve every frame. Keyed by the audio-env object
+// identity, then by the sidechain config signature. Observationally pure
+// (same inputs → same curve).
+const followerMemo = new WeakMap<AudioEnvelope, Map<string, AudioEnvelope>>();
+
+/** Get (memoized) the sidechain follower curve for an audio env + config. */
+export function followerFor(
+  audio: AudioEnvelope | null | undefined,
+  side: SidechainConfig,
+): AudioEnvelope | null {
+  if (!audio) return null;
+  let inner = followerMemo.get(audio);
+  if (!inner) {
+    inner = new Map();
+    followerMemo.set(audio, inner);
+  }
+  const key = `${side.threshold}|${side.attackS}|${side.releaseS}|${side.invert}`;
+  let curve = inner.get(key);
+  if (!curve) {
+    curve = buildFollowerCurve(audio, side);
+    inner.set(key, curve);
+  }
+  return curve;
 }

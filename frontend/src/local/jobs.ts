@@ -60,6 +60,7 @@ import type {
 import { decodeAudioToMonoPcm } from "./codec";
 import { collectSyncFailureReport } from "./diagnostics";
 import { computeEnergyCurves } from "./render/energy";
+import { buildLoudnessEnvelope } from "../editor/fx/audio-envelope";
 import { extractTimelineFrames } from "./render/frames";
 import type { TextOverlay } from "./render/ass-builder";
 import {
@@ -941,6 +942,15 @@ export async function runEditRender(
       }
     }
 
+    // Master-loudness envelope for sidechain FX modulation — only when an
+    // fx actually uses sidechain (reuse the mono decode if we already did
+    // one for visualizers, else decode once at 22.05 kHz).
+    let audioEnv: ReturnType<typeof buildLoudnessEnvelope> | null = null;
+    if ((job.fx ?? []).some((f) => f.modulation?.timeMod === "sidechain")) {
+      const pcm = monoPcm ?? (await decodeAudioToMonoPcm(audioFile, 22050)).pcm;
+      audioEnv = buildLoudnessEnvelope(pcm, 22050, 60);
+    }
+
     reportRenderProgress(jobId, { pct: 25, stage: "encoding" });
     // Audio offset is anchored to cam-1 (the master clock cam), same sign
     // convention as the legacy single-cam pipeline.
@@ -1027,6 +1037,10 @@ export async function runEditRender(
       visualizers: visualizerDescs,
       energy,
       fx: job.fx,
+      bpm: job.bpm?.value ?? null,
+      beatPhaseS: (job.bpm?.phase ?? 0) + (job.audioStartNudgeS ?? 0),
+      beatsPerBar: job.beatsPerBar ?? 4,
+      audioEnv,
       offsetMs: totalOffsetMs,
       driftRatio: job.sync.driftRatio,
       outputWidth: spec.exportOpts?.width,
@@ -1042,6 +1056,9 @@ export async function runEditRender(
     const transferables: Transferable[] = [audio.pcm.buffer];
     for (const d of visualizerDescs) {
       if (d.type === "showwaves") transferables.push(d.pcm.buffer);
+    }
+    if (audioEnv && audioEnv.data instanceof Float32Array) {
+      transferables.push(audioEnv.data.buffer);
     }
 
     const worker = new Worker(new URL("./render/edit.worker.ts", import.meta.url), {

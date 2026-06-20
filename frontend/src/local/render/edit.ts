@@ -83,6 +83,12 @@ export interface EditRenderInput {
   /** Punch-in FX (visual effects with in/out spans). Same data the live
    *  preview reads — passed through to the compositor verbatim. */
   fx?: PunchFx[];
+  /** Real song tempo + beat grid for beat-synced FX modulation. */
+  bpm?: number | null;
+  beatPhaseS?: number;
+  beatsPerBar?: number;
+  /** Normalized master-loudness curve for sidechain FX modulation. */
+  audioEnv?: import("../../editor/fx/modulation").AudioEnvelope | null;
   offsetMs: number;
   driftRatio: number;
   videoBitrateBps?: number;
@@ -265,6 +271,10 @@ export async function editRender(input: EditRenderInput): Promise<EditRenderResu
       energy: input.energy ?? null,
       visualizers: input.visualizers ?? [],
       fx: input.fx ?? [],
+      bpm: input.bpm ?? null,
+      beatPhaseS: input.beatPhaseS ?? 0,
+      beatsPerBar: input.beatsPerBar ?? 4,
+      audioEnv: input.audioEnv ?? null,
     },
     input.capabilities ?? { webgl2: false, webgpu: false },
   );
@@ -732,6 +742,10 @@ export async function editRenderMulti(
       energy: input.energy ?? null,
       visualizers: input.visualizers ?? [],
       fx: input.fx ?? [],
+      bpm: input.bpm ?? null,
+      beatPhaseS: input.beatPhaseS ?? 0,
+      beatsPerBar: input.beatsPerBar ?? 4,
+      audioEnv: input.audioEnv ?? null,
     },
     input.capabilities ?? { webgl2: false, webgpu: false },
   );

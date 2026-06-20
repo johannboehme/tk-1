@@ -633,6 +633,7 @@ function defaultReadSnapshot(): EditorStoreSnapshot {
     selectedFxKind: s.selectedFxKind,
     fxDefaults: s.fxDefaults,
     fxEnvelopes: s.fxEnvelopes,
+    fxModulations: s.fxModulations,
     pills: s.pills,
     arrangementSegments: s.arrangementSegments,
     bpm: s.jobMeta?.bpm?.value ?? null,
