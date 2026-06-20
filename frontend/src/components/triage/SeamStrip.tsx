@@ -65,10 +65,9 @@ export function SeamStrip() {
   // (chunked) with an immediate envelope-derived fallback while PCM decodes.
   const [pcmPyramid, setPcmPyramid] = useState<PeakPyramid | null>(null);
   useEffect(() => {
-    if (!pcm || pcm.length === 0) {
-      setPcmPyramid(null);
-      return;
-    }
+    // Keep an already-built pyramid if `pcm` later empties (the store detaches
+    // its PCM buffer after load) so the lanes stay on the crisp PCM pyramid.
+    if (!pcm || pcm.length === 0) return;
     let cancelled = false;
     void buildPeakPyramidAsync(pcm, pcmSampleRate, {
       baseSamplesPerBucket: 64,

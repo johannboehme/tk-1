@@ -481,10 +481,10 @@ export function TriageTimeline() {
   // recording doesn't jank the main thread.
   const [pcmPyramid, setPcmPyramid] = useState<PeakPyramid | null>(null);
   useEffect(() => {
-    if (!pcm || pcm.length === 0) {
-      setPcmPyramid(null);
-      return;
-    }
+    // Keep an already-built pyramid if `pcm` later empties — the store detaches
+    // its PCM buffer after load (BPM re-detection / worker transfer), and we'd
+    // otherwise drop back to the coarse 10 Hz envelope.
+    if (!pcm || pcm.length === 0) return;
     let cancelled = false;
     void buildPeakPyramidAsync(pcm, pcmSampleRate, {
       baseSamplesPerBucket: 64,
@@ -530,7 +530,7 @@ export function TriageTimeline() {
     // the lane stays well-filled and the silence threshold reads consistently.
     const colMax = drawWaveform(ctx, {
       pyramid,
-      pcm: pcm ?? null,
+      pcm: pcm && pcm.length > 0 ? pcm : null,
       t0S: viewStartS,
       t1S: viewEndS,
       cssW,

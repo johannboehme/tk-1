@@ -149,6 +149,35 @@ describe("expandToMinThickness — body never collapses to an invisible line", (
   });
 });
 
+describe("computeColumnModel — detached/empty PCM must not flatten the body", () => {
+  it("falls back to the pyramid (not the raw path) when pcm is length 0 at deep zoom", () => {
+    const sr = 22050;
+    const pyr = buildPeakPyramid(sine(2 * sr, sr, 440), sr); // base 64
+    // Deep zoom: samplesPerDevPx < base would trigger useRaw — but the store's
+    // PCM buffer has been detached to length 0 (still a truthy Float32Array).
+    const m = computeColumnModel({
+      pyramid: pyr,
+      pcm: new Float32Array(0),
+      t0S: 0.5,
+      t1S: 0.55, // 50 ms window
+      cssW: 400,
+      dpr: 2,
+      normalize: "peak",
+    });
+    let maxTop = 0;
+    let minBot = 0;
+    for (let i = 0; i < m.top.length; i++) {
+      if (m.top[i] > maxTop) maxTop = m.top[i];
+      if (m.bot[i] < minBot) minBot = m.bot[i];
+    }
+    // Without the pcm.length>0 guard, rawPcmColumn(empty) returns {0,0} for
+    // every column and the body is a flat line. With it, the sine's silhouette
+    // comes through the pyramid.
+    expect(maxTop).toBeGreaterThan(0.5);
+    expect(minBot).toBeLessThan(-0.5);
+  });
+});
+
 describe("computeColumnModel — extreme zoom uses raw PCM when supplied", () => {
   it("resolves detail finer than one base bucket via raw PCM", () => {
     const sr = 22050;

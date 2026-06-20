@@ -122,8 +122,13 @@ export function computeColumnModel(opts: ColumnModelOpts): ColumnModel {
   const lvl = pyramid.levels[level];
   const bucketDur = lvl.samplesPerBucket / sr;
   const samplesPerDevPx = secPerDevPx * sr;
+  // NB: pcm.length > 0 is essential — a detached/empty Float32Array is still
+  // truthy, and rawPcmColumn on it returns {0,0} for every column (a flat line).
   const useRaw =
-    !!pcm && level === 0 && samplesPerDevPx < pyramid.baseSamplesPerBucket;
+    !!pcm &&
+    pcm.length > 0 &&
+    level === 0 &&
+    samplesPerDevPx < pyramid.baseSamplesPerBucket;
 
   for (let i = 0; i < deviceWidth; i++) {
     let t0c: number;
