@@ -744,6 +744,10 @@ function Encoder({ kind, param, tint }: EncoderProps) {
     Math.min(1, range > 0 ? (value - param.min) / range : 0),
   );
   const angle = -135 + ratio * 270;
+  // Active-range arc: bipolar params grow from the centre detent (top),
+  // linear params from the scale start.
+  const arcStart = param.kind === "bipolar" ? 0 : -135;
+  const arcEnd = angle;
 
   const onPointerDown = useCallback(
     (e: ReactPointerEvent<HTMLDivElement>) => {
@@ -879,6 +883,34 @@ function Encoder({ kind, param, tint }: EncoderProps) {
           {param.kind === "linear"
             ? linearTicks(ratio, tint)
             : bipolarTicks(value, param.min, param.max, tint)}
+          {/* active-range arc hugging the knob body — faint track shows the
+              unused range, the tinted arc traces from neutral to value. */}
+          <path
+            d={encArcPath(-135, 135, ENC_ARC_R)}
+            fill="none"
+            stroke="rgba(245,240,225,0.16)"
+            strokeWidth={1.6}
+            strokeLinecap="round"
+          />
+          {Math.abs(arcEnd - arcStart) > 0.5 && (
+            <>
+              <path
+                d={encArcPath(arcStart, arcEnd, ENC_ARC_R)}
+                fill="none"
+                stroke={tint}
+                strokeWidth={2.8}
+                strokeLinecap="round"
+                opacity={0.3}
+              />
+              <path
+                d={encArcPath(arcStart, arcEnd, ENC_ARC_R)}
+                fill="none"
+                stroke={tint}
+                strokeWidth={1.6}
+                strokeLinecap="round"
+              />
+            </>
+          )}
         </svg>
 
         {/* knob body — matte black, fixed (does NOT rotate; the indicator does) */}
@@ -1131,6 +1163,21 @@ function bipolarTicks(
     );
   }
   return out;
+}
+
+// SVG arc path between two tick-space angles (0° = scale start sense used by
+// the encoder, i.e. -135..+135) at a given radius, with the same -90° SVG
+// offset the ticks use (top = 0). Round-capped when stroked.
+function encArcPath(startDeg: number, endDeg: number, r: number): string {
+  const pt = (deg: number): [number, number] => {
+    const rad = ((deg - 90) * Math.PI) / 180;
+    return [Math.cos(rad) * r, Math.sin(rad) * r];
+  };
+  const [x1, y1] = pt(startDeg);
+  const [x2, y2] = pt(endDeg);
+  const large = Math.abs(endDeg - startDeg) > 180 ? 1 : 0;
+  const sweep = endDeg >= startDeg ? 1 : 0;
+  return `M ${x1} ${y1} A ${r} ${r} 0 ${large} ${sweep} ${x2} ${y2}`;
 }
 
 // — Helpers ————————————————————————————————————————————————
@@ -2636,6 +2683,9 @@ const ENC_BODY = 36;
 const ENC_BODY_INSET = (ENC_OUTER - ENC_BODY) / 2;
 const ENC_CAP = 28;
 const ENC_CAP_INSET = (ENC_OUTER - ENC_CAP) / 2;
+// Active-range arc radius (viewBox units). Sits in the gap between the
+// black knob body (r≈36) and the inner ends of the etched scale ticks.
+const ENC_ARC_R = 38;
 
 const ALUMINUM_BODY: CSSProperties = {
   background:
