@@ -51,6 +51,7 @@ import type { FxKind, PunchFx } from "./fx/types";
 import { defaultTapLengthS, fxCatalog } from "./fx/catalog";
 import type { ADSREnvelope } from "./fx/envelope";
 import { INSTANT_ENVELOPE } from "./fx/envelope";
+import type { AudioEnvelope } from "./fx/modulation";
 
 export interface BpmInfo {
   /** BPM (detected or user-overridden). */
@@ -339,6 +340,12 @@ interface EditorState {
    *  (oder INSTANT_ENVELOPE) zurück. In-memory only — gleiche Persistenz-
    *  Frage wie fxDefaults. */
   fxEnvelopes: Partial<Record<FxKind, ADSREnvelope>>;
+
+  /** Normalized master-loudness curve (0..1 over master-audio seconds),
+   *  computed once from the decoded PCM at load. Drives sidechain
+   *  modulation and the sidechain widget's waveform/preview band. null
+   *  until the audio is decoded (or if decode failed). */
+  audioEnv: AudioEnvelope | null;
 
   /** Master-audio playback gain. 1.0 = source level (default), 0 = muted,
    *  2.0 = +6 dB. Applied by `useAudioMaster` to the master `<audio>`
@@ -687,6 +694,8 @@ interface EditorState {
   /** Reset envelope for `kind` back to the catalog's defaultEnvelope
    *  (or INSTANT_ENVELOPE if none). Used by double-click on ADSR knots. */
   resetFxEnvelope(kind: FxKind): void;
+  /** Store the master-loudness curve computed from decoded PCM at load. */
+  setAudioEnv(env: AudioEnvelope | null): void;
 
   setProgramStripMode(mode: UiSlice["programStripMode"]): void;
   setFxPanelOpen(open: boolean): void;
@@ -1044,6 +1053,7 @@ export const useEditorStore = create<EditorState>()(
     selectedFxKind: "vignette",
     fxDefaults: {},
     fxEnvelopes: {},
+    audioEnv: null,
     audioVolume: 1.0,
     arrangementSegments: [],
 
@@ -1071,6 +1081,7 @@ export const useEditorStore = create<EditorState>()(
         selectedFxKind: "vignette",
         fxDefaults: {},
         fxEnvelopes: {},
+        audioEnv: null,
         audioVolume: 1.0,
         arrangementSegments: [],
       });
@@ -1140,6 +1151,7 @@ export const useEditorStore = create<EditorState>()(
         selectedFxKind: "vignette",
         fxDefaults: {},
         fxEnvelopes: {},
+        audioEnv: null,
         audioVolume:
           typeof opts?.audioVolume === "number" && opts.audioVolume >= 0
             ? Math.min(4, opts.audioVolume)
@@ -2738,6 +2750,9 @@ export const useEditorStore = create<EditorState>()(
       const next = { ...cur };
       delete next[kind];
       set({ fxEnvelopes: next });
+    },
+    setAudioEnv(env) {
+      set({ audioEnv: env });
     },
   })),
 );

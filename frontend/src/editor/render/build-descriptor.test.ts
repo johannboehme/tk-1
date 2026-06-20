@@ -8,6 +8,12 @@ import type { Clip, ImageClip, Segment, VideoClip } from "../types";
 import { clipRangeS } from "../types";
 import type { Cut } from "../../storage/jobs-db";
 import type { PunchFx } from "../fx/types";
+import {
+  bipolarRatePeriodS,
+  DEFAULT_LFO,
+  DEFAULT_SIDECHAIN,
+  type Modulation,
+} from "../fx/modulation";
 import { generatePills } from "../arrangement-pills";
 
 function video(id: string, displayW?: number, displayH?: number, more: Partial<VideoClip> = {}): VideoClip {
@@ -522,5 +528,59 @@ describe("buildPreviewFrameDescriptor — fx wetness + live override", () => {
     // Only the real fx, no synthesised duplicate
     expect(d.fx).toHaveLength(1);
     expect(d.fx[0].id).toBe("real");
+  });
+});
+
+describe("buildPreviewFrameDescriptor — uniform modulation path", () => {
+  const flatEnv = { attackS: 0, decayS: 0, sustain: 1, releaseS: 0 };
+
+  it("beat-synced LFO modulates intensity on/off the beat (real BPM)", () => {
+    const rate = 0.82; // synced half
+    const periodS = bipolarRatePeriodS(rate, 120);
+    const mod: Modulation = {
+      envelope: flatEnv,
+      timeMod: "lfo",
+      depth: 1,
+      lfo: { shape: "saw", rate, beatSync: true },
+      side: DEFAULT_SIDECHAIN,
+    };
+    const fx: PunchFx[] = [{ id: "m1", kind: "vignette", inS: 0, outS: 20, modulation: mod }];
+    const base = snap({ fx, bpm: 120, beatPhaseS: 0, beatsPerBar: 4 });
+
+    // On the beat (phase 0 → saw peak) vs half-way (phase 0.5 → saw 0.5).
+    const onBeat = buildPreviewFrameDescriptor(base, periodS, periodS);
+    const offBeat = buildPreviewFrameDescriptor(base, periodS * 1.5, periodS * 1.5);
+    expect(onBeat.fx[0].wetness).toBeCloseTo(1, 3);
+    expect(offBeat.fx[0].wetness).toBeLessThan(onBeat.fx[0].wetness);
+    expect(offBeat.fx[0].wetness).toBeCloseTo(0.5, 2);
+    // Phase is surfaced for effects with internal geometry.
+    expect(onBeat.fx[0].phase).toBeCloseTo(0, 3);
+  });
+
+  it("sidechain reads the master audio envelope (loud → stronger)", () => {
+    const mod: Modulation = {
+      envelope: flatEnv,
+      timeMod: "sidechain",
+      depth: 1,
+      lfo: DEFAULT_LFO,
+      side: { threshold: 0.3, attackS: 0, releaseS: 0, invert: false },
+    };
+    const fx: PunchFx[] = [{ id: "s1", kind: "vignette", inS: 0, outS: 20, modulation: mod }];
+    const audioEnv = { data: [0, 0, 1, 1, 0], fps: 1 };
+    const base = snap({ fx, audioEnv });
+
+    const loud = buildPreviewFrameDescriptor(base, 2, 2); // master t=2 → loud
+    const quiet = buildPreviewFrameDescriptor(base, 0, 0); // master t=0 → silent
+    expect(loud.fx[0].wetness).toBeGreaterThan(0.9);
+    // Below threshold → intensity 0 → the effect is culled from the frame.
+    expect(quiet.fx).toHaveLength(0);
+  });
+
+  it("legacy fx (no modulation) still render bit-identically", () => {
+    const env = { attackS: 0, decayS: 0, sustain: 0.5, releaseS: 0 };
+    const fx: PunchFx[] = [{ id: "L", kind: "vignette", inS: 0, outS: 10, envelope: env }];
+    const d = buildPreviewFrameDescriptor(snap({ fx }), 1, 1);
+    // depth-0 wrapper → wetness equals the raw envelope sustain level.
+    expect(d.fx[0].wetness).toBeCloseTo(0.5, 6);
   });
 });

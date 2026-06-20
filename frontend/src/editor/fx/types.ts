@@ -58,8 +58,15 @@ export interface PunchFx {
    *  Renderer die `defaultParams` aus der FxDefinition. */
   params?: Record<string, number>;
   /** ADSR-Hüllkurve für Wet/Dry-Crossfade über die Region-Dauer.
-   *  Optional — fehlt → INSTANT_ENVELOPE (Bit-Parity zu Pre-V1). */
+   *  Optional — fehlt → INSTANT_ENVELOPE (Bit-Parity zu Pre-V1).
+   *  Legacy-Feld: bei gesetztem `modulation` ist dessen `envelope`
+   *  maßgeblich; ohne `modulation` wird hieraus eine envelope-only
+   *  Modulation (depth 0) synthetisiert → identisches Rendering. */
   envelope?: import("./envelope").ADSREnvelope;
+  /** Uniforme Modulation: Envelope ⊗ (LFO | Sidechain). Wenn gesetzt, die
+   *  alleinige Quelle für Intensität (`level`) + `phase`. Optional für
+   *  Bit-Parity zu Bestands-FX, die nur `envelope` tragen. */
+  modulation?: import("./modulation").Modulation;
 }
 
 /** Minimal-Snapshot, der einer FxDefinition reicht, um zu rendern.

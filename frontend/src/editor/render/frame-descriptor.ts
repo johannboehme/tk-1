@@ -91,6 +91,11 @@ export interface FrameFx {
    *     alpha (1 - wetness) to softly fade in/out. The descriptor builder
    *     samples the envelope so backends stay envelope-agnostic. */
   wetness: number;
+  /** Modulation cycle phase ∈ [0,1) for THIS frame (LFO mode). Effects
+   *  with internal periodic geometry (zoom pulse, echo sweep) read this
+   *  instead of computing their own period — so the timing is centralized
+   *  and beat-correct. 0 in sidechain mode / for legacy (depth-0) fx. */
+  phase?: number;
 }
 
 /**

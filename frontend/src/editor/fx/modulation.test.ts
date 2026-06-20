@@ -113,7 +113,7 @@ describe("LFO phase — beat-synced lands on the grid", () => {
   test("free LFO anchors to the region start (timeline-local)", () => {
     const lfo = { shape: "saw" as const, rate: 0.0, beatSync: false }; // fast free
     const period = bipolarRatePeriodS(0.0, 120);
-    const base = ctx({ regionInS: 5, beatSync: undefined });
+    const base = ctx({ regionInS: 5 });
     const p0 = lfoPhaseAt(lfo, { ...base, tTimelineS: 5 });
     expect(p0).toBeCloseTo(0, 5);
     const pHalf = lfoPhaseAt(lfo, { ...base, tTimelineS: 5 + period / 2 });
