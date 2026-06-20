@@ -22,10 +22,8 @@ import {
   DEFAULT_SIDECHAIN,
   type AudioEnvelope,
 } from "../fx/modulation";
-import {
-  effectiveBeatPhaseS,
-  effectiveBeatsPerBar,
-} from "../selectors/timing";
+import { arrBeatPhaseS, effectiveBeatsPerBar } from "../selectors/timing";
+import { arrToMaster } from "../arrangement-time";
 
 const LCD_GREEN = "#9FE08E";
 const RENDER_W = 280; // logical px (SVG viewBox); scales to container
@@ -81,9 +79,17 @@ export function SidechainScope({ kind }: { kind: FxKind }) {
   const side =
     useEditorStore((s) => s.fxModulations[kind]?.side) ?? DEFAULT_SIDECHAIN;
   const setFxSidechain = useEditorStore((s) => s.setFxSidechain);
-  const currentTime = useEditorStore((s) => s.playback.currentTime);
+  // Draw on the ARRANGEMENT axis (same as the timeline's audio lane), not
+  // raw master time — otherwise, in a long-form arrangement, the scope and
+  // the timeline show two different orderings of the same audio and the
+  // peaks don't line up. Each window x is mapped arr→master to read the
+  // loudness from the (master-indexed) envelope.
+  const timelineT = useEditorStore((s) => s.playback.timelineT);
+  const segments = useEditorStore((s) => s.arrangementSegments);
   const bpm = useEditorStore((s) => s.jobMeta?.bpm?.value ?? null);
-  const beatPhaseS = useEditorStore((s) => effectiveBeatPhaseS(s.jobMeta));
+  const beatPhaseS = useEditorStore((s) =>
+    arrBeatPhaseS(s.jobMeta, s.arrangementSegments),
+  );
   const beatsPerBar = useEditorStore((s) => effectiveBeatsPerBar(s.jobMeta));
   const tint = fxCatalog[kind]?.capsuleColor ?? LCD_GREEN;
 
@@ -135,15 +141,19 @@ export function SidechainScope({ kind }: { kind: FxKind }) {
     bpm && bpm > 0
       ? Math.min(MAX_SPAN_S, Math.max(MIN_SPAN_S, (BEATS_VISIBLE * 60) / bpm))
       : 4;
-  const winStart = currentTime - spanS / 2; // playhead centred
+  const winStart = timelineT - spanS / 2; // playhead (arr-time) centred
   const innerW = RENDER_W - 2 * PAD_X;
 
   let masterPath = "";
   let followerPath = "";
   const beatLines: { x: number; down: boolean }[] = [];
   if (hasAudio && audioEnv) {
+    // Each window position is arr-time; map to master-time to read the
+    // (master-indexed) loudness/follower so the scope matches the timeline.
+    const masterAt = (env: AudioEnvelope) => (arrT: number) =>
+      sampleEnv(env, arrToMaster(arrT, segments));
     masterPath = windowAreaPath(
-      (t) => sampleEnv(audioEnv, t),
+      masterAt(audioEnv),
       winStart,
       spanS,
       RENDER_W,
@@ -151,7 +161,7 @@ export function SidechainScope({ kind }: { kind: FxKind }) {
     );
     if (follower) {
       followerPath = windowAreaPath(
-        (t) => sampleEnv(follower, t),
+        masterAt(follower),
         winStart,
         spanS,
         RENDER_W,
