@@ -1273,12 +1273,12 @@ export const useEditorStore = create<EditorState>()(
     setPlaying(playing) {
       const s = get();
       if (s.playback.isPlaying === playing) return;
-      // Latched preview holds (created via pad-click while paused) only
-      // make sense while the playhead is frozen. The moment playback
-      // starts, drop them — otherwise the descriptor would synthesise a
-      // transient FX every frame on top of any persistent recording.
-      let nextHolds = s.fxHolds;
       if (playing) {
+        // Latched preview holds (created via pad-click while paused) only
+        // make sense while the playhead is frozen. The moment playback
+        // starts, drop them — otherwise the descriptor would synthesise a
+        // transient FX every frame on top of any persistent recording.
+        let nextHolds = s.fxHolds;
         let dropped = false;
         const filtered: Record<string, FxHoldEntry> = {};
         for (const [slot, h] of Object.entries(s.fxHolds)) {
@@ -1289,11 +1289,24 @@ export const useEditorStore = create<EditorState>()(
           filtered[slot] = h;
         }
         if (dropped) nextHolds = filtered;
+        set({
+          playback: { ...s.playback, isPlaying: true },
+          fxHolds: nextHolds,
+        });
+        return;
       }
-      set({
-        playback: { ...s.playback, isPlaying: playing },
-        fxHolds: nextHolds,
-      });
+      // Stopping. A persistent (recording) hold whose pad-pointerup never
+      // arrives — window blur, tab switch, or the auto-stop at song end —
+      // would otherwise dangle in `fxHolds` forever: its `outS` keeps
+      // growing on the next play and clearAllFx can't remove it (it
+      // preserves live recordings by design). Finalize each persistent
+      // hold here via the normal release path so it becomes an ordinary
+      // committed capsule that can be erased / cleared. Preview holds are
+      // valid while paused, so they stay.
+      set({ playback: { ...s.playback, isPlaying: false } });
+      for (const [slot, h] of Object.entries(s.fxHolds)) {
+        if (h.mode === "persistent") get().endFxHold(slot);
+      }
     },
     setLoop(loop) {
       const { trim, arrangementSegments } = get();

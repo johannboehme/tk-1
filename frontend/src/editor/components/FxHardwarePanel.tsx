@@ -392,6 +392,41 @@ function FxPad({ pad }: { pad: PadDef }) {
     };
   }, [heldByThisSlot, glow]);
 
+  // Off-pad release guard. The pad deliberately doesn't setPointerCapture
+  // (capture mis-routes multi-touch chords on Android Chrome), so a
+  // pointerup that lands outside the pad, a window blur, or a tab switch
+  // can strand a persistent (recording) hold — its outS then keeps growing
+  // on the next play and clearAllFx won't remove it. While this slot is
+  // held, end any *persistent* hold defensively on those events. Preview
+  // holds latch by design and are left alone. Mirrors the Encoder's
+  // off-window release guard below.
+  useEffect(() => {
+    if (!heldByThisSlot) return;
+    function endIfPersistent() {
+      const st = useEditorStore.getState();
+      const h = st.fxHolds[pad.slotKey];
+      if (h && h.mode === "persistent") st.endFxHold(pad.slotKey);
+    }
+    window.addEventListener("pointerup", endIfPersistent);
+    window.addEventListener("pointercancel", endIfPersistent);
+    window.addEventListener("blur", endIfPersistent);
+    return () => {
+      window.removeEventListener("pointerup", endIfPersistent);
+      window.removeEventListener("pointercancel", endIfPersistent);
+      window.removeEventListener("blur", endIfPersistent);
+    };
+  }, [heldByThisSlot, pad.slotKey]);
+
+  // Finalize a persistent hold if the pad unmounts mid-record (panel
+  // collapse / navigation) so it never dangles.
+  useEffect(() => {
+    return () => {
+      const st = useEditorStore.getState();
+      const h = st.fxHolds[pad.slotKey];
+      if (h && h.mode === "persistent") st.endFxHold(pad.slotKey);
+    };
+  }, [pad.slotKey]);
+
   function handleDown(e: ReactPointerEvent<HTMLButtonElement>) {
     e.preventDefault();
     // We deliberately don't `setPointerCapture` here — capture works
