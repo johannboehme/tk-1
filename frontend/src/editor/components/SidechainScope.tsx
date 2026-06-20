@@ -33,7 +33,10 @@ import {
 const LCD_GREEN = "#9FE08E";
 const RENDER_W = 280; // logical px (SVG viewBox); scales to container
 const RENDER_H = 80;
-const PAD_X = 4;
+// No horizontal inset: the time axis fills the full width exactly like the
+// timeline canvas (mapXToTime maps x=0→viewStart, x=W→viewEnd), so the scope
+// is pixel-for-pixel time-aligned across the two panels.
+const PAD_X = 0;
 const PAD_Y = 5;
 /** Fallback window (no arrangement) — ~8 beats so a kick is a clear peak. */
 const FALLBACK_BEATS = 8;
@@ -55,20 +58,21 @@ function peakAreaPath(
   spanS: number,
   w: number,
   h: number,
+  sub: number, // sub-samples per column → capture the column's true peak
 ): string {
   const innerW = w - 2 * PAD_X;
   const innerH = h - 2 * PAD_Y;
   const steps = Math.max(2, Math.round(innerW));
-  const SUB = 4; // sub-samples per column → capture the column's true peak
+  const s = Math.max(1, sub);
   let d = `M${PAD_X.toFixed(1)},${(h - PAD_Y).toFixed(1)}`;
   for (let i = 0; i <= steps; i++) {
     const x = PAD_X + (i / steps) * innerW;
     let v = 0;
-    for (let k = 0; k < SUB; k++) {
-      const frac = (i + k / SUB) / steps;
+    for (let k = 0; k < s; k++) {
+      const frac = (i + k / s) / steps;
       const arrT = winStart + frac * spanS;
-      const s = clamp01(envAtMaster(toMaster(arrT)));
-      if (s > v) v = s;
+      const val = clamp01(envAtMaster(toMaster(arrT)));
+      if (val > v) v = val;
     }
     const y = PAD_Y + (1 - v) * innerH;
     d += ` L${x.toFixed(1)},${y.toFixed(1)}`;
@@ -153,6 +157,13 @@ export function SidechainScope({ kind }: { kind: FxKind }) {
   const innerW = RENDER_W - 2 * PAD_X;
   const toMaster = (arrT: number) =>
     arrTotal > 0 ? arrToMaster(arrT, segments) : arrT;
+  // Sub-samples per column: enough to catch the tallest env sample a column
+  // spans (so peak HEIGHT isn't under-shown when zoomed out), capped for perf.
+  const envFps = audioEnv?.fps ?? 120;
+  const peakSub = Math.min(
+    32,
+    Math.max(4, Math.ceil((spanS / Math.max(1, innerW)) * envFps)),
+  );
 
   let masterPath = "";
   let followerPath = "";
@@ -165,6 +176,7 @@ export function SidechainScope({ kind }: { kind: FxKind }) {
       spanS,
       RENDER_W,
       RENDER_H,
+      peakSub,
     );
     if (follower) {
       followerPath = peakAreaPath(
@@ -174,6 +186,7 @@ export function SidechainScope({ kind }: { kind: FxKind }) {
         spanS,
         RENDER_W,
         RENDER_H,
+        peakSub,
       );
     }
     if (bpm && bpm > 0 && spanS > 0) {
