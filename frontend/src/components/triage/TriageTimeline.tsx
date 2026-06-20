@@ -1268,7 +1268,10 @@ function usePerChunkBarTicks(
           if (showBeats) kind = "beat";
         }
         if (kind) {
-          const extension = t < startS || t > endS;
+          // Half-open chunk span: the downbeat sitting exactly on endS opens
+          // the *next* bar (e.g. bar 5 of a 4-bar chunk), so it belongs to the
+          // extension, not the primary grid.
+          const extension = t < startS - 1e-9 || t > endS - 1e-9;
           ticks.push({ tS: t, kind, barIndex, extension });
         }
       }
