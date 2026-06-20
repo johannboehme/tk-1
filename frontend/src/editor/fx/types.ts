@@ -16,7 +16,24 @@ export type FxKind =
   | "rgb"
   | "tape"
   | "zoom"
-  | "uv";
+  | "uv"
+  /** Global color-grade pass (the "film stock" layer). Unlike the other
+   *  kinds it is NOT a momentary punch-in accent: the descriptor builder
+   *  emits one `grade` FrameFx, prepended ahead of the accents so they
+   *  composite on top of the graded frame. Its params are the full
+   *  `GradeParams` vector (see ./looks), not a 2-knob pair, so its catalog
+   *  entry exposes no `params` tuple. Edited via the Color-grade surface. */
+  | "grade"
+  /** Global "filter" looks — opinionated, recognizable, each its OWN effect
+   *  with its OWN controls (see FxDefinition.filterParams). Applied as a
+   *  stack UNDER the punch-in accents (above the grade), edited in the
+   *  Overlays panel's Filters section. */
+  | "vhs"
+  | "super8"
+  | "decay"
+  | "noir"
+  | "sepia"
+  | "polaroid";
 
 /** Encoder-Verhalten eines Param.
  *
@@ -45,6 +62,16 @@ export interface FxParamDef {
   min: number;
   /** Obergrenze des Storage-Ranges. */
   max: number;
+}
+
+/** One stacked global FILTER in the Overlays panel — picks an opinionated
+ *  filter kind (vhs / super8 / sepia / …) and carries that kind's own param
+ *  values (its `filterParams` schema, including the master `amount`). Slots
+ *  compose serially top→bottom, UNDER the punch-in accents. */
+export interface FilterSlot {
+  id: string;
+  kind: FxKind;
+  params: Record<string, number>;
 }
 
 export interface PunchFx {

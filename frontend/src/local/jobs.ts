@@ -30,6 +30,7 @@ import {
   type VideoAsset,
 } from "../storage/jobs-db";
 import { useOpsStore } from "./ops-store";
+import type { GradeParams } from "../editor/fx/looks";
 import { camColorAt } from "../storage/migrations";
 import { opfs } from "../storage/opfs";
 import {
@@ -1056,6 +1057,8 @@ export async function runEditRender(
       beatPhaseS: (job.bpm?.phase ?? 0) + (job.audioStartNudgeS ?? 0),
       beatsPerBar: job.beatsPerBar ?? 4,
       audioEnv,
+      colorGrade: job.colorGrade as GradeParams | undefined,
+      filterSlots: job.filterSlots,
       offsetMs: totalOffsetMs,
       driftRatio: job.sync.driftRatio,
       outputWidth: spec.exportOpts?.width,

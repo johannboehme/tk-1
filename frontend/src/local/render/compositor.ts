@@ -29,7 +29,7 @@ import type { TextOverlay, EnergyCurves } from "./ass-builder";
 import { buildAss } from "./ass-builder";
 import { renderOverlays } from "./ass-renderer";
 import type { Visualizer } from "./visualizer/types";
-import type { PunchFx } from "../../editor/fx/types";
+import type { FilterSlot, PunchFx } from "../../editor/fx/types";
 import type { ViewportTransform } from "../../editor/types";
 import { activeFxAt } from "../../editor/fx/active";
 import { fxCatalog } from "../../editor/fx/catalog";
@@ -40,6 +40,11 @@ import {
   legacyModulation,
   type AudioEnvelope,
 } from "../../editor/fx/modulation";
+import type { GradeParams } from "../../editor/fx/looks";
+import {
+  colorGradeFrameFx,
+  filterFrameFx,
+} from "../../editor/render/build-descriptor";
 import {
   createBackend,
   type BackendCapabilities,
@@ -85,6 +90,12 @@ export interface CompositorOptions {
   beatsPerBar?: number;
   /** Normalized master-loudness curve for sidechain modulation. */
   audioEnv?: AudioEnvelope | null;
+  /** The single global color grade. Applied to every frame under everything,
+   *  so the export matches the preview. */
+  colorGrade?: GradeParams;
+  /** The opinionated filter stack. Applied above the grade, under the
+   *  punch-in accents, every frame. */
+  filterSlots?: readonly FilterSlot[];
 }
 
 // Per-element placement is shared with the live preview via
@@ -230,16 +241,15 @@ export class Compositor {
       displayH: dispH,
     };
 
-    // Same uniform engine as the live preview (single source of truth).
-    // Export uses `tFx` for both the envelope (region-local) and the
-    // audio/beat-sync axes; for whole-video renders tFx == master-audio
-    // time, so beat-sync + sidechain line up. (Segmented exports map
-    // timeline→master elsewhere; audio-sync there follows tFx.)
+    // Uniform engine, same as the live preview's buildFx: global grade +
+    // opinionated filters first (the "film stock"), then punch-in accents on
+    // top. Export uses `tFx` for the envelope + audio/beat-sync axes (tFx ==
+    // master time for whole-video renders, so beat-sync + sidechain line up).
     const bpm = this.opts.bpm ?? null;
     const beatPhaseS = this.opts.beatPhaseS ?? 0;
     const beatsPerBar = this.opts.beatsPerBar ?? 4;
     const audioEnv = this.opts.audioEnv ?? null;
-    const fxFrame: FrameFx[] = this.opts.fx
+    const punchFx: FrameFx[] = this.opts.fx
       ? activeFxAt(this.opts.fx, tFx)
           .map((fx) => {
             const def = fxCatalog[fx.kind];
@@ -267,6 +277,11 @@ export class Compositor {
           })
           .filter((f) => f.wetness > 0)
       : [];
+    const fxFrame: FrameFx[] = [
+      ...colorGradeFrameFx(this.opts.colorGrade),
+      ...filterFrameFx(this.opts.filterSlots),
+      ...punchFx,
+    ];
 
     const descriptor: FrameDescriptor = {
       tMaster: tFx,

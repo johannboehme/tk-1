@@ -628,6 +628,8 @@ function defaultReadSnapshot(): EditorStoreSnapshot {
     clips: s.clips,
     cuts: s.cuts,
     fx: s.fx,
+    colorGrade: s.colorGrade,
+    filterSlots: s.filterSlots,
     exportSpec: s.exportSpec,
     fxHolds: s.fxHolds,
     selectedFxKind: s.selectedFxKind,

@@ -83,6 +83,10 @@ export function buildPersistPatch(
     ui: { snapMode: s.ui.snapMode, lanesLocked: s.ui.lanesLocked },
     trim: { in: s.trim.in, out: s.trim.out },
     fx: s.fx,
+    // GradeParams is structurally a flat number map; the storage record is
+    // the same shape with an index signature.
+    colorGrade: s.colorGrade as unknown as Record<string, number>,
+    filterSlots: s.filterSlots,
     audioVolume: s.audioVolume,
     exportSpec: s.exportSpec,
     // Persist user-edited pills so a refresh / re-open keeps move + trim
@@ -147,6 +151,8 @@ export function useAutoPersist(jobId: string | null): void {
         state.jobMeta.beatsPerBar !== prev.jobMeta?.beatsPerBar ||
         state.jobMeta.barOffsetBeats !== prev.jobMeta?.barOffsetBeats ||
         state.fx !== prev.fx ||
+        state.colorGrade !== prev.colorGrade ||
+        state.filterSlots !== prev.filterSlots ||
         state.audioVolume !== prev.audioVolume ||
         state.exportSpec !== prev.exportSpec
       ) {

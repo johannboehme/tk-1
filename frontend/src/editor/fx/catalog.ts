@@ -12,6 +12,7 @@ import type {
 } from "./renderer-context";
 import type { ADSREnvelope } from "./envelope";
 import type { FxKind, FxParamDef, PunchFx } from "./types";
+import { ENGINE_DEFAULTS, GRADE_PARAM_KEYS, type GradeParams } from "./looks";
 
 export interface FxDefinition {
   kind: FxKind;
@@ -25,6 +26,12 @@ export interface FxDefinition {
    *  und schreibt in `fxDefaults` im Store. Optional damit alte Tests, die
    *  ad-hoc FxDefinition-Stubs bauen, nicht brechen. */
   params?: readonly [FxParamDef, FxParamDef];
+  /** Per-FILTER control schema (variable length, 2-6 entries). Distinct
+   *  from `params` (the fixed 2-knob hardware-encoder pair): this drives the
+   *  Overlays "Filters" card, which renders one slider per entry — so each
+   *  filter shows ITS OWN controls (VHS: TRACK/BLEED/SNOW/WOBBLE; Sepia:
+   *  TONE/CONTRAST/FADE/GRAIN; …). Must include a master "amount". */
+  filterParams?: readonly FxParamDef[];
   /** ADSR-Default für neue Regionen. Wird beim `beginFxHold` in die
    *  PunchFx eingefroren (modulo User-Override via `fxEnvelopes[kind]`).
    *  Optional damit alte Tests Stubs ohne Envelope bauen können —
@@ -831,6 +838,249 @@ function pseudoRand(seed: number): number {
   return Math.abs(Math.sin(seed * 91.345) * 43758.5453) % 1;
 }
 
+// — GRADE — Global color-grade (the "film stock" layer) ————————————
+//
+// Unlike the punch-in kinds, GRADE is not a momentary accent: the
+// descriptor builder emits one `grade` FrameFx per active GradeSlot with
+// the full `GradeParams` vector already merged in (look + macros + the
+// STRENGTH blend), prepended ahead of the accents so they composite on the
+// graded frame. So this entry exposes no 2-knob `params` tuple (its editing
+// surface is the Overlays panel), and no `applyWetness` (its dry/wet IS the
+// `strength` param, mixed inside the shader as `mix(source, graded,
+// strength)`). Source-sampling REPLACE effect — same backend contract as
+// RGB/ZOOM: bindSourceTexture + setBlendMode("replace").
+
+function gradeParamsOf(fx: PunchFx): GradeParams {
+  return { ...ENGINE_DEFAULTS, ...(fx.params ?? {}) } as GradeParams;
+}
+
+const GRADE: FxDefinition = {
+  kind: "grade",
+  label: "GRAD",
+  capsuleColor: "#8C7BE0",
+  defaultParams: { ...ENGINE_DEFAULTS },
+  defaultLengthBeats: 0,
+  defaultLengthS: 0,
+
+  // Canvas2D fallback / export: a reduced approximation built from the same
+  // idiom as the other source-FX (drawImage + ctx.filter + overlay passes).
+  // Covers the dominant perceptual ops (exposure / contrast / saturation /
+  // temperature / fade / vignette); grain, halation and split-tone are
+  // GPU-only — the documented WEAR/UV-style fallback. Drawing the graded
+  // source at alpha=strength over the (identical) backbuffer realises the
+  // `mix(source, graded, strength)` blend without a second buffer.
+  drawCanvas2D(ctx, fx, w, h, _t, source) {
+    if (!source) return;
+    const p = gradeParamsOf(fx);
+    const strength = clamp01(p.strength);
+    if (strength <= 0) return;
+    const brightness = Math.pow(2, p.exposure);
+    const contrast = Math.max(0, 1 + p.contrast);
+    const saturate = Math.max(0, p.saturation);
+    ctx.save();
+    ctx.globalAlpha = strength;
+    ctx.filter = `brightness(${brightness}) contrast(${contrast}) saturate(${saturate})`;
+    ctx.drawImage(source, 0, 0, w, h);
+    ctx.filter = "none";
+    if (p.temp !== 0) {
+      ctx.globalCompositeOperation = "overlay";
+      ctx.globalAlpha = strength * Math.min(Math.abs(p.temp) * 0.5, 0.4);
+      ctx.fillStyle = p.temp > 0 ? "#ff9b3d" : "#3da6ff";
+      ctx.fillRect(0, 0, w, h);
+    }
+    if (p.fade > 0) {
+      ctx.globalCompositeOperation = "lighten";
+      ctx.globalAlpha = strength * p.fade * 0.25;
+      ctx.fillStyle = "#8c8c8c";
+      ctx.fillRect(0, 0, w, h);
+    }
+    if (p.vignette > 0) {
+      ctx.globalCompositeOperation = "source-over";
+      ctx.globalAlpha = strength * p.vignette;
+      const cx = w / 2;
+      const cy = h / 2;
+      const outer = Math.hypot(cx, cy);
+      const grad = ctx.createRadialGradient(cx, cy, outer * 0.5, cx, cy, outer);
+      grad.addColorStop(0, "rgba(0,0,0,0)");
+      grad.addColorStop(1, "rgba(0,0,0,1)");
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, w, h);
+    }
+    ctx.restore();
+  },
+
+  drawWebGL2(ctx, fx, _w, _h, t) {
+    const p = gradeParamsOf(fx);
+    if (clamp01(p.strength) <= 0) return;
+    ctx.setBlendMode("replace");
+    ctx.useProgram("grade");
+    ctx.bindSourceTexture("u_source");
+    for (const key of GRADE_PARAM_KEYS) {
+      ctx.setUniform1f(`u_${key}`, p[key]);
+    }
+    ctx.setUniform1f("u_time", t);
+    ctx.drawFullscreenQuad();
+  },
+
+  drawWebGPU(ctx, fx, _w, _h, t) {
+    const p = gradeParamsOf(fx);
+    if (clamp01(p.strength) <= 0) return;
+    ctx.setBlendMode("replace");
+    ctx.useProgram("grade");
+    ctx.bindSourceTexture();
+    for (const key of GRADE_PARAM_KEYS) {
+      ctx.setUniform1f(key, p[key]);
+    }
+    ctx.setUniform1f("time", t);
+    ctx.drawFullscreenQuad();
+  },
+};
+
+// — FILTERS — opinionated global looks ————————————————————————
+//
+// Each filter is a source-sampling REPLACE effect (same backend contract as
+// RGB / GRADE): bindSourceTexture + setBlendMode("replace") + one uniform
+// per param (u_<id> WebGL2 / <id> WebGPU) + u_time/time for the animated
+// ones. The shader lives in webgl2/<kind>.frag.ts + webgpu/<kind>.wgsl.ts
+// and outputs mix(source, effect, amount), so amount=0 is identity. Unlike
+// the punch-ins, filters expose a VARIABLE-LENGTH `filterParams` schema
+// (their OWN controls) instead of the 2-knob `params` tuple, and seed a
+// tasteful non-zero default so a freshly-added filter immediately looks like
+// the thing. All draws share one factory — the look lives entirely in the
+// shader + the param schema.
+
+interface FilterParamInit {
+  id: string;
+  label: string;
+  default: number;
+  min: number;
+  max: number;
+}
+
+function makeFilterDef(
+  kind: FxKind,
+  label: string,
+  capsuleColor: string,
+  cssFilter: string,
+  paramsInit: readonly FilterParamInit[],
+): FxDefinition {
+  const filterParams: FxParamDef[] = paramsInit.map((p) => ({
+    id: p.id,
+    label: p.label,
+    kind: "linear",
+    defaultValue: p.default,
+    min: p.min,
+    max: p.max,
+  }));
+  const ids = filterParams.map((p) => p.id);
+  const defaultParams: Record<string, number> = {};
+  for (const p of filterParams) defaultParams[p.id] = p.defaultValue;
+  const read = (fx: PunchFx): Record<string, number> => ({
+    ...defaultParams,
+    ...(fx.params ?? {}),
+  });
+
+  return {
+    kind,
+    label,
+    capsuleColor,
+    defaultParams,
+    filterParams,
+    defaultLengthS: 0,
+
+    // Reduced fallback — Canvas2D is the rare no-GPU live path (export uses
+    // WebGPU). A CSS filter approximates the look; grain/texture/temporal
+    // detail is GPU-only, per the WEAR/UV reduced-fidelity contract.
+    drawCanvas2D(ctx, fx, w, h, _t, source) {
+      if (!source) return;
+      const amount = clamp01(read(fx).amount ?? 1);
+      if (amount <= 0) return;
+      ctx.save();
+      ctx.globalAlpha = amount;
+      ctx.filter = cssFilter;
+      ctx.drawImage(source, 0, 0, w, h);
+      ctx.filter = "none";
+      ctx.restore();
+    },
+
+    drawWebGL2(ctx, fx, _w, _h, t) {
+      const p = read(fx);
+      if ((p.amount ?? 1) <= 0) return;
+      ctx.setBlendMode("replace");
+      ctx.useProgram(kind);
+      ctx.bindSourceTexture("u_source");
+      for (const id of ids) ctx.setUniform1f(`u_${id}`, p[id]);
+      ctx.setUniform1f("u_time", t);
+      ctx.drawFullscreenQuad();
+    },
+
+    drawWebGPU(ctx, fx, _w, _h, t) {
+      const p = read(fx);
+      if ((p.amount ?? 1) <= 0) return;
+      ctx.setBlendMode("replace");
+      ctx.useProgram(kind);
+      ctx.bindSourceTexture();
+      for (const id of ids) ctx.setUniform1f(id, p[id]);
+      ctx.setUniform1f("time", t);
+      ctx.drawFullscreenQuad();
+    },
+
+    // The master amount is the dry/wet — fold the ADSR wetness into it.
+    applyWetness(params, wetness) {
+      return { ...params, amount: (params.amount ?? 1) * wetness };
+    },
+  };
+}
+
+const VHS = makeFilterDef("vhs", "VHS", "#3CC3C3", "saturate(1.15) contrast(1.05)", [
+  { id: "tracking", label: "TRACK", default: 0.35, min: 0, max: 1 },
+  { id: "bleed", label: "BLEED", default: 0.5, min: 0, max: 1 },
+  { id: "noise", label: "SNOW", default: 0.35, min: 0, max: 1 },
+  { id: "wobble", label: "WOBBLE", default: 0.3, min: 0, max: 1 },
+  { id: "amount", label: "AMOUNT", default: 0.85, min: 0, max: 1 },
+]);
+
+const SUPER8 = makeFilterDef("super8", "SUPER-8", "#C98A3A", "sepia(0.35) saturate(0.9) brightness(1.05)", [
+  { id: "grain", label: "GRAIN", default: 0.5, min: 0, max: 1 },
+  { id: "weave", label: "WEAVE", default: 0.4, min: 0, max: 1 },
+  { id: "flicker", label: "FLICKER", default: 0.3, min: 0, max: 1 },
+  { id: "warmth", label: "WARMTH", default: 0.5, min: 0, max: 1 },
+  { id: "amount", label: "AMOUNT", default: 0.8, min: 0, max: 1 },
+]);
+
+const DECAY = makeFilterDef("decay", "DECAY", "#8A6A4A", "sepia(0.2) contrast(1.1) brightness(0.97)", [
+  { id: "dust", label: "DUST", default: 0.4, min: 0, max: 1 },
+  { id: "scratches", label: "SCRATCH", default: 0.4, min: 0, max: 1 },
+  { id: "flicker", label: "FLICKER", default: 0.35, min: 0, max: 1 },
+  { id: "leak", label: "LEAK", default: 0.3, min: 0, max: 1 },
+  { id: "amount", label: "AMOUNT", default: 0.8, min: 0, max: 1 },
+]);
+
+const NOIR = makeFilterDef("noir", "NOIR", "#4A4A52", "grayscale(1) contrast(1.4)", [
+  { id: "filter", label: "FILTER", default: 0.3, min: -1, max: 1 },
+  { id: "contrast", label: "CONTRAST", default: 0.5, min: 0, max: 1 },
+  { id: "grain", label: "GRAIN", default: 0.3, min: 0, max: 1 },
+  { id: "vignette", label: "VIGN", default: 0.5, min: 0, max: 1 },
+  { id: "amount", label: "AMOUNT", default: 0.9, min: 0, max: 1 },
+]);
+
+const SEPIA = makeFilterDef("sepia", "SEPIA", "#A87B45", "sepia(0.85) contrast(1.1)", [
+  { id: "tone", label: "TONE", default: 0.3, min: -1, max: 1 },
+  { id: "contrast", label: "CONTRAST", default: 0.4, min: 0, max: 1 },
+  { id: "fade", label: "FADE", default: 0.3, min: 0, max: 1 },
+  { id: "grain", label: "GRAIN", default: 0.3, min: 0, max: 1 },
+  { id: "amount", label: "AMOUNT", default: 0.9, min: 0, max: 1 },
+]);
+
+const POLAROID = makeFilterDef("polaroid", "INSTANT", "#E8E0D0", "saturate(0.95) brightness(1.08) contrast(0.92)", [
+  { id: "fade", label: "FADE", default: 0.4, min: 0, max: 1 },
+  { id: "bloom", label: "BLOOM", default: 0.4, min: 0, max: 1 },
+  { id: "chem", label: "CAST", default: 0.4, min: 0, max: 1 },
+  { id: "vignette", label: "VIGN", default: 0.5, min: 0, max: 1 },
+  { id: "border", label: "FRAME", default: 0, min: 0, max: 1 },
+  { id: "amount", label: "AMOUNT", default: 0.85, min: 0, max: 1 },
+]);
+
 export const fxCatalog: Readonly<Record<FxKind, FxDefinition>> = {
   vignette: VIGNETTE,
   wear: WEAR,
@@ -839,6 +1089,13 @@ export const fxCatalog: Readonly<Record<FxKind, FxDefinition>> = {
   tape: TAPE,
   zoom: ZOOM,
   uv: UV,
+  grade: GRADE,
+  vhs: VHS,
+  super8: SUPER8,
+  decay: DECAY,
+  noir: NOIR,
+  sepia: SEPIA,
+  polaroid: POLAROID,
 };
 
 export function getFxDefinition(kind: FxKind): FxDefinition {
