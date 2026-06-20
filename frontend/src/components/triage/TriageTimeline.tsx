@@ -25,6 +25,16 @@ import {
 import { snapTime } from "../../editor/snap";
 import type { Chunk } from "../../storage/jobs-db";
 import { autoFollowScrollX } from "./triage-auto-follow";
+import {
+  buildPyramidFromEnvelope,
+  type PeakPyramid,
+} from "../../local/waveform/peak-pyramid";
+import { buildPeakPyramidAsync } from "../../local/waveform/build-pyramid-async";
+import { drawWaveform, TRIAGE_STYLE } from "../../local/waveform/draw-waveform";
+import {
+  getCachedPyramid,
+  savePyramid,
+} from "../../local/waveform/pyramid-cache";
 
 // Visual hierarchy (top to bottom):
 //   Time ruler — secondary, MM:SS for absolute reference, faint
@@ -57,6 +67,9 @@ export function TriageTimeline() {
   const audioDuration = useTriageStore((s) => s.audioDuration);
   const envelope = useTriageStore((s) => s.envelope);
   const envelopeHz = useTriageStore((s) => s.envelopeHz);
+  const pcm = useTriageStore((s) => s.pcm);
+  const pcmSampleRate = useTriageStore((s) => s.pcmSampleRate);
+  const jobId = useTriageStore((s) => s.jobId);
   const chunks = useTriageStore((s) => s.chunks);
   const jobBpm = useTriageStore((s) => s.jobBpm);
   const beatsPerBar = useTriageStore((s) => s.beatsPerBar);
@@ -465,37 +478,58 @@ export function TriageTimeline() {
     pxPerSec,
   );
   // ─── Waveform ──────────────────────────────────────────────────────────
-  // Mip-pyramid: each level halves sample count + max-pools — guarantees
-  // ≤ 2 samples per pixel at any zoom. Without this the previous 1-px-bar
-  // peak-hold blocks up at low zoom and aliases at high zoom; with it we
-  // can draw a smooth filled path that breathes naturally.
-  const mipsRef = useRef<Float32Array[]>([]);
-  const peakRefValue = useRef(1);
+  // Source the silhouette from a transient-preserving min/max peak pyramid —
+  // Ableton-grade detail that holds up at any zoom. Preference order:
+  //   1. The pyramid precomputed + persisted in the sync step (instant, no pop).
+  //   2. A lazy in-memory build from the store PCM (jobs synced before the
+  //      cache existed).
+  //   3. A degenerate pyramid from the 10 Hz RMS envelope, painted immediately
+  //      while 1/2 are still loading/building.
+  const [cachedPyramid, setCachedPyramid] = useState<PeakPyramid | null>(null);
   useEffect(() => {
-    if (!envelope || envelope.length === 0) {
-      mipsRef.current = [];
-      peakRefValue.current = 1;
-      return;
-    }
-    const mips: Float32Array[] = [envelope];
-    let cur = envelope;
-    while (cur.length > 64) {
-      const next = new Float32Array(Math.ceil(cur.length / 2));
-      for (let i = 0; i < next.length; i++) {
-        const a = cur[i * 2] ?? 0;
-        const b = cur[i * 2 + 1] ?? 0;
-        next[i] = a > b ? a : b;
+    if (!jobId) return;
+    let cancelled = false;
+    void getCachedPyramid(jobId, pcmSampleRate).then((p) => {
+      if (!cancelled && p) setCachedPyramid(p);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [jobId, pcmSampleRate]);
+
+  const [pcmPyramid, setPcmPyramid] = useState<PeakPyramid | null>(null);
+  useEffect(() => {
+    // Fallback build only when there's no persisted pyramid. Keep an
+    // already-built pyramid if `pcm` later empties — the store detaches its PCM
+    // buffer after load (BPM re-detection / worker transfer).
+    if (cachedPyramid || !pcm || pcm.length === 0) return;
+    let cancelled = false;
+    void buildPeakPyramidAsync(pcm, pcmSampleRate, {
+      baseSamplesPerBucket: 64,
+    }).then((p) => {
+      if (cancelled) return;
+      setPcmPyramid(p);
+      // Backfill the cache so jobs synced before the pyramid was persisted
+      // become instant on the next open. Only persist if the source PCM
+      // survived the whole build — the store may detach its buffer mid-build,
+      // which would leave the tail of the pyramid zeroed; saving that would
+      // bake a half-flat waveform into the cache.
+      if (jobId && pcm.length > 0 && p.levels.length > 0) {
+        void savePyramid(jobId, p).catch(() => {});
       }
-      mips.push(next);
-      cur = next;
-    }
-    let peak = 0.01;
-    for (let i = 0; i < envelope.length; i++) {
-      if (envelope[i] > peak) peak = envelope[i];
-    }
-    mipsRef.current = mips;
-    peakRefValue.current = peak;
-  }, [envelope]);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [pcm, pcmSampleRate, cachedPyramid, jobId]);
+  const envelopePyramid = useMemo(
+    () =>
+      envelope && envelope.length > 0
+        ? buildPyramidFromEnvelope(envelope, envelopeHz, pcmSampleRate)
+        : null,
+    [envelope, envelopeHz, pcmSampleRate],
+  );
+  const pyramid = cachedPyramid ?? pcmPyramid ?? envelopePyramid;
 
   const waveformCanvasRef = useRef<HTMLCanvasElement | null>(null);
   useEffect(() => {
@@ -513,138 +547,99 @@ export function TriageTimeline() {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, cssW, cssH);
 
-    const mips = mipsRef.current;
-    if (mips.length === 0) {
-      // No envelope yet — leave the recessed paper-hi panel empty.
+    if (!pyramid || pyramid.levels.length === 0) {
+      // No data yet — leave the recessed paper-hi panel empty.
       return;
     }
 
-    const thresholdLin = Math.pow(10, silenceConfig.thresholdDb / 20);
-    const peakRef = Math.max(0.01, peakRefValue.current);
-    const cx = cssH / 2;
-    const half = cssH / 2 - 2;
+    // Crisp transient-accurate body via the shared engine (one vertex per
+    // device pixel, no smoothing). Triage normalizes to its loudest point so
+    // the lane stays well-filled and the silence threshold reads consistently.
+    const colMax = drawWaveform(ctx, {
+      pyramid,
+      pcm: pcm && pcm.length > 0 ? pcm : null,
+      t0S: viewStartS,
+      t1S: viewEndS,
+      cssW,
+      cssH,
+      dpr,
+      style: TRIAGE_STYLE,
+      normalize: "peak",
+    });
 
-    // Pick the mip level so we read at most ~2 samples per pixel.
-    // level 0 native rate = envelopeHz Hz; each level halves it.
-    const samplesPerPxL0 = envelopeHz / pxPerSec;
-    let level = 0;
-    while (level + 1 < mips.length && samplesPerPxL0 / Math.pow(2, level) > 2) {
-      level++;
-    }
-    const mip = mips[level];
-    const mipHz = envelopeHz / Math.pow(2, level);
-    const sPerSample = 1 / mipHz;
+    // Silence overlay — still driven by the 10 Hz RMS envelope + dB threshold
+    // (detection semantics unchanged), but shaped to the crisp body via colMax
+    // so the amber tint stays locked to the silhouette.
+    if (envelope && envelope.length > 0) {
+      const cx = cssH / 2;
+      const half = cssH / 2 - 2;
+      const yTop = (v: number) => cx - v * half;
+      const yBot = (v: number) => cx + v * half;
+      const thresholdLin = Math.pow(10, silenceConfig.thresholdDb / 20);
+      const thresholdNorm = thresholdLin / pyramid.globalPeak;
+      const n = colMax.length;
 
-    // Bucket peak-hold per pixel + 1-D box-blur for sub-pixel smoothness.
-    const samples = new Float32Array(cssW);
-    for (let xPx = 0; xPx < cssW; xPx++) {
-      const t0 = xToTime(xPx);
-      const t1 = xToTime(xPx + 1);
-      const i0 = Math.max(0, Math.floor(t0 / sPerSample));
-      const i1 = Math.min(mip.length, Math.ceil(t1 / sPerSample));
-      let m = 0;
-      if (i1 > i0) {
-        for (let i = i0; i < i1; i++) {
-          if (mip[i] > m) m = mip[i];
-        }
-      } else if (i0 < mip.length) {
-        // Sub-sample regime — interpolate between neighbours.
-        const sFloat = t0 / sPerSample;
-        const j = Math.floor(sFloat);
-        const frac = sFloat - j;
-        const a = mip[Math.max(0, Math.min(mip.length - 1, j))] ?? 0;
-        const b = mip[Math.max(0, Math.min(mip.length - 1, j + 1))] ?? 0;
-        m = a * (1 - frac) + b * frac;
+      // Peak-hold the RMS envelope per CSS column for the threshold test.
+      const sPerEnv = 1 / envelopeHz;
+      const envCol = new Float32Array(n);
+      for (let x = 0; x < n; x++) {
+        const t0 = xToTime(x);
+        const t1 = xToTime(x + 1);
+        const i0 = Math.max(0, Math.floor(t0 / sPerEnv));
+        const i1 = Math.min(envelope.length, Math.ceil(t1 / sPerEnv));
+        let m = 0;
+        for (let i = i0; i < i1; i++) if (envelope[i] > m) m = envelope[i];
+        envCol[x] = m;
       }
-      samples[xPx] = m / peakRef;
-    }
 
-    // 3-tap smoothing — visually folds peaks into curves without losing
-    // the silhouette of transients.
-    const smoothed = new Float32Array(cssW);
-    for (let x = 0; x < cssW; x++) {
-      const a = samples[Math.max(0, x - 1)];
-      const b = samples[x];
-      const c = samples[Math.min(cssW - 1, x + 1)];
-      smoothed[x] = (a + 2 * b + c) * 0.25;
-    }
+      // Phosphor-amber tint over above-threshold spans, shaped to the body.
+      const tintGrad = ctx.createLinearGradient(0, 0, 0, cssH);
+      tintGrad.addColorStop(0, "rgba(255, 87, 34, 0)");
+      tintGrad.addColorStop(0.5, "rgba(255, 87, 34, 0.28)");
+      tintGrad.addColorStop(1, "rgba(255, 87, 34, 0)");
+      ctx.fillStyle = tintGrad;
+      let spanStart = -1;
+      for (let x = 0; x <= n; x++) {
+        const above = x < n && envCol[x] > thresholdLin;
+        if (above && spanStart < 0) spanStart = x;
+        else if (!above && spanStart >= 0) {
+          const spanEnd = x;
+          ctx.beginPath();
+          ctx.moveTo(spanStart, yTop(colMax[spanStart]));
+          for (let xx = spanStart + 1; xx < spanEnd; xx++) {
+            ctx.lineTo(xx, yTop(colMax[xx]));
+          }
+          for (let xx = spanEnd - 1; xx >= spanStart; xx--) {
+            ctx.lineTo(xx, yBot(colMax[xx]));
+          }
+          ctx.closePath();
+          ctx.fill();
+          spanStart = -1;
+        }
+      }
 
-    const yTop = (v: number) => cx - v * half;
-    const yBot = (v: number) => cx + v * half;
-
-    // Subtle ground line — keeps the visual anchored even when the
-    // envelope is dead silent for long stretches.
-    ctx.strokeStyle = "rgba(154,143,128,0.30)";
-    ctx.lineWidth = 0.5;
-    ctx.beginPath();
-    ctx.moveTo(0, cx);
-    ctx.lineTo(cssW, cx);
-    ctx.stroke();
-
-    // Layer 1 — full envelope shape, vertical gradient: dark warm ink at
-    // the centre fading to paper at the edges. Tape-loop-deck vibe.
-    const baseGrad = ctx.createLinearGradient(0, 0, 0, cssH);
-    baseGrad.addColorStop(0, "rgba(34, 30, 26, 0)");
-    baseGrad.addColorStop(0.18, "rgba(34, 30, 26, 0.32)");
-    baseGrad.addColorStop(0.5, "rgba(34, 30, 26, 0.92)");
-    baseGrad.addColorStop(0.82, "rgba(34, 30, 26, 0.32)");
-    baseGrad.addColorStop(1, "rgba(34, 30, 26, 0)");
-    ctx.beginPath();
-    ctx.moveTo(0, yTop(smoothed[0]));
-    for (let x = 1; x < cssW; x++) ctx.lineTo(x, yTop(smoothed[x]));
-    for (let x = cssW - 1; x >= 0; x--) ctx.lineTo(x, yBot(smoothed[x]));
-    ctx.closePath();
-    ctx.fillStyle = baseGrad;
-    ctx.fill();
-
-    // Layer 2 — phosphor-amber tint over above-threshold spans.
-    // Communicates "this part will pass detection" without re-drawing
-    // the silhouette in a different colour everywhere.
-    const tintGrad = ctx.createLinearGradient(0, 0, 0, cssH);
-    tintGrad.addColorStop(0, "rgba(255, 87, 34, 0)");
-    tintGrad.addColorStop(0.5, "rgba(255, 87, 34, 0.28)");
-    tintGrad.addColorStop(1, "rgba(255, 87, 34, 0)");
-    ctx.fillStyle = tintGrad;
-    const thresholdNorm = thresholdLin / peakRef;
-    let spanStart = -1;
-    for (let x = 0; x <= cssW; x++) {
-      const above = x < cssW && smoothed[x] > thresholdNorm;
-      if (above && spanStart < 0) spanStart = x;
-      else if (!above && spanStart >= 0) {
-        const spanEnd = x;
+      // Threshold guides — phosphor-amber hairline dashes, mirrored
+      // across the centre. Dashed gives "guideline" not "limit fence".
+      const thresholdY = cx - thresholdNorm * half;
+      if (thresholdY > 0 && thresholdY < cssH) {
+        ctx.strokeStyle = "rgba(255,138,79,0.55)";
+        ctx.lineWidth = 0.75;
+        ctx.setLineDash([4, 3]);
         ctx.beginPath();
-        ctx.moveTo(spanStart, yTop(smoothed[spanStart]));
-        for (let xx = spanStart + 1; xx < spanEnd; xx++) {
-          ctx.lineTo(xx, yTop(smoothed[xx]));
+        ctx.moveTo(0, thresholdY);
+        ctx.lineTo(cssW, thresholdY);
+        const thresholdYBottom = cx + thresholdNorm * half;
+        if (thresholdYBottom < cssH) {
+          ctx.moveTo(0, thresholdYBottom);
+          ctx.lineTo(cssW, thresholdYBottom);
         }
-        for (let xx = spanEnd - 1; xx >= spanStart; xx--) {
-          ctx.lineTo(xx, yBot(smoothed[xx]));
-        }
-        ctx.closePath();
-        ctx.fill();
-        spanStart = -1;
+        ctx.stroke();
+        ctx.setLineDash([]);
       }
-    }
-
-    // Threshold guides — phosphor-amber hairline dashes, mirrored
-    // across the centre. Dashed gives "guideline" not "limit fence".
-    const thresholdY = cx - thresholdNorm * half;
-    if (thresholdY > 0 && thresholdY < cssH) {
-      ctx.strokeStyle = "rgba(255,138,79,0.55)";
-      ctx.lineWidth = 0.75;
-      ctx.setLineDash([4, 3]);
-      ctx.beginPath();
-      ctx.moveTo(0, thresholdY);
-      ctx.lineTo(cssW, thresholdY);
-      const thresholdYBottom = cx + thresholdNorm * half;
-      if (thresholdYBottom < cssH) {
-        ctx.moveTo(0, thresholdYBottom);
-        ctx.lineTo(cssW, thresholdYBottom);
-      }
-      ctx.stroke();
-      ctx.setLineDash([]);
     }
   }, [
+    pyramid,
+    pcm,
     envelope,
     envelopeHz,
     size.width,
@@ -653,7 +648,6 @@ export function TriageTimeline() {
     viewEndS,
     silenceConfig,
     xToTime,
-    pxPerSec,
   ]);
 
   const totalHeight =

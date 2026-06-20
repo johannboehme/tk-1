@@ -52,6 +52,8 @@ import {
 import { BarsHeader } from "./timeline/BarsHeader";
 import { useIsNarrowViewport } from "../use-is-narrow";
 import { MASTER_AUDIO_ID } from "../types";
+import { drawWaveform, EDITOR_STYLE } from "../../local/waveform/draw-waveform";
+import type { PeakPyramid } from "../../local/waveform/peak-pyramid";
 
 interface CamAssetInfo {
   /** OPFS object URL for this cam's thumbnail strip (may be null). */
@@ -67,7 +69,7 @@ interface CamAssetInfo {
 interface Props {
   /** Per-cam asset info, keyed by camId. */
   cams: Record<string, CamAssetInfo>;
-  peaks: [number, number][];
+  pyramid: PeakPyramid;
   audioDuration: number;
   /** Audio-lane height in px. Defaults to the legacy 88 to keep the waveform familiar. */
   audioLaneHeight?: number;
@@ -163,7 +165,7 @@ const SCROLLBAR_H = 14;
 
 export function Timeline({
   cams,
-  peaks,
+  pyramid,
   audioDuration,
   audioLaneHeight = 48,
   videoLaneHeight = 48,
@@ -620,135 +622,48 @@ export function Timeline({
     ctx.fillStyle = "#DDD4BE"; // paper-panel
     ctx.fillRect(0, audioBand.top, audioRightX, audioLaneHeight);
 
-    // Audio waveform.
-    //   Direct-mode: walk peaks linearly across [viewStart, viewEnd] in
-    //     master-time. Same as before.
-    //   Arrangement-mode: walk peaks per segment. The arr-time X axis is
-    //     piece-wise-linear over master-time, so a single linear walk
-    //     would smear discontinuous master regions onto each other. For
-    //     each segment we slice the peaks-range corresponding to its
-    //     master span and project onto the segment's arr window.
-    if (peaks.length > 0 && audioDuration > 0) {
-      const wfMid = audioBand.top + audioLaneHeight / 2;
-      const peaksPerSec = peaks.length / audioDuration;
-      // Padding so the loudest peaks don't kiss the lane edges.
-      const half = audioLaneHeight / 2 - 2;
-      const width = Math.max(1, Math.ceil(canvasWidth));
-
-      // Per-pixel-column envelope. We fill EVERY column a segment covers
-      // (x -> arr-T -> peak-index inverse) instead of stamping one 1-px bar
-      // per peak — that's what turns the old scattered ticks into a
-      // continuous filled body. colTop/colBot hold normalized max/min
-      // amplitude; hasData marks which columns a segment actually painted.
-      const colTop = new Float32Array(width);
-      const colBot = new Float32Array(width);
-      const hasData = new Uint8Array(width);
-
+    // Audio waveform — a transient-accurate min/max peak pyramid drawn at
+    // device-pixel resolution by the shared engine (crisp, no smoothing). The
+    // arr-time X axis is piece-wise-linear over master-time, so we hand the
+    // engine a mapXToTime closure that projects each column's arr-time back to
+    // its arrangement segment's master-time and returns null in the gaps —
+    // discontinuous master regions never smear and long-form gaps stay gaps.
+    if (pyramid.levels.length > 0) {
       const arrStarts = segmentArrStarts(arrangementSegments);
-      for (let segIdx = 0; segIdx < arrangementSegments.length; segIdx++) {
-        const seg = arrangementSegments[segIdx];
-        const segArrIn = arrStarts[segIdx];
-        const segArrOut = segArrIn + Math.max(0, seg.out - seg.in);
-        if (segArrOut < viewStart || segArrIn > viewEnd) continue;
-        const xLo = Math.max(0, Math.floor(arrTToX(segArrIn)));
-        const xHi = Math.min(width, Math.ceil(arrTToX(segArrOut)));
-        // Inverse of peakIdxToX within this segment: x -> arr-T (arrTToX is
-        // linear) -> master-T -> fractional peak index.
-        const xToPeakIdx = (x: number) => {
-          const arrT = viewStart + (x / canvasWidth) * visibleDur;
-          return (seg.in + (arrT - segArrIn)) * peaksPerSec;
+      const segBounds = arrangementSegments.map((seg, i) => {
+        const segArrIn = arrStarts[i];
+        return {
+          segArrIn,
+          segArrOut: segArrIn + Math.max(0, seg.out - seg.in),
+          masterIn: seg.in,
         };
-        for (let x = xLo; x < xHi; x++) {
-          const f0 = xToPeakIdx(x);
-          const f1 = xToPeakIdx(x + 1);
-          const lo = Math.min(f0, f1);
-          const hi = Math.max(f0, f1);
-          const i0 = Math.max(0, Math.floor(lo));
-          const i1 = Math.min(peaks.length, Math.ceil(hi));
-          let mx = 0;
-          let mn = 0;
-          if (i1 - i0 >= 1) {
-            // Peak-hold — >= 1 peak per pixel (zoomed out).
-            for (let i = i0; i < i1; i++) {
-              const p = peaks[i];
-              if (p[1] > mx) mx = p[1];
-              if (p[0] < mn) mn = p[0];
-            }
-          } else {
-            // Sub-sample — < 1 peak per pixel (zoomed in): interpolate
-            // between neighbours so the body stays smooth.
-            const fc = (lo + hi) / 2;
-            const j = Math.floor(fc);
-            const frac = fc - j;
-            const a = peaks[Math.max(0, Math.min(peaks.length - 1, j))];
-            const b = peaks[Math.max(0, Math.min(peaks.length - 1, j + 1))];
-            mx = a[1] * (1 - frac) + b[1] * frac;
-            mn = a[0] * (1 - frac) + b[0] * frac;
-          }
-          colTop[x] = mx > 0 ? mx : 0;
-          colBot[x] = mn < 0 ? mn : 0;
-          hasData[x] = 1;
+      });
+      // arrStarts are cumulative (ascending, non-overlapping) → binary search.
+      const mapXToTime = (cssX: number): number | null => {
+        const arrT = viewStart + (cssX / canvasWidth) * visibleDur;
+        let lo = 0;
+        let hi = segBounds.length - 1;
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1;
+          const b = segBounds[mid];
+          if (arrT < b.segArrIn) hi = mid - 1;
+          else if (arrT > b.segArrOut) lo = mid + 1;
+          else return b.masterIn + (arrT - b.segArrIn);
         }
-      }
-
-      // Vertical gradient: transparent at the lane edges -> warm waveform
-      // ink at the centre. The "glow from the centreline" the Triage
-      // waveform uses, kept inside the existing palette (#5C544A ink).
-      const grad = ctx.createLinearGradient(
-        0,
-        audioBand.top,
-        0,
-        audioBand.bottom,
-      );
-      grad.addColorStop(0, "rgba(92,84,74,0)");
-      grad.addColorStop(0.18, "rgba(92,84,74,0.32)");
-      grad.addColorStop(0.5, "rgba(92,84,74,0.92)");
-      grad.addColorStop(0.82, "rgba(92,84,74,0.32)");
-      grad.addColorStop(1, "rgba(92,84,74,0)");
-
-      const y = (v: number) => wfMid - v * half;
-
-      // Draw each contiguous run of painted columns as its own filled body.
-      // Per-run keeps long-form arrangement gaps as real gaps and stops the
-      // 3-tap smoothing from smearing across them.
-      const drawRun = (s: number, e: number) => {
-        const n = e - s;
-        const top = new Float32Array(n);
-        const bot = new Float32Array(n);
-        // 3-tap smoothing — folds peaks into curves without losing the
-        // silhouette of transients.
-        for (let k = 0; k < n; k++) {
-          const x = s + k;
-          const xl = Math.max(s, x - 1);
-          const xr = Math.min(e - 1, x + 1);
-          top[k] = (colTop[xl] + 2 * colTop[x] + colTop[xr]) * 0.25;
-          bot[k] = (colBot[xl] + 2 * colBot[x] + colBot[xr]) * 0.25;
-        }
-        // Subtle ground line keeps quiet / silent stretches anchored.
-        ctx.strokeStyle = "rgba(92,84,74,0.30)";
-        ctx.lineWidth = 0.5;
-        ctx.beginPath();
-        ctx.moveTo(s, wfMid);
-        ctx.lineTo(e, wfMid);
-        ctx.stroke();
-        // Filled body: top edge along the max envelope, back along the min.
-        ctx.beginPath();
-        ctx.moveTo(s, y(top[0]));
-        for (let k = 1; k < n; k++) ctx.lineTo(s + k, y(top[k]));
-        for (let k = n - 1; k >= 0; k--) ctx.lineTo(s + k, y(bot[k]));
-        ctx.closePath();
-        ctx.fillStyle = grad;
-        ctx.fill();
+        return null;
       };
-      let runStart = -1;
-      for (let x = 0; x <= width; x++) {
-        const on = x < width && hasData[x] === 1;
-        if (on && runStart < 0) runStart = x;
-        else if (!on && runStart >= 0) {
-          drawRun(runStart, x);
-          runStart = -1;
-        }
-      }
+      drawWaveform(ctx, {
+        pyramid,
+        t0S: viewStart,
+        t1S: viewEnd,
+        cssW: canvasWidth,
+        cssH: audioLaneHeight,
+        yTop: audioBand.top,
+        dpr,
+        style: EDITOR_STYLE,
+        normalize: "absolute",
+        mapXToTime,
+      });
     }
 
     // Trim-dim, trim-handles, and audio-start marker — universal across
@@ -958,7 +873,7 @@ export function Timeline({
     viewEnd,
     visibleDur,
     duration,
-    peaks,
+    pyramid,
     audioDuration,
     trim.in,
     trim.out,
