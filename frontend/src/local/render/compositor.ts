@@ -29,13 +29,18 @@ import type { TextOverlay, EnergyCurves } from "./ass-builder";
 import { buildAss } from "./ass-builder";
 import { renderOverlays } from "./ass-renderer";
 import type { Visualizer } from "./visualizer/types";
-import type { PunchFx } from "../../editor/fx/types";
+import type { FilterSlot, PunchFx } from "../../editor/fx/types";
 import type { ViewportTransform } from "../../editor/types";
 import { activeFxAt } from "../../editor/fx/active";
 import { fxCatalog } from "../../editor/fx/catalog";
-import { envelopeAt, INSTANT_ENVELOPE } from "../../editor/fx/envelope";
+import { INSTANT_ENVELOPE } from "../../editor/fx/envelope";
+import {
+  computeIntensity,
+  followerFor,
+  legacyModulation,
+  type AudioEnvelope,
+} from "../../editor/fx/modulation";
 import type { GradeParams } from "../../editor/fx/looks";
-import type { FilterSlot } from "../../editor/fx/types";
 import {
   colorGradeFrameFx,
   filterFrameFx,
@@ -78,6 +83,13 @@ export interface CompositorOptions {
    *  visualizers and text overlays. Same `fxCatalog[kind]` impl as the
    *  live preview — single source of truth per kind. */
   fx?: readonly PunchFx[];
+  /** Real song tempo for beat-synced LFO modulation. null → no beat-sync. */
+  bpm?: number | null;
+  /** Master-time of beat 0 (grid anchor for beat-synced LFO). */
+  beatPhaseS?: number;
+  beatsPerBar?: number;
+  /** Normalized master-loudness curve for sidechain modulation. */
+  audioEnv?: AudioEnvelope | null;
   /** The single global color grade. Applied to every frame under everything,
    *  so the export matches the preview. */
   colorGrade?: GradeParams;
@@ -229,21 +241,39 @@ export class Compositor {
       displayH: dispH,
     };
 
-    // Global grades FIRST (the "film stock" layer), then the punch-in
-    // accents on top — identical order + resolution to the live preview's
-    // buildFx, so the exported look matches what the user dialled in.
+    // Uniform engine, same as the live preview's buildFx: global grade +
+    // opinionated filters first (the "film stock"), then punch-in accents on
+    // top. Export uses `tFx` for the envelope + audio/beat-sync axes (tFx ==
+    // master time for whole-video renders, so beat-sync + sidechain line up).
+    const bpm = this.opts.bpm ?? null;
+    const beatPhaseS = this.opts.beatPhaseS ?? 0;
+    const beatsPerBar = this.opts.beatsPerBar ?? 4;
+    const audioEnv = this.opts.audioEnv ?? null;
     const punchFx: FrameFx[] = this.opts.fx
       ? activeFxAt(this.opts.fx, tFx)
           .map((fx) => {
             const def = fxCatalog[fx.kind];
-            const env = fx.envelope ?? INSTANT_ENVELOPE;
-            const wetness = envelopeAt(env, fx.outS - fx.inS, tFx - fx.inS);
+            const env = fx.modulation?.envelope ?? fx.envelope ?? INSTANT_ENVELOPE;
+            const mod = fx.modulation ?? legacyModulation(env);
+            const sidechainCurve =
+              mod.timeMod === "sidechain" ? followerFor(audioEnv, mod.side) : null;
+            const { level, phase } = computeIntensity(mod, {
+              tMasterS: tFx,
+              tTimelineS: tFx,
+              regionInS: fx.inS,
+              regionDurS: fx.outS - fx.inS,
+              holding: false,
+              bpm,
+              beatPhaseS,
+              beatsPerBar,
+              sidechainCurve,
+            });
             const merged = { ...def.defaultParams, ...(fx.params ?? {}) };
             const params =
-              def.applyWetness && wetness < 1
-                ? def.applyWetness(merged, wetness)
+              def.applyWetness && level < 1
+                ? def.applyWetness(merged, level)
                 : merged;
-            return { id: fx.id, kind: fx.kind, inS: fx.inS, params, wetness };
+            return { id: fx.id, kind: fx.kind, inS: fx.inS, params, wetness: level, phase };
           })
           .filter((f) => f.wetness > 0)
       : [];

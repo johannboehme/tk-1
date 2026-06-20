@@ -1605,3 +1605,74 @@ describe("useEditorStore", () => {
     });
   });
 });
+
+describe("FX hold lifecycle — stuck-hold safety nets", () => {
+  beforeEach(() => {
+    useEditorStore.getState().reset();
+    // baseJobMeta has no bpm → snapTimelineTime is a no-op, keeping the
+    // arithmetic below exact.
+    useEditorStore.getState().loadJob(baseJobMeta);
+  });
+
+  test("persistent hold left in-flight is finalized when playback stops", () => {
+    const s = () => useEditorStore.getState();
+    s().setPlaying(true);
+    s().beginFxHold("pad:0", "vignette", 1.0);
+    // RAF grows outS past the playhead while the pad is held.
+    s().tickFxHold("pad:0", 2.0);
+    expect(Object.keys(s().fxHolds)).toHaveLength(1);
+    expect(s().fx).toHaveLength(1);
+    const grown = s().fx[0].outS;
+    expect(grown).toBeGreaterThan(2.0);
+
+    // Playback stops (e.g. auto-stop at song end) WITHOUT a pad pointerup.
+    // The hold must be finalized, not left dangling with a growing outS.
+    s().setPlaying(false);
+
+    expect(Object.keys(s().fxHolds)).toHaveLength(0);
+    expect(s().fx).toHaveLength(1);
+    const f = s().fx[0];
+    // outS is finite and bounded near where playback stopped (within the
+    // release-tail), never the runaway-grown value.
+    expect(Number.isFinite(f.outS)).toBe(true);
+    expect(f.outS).toBeGreaterThanOrEqual(f.inS + 0.05);
+    expect(f.outS).toBeLessThanOrEqual(grown + 1);
+  });
+
+  test("a finalized (formerly stuck) FX is then deletable via clearAllFx", () => {
+    const s = () => useEditorStore.getState();
+    s().setPlaying(true);
+    s().beginFxHold("pad:0", "vignette", 1.0);
+    s().tickFxHold("pad:0", 2.0);
+    s().setPlaying(false); // finalizes → becomes a normal committed FX
+    expect(s().fx).toHaveLength(1);
+
+    s().clearAllFx();
+    expect(s().fx).toHaveLength(0);
+  });
+
+  test("clearAllFx removes committed FX but preserves a genuinely live hold", () => {
+    const s = () => useEditorStore.getState();
+    // Commit one FX cleanly (record + release while playing).
+    s().setPlaying(true);
+    s().beginFxHold("pad:0", "vignette", 1.0);
+    s().tickFxHold("pad:0", 1.5);
+    s().endFxHold("pad:0");
+    expect(s().fx).toHaveLength(1);
+    expect(Object.keys(s().fxHolds)).toHaveLength(0);
+    const committedId = s().fx[0].id;
+
+    // Start a second, still-live recording on another pad.
+    s().beginFxHold("pad:1", "wear", 2.0);
+    expect(s().fx).toHaveLength(2);
+
+    // Clear-all wipes the committed FX but leaves the in-flight recording
+    // untouched (that's the X-hold-to-clear contract).
+    s().clearAllFx();
+    const ids = s().fx.map((f) => f.id);
+    expect(ids).not.toContain(committedId);
+    expect(s().fx).toHaveLength(1);
+    expect(s().fx[0].kind).toBe("wear");
+    expect(Object.keys(s().fxHolds)).toContain("pad:1");
+  });
+});

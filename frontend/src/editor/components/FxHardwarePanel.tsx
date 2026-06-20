@@ -37,6 +37,13 @@ import { useEditorStore } from "../store";
 import { fxCatalog, defaultTapLengthS } from "../fx/catalog";
 import type { FxKind, FxParamDef } from "../fx/types";
 import { INSTANT_ENVELOPE, type ADSREnvelope } from "../fx/envelope";
+import {
+  bipolarRateLabel,
+  DEFAULT_MOD_CONFIG,
+  type LfoShape,
+} from "../fx/modulation";
+import { SidechainScope } from "./SidechainScope";
+import { SegmentedControl } from "./SegmentedControl";
 import { useIsNarrowViewport } from "../use-is-narrow";
 
 interface PadDef {
@@ -61,6 +68,8 @@ const BEAT_STOPS = ["1/16", "1/8", "1/4", "1/2", "1", "2", "4"] as const;
 
 const TAB_H = 12;
 const PAD_BODY_H = 110;
+/** Extra panel height for the sidechain scope strip (mod-screen, SIDE). */
+const SIDECHAIN_STRIP_H = 92;
 // Mobile pad layout pieces — used to compute panel height per-viewport
 // so the bottom padding under the pad row matches the top padding
 // above the LCD (`py-1.5` = 6 px). At fold-folded (280 px wide) we get
@@ -142,8 +151,18 @@ export function FxHardwarePanel() {
     ro.observe(el);
     return () => ro.disconnect();
   }, [isNarrow]);
+  // Screen mode is lifted here (was local to PadBody) because the panel
+  // HEIGHT depends on it: the sidechain scope strip grows the panel only in
+  // mod-screen + SIDE. All other states stay pixel-identical.
+  const [screenMode, setScreenMode] = useState<ScreenMode>("params");
+  const selectedFxKind = useEditorStore((s) => s.selectedFxKind);
+  const timeMod = useEditorStore(
+    (s) => s.fxModulations[selectedFxKind]?.timeMod ?? "lfo",
+  );
+  const sidechainExpanded = screenMode === "mod" && timeMod === "sidechain";
   const padRowsNarrow = Math.ceil(PADS.length / padsPerRowNarrow(containerW || 280));
-  const padBodyH = isNarrow ? padBodyHeightNarrow(padRowsNarrow) : PAD_BODY_H;
+  const baseBodyH = isNarrow ? padBodyHeightNarrow(padRowsNarrow) : PAD_BODY_H;
+  const padBodyH = baseBodyH + (sidechainExpanded ? SIDECHAIN_STRIP_H : 0);
   const expandedH = TAB_H + padBodyH;
 
   // Margin strategy:
@@ -190,7 +209,12 @@ export function FxHardwarePanel() {
             height: padBodyH,
           }}
         >
-          <PadBody narrow={isNarrow} />
+          <PadBody
+            narrow={isNarrow}
+            screenMode={screenMode}
+            setScreenMode={setScreenMode}
+            sidechainExpanded={sidechainExpanded}
+          />
         </div>
       </div>
       <Tab
@@ -270,13 +294,37 @@ function Tab({
   );
 }
 
-function PadBody({ narrow = false }: { narrow?: boolean }) {
+function PadBody({
+  narrow = false,
+  screenMode,
+  setScreenMode,
+  sidechainExpanded = false,
+}: {
+  narrow?: boolean;
+  screenMode: ScreenMode;
+  setScreenMode: (m: ScreenMode) => void;
+  sidechainExpanded?: boolean;
+}) {
   const selectedFxKind = useEditorStore((s) => s.selectedFxKind);
   const def = fxCatalog[selectedFxKind];
-  // Local-only state — no persistence and no need for cross-component
-  // sync, so we keep it out of the Zustand store. Re-mounted with the
-  // panel itself, which is fine.
-  const [screenMode, setScreenMode] = useState<ScreenMode>("params");
+
+  // The encoder cluster (P/E) or the modulation controls (M) share the
+  // same slot between the LCD and the pad bank.
+  const controls =
+    screenMode === "mod" ? (
+      <ModControls kind={selectedFxKind} narrow={narrow} />
+    ) : def.params ? (
+      <div
+        className={
+          narrow
+            ? "flex items-end gap-2"
+            : "flex items-end gap-3 self-center ml-1"
+        }
+      >
+        <Encoder kind={selectedFxKind} param={def.params[0]} tint={ENCODER_HOT} />
+        <Encoder kind={selectedFxKind} param={def.params[1]} tint={ENCODER_COBALT} />
+      </div>
+    ) : null;
 
   return (
     <div className="relative w-full h-full" style={MECHANISM_BODY}>
@@ -292,35 +340,17 @@ function PadBody({ narrow = false }: { narrow?: boolean }) {
       />
 
       {narrow ? (
-        // Narrow phones: the LCD gets its own full-width row so the
-        // ENV-mode plot and finger-friendly knot hit-targets have real
-        // estate to live in. Mode-buttons + encoders sit horizontally
-        // below the LCD, then the pad bank wraps underneath. This trades
-        // a few extra vertical pixels for a usable envelope editor on
-        // mobile.
         <div className="relative h-full flex flex-col gap-1.5 px-2 py-1.5">
           <Lcd kind={selectedFxKind} mode={screenMode} narrow />
           <div className="flex items-center justify-center gap-3 shrink-0">
-            <ScreenModeColumn
-              mode={screenMode}
-              setMode={setScreenMode}
-              narrow
-            />
-            {def.params && (
-              <div className="flex items-end gap-2">
-                <Encoder
-                  kind={selectedFxKind}
-                  param={def.params[0]}
-                  tint={ENCODER_HOT}
-                />
-                <Encoder
-                  kind={selectedFxKind}
-                  param={def.params[1]}
-                  tint={ENCODER_COBALT}
-                />
-              </div>
-            )}
+            <ScreenModeColumn mode={screenMode} setMode={setScreenMode} narrow />
+            {controls}
           </div>
+          {sidechainExpanded && (
+            <div className="shrink-0">
+              <SidechainScope kind={selectedFxKind} />
+            </div>
+          )}
           <div className="flex flex-wrap gap-1 justify-center">
             {PADS.map((p) => (
               <FxPad key={p.slotKey} pad={p} />
@@ -328,36 +358,33 @@ function PadBody({ narrow = false }: { narrow?: boolean }) {
           </div>
         </div>
       ) : (
-        <div className="relative h-full flex items-center gap-2 pl-2 pr-5">
-          <ScreenModeColumn mode={screenMode} setMode={setScreenMode} />
-          <Lcd kind={selectedFxKind} mode={screenMode} />
-          {def.params && (
-            <div className="flex items-end gap-3 self-center ml-1">
-              <Encoder
-                kind={selectedFxKind}
-                param={def.params[0]}
-                tint={ENCODER_HOT}
-              />
-              <Encoder
-                kind={selectedFxKind}
-                param={def.params[1]}
-                tint={ENCODER_COBALT}
-              />
+        <div className="relative h-full flex flex-col">
+          <div
+            className="flex items-center gap-2 pl-2 pr-5"
+            style={{ flex: 1, minHeight: 0 }}
+          >
+            <ScreenModeColumn mode={screenMode} setMode={setScreenMode} />
+            <Lcd kind={selectedFxKind} mode={screenMode} />
+            {controls}
+            <Divider />
+            <div className="flex items-center gap-2">
+              {PADS.map((p) => (
+                <FxPad key={p.slotKey} pad={p} />
+              ))}
+            </div>
+          </div>
+          {sidechainExpanded && (
+            <div className="px-3 pb-2 pt-0.5">
+              <SidechainScope kind={selectedFxKind} />
             </div>
           )}
-          <Divider />
-          <div className="flex items-center gap-2">
-            {PADS.map((p) => (
-              <FxPad key={p.slotKey} pad={p} />
-            ))}
-          </div>
         </div>
       )}
     </div>
   );
 }
 
-type ScreenMode = "params" | "env";
+type ScreenMode = "params" | "env" | "mod";
 
 // — Pad ————————————————————————————————————————————————————
 
@@ -391,6 +418,41 @@ function FxPad({ pad }: { pad: PadDef }) {
       }
     };
   }, [heldByThisSlot, glow]);
+
+  // Off-pad release guard. The pad deliberately doesn't setPointerCapture
+  // (capture mis-routes multi-touch chords on Android Chrome), so a
+  // pointerup that lands outside the pad, a window blur, or a tab switch
+  // can strand a persistent (recording) hold — its outS then keeps growing
+  // on the next play and clearAllFx won't remove it. While this slot is
+  // held, end any *persistent* hold defensively on those events. Preview
+  // holds latch by design and are left alone. Mirrors the Encoder's
+  // off-window release guard below.
+  useEffect(() => {
+    if (!heldByThisSlot) return;
+    function endIfPersistent() {
+      const st = useEditorStore.getState();
+      const h = st.fxHolds[pad.slotKey];
+      if (h && h.mode === "persistent") st.endFxHold(pad.slotKey);
+    }
+    window.addEventListener("pointerup", endIfPersistent);
+    window.addEventListener("pointercancel", endIfPersistent);
+    window.addEventListener("blur", endIfPersistent);
+    return () => {
+      window.removeEventListener("pointerup", endIfPersistent);
+      window.removeEventListener("pointercancel", endIfPersistent);
+      window.removeEventListener("blur", endIfPersistent);
+    };
+  }, [heldByThisSlot, pad.slotKey]);
+
+  // Finalize a persistent hold if the pad unmounts mid-record (panel
+  // collapse / navigation) so it never dangles.
+  useEffect(() => {
+    return () => {
+      const st = useEditorStore.getState();
+      const h = st.fxHolds[pad.slotKey];
+      if (h && h.mode === "persistent") st.endFxHold(pad.slotKey);
+    };
+  }, [pad.slotKey]);
 
   function handleDown(e: ReactPointerEvent<HTMLButtonElement>) {
     e.preventDefault();
@@ -561,6 +623,8 @@ function Lcd({
       >
         {mode === "params" ? (
           <LcdParamsView kind={kind} />
+        ) : mode === "mod" ? (
+          <LcdModView kind={kind} />
         ) : (
           <LcdEnvelopeView kind={kind} narrow={narrow} />
         )}
@@ -664,26 +728,42 @@ interface EncoderProps {
  *  (6×). Doppelklick reset auf catalog-Default. Shift+Pfeile auf Tastatur
  *  nudgen feiner (vgl. existing Knob.tsx).
  */
-function Encoder({ kind, param, tint }: EncoderProps) {
-  const fxDefaults = useEditorStore((s) => s.fxDefaults[kind]);
-  const setFxDefault = useEditorStore((s) => s.setFxDefault);
-  const value = fxDefaults?.[param.id] ?? param.defaultValue;
-
+function EncoderKnob({
+  value,
+  min,
+  max,
+  kind,
+  tint,
+  label,
+  onChange,
+  onReset,
+  size = ENC_OUTER,
+}: {
+  value: number;
+  min: number;
+  max: number;
+  kind: FxParamDef["kind"];
+  tint: string;
+  label: string;
+  onChange: (v: number) => void;
+  onReset?: () => void;
+  size?: number;
+}) {
   const startY = useRef(0);
   const startVal = useRef(0);
   const [dragging, setDragging] = useState(false);
 
-  const range = param.max - param.min;
+  const range = max - min;
   // Display sweep is 0..1 regardless of storage range; angle -135..+135.
-  const ratio = Math.max(
-    0,
-    Math.min(1, range > 0 ? (value - param.min) / range : 0),
-  );
+  const ratio = Math.max(0, Math.min(1, range > 0 ? (value - min) / range : 0));
   const angle = -135 + ratio * 270;
-  // Active-range arc: bipolar params grow from the centre detent (top),
-  // linear params from the scale start.
-  const arcStart = param.kind === "bipolar" ? 0 : -135;
+  // Active-range arc: bipolar grows from the centre detent (top), linear
+  // from the scale start.
+  const arcStart = kind === "bipolar" ? 0 : -135;
   const arcEnd = angle;
+  // Uniform scale so smaller panels reuse the identical look without
+  // re-deriving any geometry constant.
+  const scale = size / ENC_OUTER;
 
   const onPointerDown = useCallback(
     (e: ReactPointerEvent<HTMLDivElement>) => {
@@ -702,7 +782,7 @@ function Encoder({ kind, param, tint }: EncoderProps) {
       const dy = e.clientY - cy;
       const r = Math.hypot(dx, dy);
       // Knob-Body-Radius mit 1 px Toleranz; Klicks außerhalb → Skala.
-      const KNOB_HIT_R = ENC_BODY / 2 + 1;
+      const KNOB_HIT_R = (ENC_BODY / 2 + 1) * scale;
       let baseline = value;
       if (r > KNOB_HIT_R) {
         // Click angle: top = 0, right-half positive, left-half negative.
@@ -710,30 +790,21 @@ function Encoder({ kind, param, tint }: EncoderProps) {
         const aDeg = (Math.atan2(dx, -dy) * 180) / Math.PI;
         const clamped = Math.max(-135, Math.min(135, aDeg));
         const ratioFromClick = (clamped + 135) / 270;
-        let next = param.min + ratioFromClick * range;
-        if (param.kind === "bipolar") {
-          next = snapBipolar(next, param.min, param.max);
+        let next = min + ratioFromClick * range;
+        if (kind === "bipolar") {
+          next = snapBipolar(next, min, max);
         } else {
           const decimals = range <= 1.5 ? 2 : 0;
           next = roundTo(next, decimals);
         }
-        setFxDefault(kind, param.id, next);
+        onChange(next);
         baseline = next;
       }
       startY.current = e.clientY;
       startVal.current = baseline;
       setDragging(true);
     },
-    [
-      value,
-      kind,
-      param.id,
-      param.kind,
-      param.min,
-      param.max,
-      range,
-      setFxDefault,
-    ],
+    [value, kind, min, max, range, onChange, scale],
   );
 
   const onPointerMove = useCallback(
@@ -752,9 +823,9 @@ function Encoder({ kind, param, tint }: EncoderProps) {
       const dy = startY.current - e.clientY;
       const sensitivity = e.shiftKey ? 1200 : 200;
       let next = startVal.current + (dy / sensitivity) * range;
-      next = Math.max(param.min, Math.min(param.max, next));
-      if (param.kind === "bipolar") {
-        next = snapBipolar(next, param.min, param.max);
+      next = Math.max(min, Math.min(max, next));
+      if (kind === "bipolar") {
+        next = snapBipolar(next, min, max);
       } else {
         // Round to a sensible step. For 0..1 ranges, two decimals; for
         // 0..100 ranges, integers; pick whichever makes sense from the
@@ -762,9 +833,9 @@ function Encoder({ kind, param, tint }: EncoderProps) {
         const decimals = range <= 1.5 ? 2 : 0;
         next = roundTo(next, decimals);
       }
-      setFxDefault(kind, param.id, next);
+      onChange(next);
     },
-    [dragging, kind, param.id, param.kind, param.min, param.max, range, setFxDefault],
+    [dragging, kind, min, max, range, onChange],
   );
 
   const onPointerUp = useCallback(() => setDragging(false), []);
@@ -788,17 +859,17 @@ function Encoder({ kind, param, tint }: EncoderProps) {
   }, [dragging]);
 
   const onDoubleClick = useCallback(() => {
-    setFxDefault(kind, param.id, param.defaultValue);
-  }, [kind, param.id, param.defaultValue, setFxDefault]);
+    onReset?.();
+  }, [onReset]);
 
-  return (
+  const knob = (
     <div className="flex flex-col items-center" style={{ gap: 3 }}>
       <div
         role="slider"
-        aria-valuemin={param.min}
-        aria-valuemax={param.max}
+        aria-valuemin={min}
+        aria-valuemax={max}
         aria-valuenow={value}
-        aria-label={param.label}
+        aria-label={label}
         tabIndex={0}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
@@ -816,9 +887,9 @@ function Encoder({ kind, param, tint }: EncoderProps) {
           width={ENC_OUTER}
           height={ENC_OUTER}
         >
-          {param.kind === "linear"
+          {kind === "linear"
             ? linearTicks(ratio, tint)
-            : bipolarTicks(value, param.min, param.max, tint)}
+            : bipolarTicks(value, min, max, tint)}
           {/* active-range arc hugging the knob body — faint track shows the
               unused range, the tinted arc traces from neutral to value. */}
           <path
@@ -986,9 +1057,47 @@ function Encoder({ kind, param, tint }: EncoderProps) {
           lineHeight: 1,
         }}
       >
-        {param.label}
+        {label}
       </span>
     </div>
+  );
+
+  if (scale === 1) return knob;
+  // Scale the whole native (ENC_OUTER-based) knob uniformly. The outer box
+  // reserves the scaled footprint so siblings lay out correctly; the inner
+  // transform keeps every gradient / arc / tick pixel-proportional.
+  return (
+    <div style={{ width: ENC_OUTER * scale, height: (ENC_OUTER + 3 + 9) * scale }}>
+      <div
+        style={{
+          width: ENC_OUTER,
+          transform: `scale(${scale})`,
+          transformOrigin: "top left",
+        }}
+      >
+        {knob}
+      </div>
+    </div>
+  );
+}
+
+/** Store-bound FX macro encoder — reads/writes `fxDefaults[kind][param.id]`
+ *  and renders the shared `EncoderKnob` look. */
+function Encoder({ kind, param, tint }: EncoderProps) {
+  const fxDefaults = useEditorStore((s) => s.fxDefaults[kind]);
+  const setFxDefault = useEditorStore((s) => s.setFxDefault);
+  const value = fxDefaults?.[param.id] ?? param.defaultValue;
+  return (
+    <EncoderKnob
+      value={value}
+      min={param.min}
+      max={param.max}
+      kind={param.kind}
+      tint={tint}
+      label={param.label}
+      onChange={(v) => setFxDefault(kind, param.id, v)}
+      onReset={() => setFxDefault(kind, param.id, param.defaultValue)}
+    />
   );
 }
 
@@ -1262,6 +1371,12 @@ function ScreenModeColumn({
         onClick={() => setMode("env")}
         ariaLabel="Show envelope"
       />
+      <ScreenModeButton
+        active={mode === "mod"}
+        label="M"
+        onClick={() => setMode("mod")}
+        ariaLabel="Show modulation"
+      />
     </div>
   );
 }
@@ -1273,7 +1388,7 @@ function ScreenModeButton({
   ariaLabel,
 }: {
   active: boolean;
-  label: "P" | "E";
+  label: string;
   onClick: () => void;
   ariaLabel: string;
 }) {
@@ -1338,6 +1453,284 @@ function ScreenModeButton({
         {label}
       </span>
     </button>
+  );
+}
+
+// — LCD MOD mode (modulation readout) ————————————————————————
+
+const SHAPE_GLYPH: Record<LfoShape, string> = {
+  sine: "∿",
+  triangle: "△",
+  saw: "◺",
+  ramp: "◹",
+  square: "⊓",
+};
+const SHAPE_ORDER: readonly LfoShape[] = [
+  "sine",
+  "triangle",
+  "saw",
+  "ramp",
+  "square",
+];
+
+/** Compact phosphor readout for the modulation screen — the physical
+ *  controls live in <ModControls> beside it (like real hardware). */
+function LcdModView({ kind }: { kind: FxKind }) {
+  const mc = useEditorStore((s) => s.fxModulations[kind]) ?? DEFAULT_MOD_CONFIG;
+  const bpm = useEditorStore((s) => s.jobMeta?.bpm?.value ?? null);
+  const isLfo = mc.timeMod === "lfo";
+  const headline = isLfo
+    ? `${SHAPE_GLYPH[mc.lfo.shape]} ${bipolarRateLabel(mc.lfo.rate, bpm)}`
+    : `THR ${Math.round(mc.side.threshold * 100)}`;
+  const sub = isLfo
+    ? mc.lfo.beatSync
+      ? "SYNC"
+      : "FREE"
+    : mc.side.invert
+      ? "DUCK"
+      : "GATE";
+  return (
+    <div className="flex flex-col h-full justify-between px-2 py-1.5">
+      <div
+        className="flex items-baseline justify-between"
+        style={{ ...LCD_TEXT_DIM, fontSize: 7, letterSpacing: 1.4 }}
+      >
+        <span>VAS · MOD</span>
+        <span>{isLfo ? "LFO" : "SIDE"}</span>
+      </div>
+      <div
+        style={{
+          fontFamily: '"JetBrains Mono Variable", ui-monospace, monospace',
+          fontSize: 20,
+          letterSpacing: 1,
+          lineHeight: 1,
+          fontWeight: 700,
+          ...LCD_TEXT,
+        }}
+      >
+        {headline}
+      </div>
+      <div
+        className="flex justify-between items-baseline"
+        style={{
+          fontFamily: '"JetBrains Mono Variable", ui-monospace, monospace',
+          fontSize: 9,
+          letterSpacing: 0.5,
+          ...LCD_TEXT,
+        }}
+      >
+        <span>
+          {isLfo
+            ? `DEPTH ${Math.round(mc.depth * 100)}`
+            : `DEP ${Math.round(mc.depth * 100)} · A ${Math.round(
+                mc.side.attackS * 1000,
+              )} · R ${Math.round(mc.side.releaseS * 1000)}`}
+        </span>
+        <span style={LCD_TEXT_DIM}>{sub}</span>
+      </div>
+    </div>
+  );
+}
+
+// — MOD controls (knobs + toggles beside the LCD) ————————————
+
+function ModControls({ kind, narrow }: { kind: FxKind; narrow: boolean }) {
+  const mc = useEditorStore((s) => s.fxModulations[kind]) ?? DEFAULT_MOD_CONFIG;
+  const setFxTimeMod = useEditorStore((s) => s.setFxTimeMod);
+  const setFxModDepth = useEditorStore((s) => s.setFxModDepth);
+  const setFxLfo = useEditorStore((s) => s.setFxLfo);
+  const setFxSidechain = useEditorStore((s) => s.setFxSidechain);
+  // The M-screen knobs reuse the macro Encoder look at a compact size.
+  const KNOB = 36;
+
+  const cycleShape = () => {
+    const i = SHAPE_ORDER.indexOf(mc.lfo.shape);
+    setFxLfo(kind, { shape: SHAPE_ORDER[(i + 1) % SHAPE_ORDER.length] });
+  };
+
+  return (
+    <div
+      className={
+        (narrow ? "flex items-center gap-2" : "flex items-center gap-2 ml-1") +
+        " self-center"
+      }
+    >
+      <SegmentedControl
+        value={mc.timeMod}
+        onChange={(v) => setFxTimeMod(kind, v)}
+        size="sm"
+        options={[
+          { value: "lfo", label: "LFO" },
+          { value: "sidechain", label: "SIDE" },
+        ]}
+      />
+      {mc.timeMod === "lfo" ? (
+        <>
+          <ShapeButton glyph={SHAPE_GLYPH[mc.lfo.shape]} onClick={cycleShape} />
+          <EncoderKnob
+            label="RATE"
+            kind="bipolar"
+            value={mc.lfo.rate}
+            min={0}
+            max={1}
+            size={KNOB}
+            tint={ENCODER_HOT}
+            onChange={(v) => setFxLfo(kind, { rate: v })}
+            onReset={() => setFxLfo(kind, { rate: DEFAULT_MOD_CONFIG.lfo.rate })}
+          />
+          <EncoderKnob
+            label="DEPTH"
+            kind="linear"
+            value={mc.depth}
+            min={0}
+            max={1}
+            size={KNOB}
+            tint={ENCODER_COBALT}
+            onChange={(v) => setFxModDepth(kind, v)}
+            onReset={() => setFxModDepth(kind, DEFAULT_MOD_CONFIG.depth)}
+          />
+          <MiniToggle
+            active={mc.lfo.beatSync}
+            label="SYNC"
+            onClick={() => setFxLfo(kind, { beatSync: !mc.lfo.beatSync })}
+          />
+        </>
+      ) : (
+        <>
+          <EncoderKnob
+            label="ATK"
+            kind="linear"
+            value={mc.side.attackS}
+            min={0}
+            max={0.5}
+            size={KNOB}
+            tint={ENCODER_HOT}
+            onChange={(v) => setFxSidechain(kind, { attackS: v })}
+            onReset={() =>
+              setFxSidechain(kind, { attackS: DEFAULT_MOD_CONFIG.side.attackS })
+            }
+          />
+          <EncoderKnob
+            label="REL"
+            kind="linear"
+            value={mc.side.releaseS}
+            min={0}
+            max={1.5}
+            size={KNOB}
+            tint={ENCODER_HOT}
+            onChange={(v) => setFxSidechain(kind, { releaseS: v })}
+            onReset={() =>
+              setFxSidechain(kind, { releaseS: DEFAULT_MOD_CONFIG.side.releaseS })
+            }
+          />
+          <EncoderKnob
+            label="DEPTH"
+            kind="linear"
+            value={mc.depth}
+            min={0}
+            max={1}
+            size={KNOB}
+            tint={ENCODER_COBALT}
+            onChange={(v) => setFxModDepth(kind, v)}
+            onReset={() => setFxModDepth(kind, DEFAULT_MOD_CONFIG.depth)}
+          />
+          <MiniToggle
+            active={mc.side.invert}
+            label="INV"
+            onClick={() => setFxSidechain(kind, { invert: !mc.side.invert })}
+          />
+        </>
+      )}
+    </div>
+  );
+}
+
+
+/** Small latching toggle (SYNC / INV) styled like the screen-mode keys. */
+function MiniToggle({
+  active,
+  label,
+  onClick,
+}: {
+  active: boolean;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      aria-label={label}
+      className="relative focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hot/40"
+      style={{
+        minWidth: 26,
+        height: 16,
+        padding: "0 4px",
+        borderRadius: 2.5,
+        background: "linear-gradient(180deg,#2C2925 0%,#1A1815 100%)",
+        border: "1px solid rgba(0,0,0,0.7)",
+        boxShadow: active
+          ? "inset 0 2px 3px rgba(0,0,0,0.6)"
+          : "inset 0 1px 0 rgba(255,255,255,0.07), inset 0 -1px 1px rgba(0,0,0,0.55), 0 1px 1px rgba(0,0,0,0.4)",
+        transform: active ? "translateY(1px)" : "translateY(0)",
+        transition: "transform 50ms, box-shadow 80ms",
+        cursor: "pointer",
+        color: active ? "#9FE08E" : "rgba(245,240,225,0.5)",
+        textShadow: active
+          ? "0 0 4px rgba(159,224,142,0.7)"
+          : "0 1px 0 rgba(0,0,0,0.6)",
+        fontFamily: '"JetBrains Mono Variable", ui-monospace, monospace',
+        fontSize: 7,
+        fontWeight: 700,
+        letterSpacing: 0.6,
+      }}
+    >
+      {label}
+    </button>
+  );
+}
+
+/** Click-to-cycle LFO shape button showing the current glyph. */
+function ShapeButton({ glyph, onClick }: { glyph: string; onClick: () => void }) {
+  return (
+    <div className="flex flex-col items-center" style={{ gap: 2 }}>
+      <button
+        type="button"
+        onClick={onClick}
+        aria-label="LFO shape"
+        className="relative focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hot/40"
+        style={{
+          width: 26,
+          height: 26,
+          borderRadius: 4,
+          background: "linear-gradient(180deg,#2C2925 0%,#1A1815 100%)",
+          border: "1px solid rgba(0,0,0,0.7)",
+          boxShadow:
+            "inset 0 1px 0 rgba(255,255,255,0.07), inset 0 -1px 1px rgba(0,0,0,0.55), 0 1px 1px rgba(0,0,0,0.4)",
+          cursor: "pointer",
+          color: "#9FE08E",
+          textShadow: "0 0 4px rgba(159,224,142,0.6)",
+          fontSize: 14,
+          lineHeight: 1,
+        }}
+      >
+        {glyph}
+      </button>
+      <span
+        style={{
+          fontSize: 6.5,
+          letterSpacing: 1,
+          color: "rgba(245,240,225,0.5)",
+          textShadow: "0 1px 0 rgba(0,0,0,0.55)",
+          fontWeight: 700,
+          fontFamily: '"JetBrains Mono Variable", ui-monospace, monospace',
+          lineHeight: 1,
+        }}
+      >
+        SHAPE
+      </span>
+    </div>
   );
 }
 

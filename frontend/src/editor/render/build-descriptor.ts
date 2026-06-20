@@ -13,14 +13,21 @@
 import type { Clip, ExportSpec, Pill, Segment } from "../types";
 import { isImageClip, normaliseRotation } from "../types";
 import type { Cut } from "../../storage/jobs-db";
-import type { FxKind, PunchFx } from "../fx/types";
+import type { FilterSlot, FxKind, PunchFx } from "../fx/types";
 import { activeCamAtArr } from "../arrangement-pills";
 import { masterToArr } from "../arrangement-time";
 import { activeFxAt } from "../fx/active";
 import { fxCatalog } from "../fx/catalog";
+import { INSTANT_ENVELOPE, type ADSREnvelope } from "../fx/envelope";
+import {
+  computeIntensity,
+  followerFor,
+  legacyModulation,
+  type AudioEnvelope,
+  type ModConfig,
+  type Modulation,
+} from "../fx/modulation";
 import { gradeIsIdentity, type GradeParams } from "../fx/looks";
-import type { FilterSlot } from "../fx/types";
-import { envelopeAt, INSTANT_ENVELOPE, type ADSREnvelope } from "../fx/envelope";
 import { resolveOutputDims } from "../output-frame";
 import {
   buildElementFitRect,
@@ -73,6 +80,18 @@ export interface EditorStoreSnapshot {
   /** Per-kind live ADSR envelope values. Same override scope as
    *  fxDefaults — only the selected kind's envelope is overridden. */
   fxEnvelopes?: Readonly<Partial<Record<FxKind, ADSREnvelope>>>;
+  /** Per-kind live modulator config (timeMod/depth/lfo/side). For the
+   *  selected kind this overrides active fx so M-screen edits show live. */
+  fxModulations?: Readonly<Partial<Record<FxKind, ModConfig>>>;
+  /** Real song tempo for beat-synced modulation. null/absent disables
+   *  beat-sync (the LFO falls back to a 120-BPM-equivalent division). */
+  bpm?: number | null;
+  /** Master-time of beat 0 — the grid anchor for beat-synced LFO phase. */
+  beatPhaseS?: number;
+  beatsPerBar?: number;
+  /** Normalized master-loudness curve (0..1 over master-time) driving
+   *  sidechain modulation. Absent → sidechain reads silence. */
+  audioEnv?: AudioEnvelope | null;
   /** Single global color grade — the corrective/creative pass. Emitted as
    *  one `grade` FrameFx prepended ahead of everything (skipped when it's the
    *  identity). Optional so test stubs / the export compositor can omit it. */
@@ -111,7 +130,7 @@ export function buildPreviewFrameDescriptor(
   const output = computeOutputSnapped(snapshot.clips, snapshot.exportSpec.resolution);
   const segments = snapshot.arrangementSegments ?? [];
   const tArr = tTimeline ?? masterToArr(tMaster, segments);
-  const fxOut = buildFx(snapshot, tArr);
+  const fxOut = buildFx(snapshot, tMaster, tArr);
 
   if (!output) {
     return { tMaster, output: null, layers: [], fx: fxOut };
@@ -250,6 +269,7 @@ export function filterFrameFx(
 
 function buildFx(
   snapshot: EditorStoreSnapshot,
+  tMaster: number,
   tTimeline: number,
 ): FrameFx[] {
   // Order: color grade (corrective pass) → opinionated filters (the looks) →
@@ -268,6 +288,9 @@ function buildFx(
   const hasParamOverride = !!(
     overrideParams && Object.keys(overrideParams).length > 0
   );
+  const bpm = snapshot.bpm ?? null;
+  const beatPhaseS = snapshot.beatPhaseS ?? 0;
+  const beatsPerBar = snapshot.beatsPerBar ?? 4;
 
   // Currently-held PunchFx ids (persistent holds only — preview holds
   // have no fxId). While held, envelope sampling skips the release phase
@@ -282,7 +305,9 @@ function buildFx(
     }
   }
 
-  // Persistent: real PunchFx capsules on the timeline. ADSR-sampled.
+  // Persistent: real PunchFx capsules on the timeline. Intensity is the
+  // unified envelope ⊗ (lfo|sidechain); legacy fx (no `modulation`) route
+  // through a depth-0 wrapper → identical to the old envelope-only path.
   for (const f of activeFxAt(snapshot.fx, tTimeline)) {
     const def = fxCatalog[f.kind];
     const useOverride = selectedKind === f.kind;
@@ -293,32 +318,56 @@ function buildFx(
     };
     const env =
       (useOverride ? overrideEnv : undefined) ??
+      f.modulation?.envelope ??
       f.envelope ??
       INSTANT_ENVELOPE;
+    // While a kind is selected, the M-screen's live modulator config drives
+    // the preview (recording-head); committed fx keep their baked modulation.
+    const liveModCfg = useOverride ? snapshot.fxModulations?.[f.kind] : undefined;
+    let mod: Modulation;
+    if (liveModCfg) {
+      mod = { envelope: env, ...liveModCfg };
+    } else if (f.modulation) {
+      // Live ADSR-editor edits still override the active kind's envelope.
+      mod = useOverride && overrideEnv ? { ...f.modulation, envelope: env } : f.modulation;
+    } else {
+      mod = legacyModulation(env);
+    }
     const holding = heldIds.has(f.id);
-    const wetness = envelopeAt(env, f.outS - f.inS, tTimeline - f.inS, holding);
-    if (wetness <= 0) continue;
-    // Per-kind wetness application — each effect knows how to dim
-    // itself intelligently. Generic alpha-blend over source doesn't
-    // work for displacement effects (zoom would ghost), so the kinds
-    // ship their own scaling in `def.applyWetness`.
+    const sidechainCurve =
+      mod.timeMod === "sidechain" ? followerFor(snapshot.audioEnv, mod.side) : null;
+    const { level, phase } = computeIntensity(mod, {
+      tMasterS: tMaster,
+      tTimelineS: tTimeline,
+      regionInS: f.inS,
+      regionDurS: f.outS - f.inS,
+      holding,
+      bpm,
+      beatPhaseS,
+      beatsPerBar,
+      sidechainCurve,
+    });
+    if (level <= 0) continue;
+    // Per-kind intensity application — each effect knows how to dim itself
+    // intelligently. Generic alpha-blend over source doesn't work for
+    // displacement effects (zoom would ghost), so kinds ship their own
+    // scaling in `def.applyWetness`.
     const params =
-      def.applyWetness && wetness < 1
-        ? def.applyWetness(merged, wetness)
-        : merged;
+      def.applyWetness && level < 1 ? def.applyWetness(merged, level) : merged;
     out.push({
       id: f.id,
       kind: f.kind,
       inS: f.inS,
       params,
-      wetness,
+      wetness: level,
+      phase,
     });
   }
 
   // Preview holds: while playback is paused, pad-presses overlay the
   // effect at full strength on the live frame without writing anything
   // to fx[]. Synthesised here as transient FrameFx with wetness=1 so the
-  // user can dial DEPTH/EDGE with full visual feedback.
+  // user can dial macros with full visual feedback.
   if (snapshot.fxHolds) {
     for (const hold of Object.values(snapshot.fxHolds)) {
       if (hold.mode !== "preview") continue;
@@ -335,6 +384,7 @@ function buildFx(
         inS: hold.startS,
         params,
         wetness: 1,
+        phase: 0,
       });
     }
   }

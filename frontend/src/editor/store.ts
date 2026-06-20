@@ -52,6 +52,14 @@ import { defaultColorGrade, type GradeParams } from "./fx/looks";
 import { defaultTapLengthS, fxCatalog } from "./fx/catalog";
 import type { ADSREnvelope } from "./fx/envelope";
 import { INSTANT_ENVELOPE } from "./fx/envelope";
+import {
+  DEFAULT_MOD_CONFIG,
+  type AudioEnvelope,
+  type LfoConfig,
+  type ModConfig,
+  type Modulation,
+  type SidechainConfig,
+} from "./fx/modulation";
 
 export interface BpmInfo {
   /** BPM (detected or user-overridden). */
@@ -352,6 +360,17 @@ interface EditorState {
    *  (oder INSTANT_ENVELOPE) zurück. In-memory only — gleiche Persistenz-
    *  Frage wie fxDefaults. */
   fxEnvelopes: Partial<Record<FxKind, ADSREnvelope>>;
+
+  /** Per-kind modulator config (timeMod + depth + lfo + sidechain) — the
+   *  M-screen edits this; baked into new PunchFx at beginFxHold alongside
+   *  the envelope. Missing → DEFAULT_MOD_CONFIG (envelope-only). */
+  fxModulations: Partial<Record<FxKind, ModConfig>>;
+
+  /** Normalized master-loudness curve (0..1 over master-audio seconds),
+   *  computed once from the decoded PCM at load. Drives sidechain
+   *  modulation and the sidechain widget's waveform/preview band. null
+   *  until the audio is decoded (or if decode failed). */
+  audioEnv: AudioEnvelope | null;
 
   /** Master-audio playback gain. 1.0 = source level (default), 0 = muted,
    *  2.0 = +6 dB. Applied by `useAudioMaster` to the master `<audio>`
@@ -724,6 +743,16 @@ interface EditorState {
   /** Reset envelope for `kind` back to the catalog's defaultEnvelope
    *  (or INSTANT_ENVELOPE if none). Used by double-click on ADSR knots. */
   resetFxEnvelope(kind: FxKind): void;
+  /** Pick the active time-modulator for a kind (LFO vs sidechain). */
+  setFxTimeMod(kind: FxKind, timeMod: "lfo" | "sidechain"): void;
+  /** Set how strongly the modulator grabs the intensity (0..1). */
+  setFxModDepth(kind: FxKind, depth: number): void;
+  /** Patch the kind's LFO config (shape / rate / beatSync). */
+  setFxLfo(kind: FxKind, patch: Partial<LfoConfig>): void;
+  /** Patch the kind's sidechain config (threshold / attack / release / invert). */
+  setFxSidechain(kind: FxKind, patch: Partial<SidechainConfig>): void;
+  /** Store the master-loudness curve computed from decoded PCM at load. */
+  setAudioEnv(env: AudioEnvelope | null): void;
 
   setProgramStripMode(mode: UiSlice["programStripMode"]): void;
   setFxPanelOpen(open: boolean): void;
@@ -1083,6 +1112,8 @@ export const useEditorStore = create<EditorState>()(
     selectedFxKind: "vignette",
     fxDefaults: {},
     fxEnvelopes: {},
+    fxModulations: {},
+    audioEnv: null,
     audioVolume: 1.0,
     arrangementSegments: [],
 
@@ -1112,6 +1143,8 @@ export const useEditorStore = create<EditorState>()(
         selectedFxKind: "vignette",
         fxDefaults: {},
         fxEnvelopes: {},
+        fxModulations: {},
+        audioEnv: null,
         audioVolume: 1.0,
         arrangementSegments: [],
       });
@@ -1185,6 +1218,8 @@ export const useEditorStore = create<EditorState>()(
         selectedFxKind: "vignette",
         fxDefaults: {},
         fxEnvelopes: {},
+        fxModulations: {},
+        audioEnv: null,
         audioVolume:
           typeof opts?.audioVolume === "number" && opts.audioVolume >= 0
             ? Math.min(4, opts.audioVolume)
@@ -1318,12 +1353,12 @@ export const useEditorStore = create<EditorState>()(
     setPlaying(playing) {
       const s = get();
       if (s.playback.isPlaying === playing) return;
-      // Latched preview holds (created via pad-click while paused) only
-      // make sense while the playhead is frozen. The moment playback
-      // starts, drop them — otherwise the descriptor would synthesise a
-      // transient FX every frame on top of any persistent recording.
-      let nextHolds = s.fxHolds;
       if (playing) {
+        // Latched preview holds (created via pad-click while paused) only
+        // make sense while the playhead is frozen. The moment playback
+        // starts, drop them — otherwise the descriptor would synthesise a
+        // transient FX every frame on top of any persistent recording.
+        let nextHolds = s.fxHolds;
         let dropped = false;
         const filtered: Record<string, FxHoldEntry> = {};
         for (const [slot, h] of Object.entries(s.fxHolds)) {
@@ -1334,11 +1369,24 @@ export const useEditorStore = create<EditorState>()(
           filtered[slot] = h;
         }
         if (dropped) nextHolds = filtered;
+        set({
+          playback: { ...s.playback, isPlaying: true },
+          fxHolds: nextHolds,
+        });
+        return;
       }
-      set({
-        playback: { ...s.playback, isPlaying: playing },
-        fxHolds: nextHolds,
-      });
+      // Stopping. A persistent (recording) hold whose pad-pointerup never
+      // arrives — window blur, tab switch, or the auto-stop at song end —
+      // would otherwise dangle in `fxHolds` forever: its `outS` keeps
+      // growing on the next play and clearAllFx can't remove it (it
+      // preserves live recordings by design). Finalize each persistent
+      // hold here via the normal release path so it becomes an ordinary
+      // committed capsule that can be erased / cleared. Preview holds are
+      // valid while paused, so they stay.
+      set({ playback: { ...s.playback, isPlaying: false } });
+      for (const [slot, h] of Object.entries(s.fxHolds)) {
+        if (h.mode === "persistent") get().endFxHold(slot);
+      }
     },
     setLoop(loop) {
       const { trim, arrangementSegments } = get();
@@ -2560,6 +2608,17 @@ export const useEditorStore = create<EditorState>()(
       const userEnv = s.fxEnvelopes[kind];
       const catalogEnv = fxCatalog[kind]?.defaultEnvelope;
       const envelope: ADSREnvelope = userEnv ?? catalogEnv ?? INSTANT_ENVELOPE;
+      // Freeze the full modulation (envelope + the kind's modulator config)
+      // into the capsule, mirroring the encoder/envelope recording-head
+      // freeze — what's dialled in at the moment of the punch is what plays.
+      const modCfg = s.fxModulations[kind] ?? DEFAULT_MOD_CONFIG;
+      const modulation: Modulation = {
+        envelope: { ...envelope },
+        timeMod: modCfg.timeMod,
+        depth: modCfg.depth,
+        lfo: { ...modCfg.lfo },
+        side: { ...modCfg.side },
+      };
       // Clobber sees the new fx's eventual footprint (incl. release
       // tail) so a rapid same-spot retrigger erases the previous fx in
       // full instead of leaving a release-tail stub behind. Also tape-
@@ -2580,6 +2639,7 @@ export const useEditorStore = create<EditorState>()(
         outS,
         params,
         envelope: { ...envelope },
+        modulation,
       };
       const nextFx = [...clobbered, newFx];
 
@@ -2815,6 +2875,43 @@ export const useEditorStore = create<EditorState>()(
       const next = { ...cur };
       delete next[kind];
       set({ fxEnvelopes: next });
+    },
+    setFxTimeMod(kind, timeMod) {
+      const cur = get().fxModulations[kind] ?? DEFAULT_MOD_CONFIG;
+      set({
+        fxModulations: { ...get().fxModulations, [kind]: { ...cur, timeMod } },
+      });
+    },
+    setFxModDepth(kind, depth) {
+      const cur = get().fxModulations[kind] ?? DEFAULT_MOD_CONFIG;
+      const clamped = depth < 0 ? 0 : depth > 1 ? 1 : depth;
+      set({
+        fxModulations: {
+          ...get().fxModulations,
+          [kind]: { ...cur, depth: clamped },
+        },
+      });
+    },
+    setFxLfo(kind, patch) {
+      const cur = get().fxModulations[kind] ?? DEFAULT_MOD_CONFIG;
+      set({
+        fxModulations: {
+          ...get().fxModulations,
+          [kind]: { ...cur, lfo: { ...cur.lfo, ...patch } },
+        },
+      });
+    },
+    setFxSidechain(kind, patch) {
+      const cur = get().fxModulations[kind] ?? DEFAULT_MOD_CONFIG;
+      set({
+        fxModulations: {
+          ...get().fxModulations,
+          [kind]: { ...cur, side: { ...cur.side, ...patch } },
+        },
+      });
+    },
+    setAudioEnv(env) {
+      set({ audioEnv: env });
     },
   })),
 );

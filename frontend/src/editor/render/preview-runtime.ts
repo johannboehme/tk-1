@@ -25,6 +25,10 @@ import {
   type VideoElementPoolOptions,
 } from "./video-element-pool";
 import { useEditorStore } from "../store";
+import {
+  effectiveBeatPhaseS,
+  effectiveBeatsPerBar,
+} from "../selectors/timing";
 import { isImageClip, isVideoClip, type Clip } from "../types";
 
 export type ClipUrlMap = Readonly<Record<string, { videoUrl: string }>>;
@@ -631,8 +635,13 @@ function defaultReadSnapshot(): EditorStoreSnapshot {
     selectedFxKind: s.selectedFxKind,
     fxDefaults: s.fxDefaults,
     fxEnvelopes: s.fxEnvelopes,
+    fxModulations: s.fxModulations,
     pills: s.pills,
     arrangementSegments: s.arrangementSegments,
+    bpm: s.jobMeta?.bpm?.value ?? null,
+    beatPhaseS: effectiveBeatPhaseS(s.jobMeta),
+    beatsPerBar: effectiveBeatsPerBar(s.jobMeta),
+    audioEnv: s.audioEnv,
   };
 }
 

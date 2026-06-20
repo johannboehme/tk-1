@@ -48,6 +48,7 @@ import { confirmDestructive } from "../lib/confirm";
 import { countEditsAffectedByCamRemoval } from "../local/edits-impact";
 import { buildPeakPyramidAsync } from "../local/waveform/build-pyramid-async";
 import type { PeakPyramid } from "../local/waveform/peak-pyramid";
+import { buildLoudnessEnvelope } from "../editor/fx/audio-envelope";
 import { exportSpecToRenderOpts } from "../editor/exportPresets";
 import { loadAssetFile } from "../local/asset-source";
 import type { ClipInit } from "../editor/store";
@@ -785,6 +786,17 @@ export default function Editor() {
           storedPills: j.pills ?? [],
         },
       );
+
+      // Master-loudness envelope for sidechain modulation (+ the sidechain
+      // widget). MUST run AFTER loadJob — loadJob resets per-job state
+      // including audioEnv, so setting it earlier gets clobbered (that's
+      // why the sidechain showed "NO AUDIO"). Reuses the decoded PCM.
+      if (studioPcm) {
+        useEditorStore
+          .getState()
+          .setAudioEnv(buildLoudnessEnvelope(studioPcm, studioSampleRate));
+      }
+
       // E2E hook (dev only) — Playwright reads `arrangementSegments[]`
       // length via `window.__editorTestHooks` so the screenshot script
       // can verify the long-form handoff without re-importing the

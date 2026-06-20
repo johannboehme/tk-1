@@ -198,90 +198,43 @@ const VIGNETTE: FxDefinition = {
   },
 };
 
-// — Helpers für Bipolar-Params (LFO-Style) ——————————————————
+// — Macro helpers ————————————————————————————————————————————
 //
-// Mehrere FX (ECHO, ZOOM, TAPE) haben einen Time-Param der bipolar
-// im Encoder geführt wird: linke Hälfte free, rechte Hälfte synced
-// auf Beat-Divisions {1/16, 1/8, 1/4, 1/2, 1, 2, 4}. Die Backend-Logic
-// muss daraus eine Periode (in Sekunden) ableiten, die dann mit der
-// capsule-local-time zu einem 0..1 Phase-Wert wird (für sin-LFOs etc.).
+// Time-based movement (the old per-effect "LFO" knobs) is gone: the
+// uniform modulation engine (see ./modulation.ts) drives every effect's
+// INTENSITY centrally (envelope ⊗ LFO|sidechain) and hands the result in
+// as `wetness`. Each effect now exposes two opinionated linear macros and
+// scales itself by `wetness` in `applyWetness`. The only residual
+// self-animation is WEAR's tracking bar, whose roll is a tasteful macro.
 
-const BEAT_STOPS_S: readonly number[] = [
-  // Sekunden bei 120 BPM Default (= 0.5 s pro Beat). Wenn das Job-BPM
-  // gesetzt ist, könnte der Renderer das mitziehen — V1 ist bewusst
-  // BPM-frei (der Backend-Pass sieht keinen BPM-Context), wir nehmen
-  // den Default als pragmatische Konstante.
-  // 1/16, 1/8, 1/4, 1/2, 1, 2, 4 beats at 120 BPM:
-  0.5 / 4, // 1/16 = 0.125 s
-  0.5 / 2, // 1/8  = 0.25 s
-  0.5 / 1, // 1/4  = 0.5 s
-  0.5 * 2, // 1/2  = 1.0 s
-  0.5 * 4, // 1    = 2.0 s
-  0.5 * 8, // 2    = 4.0 s
-  0.5 * 16, // 4    = 8.0 s
-];
-
-/** Resolve a bipolar 0..1 value to a period in seconds.
- *  - ~0.5:    "OFF" → returns Infinity (no LFO modulation)
- *  - 0..0.48: free side; near OFF = slowest, full left = fastest
- *  - 0.52..1: synced side; near OFF = slowest beat (4×), far right = 1/16
- *
- *  TE convention: the OFF detent at 12 o'clock is the "do nothing" pose,
- *  so the SLOWEST modulation lives one nudge away from OFF (it's the
- *  closest thing to "barely doing anything"), and the fastest sits at
- *  the extremes. Going far from centre = pushing harder. Returns
- *  Infinity for OFF so callers can branch on isFinite. */
-function bipolarPeriodS(v: number): number {
-  if (v >= 0.48 && v <= 0.52) return Infinity; // OFF detent
-  if (v < 0.5) {
-    // Free: t=0 at full left (fastest), t=1 near OFF (slowest free).
-    const t = v / 0.48;
-    return 0.04 + t * (2.0 - 0.04);
-  }
-  // Synced: 7 buckets evenly across 0.52..1.0. Near OFF maps to the
-  // slowest beat (4×), far right maps to 1/16. Indexing into
-  // BEAT_STOPS_S in reverse gives the TE-style "extreme = fast" layout.
-  const tt = (v - 0.5) / 0.5; // 0..1
-  const idx = Math.min(6, Math.max(0, Math.round(tt * 7 - 0.5)));
-  return BEAT_STOPS_S[BEAT_STOPS_S.length - 1 - idx];
+/** WEAR tracking-bar vertical position 0..1, scrolling at a roll-macro-
+ *  controlled speed off master-time `t`. roll 0 → static bar. */
+function wearDriftPhase(t: number, roll: number): number {
+  const hz = clamp01(roll) * 0.5; // up to 0.5 cycles/s (2 s per pass)
+  const p = (t * hz) % 1;
+  return p < 0 ? p + 1 : p;
 }
 
-/** Compute the LFO phase 0..1 within the current period for a capsule
- *  at master-time `t` (capsule started at `inS`). For "OFF" period
- *  returns 0 so the FX shader sees a stationary phase. */
-function lfoPhase(t: number, inS: number, period: number): number {
-  if (!isFinite(period) || period <= 0) return 0;
-  const local = Math.max(0, t - inS);
-  return (local % period) / period;
-}
-
-/** One-shot phase: ramps 0→1 over the period and HOLDS at 1. Used for
- *  effects whose semantics are "this happens once and stays" — TAPE-stop
- *  is the canonical case (the tape slows down, then is stationary;
- *  it does NOT periodically un-stop). */
-function oneShotPhase(t: number, inS: number, period: number): number {
-  if (!isFinite(period) || period <= 0) return 0;
-  const local = Math.max(0, t - inS);
-  return Math.min(1, local / period);
-}
+/** ECHO trail direction — a fixed tasteful up-left diagonal (phase units,
+ *  0..1 mapped to 0..2π in the shader / cos-sin axis in canvas2d). */
+const ECHO_DIR_PHASE = 0.125;
 
 // — WEAR — Vintage-VHS-Verschleiß ———————————————————————————
 
 const WEAR_DEFAULTS = {
-  /** 0..1 — Master-Intensität. 0 = clean pass-through, 1 = totales
-   *  VHS-Wrack mit Dropout-Flecken und maximalem Color-Bleed. */
+  /** 0..1 — AGE macro. Master wear amount: Y/C bleed, head misalign,
+   *  burn-in tint, tracking-bar visibility all scale with it. */
   decay: 0.55,
-  /** 0..1 — bipolar; siehe `bipolarPeriodS`. Steuert die Periode der
-   *  Tracking-Bar-Bewegung. OFF-Detent = Bar versteckt. Default 0.821
-   *  = synced auf 1 Beat (langsame, ruhige Wanderung). */
-  drift: 0.821,
+  /** 0..1 — ROLL macro. Speed the VHS tracking bar scrolls down the
+   *  frame. 0 = static bar, 1 = fast roll. */
+  roll: 0.4,
 } as const;
 
-function wearParams(fx: PunchFx): { decay: number; drift: number } {
+function wearParams(fx: PunchFx): { decay: number; roll: number } {
   const p = fx.params ?? {};
   const decay = clamp01(p.decay ?? WEAR_DEFAULTS.decay);
-  const drift = clamp01(p.drift ?? WEAR_DEFAULTS.drift);
-  return { decay, drift };
+  const roll = clamp01(p.roll ?? WEAR_DEFAULTS.roll);
+  return { decay, roll };
 }
 
 const WEAR: FxDefinition = {
@@ -295,17 +248,17 @@ const WEAR: FxDefinition = {
   params: [
     {
       id: "decay",
-      label: "DECAY",
+      label: "AGE",
       kind: "linear",
       defaultValue: WEAR_DEFAULTS.decay,
       min: 0,
       max: 1,
     },
     {
-      id: "drift",
-      label: "DRIFT",
-      kind: "bipolar",
-      defaultValue: WEAR_DEFAULTS.drift,
+      id: "roll",
+      label: "ROLL",
+      kind: "linear",
+      defaultValue: WEAR_DEFAULTS.roll,
       min: 0,
       max: 1,
     },
@@ -314,10 +267,9 @@ const WEAR: FxDefinition = {
   defaultLengthS: 0,
 
   drawCanvas2D(ctx, fx, w, h, t, source) {
-    const { decay, drift } = wearParams(fx);
+    const { decay, roll } = wearParams(fx);
     if (!source) return;
-    const period = bipolarPeriodS(drift);
-    const driftPhase = isFinite(period) ? lfoPhase(t, fx.inS, period) : -1;
+    const driftPhase = wearDriftPhase(t, roll);
     ctx.save();
     ctx.clearRect(0, 0, w, h);
 
@@ -375,9 +327,8 @@ const WEAR: FxDefinition = {
   },
 
   drawWebGL2(ctx, fx, w, h, t) {
-    const { decay, drift } = wearParams(fx);
-    const period = bipolarPeriodS(drift);
-    const driftPhase = isFinite(period) ? lfoPhase(t, fx.inS, period) : -1;
+    const { decay, roll } = wearParams(fx);
+    const driftPhase = wearDriftPhase(t, roll);
     ctx.setBlendMode("replace");
     ctx.useProgram("wear");
     ctx.bindSourceTexture("u_source");
@@ -388,9 +339,8 @@ const WEAR: FxDefinition = {
     ctx.drawFullscreenQuad();
   },
   drawWebGPU(ctx, fx, w, h, t) {
-    const { decay, drift } = wearParams(fx);
-    const period = bipolarPeriodS(drift);
-    const driftPhase = isFinite(period) ? lfoPhase(t, fx.inS, period) : -1;
+    const { decay, roll } = wearParams(fx);
+    const driftPhase = wearDriftPhase(t, roll);
     ctx.setBlendMode("replace");
     ctx.useProgram("wear");
     ctx.bindSourceTexture();
@@ -400,10 +350,11 @@ const WEAR: FxDefinition = {
     ctx.setUniform2f("texel", w > 0 ? 1 / w : 0, h > 0 ? 1 / h : 0);
     ctx.drawFullscreenQuad();
   },
-  // Wear's master amount is `decay` — every component (Y/C bleed,
+  // Wear's master amount is `decay` (AGE) — every component (Y/C bleed,
   // tracking-bar visibility, wobble depth, grain density, dropouts,
-  // tint) scales internally with it. Drift (LFO timing) keeps its
-  // direction; only the wear-amount fades with the envelope.
+  // tint) scales internally with it, so dimming it with the intensity
+  // (`wetness`) fades the whole effect to a clean pass-through at 0.
+  // ROLL (bar scroll speed) keeps its timing.
   applyWetness(params, wetness) {
     return { ...params, decay: (params.decay ?? 0) * wetness };
   },
@@ -524,7 +475,7 @@ function createOffscreen(
 
 // — ZOOM — Beat-Pump (source-resample) ——————————————————————
 
-const ZOOM_DEFAULTS = { punch: 0.5, rate: 0.821 } as const;
+const ZOOM_DEFAULTS = { punch: 0.5, push: 0.8 } as const;
 
 const ZOOM: FxDefinition = {
   kind: "zoom",
@@ -534,19 +485,21 @@ const ZOOM: FxDefinition = {
   defaultParams: { ...ZOOM_DEFAULTS },
   params: [
     { id: "punch", label: "PUNCH", kind: "linear", defaultValue: ZOOM_DEFAULTS.punch, min: 0, max: 1 },
-    // RATE bipolar — left=free, right=beat-synced (1/16..4)
-    { id: "rate", label: "RATE", kind: "bipolar", defaultValue: ZOOM_DEFAULTS.rate, min: 0, max: 1 },
+    // PUSH — how aggressively the zoom engages (static curve shaper).
+    { id: "push", label: "PUSH", kind: "linear", defaultValue: ZOOM_DEFAULTS.push, min: 0, max: 1 },
   ],
   defaultLengthBeats: 0,
   defaultLengthS: 0,
 
-  drawCanvas2D(ctx, fx, w, h, t, source) {
+  drawCanvas2D(ctx, fx, w, h, _t, source) {
     const p = fx.params ?? {};
     const punch = clamp01(p.punch ?? ZOOM_DEFAULTS.punch);
-    const rate = clamp01(p.rate ?? ZOOM_DEFAULTS.rate);
+    const push = clamp01(p.push ?? ZOOM_DEFAULTS.push);
     if (punch <= 0 || !source) return;
-    const period = bipolarPeriodS(rate);
-    const phase = lfoPhase(t, fx.inS, period);
+    // No internal LFO — the zoom magnitude is driven by `punch` (which the
+    // intensity bus scales via wetness). PUSH shapes how much of the punch
+    // engages, via the same pow curve the shader uses (phase = 1 - push).
+    const phase = 1 - push;
     const pulse = Math.pow(1 - phase, 4);
     const zoom = 1 + punch * 0.3 * pulse;
     if (zoom <= 1.0001) return;
@@ -562,12 +515,11 @@ const ZOOM: FxDefinition = {
     ctx.restore();
   },
 
-  drawWebGL2(ctx, fx, _w, _h, t) {
+  drawWebGL2(ctx, fx, _w, _h, _t) {
     const p = fx.params ?? {};
     const punch = clamp01(p.punch ?? ZOOM_DEFAULTS.punch);
-    const rate = clamp01(p.rate ?? ZOOM_DEFAULTS.rate);
-    const period = bipolarPeriodS(rate);
-    const phase = lfoPhase(t, fx.inS, period);
+    const push = clamp01(p.push ?? ZOOM_DEFAULTS.push);
+    const phase = 1 - push;
     ctx.setBlendMode("replace");
     ctx.useProgram("zoom");
     ctx.bindSourceTexture("u_source");
@@ -575,12 +527,11 @@ const ZOOM: FxDefinition = {
     ctx.setUniform1f("u_phase", phase);
     ctx.drawFullscreenQuad();
   },
-  drawWebGPU(ctx, fx, _w, _h, t) {
+  drawWebGPU(ctx, fx, _w, _h, _t) {
     const p = fx.params ?? {};
     const punch = clamp01(p.punch ?? ZOOM_DEFAULTS.punch);
-    const rate = clamp01(p.rate ?? ZOOM_DEFAULTS.rate);
-    const period = bipolarPeriodS(rate);
-    const phase = lfoPhase(t, fx.inS, period);
+    const push = clamp01(p.push ?? ZOOM_DEFAULTS.push);
+    const phase = 1 - push;
     ctx.setBlendMode("replace");
     ctx.useProgram("zoom");
     ctx.bindSourceTexture();
@@ -691,7 +642,7 @@ const UV: FxDefinition = {
 
 // — ECHO — Stateless Multi-Tap Trail ————————————————————————
 
-const ECHO_DEFAULTS = { trail: 0.679, mix: 0.5 } as const;
+const ECHO_DEFAULTS = { spread: 0.6, feedback: 0.5 } as const;
 
 const ECHO: FxDefinition = {
   kind: "echo",
@@ -700,20 +651,20 @@ const ECHO: FxDefinition = {
   capsuleColor: "#9C5BD9",
   defaultParams: { ...ECHO_DEFAULTS },
   params: [
-    { id: "trail", label: "TRAIL", kind: "bipolar", defaultValue: ECHO_DEFAULTS.trail, min: 0, max: 1 },
-    { id: "mix", label: "MIX", kind: "linear", defaultValue: ECHO_DEFAULTS.mix, min: 0, max: 1 },
+    { id: "spread", label: "SPREAD", kind: "linear", defaultValue: ECHO_DEFAULTS.spread, min: 0, max: 1 },
+    { id: "feedback", label: "FEED", kind: "linear", defaultValue: ECHO_DEFAULTS.feedback, min: 0, max: 1 },
   ],
   defaultLengthBeats: 0,
   defaultLengthS: 0,
 
-  drawCanvas2D(ctx, fx, w, h, t, source) {
+  drawCanvas2D(ctx, fx, w, h, _t, source) {
     const p = fx.params ?? {};
-    const trail = clamp01(p.trail ?? ECHO_DEFAULTS.trail);
-    const mix = clamp01(p.mix ?? ECHO_DEFAULTS.mix);
+    const trail = clamp01(p.spread ?? ECHO_DEFAULTS.spread);
+    const mix = clamp01(p.feedback ?? ECHO_DEFAULTS.feedback);
     if (!source || mix <= 0) return;
-    const period = bipolarPeriodS(trail);
-    const phase = lfoPhase(t, fx.inS, period);
-    const a = phase * Math.PI * 2;
+    // Fixed trail direction — no internal LFO; the beat motion now comes
+    // from the intensity bus pumping `feedback` via wetness.
+    const a = ECHO_DIR_PHASE * Math.PI * 2;
     const ax = Math.cos(a);
     const ay = Math.sin(a);
     // Stateless trail: draw 5 offset copies behind axis with decaying alpha.
@@ -735,44 +686,41 @@ const ECHO: FxDefinition = {
     ctx.restore();
   },
 
-  drawWebGL2(ctx, fx, _w, _h, t) {
+  drawWebGL2(ctx, fx, _w, _h, _t) {
     const p = fx.params ?? {};
-    const trail = clamp01(p.trail ?? ECHO_DEFAULTS.trail);
-    const mix = clamp01(p.mix ?? ECHO_DEFAULTS.mix);
-    const period = bipolarPeriodS(trail);
-    const phase = lfoPhase(t, fx.inS, period);
+    const trail = clamp01(p.spread ?? ECHO_DEFAULTS.spread);
+    const mix = clamp01(p.feedback ?? ECHO_DEFAULTS.feedback);
     ctx.setBlendMode("replace");
     ctx.useProgram("echo");
     ctx.bindSourceTexture("u_source");
     ctx.setUniform1f("u_trail", trail);
     ctx.setUniform1f("u_mix", mix);
-    ctx.setUniform1f("u_phase", phase);
+    ctx.setUniform1f("u_phase", ECHO_DIR_PHASE);
     ctx.drawFullscreenQuad();
   },
-  drawWebGPU(ctx, fx, _w, _h, t) {
+  drawWebGPU(ctx, fx, _w, _h, _t) {
     const p = fx.params ?? {};
-    const trail = clamp01(p.trail ?? ECHO_DEFAULTS.trail);
-    const mix = clamp01(p.mix ?? ECHO_DEFAULTS.mix);
-    const period = bipolarPeriodS(trail);
-    const phase = lfoPhase(t, fx.inS, period);
+    const trail = clamp01(p.spread ?? ECHO_DEFAULTS.spread);
+    const mix = clamp01(p.feedback ?? ECHO_DEFAULTS.feedback);
     ctx.setBlendMode("replace");
     ctx.useProgram("echo");
     ctx.bindSourceTexture();
     ctx.setUniform1f("trail", trail);
     ctx.setUniform1f("mix", mix);
-    ctx.setUniform1f("phase", phase);
+    ctx.setUniform1f("phase", ECHO_DIR_PHASE);
     ctx.drawFullscreenQuad();
   },
-  // Echo's `mix` is its wet/dry — at mix=0 the additive trails vanish
-  // and only the source survives. Trail (LFO timing) keeps direction.
+  // Echo's `feedback` is its wet/dry — at 0 the additive trails vanish and
+  // only the source survives, so dimming it with the intensity (`wetness`)
+  // fades the whole effect out. SPREAD (trail length) keeps its reach.
   applyWetness(params, wetness) {
-    return { ...params, mix: (params.mix ?? 0) * wetness };
+    return { ...params, feedback: (params.feedback ?? 0) * wetness };
   },
 };
 
 // — TAPE — Stateless Tape-Stop Approximation ————————————————
 
-const TAPE_DEFAULTS = { bend: 0.679, warp: 0.5 } as const;
+const TAPE_DEFAULTS = { stop: 0.7, warp: 0.5 } as const;
 
 const TAPE: FxDefinition = {
   kind: "tape",
@@ -781,26 +729,21 @@ const TAPE: FxDefinition = {
   capsuleColor: "#E5A100",
   defaultParams: { ...TAPE_DEFAULTS },
   params: [
-    { id: "bend", label: "BEND", kind: "bipolar", defaultValue: TAPE_DEFAULTS.bend, min: 0, max: 1 },
+    { id: "stop", label: "STOP", kind: "linear", defaultValue: TAPE_DEFAULTS.stop, min: 0, max: 1 },
     { id: "warp", label: "WARP", kind: "linear", defaultValue: TAPE_DEFAULTS.warp, min: 0, max: 1 },
   ],
   defaultLengthBeats: 0,
   defaultLengthS: 0,
 
-  drawCanvas2D(ctx, fx, w, h, t, source) {
+  drawCanvas2D(ctx, fx, w, h, _t, source) {
     const p = fx.params ?? {};
-    const bend = clamp01(p.bend ?? TAPE_DEFAULTS.bend);
+    // STOP = tape-stop progression (band drift / darken depth). WARP =
+    // chroma + texture depth. Both are scaled by the intensity bus
+    // (wetness) in applyWetness, so the whole stop pumps with envelope /
+    // LFO / sidechain and collapses to a clean image at 0.
+    const phase = clamp01(p.stop ?? TAPE_DEFAULTS.stop);
     const warp = clamp01(p.warp ?? TAPE_DEFAULTS.warp);
     if (!source) return;
-    const period = bipolarPeriodS(bend);
-    // One-shot: tape decelerates over `period`, then stays stopped.
-    // The envelope's wetness raises the phase floor — with a rectangle
-    // envelope (wetness=1 from t=0) the tape is already at full warp
-    // when the region starts, instead of waiting for `bend`'s slow
-    // ramp. With a soft attack, the floor rises gradually.
-    const oneShot = oneShotPhase(t, fx.inS, period);
-    const phaseFloor = clamp01(p.phaseFloor ?? 0);
-    const phase = Math.max(oneShot, phaseFloor);
     const warpScale = 0.5 + warp * 0.5;
     ctx.save();
     ctx.clearRect(0, 0, w, h);
@@ -856,14 +799,10 @@ const TAPE: FxDefinition = {
     ctx.restore();
   },
 
-  drawWebGL2(ctx, fx, _w, _h, t) {
+  drawWebGL2(ctx, fx, _w, _h, _t) {
     const p = fx.params ?? {};
-    const bend = clamp01(p.bend ?? TAPE_DEFAULTS.bend);
+    const phase = clamp01(p.stop ?? TAPE_DEFAULTS.stop);
     const warp = clamp01(p.warp ?? TAPE_DEFAULTS.warp);
-    const period = bipolarPeriodS(bend);
-    const oneShot = oneShotPhase(t, fx.inS, period);
-    const phaseFloor = clamp01(p.phaseFloor ?? 0);
-    const phase = Math.max(oneShot, phaseFloor);
     ctx.setBlendMode("replace");
     ctx.useProgram("tape");
     ctx.bindSourceTexture("u_source");
@@ -871,14 +810,10 @@ const TAPE: FxDefinition = {
     ctx.setUniform1f("u_phase", phase);
     ctx.drawFullscreenQuad();
   },
-  drawWebGPU(ctx, fx, _w, _h, t) {
+  drawWebGPU(ctx, fx, _w, _h, _t) {
     const p = fx.params ?? {};
-    const bend = clamp01(p.bend ?? TAPE_DEFAULTS.bend);
+    const phase = clamp01(p.stop ?? TAPE_DEFAULTS.stop);
     const warp = clamp01(p.warp ?? TAPE_DEFAULTS.warp);
-    const period = bipolarPeriodS(bend);
-    const oneShot = oneShotPhase(t, fx.inS, period);
-    const phaseFloor = clamp01(p.phaseFloor ?? 0);
-    const phase = Math.max(oneShot, phaseFloor);
     ctx.setBlendMode("replace");
     ctx.useProgram("tape");
     ctx.bindSourceTexture();
@@ -886,23 +821,15 @@ const TAPE: FxDefinition = {
     ctx.setUniform1f("phase", phase);
     ctx.drawFullscreenQuad();
   },
-  // Tape's visual stop is driven by `warp` (chroma + darken depth).
-  // At wetness=0 the warp collapses to 0 → no smear, no darkening,
-  // no chromatic split → identity image. Bend (which sets the one-shot
-  // ramp duration) is left alone so the timing the user dialed in
-  // still applies if/when wetness rises.
-  //
-  // We also pass wetness as a `phaseFloor` synthetic param: with a
-  // rectangle envelope (wetness=1 instantly) the tape phase jumps to
-  // full at t=0 instead of waiting for `bend`'s ramp — matches the
-  // user's mental model that "rectangle envelope = effect on now".
-  // With a soft envelope, the floor rises gradually; bend's one-shot
-  // can still overtake if it's faster.
+  // Tape's stop reads from STOP (u_phase: band drift + darken) and WARP
+  // (u_warp: chroma + grain). The intensity bus scales BOTH by wetness so
+  // the whole tape-stop pumps with the envelope / LFO / sidechain and
+  // collapses to a clean image at wetness 0.
   applyWetness(params, wetness) {
     return {
       ...params,
+      stop: (params.stop ?? 0) * wetness,
       warp: (params.warp ?? 0) * wetness,
-      phaseFloor: wetness,
     };
   },
 };

@@ -97,6 +97,14 @@ export interface EditWorkerInput {
   /** Punch-in FX (visual effects with in/out spans). Same shape the
    *  editor store holds; passed through verbatim to the compositor. */
   fx?: PunchFx[];
+  /** Real song tempo + beat grid for beat-synced FX modulation. null bpm
+   *  disables beat-sync. */
+  bpm?: number | null;
+  beatPhaseS?: number;
+  beatsPerBar?: number;
+  /** Normalized master-loudness curve (0..1 over master seconds) for
+   *  sidechain FX modulation. Transferred (Float32Array) from the host. */
+  audioEnv?: import("../../editor/fx/modulation").AudioEnvelope | null;
   /** The single global color grade — same shape the editor store holds. */
   colorGrade?: GradeParams;
   /** The opinionated filter stack — same shape the editor store holds; passed
@@ -213,6 +221,10 @@ ctx.addEventListener("message", async (e: MessageEvent<EditWorkerMessage>) => {
       energy: input.energy,
       visualizers,
       fx: input.fx,
+      bpm: input.bpm,
+      beatPhaseS: input.beatPhaseS,
+      beatsPerBar: input.beatsPerBar,
+      audioEnv: input.audioEnv,
       colorGrade: input.colorGrade,
       filterSlots: input.filterSlots,
       offsetMs: input.offsetMs,
