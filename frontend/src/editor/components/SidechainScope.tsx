@@ -1,17 +1,18 @@
 /**
- * Sidechain scope — the Ableton-style marquee widget.
+ * Sidechain scope — an Ableton-style marquee that is a true LENS over the
+ * timeline's master-audio lane.
  *
- * A phosphor-LCD field that shows a ZOOMED, playhead-centred window of the
- * master-loudness envelope (~8 beats wide) so individual hits — the kick,
- * the snare — are legible. Faint beat grid-lines mark where the beats fall,
- * a draggable threshold line sets the level above which the effect engages,
- * and a tinted band shows the resulting effect-strength (the follower
- * curve) responding in real time. Renderer and this widget sample the SAME
- * follower curve, so what you see is what plays.
+ * It mirrors the timeline's EXACT visible window (same arrangement-time
+ * range, derived from the shared ui.zoom + ui.scrollX + arrangement
+ * duration) and maps every column arr→master before reading the
+ * master-indexed amplitude envelope — so the peaks line up 1:1 with the
+ * timeline audio lane, including across pill/segment seams in long-form.
+ * Columns are MIN/MAX-bucketed (peak per column), not point-sampled, so the
+ * waveform is stable while playback pages the window (no shimmer/"wabern").
  *
- * Drawing the whole song squashed into the width (the old behaviour) made
- * the peaks unreadable — you couldn't tell a kick from a hi-hat, let alone
- * tune a threshold to it. The window scrolls with the playhead instead.
+ * Overlaid: a draggable threshold line, the resulting effect-strength band
+ * (the follower curve, same one the renderer uses), beat grid-lines, and
+ * the playhead at its true position in the window.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useEditorStore } from "../store";
@@ -23,19 +24,19 @@ import {
   type AudioEnvelope,
 } from "../fx/modulation";
 import { arrBeatPhaseS, effectiveBeatsPerBar } from "../selectors/timing";
-import { arrToMaster } from "../arrangement-time";
+import { arrToMaster, totalArrDuration } from "../arrangement-time";
 
 const LCD_GREEN = "#9FE08E";
 const RENDER_W = 280; // logical px (SVG viewBox); scales to container
 const RENDER_H = 80;
 const PAD_X = 4;
 const PAD_Y = 5;
-/** How many beats the window spans — wide enough for context, tight enough
- *  that a single kick is a clear, separate peak. Clamped to a seconds range
- *  for very slow / very fast tempos (and when BPM is unknown). */
-const BEATS_VISIBLE = 8;
-const MIN_SPAN_S = 2;
-const MAX_SPAN_S = 8;
+/** Fallback window (no arrangement) — ~8 beats so a kick is a clear peak. */
+const FALLBACK_BEATS = 8;
+
+function clamp01(v: number): number {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
 
 /** Linear-interpolated sample of a 0..1 envelope at master-time `tSec`. */
 function sampleEnv(env: AudioEnvelope, tSec: number): number {
@@ -51,9 +52,15 @@ function sampleEnv(env: AudioEnvelope, tSec: number): number {
   return data[i] * (1 - f) + data[i + 1] * f;
 }
 
-/** Filled area path sampled per-pixel across the visible window. */
-function windowAreaPath(
-  sampleAt: (t: number) => number,
+/**
+ * Filled area path, PEAK-bucketed per column: each column takes the max
+ * envelope value over the arr-time slice it covers, mapped arr→master. This
+ * keeps the waveform identical to the timeline (which also min/max buckets)
+ * and stable as the window pages — point-sampling shimmered instead.
+ */
+function peakAreaPath(
+  envAtMaster: (masterT: number) => number,
+  toMaster: (arrT: number) => number,
   winStart: number,
   spanS: number,
   w: number,
@@ -62,11 +69,17 @@ function windowAreaPath(
   const innerW = w - 2 * PAD_X;
   const innerH = h - 2 * PAD_Y;
   const steps = Math.max(2, Math.round(innerW));
+  const SUB = 4; // sub-samples per column → capture the column's true peak
   let d = `M${PAD_X.toFixed(1)},${(h - PAD_Y).toFixed(1)}`;
   for (let i = 0; i <= steps; i++) {
     const x = PAD_X + (i / steps) * innerW;
-    const t = winStart + (i / steps) * spanS;
-    const v = Math.max(0, Math.min(1, sampleAt(t)));
+    let v = 0;
+    for (let k = 0; k < SUB; k++) {
+      const frac = (i + k / SUB) / steps;
+      const arrT = winStart + frac * spanS;
+      const s = clamp01(envAtMaster(toMaster(arrT)));
+      if (s > v) v = s;
+    }
     const y = PAD_Y + (1 - v) * innerH;
     d += ` L${x.toFixed(1)},${y.toFixed(1)}`;
   }
@@ -79,13 +92,13 @@ export function SidechainScope({ kind }: { kind: FxKind }) {
   const side =
     useEditorStore((s) => s.fxModulations[kind]?.side) ?? DEFAULT_SIDECHAIN;
   const setFxSidechain = useEditorStore((s) => s.setFxSidechain);
-  // Draw on the ARRANGEMENT axis (same as the timeline's audio lane), not
-  // raw master time — otherwise, in a long-form arrangement, the scope and
-  // the timeline show two different orderings of the same audio and the
-  // peaks don't line up. Each window x is mapped arr→master to read the
-  // loudness from the (master-indexed) envelope.
   const timelineT = useEditorStore((s) => s.playback.timelineT);
   const segments = useEditorStore((s) => s.arrangementSegments);
+  // The timeline's visible window is derived from these shared values
+  // (liveTimelineRange is always [0, arrTotal]), so we can reconstruct the
+  // EXACT same range here without lifting any local Timeline state.
+  const zoom = useEditorStore((s) => s.ui.zoom);
+  const scrollX = useEditorStore((s) => s.ui.scrollX);
   const bpm = useEditorStore((s) => s.jobMeta?.bpm?.value ?? null);
   const beatPhaseS = useEditorStore((s) =>
     arrBeatPhaseS(s.jobMeta, s.arrangementSegments),
@@ -104,14 +117,12 @@ export function SidechainScope({ kind }: { kind: FxKind }) {
       const innerTop = rect.top + (PAD_Y / RENDER_H) * rect.height;
       const innerH = rect.height * (1 - (2 * PAD_Y) / RENDER_H);
       const frac = innerH > 0 ? (clientY - innerTop) / innerH : 0;
-      const v = 1 - frac; // top = 1, bottom = 0
-      setFxSidechain(kind, { threshold: Math.max(0, Math.min(1, v)) });
+      setFxSidechain(kind, { threshold: clamp01(1 - frac) }); // top = 1
     },
     [kind, setFxSidechain],
   );
 
-  // Off-window release guard — mirror the Encoder's belt-and-suspenders so a
-  // pointerup outside the widget doesn't strand the drag.
+  // Off-window release guard — mirror the Encoder's belt-and-suspenders.
   useEffect(() => {
     if (!dragging) return;
     const move = (e: PointerEvent) => setThresholdFromClientY(e.clientY);
@@ -130,45 +141,51 @@ export function SidechainScope({ kind }: { kind: FxKind }) {
 
   const hasAudio = !!audioEnv && audioEnv.data.length > 0;
 
-  // Full follower curve (memoized by audio-env + config), sampled in the
-  // window below — never rebuilt per frame.
   const follower = useMemo(
     () => (hasAudio && audioEnv ? followerFor(audioEnv, side) : null),
     [hasAudio, audioEnv, side],
   );
 
-  const spanS =
-    bpm && bpm > 0
-      ? Math.min(MAX_SPAN_S, Math.max(MIN_SPAN_S, (BEATS_VISIBLE * 60) / bpm))
-      : 4;
-  const winStart = timelineT - spanS / 2; // playhead (arr-time) centred
+  // Reconstruct the timeline's exact visible arr-time window.
+  const arrTotal = totalArrDuration(segments);
+  let spanS: number;
+  let winStart: number;
+  if (arrTotal > 0) {
+    spanS = arrTotal / Math.max(1, zoom);
+    const maxScroll = Math.max(0, arrTotal - spanS);
+    winStart = Math.max(0, Math.min(maxScroll, scrollX));
+  } else {
+    // No arrangement → centre a fallback window on the playhead.
+    spanS = bpm && bpm > 0 ? Math.min(8, Math.max(2, (FALLBACK_BEATS * 60) / bpm)) : 4;
+    winStart = timelineT - spanS / 2;
+  }
   const innerW = RENDER_W - 2 * PAD_X;
+  const toMaster = (arrT: number) =>
+    arrTotal > 0 ? arrToMaster(arrT, segments) : arrT;
 
   let masterPath = "";
   let followerPath = "";
   const beatLines: { x: number; down: boolean }[] = [];
   if (hasAudio && audioEnv) {
-    // Each window position is arr-time; map to master-time to read the
-    // (master-indexed) loudness/follower so the scope matches the timeline.
-    const masterAt = (env: AudioEnvelope) => (arrT: number) =>
-      sampleEnv(env, arrToMaster(arrT, segments));
-    masterPath = windowAreaPath(
-      masterAt(audioEnv),
+    masterPath = peakAreaPath(
+      (m) => sampleEnv(audioEnv, m),
+      toMaster,
       winStart,
       spanS,
       RENDER_W,
       RENDER_H,
     );
     if (follower) {
-      followerPath = windowAreaPath(
-        masterAt(follower),
+      followerPath = peakAreaPath(
+        (m) => sampleEnv(follower, m),
+        toMaster,
         winStart,
         spanS,
         RENDER_W,
         RENDER_H,
       );
     }
-    if (bpm && bpm > 0) {
+    if (bpm && bpm > 0 && spanS > 0) {
       const period = 60 / bpm;
       const firstK = Math.ceil((winStart - beatPhaseS) / period);
       for (let k = firstK; ; k++) {
@@ -182,7 +199,12 @@ export function SidechainScope({ kind }: { kind: FxKind }) {
     }
   }
 
-  const playheadX = PAD_X + 0.5 * innerW; // centred
+  // Playhead at its TRUE position in the window (matches the timeline).
+  const playheadFrac = spanS > 0 ? (timelineT - winStart) / spanS : -1;
+  const playheadX =
+    playheadFrac >= 0 && playheadFrac <= 1
+      ? PAD_X + playheadFrac * innerW
+      : -1;
   const threshY = PAD_Y + (1 - side.threshold) * (RENDER_H - 2 * PAD_Y);
 
   return (
@@ -230,8 +252,6 @@ export function SidechainScope({ kind }: { kind: FxKind }) {
             setThresholdFromClientY(e.clientY);
           }}
         >
-          {/* beat grid — faint; downbeats brighter. Behind the waveform so
-              the hits read on top but you can still see where beats fall. */}
           {beatLines.map((b, i) => (
             <line
               key={i}
@@ -244,7 +264,6 @@ export function SidechainScope({ kind }: { kind: FxKind }) {
               strokeWidth={b.down ? 0.8 : 0.5}
             />
           ))}
-          {/* master loudness — dim phosphor fill */}
           <path
             d={masterPath}
             fill={LCD_GREEN}
@@ -253,7 +272,6 @@ export function SidechainScope({ kind }: { kind: FxKind }) {
             strokeOpacity={0.45}
             strokeWidth={0.7}
           />
-          {/* effect-strength band — tinted with the effect colour */}
           <path
             d={followerPath}
             fill={tint}
@@ -262,7 +280,6 @@ export function SidechainScope({ kind }: { kind: FxKind }) {
             strokeOpacity={0.9}
             strokeWidth={0.8}
           />
-          {/* threshold line */}
           <line
             x1={PAD_X}
             x2={RENDER_W - PAD_X}
@@ -272,16 +289,17 @@ export function SidechainScope({ kind }: { kind: FxKind }) {
             strokeWidth={dragging ? 1.6 : 1}
             strokeDasharray="3 2"
           />
-          {/* playhead (centred "now") */}
-          <line
-            x1={playheadX}
-            x2={playheadX}
-            y1={PAD_Y}
-            y2={RENDER_H - PAD_Y}
-            stroke="#FFFFFF"
-            strokeOpacity={0.55}
-            strokeWidth={0.8}
-          />
+          {playheadX >= 0 && (
+            <line
+              x1={playheadX}
+              x2={playheadX}
+              y1={PAD_Y}
+              y2={RENDER_H - PAD_Y}
+              stroke="#FFFFFF"
+              strokeOpacity={0.55}
+              strokeWidth={0.8}
+            />
+          )}
         </svg>
       ) : (
         <div
@@ -297,7 +315,6 @@ export function SidechainScope({ kind }: { kind: FxKind }) {
           NO AUDIO
         </div>
       )}
-      {/* threshold readout */}
       {hasAudio && (
         <span
           aria-hidden
