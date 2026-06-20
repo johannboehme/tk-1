@@ -34,8 +34,12 @@ import type { ViewportTransform } from "../../editor/types";
 import { activeFxAt } from "../../editor/fx/active";
 import { fxCatalog } from "../../editor/fx/catalog";
 import { envelopeAt, INSTANT_ENVELOPE } from "../../editor/fx/envelope";
-import type { GradeSlot } from "../../editor/fx/looks";
-import { gradeFrameFxFor } from "../../editor/render/build-descriptor";
+import type { GradeParams } from "../../editor/fx/looks";
+import type { FilterSlot } from "../../editor/fx/types";
+import {
+  colorGradeFrameFx,
+  filterFrameFx,
+} from "../../editor/render/build-descriptor";
 import {
   createBackend,
   type BackendCapabilities,
@@ -74,11 +78,12 @@ export interface CompositorOptions {
    *  visualizers and text overlays. Same `fxCatalog[kind]` impl as the
    *  live preview — single source of truth per kind. */
   fx?: readonly PunchFx[];
-  /** Global color-grade stack — the "film stock" layer. Applied to every
-   *  frame UNDER the punch-in accents (no in/out spans), so the export look
-   *  matches the preview. Same `gradeFrameFxFor` resolution as the live
-   *  preview. */
-  grades?: readonly GradeSlot[];
+  /** The single global color grade. Applied to every frame under everything,
+   *  so the export matches the preview. */
+  colorGrade?: GradeParams;
+  /** The opinionated filter stack. Applied above the grade, under the
+   *  punch-in accents, every frame. */
+  filterSlots?: readonly FilterSlot[];
 }
 
 // Per-element placement is shared with the live preview via
@@ -243,7 +248,8 @@ export class Compositor {
           .filter((f) => f.wetness > 0)
       : [];
     const fxFrame: FrameFx[] = [
-      ...gradeFrameFxFor(this.opts.grades),
+      ...colorGradeFrameFx(this.opts.colorGrade),
+      ...filterFrameFx(this.opts.filterSlots),
       ...punchFx,
     ];
 

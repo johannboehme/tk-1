@@ -3,11 +3,7 @@ import { fxCatalog } from "./catalog";
 import { REGISTERED_FRAGMENTS } from "./webgl2/program-cache";
 import { FX_WEBGPU_SPECS } from "./webgpu/registry";
 import { GRADE_SPEC } from "./webgpu/grade.wgsl";
-import {
-  GRADE_PARAM_KEYS,
-  defaultGradeSlot,
-  mergeGradeParams,
-} from "./looks";
+import { ENGINE_DEFAULTS, GRADE_PARAM_KEYS } from "./looks";
 import type { PunchFx } from "./types";
 import type { WebGL2DrawContext, WebGPUDrawContext } from "./renderer-context";
 
@@ -60,12 +56,15 @@ describe("GRADE — registration / wiring", () => {
 
 describe("GRADE — backend parity (param level)", () => {
   it("WebGL2 (u_<key>) and WebGPU (<key>) drive identical uniform values", () => {
-    const params = mergeGradeParams({
-      ...defaultGradeSlot("g1"),
-      lookId: "ember",
-      warmth: 0.4,
-      punch: 0.6,
-    });
+    const params = {
+      ...ENGINE_DEFAULTS,
+      exposure: 0.2,
+      temp: 0.4,
+      contrast: 0.3,
+      saturation: 1.2,
+      shadowsLift: 0.3,
+      highlightsGain: 0.25,
+    };
     const fx = fxFrom(params as unknown as Record<string, number>);
     const t = 7.5;
 
@@ -84,7 +83,7 @@ describe("GRADE — backend parity (param level)", () => {
   });
 
   it("both backends bind source + use replace blend + draw once", () => {
-    const fx = fxFrom(mergeGradeParams(defaultGradeSlot("g1")) as unknown as Record<string, number>);
+    const fx = fxFrom({ ...ENGINE_DEFAULTS } as unknown as Record<string, number>);
     for (const draw of [
       (s: ReturnType<typeof makeStub>) => fxCatalog.grade.drawWebGL2(s.ctx, fx, 8, 8, 0),
       (s: ReturnType<typeof makeStub>) => fxCatalog.grade.drawWebGPU(s.ctx, fx, 8, 8, 0),
@@ -100,7 +99,7 @@ describe("GRADE — backend parity (param level)", () => {
 
   it("skips the draw entirely at strength 0 (no wasted pass)", () => {
     const fx = fxFrom(
-      mergeGradeParams({ ...defaultGradeSlot("g1"), lookId: "ember", strength: 0 }) as unknown as Record<string, number>,
+      { ...ENGINE_DEFAULTS, strength: 0 } as unknown as Record<string, number>,
     );
     const gl = makeStub();
     fxCatalog.grade.drawWebGL2(gl.ctx, fx, 8, 8, 0);

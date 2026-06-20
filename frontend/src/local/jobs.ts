@@ -30,6 +30,7 @@ import {
   type VideoAsset,
 } from "../storage/jobs-db";
 import { useOpsStore } from "./ops-store";
+import type { GradeParams } from "../editor/fx/looks";
 import { camColorAt } from "../storage/migrations";
 import { opfs } from "../storage/opfs";
 import {
@@ -1027,7 +1028,8 @@ export async function runEditRender(
       visualizers: visualizerDescs,
       energy,
       fx: job.fx,
-      grades: job.grades,
+      colorGrade: job.colorGrade as GradeParams | undefined,
+      filterSlots: job.filterSlots,
       offsetMs: totalOffsetMs,
       driftRatio: job.sync.driftRatio,
       outputWidth: spec.exportOpts?.width,

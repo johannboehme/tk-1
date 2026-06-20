@@ -1,25 +1,27 @@
-// Global color-grade stack for the Overlays panel. A vertical list of
-// filter cards — same idiom as the text-overlay cards: ADD appends, each
-// card picks a look + dials Amount and four macros, REMOVE / reorder nudges
-// live in the card header. Card order top→bottom IS the serial compose
-// order (each look grades the previous one's output). Reuses the panel's
-// existing primitives so it reads as part of the panel, not a new widget.
+// Filters section for the Overlays panel — a stack of opinionated looks
+// (VHS / Super-8 / Decay / Noir / Sepia / Instant). ADD appends a filter
+// card; each card picks a kind and renders THAT kind's OWN controls (read
+// from FxDefinition.filterParams), so a VHS card shows TRACK/BLEED/SNOW and a
+// Sepia card shows TONE/CONTRAST/FADE — no shared macro block. Card order
+// top→bottom is the serial compose order. Reuses the panel's card + slider
+// idioms.
 import { useEditorStore } from "../store";
-import {
-  GRADE_LOOK_IDS,
-  GRADE_LOOKS,
-  type GradeLookId,
-  type GradeSlot,
-} from "../fx/looks";
+import { fxCatalog } from "../fx/catalog";
+import type { FilterSlot, FxKind } from "../fx/types";
 import { ChunkyButton } from "./ChunkyButton";
+import { ParamSlider } from "./ParamSlider";
 import { ChevronLeftIcon, PlusIcon, TrashIcon } from "./icons";
 
+/** The shippable filter kinds, in picker order. */
+const FILTER_KINDS: FxKind[] = ["vhs", "super8", "decay", "noir", "sepia", "polaroid"];
+
 export function FilterStack() {
-  const slots = useEditorStore((s) => s.gradeSlots);
-  const addGradeSlot = useEditorStore((s) => s.addGradeSlot);
-  const updateGradeSlot = useEditorStore((s) => s.updateGradeSlot);
-  const removeGradeSlot = useEditorStore((s) => s.removeGradeSlot);
-  const moveGradeSlot = useEditorStore((s) => s.moveGradeSlot);
+  const slots = useEditorStore((s) => s.filterSlots);
+  const addFilterSlot = useEditorStore((s) => s.addFilterSlot);
+  const setFilterKind = useEditorStore((s) => s.setFilterKind);
+  const setFilterParam = useEditorStore((s) => s.setFilterParam);
+  const removeFilterSlot = useEditorStore((s) => s.removeFilterSlot);
+  const moveFilterSlot = useEditorStore((s) => s.moveFilterSlot);
 
   return (
     <section className="flex flex-col gap-3">
@@ -29,7 +31,7 @@ export function FilterStack() {
           size="sm"
           variant="primary"
           iconLeft={<PlusIcon />}
-          onClick={() => addGradeSlot()}
+          onClick={() => addFilterSlot(FILTER_KINDS[0])}
         >
           ADD
         </ChunkyButton>
@@ -50,10 +52,10 @@ export function FilterStack() {
             slot={slot}
             idx={idx}
             total={slots.length}
-            onLook={(lookId) => updateGradeSlot(slot.id, { lookId })}
-            onParam={(patch) => updateGradeSlot(slot.id, patch)}
-            onRemove={() => removeGradeSlot(slot.id)}
-            onMove={(dir) => moveGradeSlot(slot.id, dir)}
+            onKind={(kind) => setFilterKind(slot.id, kind)}
+            onParam={(key, v) => setFilterParam(slot.id, key, v)}
+            onRemove={() => removeFilterSlot(slot.id)}
+            onMove={(dir) => moveFilterSlot(slot.id, dir)}
           />
         ))}
       </div>
@@ -62,17 +64,18 @@ export function FilterStack() {
 }
 
 interface CardProps {
-  slot: GradeSlot;
+  slot: FilterSlot;
   idx: number;
   total: number;
-  onLook: (lookId: GradeLookId) => void;
-  onParam: (patch: Partial<GradeSlot>) => void;
+  onKind: (kind: FxKind) => void;
+  onParam: (key: string, value: number) => void;
   onRemove: () => void;
   onMove: (dir: -1 | 1) => void;
 }
 
-function FilterCard({ slot, idx, total, onLook, onParam, onRemove, onMove }: CardProps) {
-  const look = GRADE_LOOKS[slot.lookId];
+function FilterCard({ slot, idx, total, onKind, onParam, onRemove, onMove }: CardProps) {
+  const def = fxCatalog[slot.kind];
+  const params = def.filterParams ?? [];
   return (
     <div className="rounded-md bg-paper-deep p-3 shadow-pressed flex flex-col gap-2">
       <div className="flex items-center justify-between">
@@ -80,93 +83,50 @@ function FilterCard({ slot, idx, total, onLook, onParam, onRemove, onMove }: Car
           <span
             aria-hidden
             className="inline-block w-3 h-3 rounded-full border border-rule shrink-0"
-            style={{ background: look.swatch }}
+            style={{ background: def.capsuleColor }}
           />
-          <span className="label truncate">
-            #{idx + 1} · {look.label}
-          </span>
+          <span className="label truncate">#{idx + 1}</span>
         </div>
         <div className="flex items-center gap-1 shrink-0">
           <NudgeButton dir="up" disabled={idx === 0} onClick={() => onMove(-1)} />
           <NudgeButton dir="down" disabled={idx === total - 1} onClick={() => onMove(1)} />
-          <ChunkyButton
-            size="sm"
-            variant="ghost"
-            iconLeft={<TrashIcon />}
-            onClick={onRemove}
-          >
+          <ChunkyButton size="sm" variant="ghost" iconLeft={<TrashIcon />} onClick={onRemove}>
             REMOVE
           </ChunkyButton>
         </div>
       </div>
 
       <label className="flex flex-col gap-1">
-        <span className="label">Look</span>
+        <span className="label">Filter</span>
         <select
-          aria-label="Look"
-          value={slot.lookId}
-          onChange={(e) => onLook(e.target.value as GradeLookId)}
+          aria-label="Filter"
+          value={slot.kind}
+          onChange={(e) => onKind(e.target.value as FxKind)}
           className="bg-paper-hi border border-rule rounded-md h-10 px-2 font-mono text-sm"
         >
-          {GRADE_LOOK_IDS.map((id) => (
-            <option key={id} value={id}>
-              {GRADE_LOOKS[id].label}
+          {FILTER_KINDS.map((k) => (
+            <option key={k} value={k}>
+              {fxCatalog[k].label}
             </option>
           ))}
         </select>
       </label>
 
-      <ParamSlider
-        label="Amount"
-        unit="%"
-        value={Math.round(slot.strength * 100)}
-        min={0}
-        max={100}
-        onChange={(v) => onParam({ strength: v / 100 })}
-      />
-
-      <div className="grid grid-cols-2 gap-x-3 gap-y-2 pt-1">
-        <ParamSlider label="Warmth" bipolar value={Math.round(slot.warmth * 100)} min={-100} max={100} onChange={(v) => onParam({ warmth: v / 100 })} />
-        <ParamSlider label="Fade" bipolar value={Math.round(slot.fade * 100)} min={-100} max={100} onChange={(v) => onParam({ fade: v / 100 })} />
-        <ParamSlider label="Punch" bipolar value={Math.round(slot.punch * 100)} min={-100} max={100} onChange={(v) => onParam({ punch: v / 100 })} />
-        <ParamSlider label="Grain" bipolar value={Math.round(slot.grain * 100)} min={-100} max={100} onChange={(v) => onParam({ grain: v / 100 })} />
-      </div>
-    </div>
-  );
-}
-
-interface SliderProps {
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-  unit?: string;
-  /** Centre-zero param — show a leading "+" on positive values. */
-  bipolar?: boolean;
-  onChange: (v: number) => void;
-}
-
-function ParamSlider({ label, value, min, max, unit, bipolar, onChange }: SliderProps) {
-  const display = bipolar && value > 0 ? `+${value}` : `${value}`;
-  return (
-    <div className="flex flex-col gap-1">
-      <div className="flex items-center justify-between">
-        <span className="label">{label}</span>
-        <span className="font-mono text-[10px] tracking-label uppercase text-ink-2">
-          {display}
-          {unit ?? ""}
-        </span>
-      </div>
-      <input
-        type="range"
-        aria-label={label}
-        min={min}
-        max={max}
-        step={1}
-        value={value}
-        onChange={(e) => onChange(parseInt(e.target.value, 10))}
-        className="w-full accent-hot"
-      />
+      {params.map((p) => {
+        const raw = slot.params[p.id] ?? p.defaultValue;
+        return (
+          <ParamSlider
+            key={p.id}
+            label={p.label}
+            value={Math.round(raw * 100)}
+            min={Math.round(p.min * 100)}
+            max={Math.round(p.max * 100)}
+            unit={p.id === "amount" ? "%" : undefined}
+            bipolar={p.min < 0}
+            onChange={(v) => onParam(p.id, v / 100)}
+          />
+        );
+      })}
     </div>
   );
 }

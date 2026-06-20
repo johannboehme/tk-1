@@ -64,6 +64,16 @@ export interface FxParamDef {
   max: number;
 }
 
+/** One stacked global FILTER in the Overlays panel — picks an opinionated
+ *  filter kind (vhs / super8 / sepia / …) and carries that kind's own param
+ *  values (its `filterParams` schema, including the master `amount`). Slots
+ *  compose serially top→bottom, UNDER the punch-in accents. */
+export interface FilterSlot {
+  id: string;
+  kind: FxKind;
+  params: Record<string, number>;
+}
+
 export interface PunchFx {
   id: string;
   kind: FxKind;

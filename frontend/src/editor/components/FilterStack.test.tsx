@@ -3,75 +3,70 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { FilterStack } from "./FilterStack";
 import { useEditorStore } from "../store";
 
+const S = () => useEditorStore.getState();
+
 describe("FilterStack", () => {
-  beforeEach(() => {
-    useEditorStore.getState().reset();
-  });
+  beforeEach(() => S().reset());
 
   it("shows an empty state and a working ADD button", () => {
     render(<FilterStack />);
     expect(screen.getByText(/No filters yet/i)).toBeTruthy();
-
     fireEvent.click(screen.getByRole("button", { name: "ADD" }));
-    expect(useEditorStore.getState().gradeSlots).toHaveLength(1);
+    expect(S().filterSlots).toHaveLength(1);
     expect(screen.queryByText(/No filters yet/i)).toBeNull();
   });
 
-  it("renders look select + Amount + four macro sliders per card", () => {
-    useEditorStore.getState().addGradeSlot();
+  it("renders the Filter picker + the selected kind's OWN controls", () => {
+    S().addFilterSlot("vhs");
     render(<FilterStack />);
-    expect(screen.getByLabelText("Look")).toBeTruthy();
-    for (const name of ["Amount", "Warmth", "Fade", "Punch", "Grain"]) {
+    expect(screen.getByLabelText("Filter")).toBeTruthy();
+    // VHS shows its own param sliders
+    for (const name of ["TRACK", "BLEED", "SNOW", "WOBBLE", "AMOUNT"]) {
       expect(screen.getByLabelText(name)).toBeTruthy();
     }
   });
 
-  it("changing the look select writes to the store", () => {
-    const id = useEditorStore.getState().addGradeSlot();
+  it("switching the filter kind swaps the whole control set", () => {
+    const id = S().addFilterSlot("vhs");
     render(<FilterStack />);
-    fireEvent.change(screen.getByLabelText("Look"), { target: { value: "ember" } });
-    const slot = useEditorStore.getState().gradeSlots.find((s) => s.id === id);
-    expect(slot?.lookId).toBe("ember");
+    expect(screen.queryByLabelText("TRACK")).toBeTruthy();
+    expect(screen.queryByLabelText("TONE")).toBeNull();
+
+    fireEvent.change(screen.getByLabelText("Filter"), { target: { value: "sepia" } });
+    expect(S().filterSlots.find((s) => s.id === id)?.kind).toBe("sepia");
+    // now Sepia's controls render, VHS's are gone
+    expect(screen.queryByLabelText("TONE")).toBeTruthy();
+    expect(screen.queryByLabelText("TRACK")).toBeNull();
   });
 
-  it("Amount slider maps 0..100 to strength 0..1", () => {
-    const id = useEditorStore.getState().addGradeSlot();
+  it("a param slider writes back to the slot (0..100 -> 0..1)", () => {
+    const id = S().addFilterSlot("vhs");
     render(<FilterStack />);
-    fireEvent.change(screen.getByLabelText("Amount"), { target: { value: "40" } });
-    expect(useEditorStore.getState().gradeSlots.find((s) => s.id === id)?.strength).toBeCloseTo(0.4);
-  });
-
-  it("a bipolar macro maps -100..100 to -1..1", () => {
-    const id = useEditorStore.getState().addGradeSlot();
-    render(<FilterStack />);
-    fireEvent.change(screen.getByLabelText("Punch"), { target: { value: "-50" } });
-    expect(useEditorStore.getState().gradeSlots.find((s) => s.id === id)?.punch).toBeCloseTo(-0.5);
+    fireEvent.change(screen.getByLabelText("TRACK"), { target: { value: "80" } });
+    expect(S().filterSlots.find((s) => s.id === id)?.params.tracking).toBeCloseTo(0.8);
   });
 
   it("REMOVE drops the card", () => {
-    useEditorStore.getState().addGradeSlot();
+    S().addFilterSlot("vhs");
     render(<FilterStack />);
     fireEvent.click(screen.getByRole("button", { name: "REMOVE" }));
-    expect(useEditorStore.getState().gradeSlots).toHaveLength(0);
+    expect(S().filterSlots).toHaveLength(0);
   });
 
   it("reorder nudges move a slot and are disabled at the ends", () => {
-    const a = useEditorStore.getState().addGradeSlot();
-    const b = useEditorStore.getState().addGradeSlot();
+    const a = S().addFilterSlot("vhs");
+    const b = S().addFilterSlot("sepia");
     render(<FilterStack />);
     const ups = screen.getAllByRole("button", { name: "Move filter up" });
-    // first card's up is disabled, second card's up moves b above a
     expect((ups[0] as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(ups[1]);
-    expect(useEditorStore.getState().gradeSlots.map((s) => s.id)).toEqual([b, a]);
+    expect(S().filterSlots.map((s) => s.id)).toEqual([b, a]);
   });
 
-  it("the card header shows the look's swatch + label", () => {
-    const id = useEditorStore.getState().addGradeSlot();
-    useEditorStore.getState().updateGradeSlot(id, { lookId: "gold" });
-    render(<FilterStack />);
-    // GOLD label appears in the header chip line (and as the selected option)
-    const headers = screen.getAllByText(/GOLD/);
-    expect(headers.length).toBeGreaterThan(0);
+  it("the card header shows the kind's swatch", () => {
+    S().addFilterSlot("noir");
+    const { container } = render(<FilterStack />);
+    // swatch chip is an aria-hidden span with a background colour
+    expect(container.querySelector('span[aria-hidden]')).toBeTruthy();
   });
 });

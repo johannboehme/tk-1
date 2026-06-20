@@ -4,6 +4,7 @@ import { useEditorStore } from "../store";
 import { ChunkyButton } from "./ChunkyButton";
 import { SegmentedControl } from "./SegmentedControl";
 import { FilterStack } from "./FilterStack";
+import { ColorGradePanel } from "./ColorGradePanel";
 import { PlusIcon, TrashIcon } from "./icons";
 
 const VIS_OPTIONS: { value: VisualizerConfig["type"] | ""; label: string }[] = [
@@ -85,6 +86,8 @@ export function OverlaysPanel() {
           ))}
         </select>
       </div>
+
+      <ColorGradePanel />
 
       <FilterStack />
 

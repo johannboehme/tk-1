@@ -7,8 +7,8 @@ import {
 import type { Clip, ImageClip, Segment, VideoClip } from "../types";
 import { clipRangeS } from "../types";
 import type { Cut } from "../../storage/jobs-db";
-import type { PunchFx } from "../fx/types";
-import type { GradeSlot } from "../fx/looks";
+import type { FilterSlot, PunchFx } from "../fx/types";
+import { ENGINE_DEFAULTS } from "../fx/looks";
 import { generatePills } from "../arrangement-pills";
 
 function video(id: string, displayW?: number, displayH?: number, more: Partial<VideoClip> = {}): VideoClip {
@@ -318,77 +318,72 @@ describe("buildPreviewFrameDescriptor — fx", () => {
 
 // ----------------------------------------------------------------------
 
-describe("buildPreviewFrameDescriptor — global grade slots", () => {
-  function slot(over: Partial<GradeSlot> = {}): GradeSlot {
-    return {
-      id: "g1",
-      lookId: "ember",
-      strength: 1,
-      warmth: 0,
-      fade: 0,
-      punch: 0,
-      grain: 0,
-      ...over,
-    };
-  }
-
-  it("prepends an active grade BEFORE the punch-in fx", () => {
-    const fx: PunchFx[] = [{ id: "v1", kind: "vignette", inS: 0, outS: 2 }];
-    const d = buildPreviewFrameDescriptor(
-      snap({ fx, gradeSlots: [slot()] }),
-      0.5,
-    );
-    expect(d.fx.map((f) => f.kind)).toEqual(["grade", "vignette"]);
-    expect(d.fx[0].id).toBe("g1");
+describe("buildPreviewFrameDescriptor — color grade + filters", () => {
+  const warmGrade = { ...ENGINE_DEFAULTS, temp: 0.3, contrast: 0.2 };
+  const filter = (id: string, kind: FilterSlot["kind"], amount = 0.8): FilterSlot => ({
+    id,
+    kind,
+    params: { amount },
   });
 
-  it("grade carries the merged engine vector, wetness 1, inS 0", () => {
-    const d = buildPreviewFrameDescriptor(snap({ gradeSlots: [slot()] }), 12.3);
+  it("emits the color grade FIRST, then filters, then punch-ins", () => {
+    const fx: PunchFx[] = [{ id: "v1", kind: "vignette", inS: 0, outS: 2 }];
+    const d = buildPreviewFrameDescriptor(
+      snap({ fx, colorGrade: warmGrade, filterSlots: [filter("flt", "vhs")] }),
+      0.5,
+    );
+    expect(d.fx.map((f) => f.kind)).toEqual(["grade", "vhs", "vignette"]);
+    expect(d.fx[0].id).toBe("grade");
+  });
+
+  it("the grade FrameFx carries the vector, wetness 1, inS 0", () => {
+    const d = buildPreviewFrameDescriptor(snap({ colorGrade: warmGrade }), 12.3);
     const g = d.fx[0];
     expect(g.kind).toBe("grade");
     expect(g.inS).toBe(0);
     expect(g.wetness).toBe(1);
-    // EMBER pushes temperature warm + strength carried through.
-    expect(g.params.temp).toBeGreaterThan(0);
-    expect(g.params.strength).toBe(1);
+    expect(g.params.temp).toBe(0.3);
   });
 
-  it("is global — present at any t, with no punch-in fx and no layers", () => {
-    const d = buildPreviewFrameDescriptor(snap({ gradeSlots: [slot()] }), 999);
-    expect(d.fx).toHaveLength(1);
-    expect(d.fx[0].kind).toBe("grade");
-  });
-
-  it("skips RAW and zero-strength slots", () => {
-    const d = buildPreviewFrameDescriptor(
-      snap({
-        gradeSlots: [
-          slot({ id: "raw1", lookId: "raw" }),
-          slot({ id: "muted", lookId: "ember", strength: 0 }),
-        ],
-      }),
-      0.5,
-    );
+  it("skips the grade entirely when it is the identity", () => {
+    const d = buildPreviewFrameDescriptor(snap({ colorGrade: { ...ENGINE_DEFAULTS } }), 0.5);
     expect(d.fx).toHaveLength(0);
   });
 
-  it("stacks multiple grade slots in slot order (A → B → C)", () => {
+  it("filters are global — present at any t, no punch-in fx, no layers", () => {
+    const d = buildPreviewFrameDescriptor(snap({ filterSlots: [filter("f", "super8")] }), 999);
+    expect(d.fx).toHaveLength(1);
+    expect(d.fx[0].kind).toBe("super8");
+  });
+
+  it("merges the kind's defaults into each filter's params", () => {
+    const d = buildPreviewFrameDescriptor(snap({ filterSlots: [filter("f", "vhs")] }), 0.5);
+    // tracking comes from the VHS defaults even though the slot only set amount
+    expect(d.fx[0].params.tracking).toBeGreaterThan(0);
+    expect(d.fx[0].params.amount).toBe(0.8);
+  });
+
+  it("skips filter slots at amount 0", () => {
+    const d = buildPreviewFrameDescriptor(snap({ filterSlots: [filter("f", "vhs", 0)] }), 0.5);
+    expect(d.fx).toHaveLength(0);
+  });
+
+  it("stacks filter slots in slot order (A → B → C)", () => {
     const d = buildPreviewFrameDescriptor(
       snap({
-        gradeSlots: [
-          slot({ id: "a", lookId: "ember" }),
-          slot({ id: "b", lookId: "haze" }),
-          slot({ id: "c", lookId: "mono" }),
-        ],
+        filterSlots: [filter("a", "vhs"), filter("b", "sepia"), filter("c", "noir")],
       }),
       0.5,
     );
     expect(d.fx.map((f) => f.id)).toEqual(["a", "b", "c"]);
-    expect(d.fx.every((f) => f.kind === "grade")).toBe(true);
+    expect(d.fx.map((f) => f.kind)).toEqual(["vhs", "sepia", "noir"]);
   });
 
-  it("grade params survive JSON round-trip (pure data)", () => {
-    const d = buildPreviewFrameDescriptor(snap({ gradeSlots: [slot()] }), 0.5);
+  it("descriptor survives JSON round-trip (pure data)", () => {
+    const d = buildPreviewFrameDescriptor(
+      snap({ colorGrade: warmGrade, filterSlots: [filter("f", "vhs")] }),
+      0.5,
+    );
     expect(JSON.parse(JSON.stringify(d))).toEqual(d);
   });
 });

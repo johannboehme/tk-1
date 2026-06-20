@@ -34,7 +34,8 @@ import type { Visualizer } from "./visualizer/types";
 import type { TextOverlay, EnergyCurves } from "./ass-builder";
 import type { Cut } from "../../storage/jobs-db";
 import type { PunchFx } from "../../editor/fx/types";
-import type { GradeSlot } from "../../editor/fx/looks";
+import type { GradeParams } from "../../editor/fx/looks";
+import type { FilterSlot } from "../../editor/fx/types";
 
 export type VisualizerWorkerDescriptor =
   | { type: "showwaves"; pcm: Float32Array; sampleRate: number }
@@ -96,9 +97,11 @@ export interface EditWorkerInput {
   /** Punch-in FX (visual effects with in/out spans). Same shape the
    *  editor store holds; passed through verbatim to the compositor. */
   fx?: PunchFx[];
-  /** Global color-grade stack — same shape the editor store holds; passed
+  /** The single global color grade — same shape the editor store holds. */
+  colorGrade?: GradeParams;
+  /** The opinionated filter stack — same shape the editor store holds; passed
    *  through verbatim so the export look matches the preview. */
-  grades?: GradeSlot[];
+  filterSlots?: FilterSlot[];
   offsetMs: number;
   driftRatio: number;
   /** Output codec/dimension/bitrate overrides. Optional — the renderer
@@ -210,7 +213,8 @@ ctx.addEventListener("message", async (e: MessageEvent<EditWorkerMessage>) => {
       energy: input.energy,
       visualizers,
       fx: input.fx,
-      grades: input.grades,
+      colorGrade: input.colorGrade,
+      filterSlots: input.filterSlots,
       offsetMs: input.offsetMs,
       driftRatio: input.driftRatio,
       outputFps: input.outputFps,

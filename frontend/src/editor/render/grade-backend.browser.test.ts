@@ -8,7 +8,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { WebGL2Backend } from "./webgl2-backend";
 import { WebGPUBackend } from "./webgpu-backend";
 import type { FrameDescriptor, FrameFx, FrameLayer } from "./frame-descriptor";
-import { ENGINE_DEFAULTS, mergeGradeParams, defaultGradeSlot } from "../fx/looks";
+import { ENGINE_DEFAULTS } from "../fx/looks";
 
 // A non-grey source so saturation / temperature shifts are observable.
 const SRC: [number, number, number] = [180, 100, 60];
@@ -101,8 +101,16 @@ describe("grade FX — WebGPU correctness + GPU↔GPU parity", () => {
     expect(Math.abs(b - SRC[2])).toBeLessThan(4);
   });
 
-  it("WebGL2 and WebGPU grade an EMBER look to the same pixel (±6 LSB)", async () => {
-    const params = asRecord(mergeGradeParams({ ...defaultGradeSlot("g"), lookId: "ember" }));
+  it("WebGL2 and WebGPU grade a warm look to the same pixel (±6 LSB)", async () => {
+    const params = asRecord({
+      ...ENGINE_DEFAULTS,
+      temp: 0.35,
+      contrast: 0.3,
+      saturation: 1.1,
+      vibrance: 0.45,
+      shadowsLift: 0.2,
+      highlightsGain: 0.25,
+    });
     const gl = await webgl2Centre(params);
     const gpu = await webgpuCentre(params);
     for (let i = 0; i < 3; i++) {

@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, test } from "vitest";
 import { useEditorStore } from "./store";
+import { ENGINE_DEFAULTS } from "./fx/looks";
+import { fxCatalog } from "./fx/catalog";
 
 const baseJobMeta = {
   id: "j1",
@@ -10,87 +12,117 @@ const baseJobMeta = {
   algoOffsetMs: 0,
   driftRatio: 1.0,
 };
+const S = () => useEditorStore.getState();
 
-describe("grade slot actions", () => {
-  beforeEach(() => {
-    useEditorStore.getState().reset();
+describe("color grade actions", () => {
+  beforeEach(() => S().reset());
+
+  test("initial colorGrade is the identity", () => {
+    expect(S().colorGrade).toEqual(ENGINE_DEFAULTS);
   });
 
-  test("initial gradeSlots is empty", () => {
-    expect(useEditorStore.getState().gradeSlots).toEqual([]);
+  test("setColorGrade patches one or more params, leaving the rest", () => {
+    S().setColorGrade({ exposure: 0.3, temp: -0.2 });
+    expect(S().colorGrade.exposure).toBe(0.3);
+    expect(S().colorGrade.temp).toBe(-0.2);
+    expect(S().colorGrade.saturation).toBe(1); // untouched
   });
 
-  test("addGradeSlot appends a neutral slot and returns its id", () => {
-    const id = useEditorStore.getState().addGradeSlot();
-    const slots = useEditorStore.getState().gradeSlots;
+  test("resetColorGrade restores the identity", () => {
+    S().setColorGrade({ contrast: 0.5, shadowsLift: 0.4 });
+    S().resetColorGrade();
+    expect(S().colorGrade).toEqual(ENGINE_DEFAULTS);
+  });
+});
+
+describe("filter slot actions", () => {
+  beforeEach(() => S().reset());
+
+  test("initial filterSlots is empty", () => {
+    expect(S().filterSlots).toEqual([]);
+  });
+
+  test("addFilterSlot seeds the kind's tasteful defaults and returns its id", () => {
+    const id = S().addFilterSlot("vhs");
+    const slots = S().filterSlots;
     expect(slots).toHaveLength(1);
     expect(slots[0].id).toBe(id);
-    expect(slots[0].strength).toBeGreaterThan(0);
-    expect(slots[0].warmth).toBe(0);
+    expect(slots[0].kind).toBe("vhs");
+    expect(slots[0].params).toEqual(fxCatalog.vhs.defaultParams);
+    expect(slots[0].params.amount).toBeGreaterThan(0); // immediately visible
   });
 
-  test("addGradeSlot stacks in insertion order", () => {
-    const a = useEditorStore.getState().addGradeSlot();
-    const b = useEditorStore.getState().addGradeSlot();
-    expect(useEditorStore.getState().gradeSlots.map((s) => s.id)).toEqual([a, b]);
+  test("setFilterParam updates one param only", () => {
+    const id = S().addFilterSlot("vhs");
+    S().setFilterParam(id, "tracking", 0.9);
+    const slot = S().filterSlots[0];
+    expect(slot.params.tracking).toBe(0.9);
+    expect(slot.params.bleed).toBe(fxCatalog.vhs.defaultParams.bleed); // untouched
   });
 
-  test("updateGradeSlot merges a partial patch", () => {
-    const id = useEditorStore.getState().addGradeSlot();
-    useEditorStore.getState().updateGradeSlot(id, { lookId: "ember", warmth: 0.5 });
-    const slot = useEditorStore.getState().gradeSlots[0];
-    expect(slot.lookId).toBe("ember");
-    expect(slot.warmth).toBe(0.5);
-    // untouched fields preserved
-    expect(slot.strength).toBeGreaterThan(0);
+  test("setFilterKind switches kind and reseeds that kind's defaults", () => {
+    const id = S().addFilterSlot("vhs");
+    S().setFilterParam(id, "tracking", 0.9);
+    S().setFilterKind(id, "sepia");
+    const slot = S().filterSlots[0];
+    expect(slot.kind).toBe("sepia");
+    expect(slot.params).toEqual(fxCatalog.sepia.defaultParams);
+    expect(slot.params.tracking).toBeUndefined();
   });
 
-  test("updateGradeSlot ignores unknown ids", () => {
-    const id = useEditorStore.getState().addGradeSlot();
-    useEditorStore.getState().updateGradeSlot("nope", { warmth: 1 });
-    expect(useEditorStore.getState().gradeSlots[0].id).toBe(id);
-    expect(useEditorStore.getState().gradeSlots[0].warmth).toBe(0);
+  test("removeFilterSlot drops by id", () => {
+    const a = S().addFilterSlot("vhs");
+    const b = S().addFilterSlot("sepia");
+    S().removeFilterSlot(a);
+    expect(S().filterSlots.map((s) => s.id)).toEqual([b]);
   });
 
-  test("removeGradeSlot drops by id", () => {
-    const a = useEditorStore.getState().addGradeSlot();
-    const b = useEditorStore.getState().addGradeSlot();
-    useEditorStore.getState().removeGradeSlot(a);
-    expect(useEditorStore.getState().gradeSlots.map((s) => s.id)).toEqual([b]);
+  test("moveFilterSlot reorders, clamped at the ends", () => {
+    const a = S().addFilterSlot("vhs");
+    const b = S().addFilterSlot("sepia");
+    const c = S().addFilterSlot("noir");
+    S().moveFilterSlot(b, -1);
+    expect(S().filterSlots.map((s) => s.id)).toEqual([b, a, c]);
+    S().moveFilterSlot(b, -1); // already top
+    expect(S().filterSlots.map((s) => s.id)).toEqual([b, a, c]);
+    S().moveFilterSlot(c, 1); // already bottom
+    expect(S().filterSlots.map((s) => s.id)).toEqual([b, a, c]);
   });
+});
 
-  test("moveGradeSlot reorders, clamped at the ends", () => {
-    const a = useEditorStore.getState().addGradeSlot();
-    const b = useEditorStore.getState().addGradeSlot();
-    const c = useEditorStore.getState().addGradeSlot();
-    useEditorStore.getState().moveGradeSlot(b, -1); // b up
-    expect(useEditorStore.getState().gradeSlots.map((s) => s.id)).toEqual([b, a, c]);
-    useEditorStore.getState().moveGradeSlot(b, -1); // already top, no-op
-    expect(useEditorStore.getState().gradeSlots.map((s) => s.id)).toEqual([b, a, c]);
-    useEditorStore.getState().moveGradeSlot(c, 1); // already bottom, no-op
-    expect(useEditorStore.getState().gradeSlots.map((s) => s.id)).toEqual([b, a, c]);
-  });
+describe("loadJob hydration", () => {
+  beforeEach(() => S().reset());
 
-  test("loadJob hydrates gradeSlots from opts.grades", () => {
-    useEditorStore.getState().loadJob(baseJobMeta, {
-      grades: [
-        { id: "x", lookId: "frost", strength: 0.7, warmth: 0, fade: 0, punch: 0.2, grain: 0 },
-      ],
+  test("hydrates colorGrade + filterSlots from opts", () => {
+    S().loadJob(baseJobMeta, {
+      colorGrade: { ...ENGINE_DEFAULTS, exposure: 0.4 },
+      filterSlots: [{ id: "x", kind: "super8", params: { ...fxCatalog.super8.defaultParams } }],
     });
-    const slots = useEditorStore.getState().gradeSlots;
-    expect(slots).toHaveLength(1);
-    expect(slots[0].lookId).toBe("frost");
+    expect(S().colorGrade.exposure).toBe(0.4);
+    expect(S().filterSlots).toHaveLength(1);
+    expect(S().filterSlots[0].kind).toBe("super8");
   });
 
-  test("loadJob without grades defaults to empty (old jobs migrate cleanly)", () => {
-    useEditorStore.getState().addGradeSlot();
-    useEditorStore.getState().loadJob(baseJobMeta);
-    expect(useEditorStore.getState().gradeSlots).toEqual([]);
+  test("a partial persisted colorGrade still loads with every key present", () => {
+    S().loadJob(baseJobMeta, { colorGrade: { exposure: 0.5 } as never });
+    expect(S().colorGrade.exposure).toBe(0.5);
+    expect(S().colorGrade.saturation).toBe(1); // default filled in
+    expect(S().colorGrade.shadowsLift).toBe(0);
   });
 
-  test("reset clears gradeSlots", () => {
-    useEditorStore.getState().addGradeSlot();
-    useEditorStore.getState().reset();
-    expect(useEditorStore.getState().gradeSlots).toEqual([]);
+  test("without grade/filters, defaults to identity + empty (old jobs migrate cleanly)", () => {
+    S().addFilterSlot("vhs");
+    S().setColorGrade({ exposure: 0.9 });
+    S().loadJob(baseJobMeta);
+    expect(S().colorGrade).toEqual(ENGINE_DEFAULTS);
+    expect(S().filterSlots).toEqual([]);
+  });
+
+  test("reset clears colorGrade + filterSlots", () => {
+    S().addFilterSlot("vhs");
+    S().setColorGrade({ contrast: 0.7 });
+    S().reset();
+    expect(S().colorGrade).toEqual(ENGINE_DEFAULTS);
+    expect(S().filterSlots).toEqual([]);
   });
 });

@@ -389,10 +389,12 @@ export interface LocalJob {
    *  feature. The renderer reads this verbatim. */
   fx?: PunchFxRecord[];
 
-  /** Global color-grade stack — the "film stock" layer applied under the
-   *  punch-in accents (look + strength + macros per slot). Optional; absent
-   *  on jobs that pre-date the feature → loads as an empty stack. */
-  grades?: GradeSlotRecord[];
+  /** The single global color grade (a flat GradeParams vector). Optional;
+   *  absent on jobs that pre-date the feature → loads as the identity. */
+  colorGrade?: ColorGradeRecord;
+  /** The opinionated filter stack (VHS / Super-8 / …). Optional; absent on
+   *  jobs that pre-date the feature → loads empty. */
+  filterSlots?: FilterSlotRecord[];
 
   /** Master-audio playback gain (linear). 1.0 = source level (default),
    *  0 = muted, 2.0 = +6 dB. Applied at preview time and baked into the
@@ -516,32 +518,17 @@ export interface PunchFxRecord {
   };
 }
 
-/** Mirror of `GradeLookId` (editor/fx/looks). Kept duplicated to keep the
- *  storage layer free of editor imports; new looks added there should be
- *  mirrored here. Unknown ids still load (the editor degrades them to RAW). */
-export type GradeLookIdRecord =
-  | "raw"
-  | "clear"
-  | "frost"
-  | "ember"
-  | "haze"
-  | "blush"
-  | "dusk"
-  | "volt"
-  | "mono"
-  | "gold"
-  | "super8";
+/** Storage shape for the global color grade — a flat `GradeParams` vector
+ *  (editor/fx/looks). Kept as an open numeric map so the storage layer stays
+ *  free of editor imports and unknown/future params round-trip harmlessly. */
+export type ColorGradeRecord = Record<string, number>;
 
-/** Storage shape for a single global color-grade slot. Mirrors `GradeSlot`
- *  from the editor module (look + strength BLEND + four macro nudges). */
-export interface GradeSlotRecord {
+/** Storage shape for one opinionated filter slot. Mirrors `FilterSlot` from
+ *  the editor module (a filter kind + that kind's own param values). */
+export interface FilterSlotRecord {
   id: string;
-  lookId: GradeLookIdRecord;
-  strength: number;
-  warmth: number;
-  fade: number;
-  punch: number;
-  grain: number;
+  kind: PunchFxKindRecord;
+  params: Record<string, number>;
 }
 
 const DB_NAME = "videoaudiosync";
