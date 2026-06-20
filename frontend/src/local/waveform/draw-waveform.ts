@@ -74,6 +74,28 @@ function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
 }
 
+/** Minimum visible half-height of the body, in CSS pixels. */
+const MIN_HALF_PX = 0.6;
+
+/**
+ * Guarantee a minimum body thickness so the filled waveform never collapses to
+ * an invisible zero-height sliver. At extreme (sub-sample) zoom the raw-PCM path
+ * yields min==max per column; without this the body vanishes and only the
+ * centre line remains — the waveform reads as a flat stroke. Expanding a too-thin
+ * column symmetrically around its midpoint keeps the band centred on the signal,
+ * so it traces the real sample values as a thin line instead of disappearing.
+ * Returns [top, bot] in the same normalized units as the inputs.
+ */
+export function expandToMinThickness(
+  topV: number,
+  botV: number,
+  minHalf: number,
+): [number, number] {
+  if (topV - botV >= 2 * minHalf) return [topV, botV];
+  const mid = (topV + botV) / 2;
+  return [mid + minHalf, mid - minHalf];
+}
+
 export function computeColumnModel(opts: ColumnModelOpts): ColumnModel {
   const { pyramid, t0S, t1S, cssW, dpr } = opts;
   const normalize = opts.normalize ?? "absolute";
@@ -196,6 +218,8 @@ export function drawWaveform(
   for (const [off, col] of style.gradientStops) grad.addColorStop(off, col);
 
   const { top, bot, core, hasData, deviceWidth } = model;
+  // Normalized half-height that maps to MIN_HALF_PX on screen.
+  const minHalf = MIN_HALF_PX / Math.max(1, half);
 
   const drawRun = (s: number, e: number) => {
     // Subtle ground line keeps quiet / silent stretches anchored.
@@ -206,11 +230,22 @@ export function drawWaveform(
     ctx.lineTo(e / dpr, cy);
     ctx.stroke();
 
+    // Expand any column thinner than the minimum so the body stays visible
+    // (and traces the sample line) at extreme zoom instead of collapsing.
+    const n = e - s;
+    const et = new Float32Array(n);
+    const eb = new Float32Array(n);
+    for (let i = s; i < e; i++) {
+      const [t, b] = expandToMinThickness(top[i], bot[i], minHalf);
+      et[i - s] = t;
+      eb[i - s] = b;
+    }
+
     // Filled body: top edge along the max envelope, back along the min.
     ctx.beginPath();
-    ctx.moveTo(s / dpr, y(top[s]));
-    for (let i = s + 1; i < e; i++) ctx.lineTo(i / dpr, y(top[i]));
-    for (let i = e - 1; i >= s; i--) ctx.lineTo(i / dpr, y(bot[i]));
+    ctx.moveTo(s / dpr, y(et[0]));
+    for (let i = 1; i < n; i++) ctx.lineTo((s + i) / dpr, y(et[i]));
+    for (let i = n - 1; i >= 0; i--) ctx.lineTo((s + i) / dpr, y(eb[i]));
     ctx.closePath();
     ctx.fillStyle = grad;
     ctx.fill();

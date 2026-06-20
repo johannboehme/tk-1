@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { buildPeakPyramid } from "./peak-pyramid";
-import { computeColumnModel } from "./draw-waveform";
+import { computeColumnModel, expandToMinThickness } from "./draw-waveform";
 
 function sine(n: number, sr: number, freq: number, amp = 1): Float32Array {
   const y = new Float32Array(n);
@@ -126,6 +126,26 @@ describe("computeColumnModel — gaps via mapXToTime (Editor long-form)", () => 
     expect(m.hasData[100]).toBe(1);
     expect(m.hasData[180]).toBe(0);
     expect(runCount(m.hasData)).toBe(1);
+  });
+});
+
+describe("expandToMinThickness — body never collapses to an invisible line", () => {
+  it("leaves a tall body unchanged", () => {
+    expect(expandToMinThickness(0.8, -0.6, 0.01)).toEqual([0.8, -0.6]);
+  });
+
+  it("expands a fully collapsed (top==bot) column around its value", () => {
+    // At sub-sample zoom the raw path yields min==max — without this the
+    // filled body has zero height and vanishes to a flat line (the bug).
+    const [t, b] = expandToMinThickness(0.5, 0.5, 0.02);
+    expect((t + b) / 2).toBeCloseTo(0.5, 6);
+    expect(t - b).toBeCloseTo(0.04, 6);
+  });
+
+  it("expands a too-thin body to the minimum, staying centred on the signal", () => {
+    const [t, b] = expandToMinThickness(0.305, 0.295, 0.02); // h=0.01 < 0.04
+    expect((t + b) / 2).toBeCloseTo(0.3, 6);
+    expect(t - b).toBeCloseTo(0.04, 6);
   });
 });
 
