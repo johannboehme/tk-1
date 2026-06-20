@@ -531,7 +531,11 @@ export interface FilterSlotRecord {
   params: Record<string, number>;
 }
 
-const DB_NAME = "videoaudiosync";
+// DB name is overridable via VITE_DB_NAME so an isolated dev instance (e.g. a
+// git-worktree branch under review) can use its own IndexedDB instead of
+// sharing — and risking a version clash with — the real "videoaudiosync" DB.
+// Production builds set nothing → the canonical name.
+const DB_NAME = import.meta.env.VITE_DB_NAME || "videoaudiosync";
 const DB_VERSION = 8;
 const STORE = "jobs";
 const ANALYSIS_STORE = "audio-analysis";

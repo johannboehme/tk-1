@@ -2,6 +2,10 @@
 
 // Per-instance build-time env vars (see .env.example at repo root).
 interface ImportMetaEnv {
+  /** Override the IndexedDB name — lets an isolated dev instance (e.g. a
+   *  worktree under review) avoid clashing with the real "videoaudiosync" DB.
+   *  Unset in production → canonical name. */
+  readonly VITE_DB_NAME?: string;
   readonly VITE_IMPRESSUM_NAME?: string;
   readonly VITE_IMPRESSUM_ADDRESS_LINE_1?: string;
   readonly VITE_IMPRESSUM_ADDRESS_LINE_2?: string;
