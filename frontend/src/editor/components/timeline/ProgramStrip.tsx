@@ -12,6 +12,7 @@
  */
 import {
   CSSProperties,
+  memo,
   MouseEvent,
   PointerEvent as ReactPointerEvent,
   useMemo,
@@ -103,7 +104,14 @@ interface Props {
 
 const EMPTY_LIVE_FX_IDS: ReadonlySet<string> = new Set();
 
-export function ProgramStrip({
+/** Memoized: the Timeline re-renders every playback frame (its canvas
+ *  subscribes to timelineT), but the strip's inputs only change on real
+ *  edits / scroll / zoom. With stable props from the Timeline, memo()
+ *  drops the strip's per-frame DOM reconciliation (program segments +
+ *  splice tabs + FX capsules) during passive playback. */
+export const ProgramStrip = memo(ProgramStripImpl);
+
+function ProgramStripImpl({
   cuts,
   cams,
   duration,

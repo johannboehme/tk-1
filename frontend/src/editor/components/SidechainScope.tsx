@@ -153,8 +153,6 @@ export function SidechainScope({ kind }: { kind: FxKind }) {
     winStart = timelineT - spanS / 2;
   }
   const innerW = RENDER_W - 2 * PAD_X;
-  const toMaster = (arrT: number) =>
-    arrTotal > 0 ? arrToMaster(arrT, segments) : arrT;
   // Sub-samples per column: enough to catch the tallest env sample a column
   // spans (so peak HEIGHT isn't under-shown when zoomed out), capped for perf.
   const envFps = audioEnv?.fps ?? 120;
@@ -163,22 +161,22 @@ export function SidechainScope({ kind }: { kind: FxKind }) {
     Math.max(4, Math.ceil((spanS / Math.max(1, innerW)) * envFps)),
   );
 
-  let masterPath = "";
-  let followerPath = "";
-  const beatLines: { x: number; down: boolean }[] = [];
-  if (hasAudio && audioEnv) {
-    masterPath = peakAreaPath(
-      (m) => sampleEnv(audioEnv, m),
-      toMaster,
-      winStart,
-      spanS,
-      RENDER_W,
-      RENDER_H,
-      peakSub,
-    );
-    if (follower) {
-      followerPath = peakAreaPath(
-        (m) => sampleEnv(follower, m),
+  // The paths + grid depend only on the window and the curves — NOT on the
+  // playhead. This component re-renders on every timelineT tick (60 Hz
+  // during playback); without the memo it would re-trace both SVG area
+  // paths (~columns × sub-samples envelope lookups each, plus arr→master
+  // projections) per tick just to move the playhead line. In the
+  // no-arrangement fallback the window is playhead-centred, so `winStart`
+  // changes per tick and the memo recomputes — same behaviour as before.
+  const { masterPath, followerPath, beatLines } = useMemo(() => {
+    const toMaster = (arrT: number) =>
+      arrTotal > 0 ? arrToMaster(arrT, segments) : arrT;
+    let masterPath = "";
+    let followerPath = "";
+    const beatLines: { x: number; down: boolean }[] = [];
+    if (hasAudio && audioEnv) {
+      masterPath = peakAreaPath(
+        (m) => sampleEnv(audioEnv, m),
         toMaster,
         winStart,
         spanS,
@@ -186,20 +184,45 @@ export function SidechainScope({ kind }: { kind: FxKind }) {
         RENDER_H,
         peakSub,
       );
-    }
-    if (bpm && bpm > 0 && spanS > 0) {
-      const period = 60 / bpm;
-      const firstK = Math.ceil((winStart - beatPhaseS) / period);
-      for (let k = firstK; ; k++) {
-        const t = beatPhaseS + k * period;
-        if (t > winStart + spanS) break;
-        if (t < winStart) continue;
-        const x = PAD_X + ((t - winStart) / spanS) * innerW;
-        const down = ((k % beatsPerBar) + beatsPerBar) % beatsPerBar === 0;
-        beatLines.push({ x, down });
+      if (follower) {
+        followerPath = peakAreaPath(
+          (m) => sampleEnv(follower, m),
+          toMaster,
+          winStart,
+          spanS,
+          RENDER_W,
+          RENDER_H,
+          peakSub,
+        );
+      }
+      if (bpm && bpm > 0 && spanS > 0) {
+        const period = 60 / bpm;
+        const firstK = Math.ceil((winStart - beatPhaseS) / period);
+        for (let k = firstK; ; k++) {
+          const t = beatPhaseS + k * period;
+          if (t > winStart + spanS) break;
+          if (t < winStart) continue;
+          const x = PAD_X + ((t - winStart) / spanS) * innerW;
+          const down = ((k % beatsPerBar) + beatsPerBar) % beatsPerBar === 0;
+          beatLines.push({ x, down });
+        }
       }
     }
-  }
+    return { masterPath, followerPath, beatLines };
+  }, [
+    hasAudio,
+    audioEnv,
+    follower,
+    arrTotal,
+    segments,
+    winStart,
+    spanS,
+    peakSub,
+    bpm,
+    beatPhaseS,
+    beatsPerBar,
+    innerW,
+  ]);
 
   // Playhead at its TRUE position in the window (matches the timeline).
   const playheadFrac = spanS > 0 ? (timelineT - winStart) / spanS : -1;

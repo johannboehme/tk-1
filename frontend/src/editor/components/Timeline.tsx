@@ -318,6 +318,53 @@ export function Timeline({
     }),
     [trim.in, trim.out, arrangementSegments],
   );
+  // Stable ProgramStrip callbacks — the strip is memo()ed, so handing it
+  // fresh closures every render would defeat that and put its DOM
+  // reconciliation back on the 60 Hz playback path.
+  const stripRemoveCut = useCallback(
+    (atTimeS: number, camId: string) => {
+      // Strip and store both run in timeline-time after the cut/fx axis
+      // flip — pass the strip's `atTimeS` through verbatim.
+      removeCutAt(atTimeS, camId);
+    },
+    [removeCutAt],
+  );
+  const stripCutDrag = useCallback(
+    (
+      fromAtTimeS: number,
+      camId: string,
+      rawNewT: number,
+      ev: { shiftKey: boolean },
+    ) => {
+      // Same snap rules as the rest of the timeline: SHIFT bypasses,
+      // grid modes round. No view↔master projection: cuts are
+      // timeline-anchored, snap is axis-agnostic.
+      const target = ev.shiftKey
+        ? rawNewT
+        : useEditorStore.getState().snapTimelineTime(rawNewT);
+      return useEditorStore.getState().moveCut(fromAtTimeS, camId, target);
+    },
+    [],
+  );
+  // Live paint-preview for a hold gesture. `paintToS` is pinned to null
+  // while no paint is active so this memo (and the memoized strip) stays
+  // referentially stable during plain playback.
+  const paintToS = holdGesture?.painting ? timelineT : null;
+  const stripPaintPreview = useMemo(() => {
+    if (!holdGesture || !holdGesture.painting || paintToS === null) return null;
+    const idx = clips.findIndex((c) => c.id === holdGesture.camId);
+    if (idx < 0) return null;
+    // Hold-gesture endpoints live in timeline-time (matches where
+    // `holdGesture.startS` was recorded — see Editor.tsx's onKeyDown for
+    // digit keys + TAKE button).
+    return {
+      fromS: holdGesture.startS,
+      toS: paintToS,
+      color: clips[idx].color,
+      camLabel: `CAM ${idx + 1}`,
+    };
+  }, [holdGesture, clips, paintToS]);
+
   const rawAudioStartS = jobMeta?.audioStartS ?? 0;
   const audioNudgeS = jobMeta?.audioStartNudgeS ?? 0;
   const audioStartArrPositions = useMemo(
@@ -1782,46 +1829,9 @@ export function Timeline({
               viewStartS={viewStart}
               viewEndS={viewEnd}
               width={canvasWidth}
-              onRemoveCut={(atTimeS, camId) => {
-                // Strip and store both run in timeline-time after the
-                // cut/fx axis flip — pass the strip's `atTimeS`
-                // through verbatim. Pre-refactor this projected through
-                // `viewToMaster` because cuts were master-time and a
-                // single delete had to wipe every duplicate occurrence;
-                // now each timeline slot owns its own cut.
-                removeCutAt(atTimeS, camId);
-              }}
-              onCutDrag={(fromAtTimeS, camId, rawNewT, ev) => {
-                // Same snap rules as the rest of the timeline: SHIFT
-                // bypasses, grid modes round. No view↔master projection:
-                // cuts are timeline-anchored, snap is axis-agnostic.
-                const target = ev.shiftKey
-                  ? rawNewT
-                  : useEditorStore.getState().snapTimelineTime(rawNewT);
-                return useEditorStore
-                  .getState()
-                  .moveCut(fromAtTimeS, camId, target);
-              }}
-              paintPreview={(() => {
-                if (!holdGesture || !holdGesture.painting) return null;
-                const clip = clips.find((c) => c.id === holdGesture.camId);
-                if (!clip) return null;
-                const idx = clips.findIndex((c) => c.id === clip.id);
-                // Hold-gesture endpoints live in timeline-time (matches
-                // where `holdGesture.startS` was recorded — see
-                // Editor.tsx's onKeyDown for digit keys + TAKE button).
-                // No `masterToView` projection: cuts are now timeline-
-                // anchored, and projecting a timeline-time value as
-                // master-time scans onto duplicate-pill slots.
-                const fromS = holdGesture.startS;
-                const toS = timelineT;
-                return {
-                  fromS,
-                  toS,
-                  color: clip.color,
-                  camLabel: `CAM ${idx + 1}`,
-                };
-              })()}
+              onRemoveCut={stripRemoveCut}
+              onCutDrag={stripCutDrag}
+              paintPreview={stripPaintPreview}
               matchMarkers={undefined}
               mode={programStripMode}
               fx={stripFx}
@@ -1915,9 +1925,7 @@ export function Timeline({
                   (clip.syncOverrideMs !== 0 ||
                     clip.startOffsetS !== 0 ||
                     clip.selectedCandidateIdx !== 0 ||
-                    pills.some(
-                      (p) => p.camId === clip.id && isPillDirty(p),
-                    ))
+                    (pillsByCamId.get(clip.id)?.dirty.some(Boolean) ?? false))
                 }
                 onReset={() => {
                   resetClipAlignment(clip.id);

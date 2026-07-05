@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test } from "vitest";
 import { useEditorStore } from "./store";
-import { buildPersistPatch } from "./useAutoPersist";
+import { buildPersistPatch, persistRelevantChanged } from "./useAutoPersist";
 import type { LocalJob, VideoAsset } from "../storage/jobs-db";
 
 const baseJob: LocalJob = {
@@ -122,5 +122,36 @@ describe("buildPersistPatch", () => {
     expect(video0.id).toBe("cam-1");
     expect(video0.syncOverrideMs).toBeUndefined();
     expect(video0.startOffsetS).toBeUndefined();
+  });
+});
+
+describe("persistRelevantChanged", () => {
+  beforeEach(() => {
+    useEditorStore.getState().reset();
+  });
+
+  test("no-op transition schedules nothing", () => {
+    useEditorStore.getState().loadJob(meta);
+    const s = useEditorStore.getState();
+    expect(persistRelevantChanged(s, s)).toBe(false);
+  });
+
+  test("detects every field buildPersistPatch writes — incl. pills", () => {
+    useEditorStore.getState().loadJob(meta);
+    const prev = useEditorStore.getState();
+    // A pill-only edit (move/trim on the timeline) must schedule a
+    // persist — pills are part of the patch, and losing them on refresh
+    // was exactly the bug this guards against.
+    const withPills = { ...prev, pills: [...prev.pills] };
+    expect(persistRelevantChanged(withPills, prev)).toBe(true);
+
+    const withCuts = { ...prev, cuts: [...prev.cuts] };
+    expect(persistRelevantChanged(withCuts, prev)).toBe(true);
+    const withTrim = { ...prev, trim: { ...prev.trim } };
+    expect(persistRelevantChanged(withTrim, prev)).toBe(true);
+    const withFx = { ...prev, fx: [...prev.fx] };
+    expect(persistRelevantChanged(withFx, prev)).toBe(true);
+    const withVolume = { ...prev, audioVolume: prev.audioVolume + 0.1 };
+    expect(persistRelevantChanged(withVolume, prev)).toBe(true);
   });
 });

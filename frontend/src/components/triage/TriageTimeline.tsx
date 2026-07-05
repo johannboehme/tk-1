@@ -14,7 +14,7 @@
  *
  * Plus a playhead overlay and zoom/pan affordances.
  */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import {
   chunkBeatPhaseS,
@@ -190,12 +190,19 @@ export function TriageTimeline() {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally only re-pan on focus-id changes
   }, [focusedChunkId]);
 
-  function timeToX(tS: number): number {
-    return (tS - viewStartS) * pxPerSec;
-  }
-  function xToTime(xPx: number): number {
-    return viewStartS + xPx / pxPerSec;
-  }
+  // Stable identities — both sit in effect dependency arrays (waveform
+  // redraw, window drag listeners). As plain functions they'd get a fresh
+  // identity on every render, and this component re-renders on every
+  // playhead tick (`playback.currentTime` above) — the waveform would
+  // redraw its full hi-res body 60×/s during playback for nothing.
+  const timeToX = useCallback(
+    (tS: number): number => (tS - viewStartS) * pxPerSec,
+    [viewStartS, pxPerSec],
+  );
+  const xToTime = useCallback(
+    (xPx: number): number => viewStartS + xPx / pxPerSec,
+    [viewStartS, pxPerSec],
+  );
 
   function onWheel(e: React.WheelEvent) {
     e.preventDefault();
