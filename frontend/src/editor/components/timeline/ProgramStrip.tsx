@@ -12,6 +12,7 @@
  */
 import {
   CSSProperties,
+  memo,
   MouseEvent,
   PointerEvent as ReactPointerEvent,
   useMemo,
@@ -25,6 +26,7 @@ import { FxStripLayer } from "./FxStripLayer";
 import { tapeHeightForMode } from "./tape-height";
 import { useLongPressClear } from "./useLongPressClear";
 
+import { clamp } from "../../../lib/clamp";
 /** Hold-to-clear duration: 3 s feels deliberate (an accidental click
  *  doesn't trigger it) but not punishing. The user cancels by lifting
  *  or pressing Esc. */
@@ -102,7 +104,14 @@ interface Props {
 
 const EMPTY_LIVE_FX_IDS: ReadonlySet<string> = new Set();
 
-export function ProgramStrip({
+/** Memoized: the Timeline re-renders every playback frame (its canvas
+ *  subscribes to timelineT), but the strip's inputs only change on real
+ *  edits / scroll / zoom. With stable props from the Timeline, memo()
+ *  drops the strip's per-frame DOM reconciliation (program segments +
+ *  splice tabs + FX capsules) during passive playback. */
+export const ProgramStrip = memo(ProgramStripImpl);
+
+function ProgramStripImpl({
   cuts,
   cams,
   duration,
@@ -774,9 +783,6 @@ function buildProgram(
   return segments;
 }
 
-function clamp(v: number, lo: number, hi: number) {
-  return Math.max(lo, Math.min(hi, v));
-}
 
 function darken(hex: string, fraction: number): string {
   const c = hex.replace("#", "");

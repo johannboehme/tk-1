@@ -23,6 +23,7 @@ import {
   pickLevel,
   rawPcmColumn,
 } from "./peak-pyramid";
+import { clamp } from "../../lib/clamp";
 
 export type Normalize = "absolute" | "peak";
 
@@ -70,9 +71,6 @@ export interface ColumnModel {
   colMaxCss: Float32Array;
 }
 
-function clamp(v: number, lo: number, hi: number): number {
-  return v < lo ? lo : v > hi ? hi : v;
-}
 
 /** Minimum visible half-height of the body, in CSS pixels. */
 const MIN_HALF_PX = 0.6;
@@ -130,12 +128,17 @@ export function computeColumnModel(opts: ColumnModelOpts): ColumnModel {
     level === 0 &&
     samplesPerDevPx < pyramid.baseSamplesPerBucket;
 
+  // Column i's right boundary is column i+1's left boundary (same cssX), so
+  // carry it across iterations — one mapXToTime projection per boundary
+  // instead of two per column.
+  let prevBoundary: number | null | undefined;
   for (let i = 0; i < deviceWidth; i++) {
     let t0c: number;
     let t1c: number;
     if (mapXToTime) {
-      const a = mapXToTime(i / dpr);
+      const a = prevBoundary !== undefined ? prevBoundary : mapXToTime(i / dpr);
       const b = mapXToTime((i + 1) / dpr);
+      prevBoundary = b;
       if (a == null || b == null) {
         hasData[i] = 0;
         continue;
@@ -226,6 +229,12 @@ export function drawWaveform(
   // Normalized half-height that maps to MIN_HALF_PX on screen.
   const minHalf = MIN_HALF_PX / Math.max(1, half);
 
+  // Scratch buffers shared by every run in this draw call — sized once to the
+  // widest possible run so per-run allocation (and its GC churn at 60 Hz)
+  // disappears.
+  const et = new Float32Array(deviceWidth);
+  const eb = new Float32Array(deviceWidth);
+
   const drawRun = (s: number, e: number) => {
     // Subtle ground line keeps quiet / silent stretches anchored.
     ctx.strokeStyle = style.groundColor;
@@ -238,8 +247,6 @@ export function drawWaveform(
     // Expand any column thinner than the minimum so the body stays visible
     // (and traces the sample line) at extreme zoom instead of collapsing.
     const n = e - s;
-    const et = new Float32Array(n);
-    const eb = new Float32Array(n);
     for (let i = s; i < e; i++) {
       const [t, b] = expandToMinThickness(top[i], bot[i], minHalf);
       et[i - s] = t;

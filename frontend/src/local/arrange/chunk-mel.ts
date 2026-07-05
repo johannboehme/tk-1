@@ -20,6 +20,7 @@
 import type { AudioAnalysis } from "../render/audio-analysis/types";
 import type { Chunk } from "../../storage/jobs-db";
 
+import { clamp01 } from "../../lib/clamp";
 /** Number of mel bins. 64 is the sweet spot: enough vertical resolution
  *  to see formants and kicks, small enough that ~10s chunk = ~20 KB. */
 export const MEL_N_MELS = 64;
@@ -434,9 +435,6 @@ export function chunkStemHeuristic(
   return { drums, bass: bassFinal, melody, formants };
 }
 
-function clamp01(v: number): number {
-  return Math.max(0, Math.min(1, v));
-}
 
 // ─── IDB cache wrapper ───────────────────────────────────────────────────
 

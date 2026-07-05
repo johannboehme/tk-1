@@ -100,6 +100,35 @@ export function buildPersistPatch(
   };
 }
 
+type EditorStoreState = ReturnType<typeof useEditorStore.getState>;
+
+/** Pure dirty-check for the auto-persist subscription: did this store
+ *  transition touch anything `buildPersistPatch` writes? Exported for
+ *  tests — every field the patch persists must be watched here, or edits
+ *  to it silently survive only until the next unrelated change. */
+export function persistRelevantChanged(
+  state: EditorStoreState,
+  prev: EditorStoreState,
+): boolean {
+  return (
+    state.clips !== prev.clips ||
+    state.cuts !== prev.cuts ||
+    state.pills !== prev.pills ||
+    state.trim !== prev.trim ||
+    state.ui.snapMode !== prev.ui.snapMode ||
+    state.ui.lanesLocked !== prev.ui.lanesLocked ||
+    state.jobMeta?.bpm !== prev.jobMeta?.bpm ||
+    state.jobMeta?.audioStartNudgeS !== prev.jobMeta?.audioStartNudgeS ||
+    state.jobMeta?.beatsPerBar !== prev.jobMeta?.beatsPerBar ||
+    state.jobMeta?.barOffsetBeats !== prev.jobMeta?.barOffsetBeats ||
+    state.fx !== prev.fx ||
+    state.colorGrade !== prev.colorGrade ||
+    state.filterSlots !== prev.filterSlots ||
+    state.audioVolume !== prev.audioVolume ||
+    state.exportSpec !== prev.exportSpec
+  );
+}
+
 export function useAutoPersist(jobId: string | null): void {
   useEffect(() => {
     if (!jobId) return;
@@ -140,22 +169,7 @@ export function useAutoPersist(jobId: string | null): void {
         return;
       }
 
-      if (
-        state.clips !== prev.clips ||
-        state.cuts !== prev.cuts ||
-        state.trim !== prev.trim ||
-        state.ui.snapMode !== prev.ui.snapMode ||
-        state.ui.lanesLocked !== prev.ui.lanesLocked ||
-        state.jobMeta.bpm !== prev.jobMeta?.bpm ||
-        state.jobMeta.audioStartNudgeS !== prev.jobMeta?.audioStartNudgeS ||
-        state.jobMeta.beatsPerBar !== prev.jobMeta?.beatsPerBar ||
-        state.jobMeta.barOffsetBeats !== prev.jobMeta?.barOffsetBeats ||
-        state.fx !== prev.fx ||
-        state.colorGrade !== prev.colorGrade ||
-        state.filterSlots !== prev.filterSlots ||
-        state.audioVolume !== prev.audioVolume ||
-        state.exportSpec !== prev.exportSpec
-      ) {
+      if (persistRelevantChanged(state, prev)) {
         schedule();
       }
     });

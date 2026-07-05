@@ -43,7 +43,7 @@ export function gridStepSeconds(
   bpm: number | null,
   beatsPerBar: number = DEFAULT_BEATS_PER_BAR,
 ): number | null {
-  if (!bpm || bpm <= 0) return null;
+  if (!bpm || bpm <= 0 || !Number.isFinite(bpm)) return null;
   const beatS = 60 / bpm;
   const bpb = beatsPerBar > 0 ? beatsPerBar : DEFAULT_BEATS_PER_BAR;
   switch (mode) {

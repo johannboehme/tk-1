@@ -1,3 +1,4 @@
+import { clamp } from "../../lib/clamp";
 /**
  * Adaptive resolution scaler für die Live-Preview.
  *
@@ -156,6 +157,3 @@ export class AdaptiveScaler {
   }
 }
 
-function clamp(v: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, v));
-}

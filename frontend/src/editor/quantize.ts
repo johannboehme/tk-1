@@ -120,15 +120,6 @@ export function buildQuantizePreview(
   return { cuts, clipStartOffsets, trim, fxs };
 }
 
-export function isPreviewEmpty(p: QuantizePreview): boolean {
-  return (
-    p.cuts.length === 0 &&
-    p.clipStartOffsets.length === 0 &&
-    p.trim === null &&
-    p.fxs.length === 0
-  );
-}
-
 function emptyPreview(): QuantizePreview {
   return { cuts: [], clipStartOffsets: [], trim: null, fxs: [] };
 }

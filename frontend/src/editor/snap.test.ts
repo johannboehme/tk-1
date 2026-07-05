@@ -196,3 +196,13 @@ describe("snapTime — non-mode-dependent shape", () => {
     }
   });
 });
+
+describe("snapTime — degenerate bpm", () => {
+  it("returns t unchanged for non-finite bpm instead of a broken grid", () => {
+    for (const bpm of [Number.POSITIVE_INFINITY, Number.NaN]) {
+      const ctx = { bpm, beatPhase: 0 };
+      expect(snapTime(1.23, "1/4", ctx)).toBe(1.23);
+      expect(snapTime(1.23, "1", ctx)).toBe(1.23);
+    }
+  });
+});

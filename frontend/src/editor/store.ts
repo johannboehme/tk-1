@@ -61,6 +61,7 @@ import {
   type SidechainConfig,
 } from "./fx/modulation";
 
+import { clamp } from "../lib/clamp";
 export interface BpmInfo {
   /** BPM (detected or user-overridden). */
   value: number;
@@ -1004,12 +1005,6 @@ function neighbourBoundsForCam(
  *  decoder's typical seek granularity so playback can land on it. */
 const PILL_MIN_WINDOW_S = 0.05;
 
-/** Bounded clamp `min ≤ x ≤ max`. Order-of-args mirrors `Math.max(min,
- *  Math.min(max, x))` so reading the call as `clamp(value, lo, hi)` is
- *  natural. */
-function clamp(x: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, x));
-}
 
 /** Restore a pill to its auto-generated arr-window + source-trim. Used
  *  by both per-pill (`resetPill`) and per-cam (`resetPillsForCam`)

@@ -16,6 +16,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useArrangeStore } from "../../local/arrange/arrange-store";
 import { resolveJobAssetUrl } from "../../local/jobs";
 
+import { clampSeek } from "../../lib/clamp";
 const LEAD_TIME_S = 0.05;
 const CROSSFADE_S = 0.008;
 
@@ -307,11 +308,6 @@ function Driver({
   return null;
 }
 
-function clampSeek(target: number, duration: number): number {
-  if (!Number.isFinite(target)) return 0;
-  if (!Number.isFinite(duration) || duration <= 0) return Math.max(0, target);
-  return Math.max(0, Math.min(duration, target));
-}
 
 function scheduleCrossfade(g: AudioGraph, fromSide: "A" | "B", fireCtxT: number) {
   const fromGain = fromSide === "A" ? g.gainA : g.gainB;

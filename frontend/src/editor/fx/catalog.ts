@@ -14,6 +14,7 @@ import type { ADSREnvelope } from "./envelope";
 import type { FxKind, FxParamDef, PunchFx } from "./types";
 import { ENGINE_DEFAULTS, GRADE_PARAM_KEYS, type GradeParams } from "./looks";
 
+import { clamp01 } from "../../lib/clamp";
 export interface FxDefinition {
   kind: FxKind;
   /** Short display label on pads / capsules. ≤ 4 chars. */
@@ -1111,6 +1112,3 @@ export function defaultTapLengthS(kind: FxKind, bpm: number | null): number {
   return def.defaultLengthS;
 }
 
-function clamp01(n: number): number {
-  return Math.max(0, Math.min(1, n));
-}

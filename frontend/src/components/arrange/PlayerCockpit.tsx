@@ -25,6 +25,7 @@ import {
 } from "../../local/arrange/chunk-mel";
 import { PHOSPHOR_LUT } from "../../local/arrange/chunk-mel-render";
 import { CamPreviewArrange } from "./CamPreviewArrange";
+import { formatTime } from "../../lib/time-format";
 
 // ─── Props (presentational layer) ──────────────────────────────────────
 
@@ -640,12 +641,6 @@ function BezelDivider() {
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
-function formatTime(s: number): string {
-  if (!Number.isFinite(s) || s < 0) return "0:00";
-  const m = Math.floor(s / 60);
-  const sec = Math.floor(s % 60);
-  return `${m}:${sec.toString().padStart(2, "0")}`;
-}
 
 function pad(n: number, width: number): string {
   return n.toString().padStart(width, "0");
