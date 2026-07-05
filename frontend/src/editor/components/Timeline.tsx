@@ -267,6 +267,69 @@ export function Timeline({
     return set;
   }, [fxHolds]);
 
+  // Pills bucketed per cam, sorted by arr-start, with the per-pill id +
+  // dirty arrays the lane renderer consumes. The canvas draw effect re-runs
+  // every playback frame (timelineT is in its deps), so this filter/sort/map
+  // work must not live inside it — hoisted here it recomputes only when the
+  // pills themselves change.
+  const pillsByCamId = useMemo(() => {
+    const map = new Map<
+      string,
+      { pills: Pill[]; ids: (string | null)[]; dirty: boolean[] }
+    >();
+    for (const p of pills) {
+      let bucket = map.get(p.camId);
+      if (!bucket) {
+        bucket = { pills: [], ids: [], dirty: [] };
+        map.set(p.camId, bucket);
+      }
+      bucket.pills.push(p);
+    }
+    for (const bucket of map.values()) {
+      bucket.pills.sort((a, b) => a.arrStartS - b.arrStartS);
+      bucket.ids = bucket.pills.map((p) => p.id);
+      bucket.dirty = bucket.pills.map(isPillDirty);
+    }
+    return map;
+  }, [pills]);
+
+  // Segment geometry in arr-space — cumulative starts plus per-segment
+  // bounds for the waveform's arr→master projection. Segments only change
+  // on arrangement edits, never per frame.
+  const segGeometry = useMemo(() => {
+    const arrStarts = segmentArrStarts(arrangementSegments);
+    const segBounds = arrangementSegments.map((seg, i) => {
+      const segArrIn = arrStarts[i];
+      return {
+        segArrIn,
+        segArrOut: segArrIn + Math.max(0, seg.out - seg.in),
+        masterIn: seg.in,
+      };
+    });
+    return { arrStarts, segBounds };
+  }, [arrangementSegments]);
+
+  // Trim window + audio-start marker projected into arr-time. Both are
+  // master-time values that rarely change; projecting them per redraw
+  // (60 Hz during playback) re-scans the whole segment list for nothing.
+  const trimProjection = useMemo(
+    () => ({
+      playableSlices: sliceByArrSegments(trim.in, trim.out, arrangementSegments),
+      trimInArrPositions: mastersToArrAll(trim.in, arrangementSegments),
+      trimOutArrPositions: mastersToArrAll(trim.out, arrangementSegments),
+    }),
+    [trim.in, trim.out, arrangementSegments],
+  );
+  const rawAudioStartS = jobMeta?.audioStartS ?? 0;
+  const audioNudgeS = jobMeta?.audioStartNudgeS ?? 0;
+  const audioStartArrPositions = useMemo(
+    () =>
+      rawAudioStartS > 0 || audioNudgeS !== 0
+        ? mastersToArrAll(rawAudioStartS + audioNudgeS, arrangementSegments)
+        : null,
+    [rawAudioStartS, audioNudgeS, arrangementSegments],
+  );
+
   const takePromoteTimerRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
 
   const duration = jobMeta?.duration || audioDuration || 0;
@@ -502,16 +565,9 @@ export function Timeline({
   // ---- Active-cam status per lane (drives LED color) ----
   const camStatusByCamId = useMemo(() => {
     const result: Record<string, CamStatus> = {};
-    const ranges = clips.map((c) => {
-      const r = clipRangeS(c);
-      return { id: c.id, startS: r.startS, endS: r.endS };
-    });
-    const activeId = (() => {
-      const s = useEditorStore.getState();
-      return s.activeCamId(timelineT);
-    })();
+    const activeId = useEditorStore.getState().activeCamId(timelineT);
     for (const cam of clips) {
-      const range = ranges.find((r) => r.id === cam.id)!;
+      const range = clipRangeS(cam);
       const hasMaterial = currentTime >= range.startS && currentTime < range.endS;
       const status: CamStatus =
         cam.id === activeId
@@ -551,10 +607,8 @@ export function Timeline({
       const clip = clips[i];
       const band = videoBands[i];
       const range = clipRangeS(clip);
-      const lanePills = pills
-        .filter((p) => p.camId === clip.id)
-        .slice()
-        .sort((a, b) => a.arrStartS - b.arrStartS);
+      const laneBucket = pillsByCamId.get(clip.id);
+      const lanePills = laneBucket?.pills ?? [];
       const drift = isVideoClip(clip) ? clip.driftRatio : 1;
       const slices: ClipPillSlice[] = lanePills.map((p) => {
         // Source-time range projected back into master-time so the
@@ -569,9 +623,9 @@ export function Timeline({
           xEnd: ((p.arrEndS - viewStart) / visibleDur) * canvasWidth,
         };
       });
-      const pillIds: (string | null)[] = lanePills.map((p) => p.id);
+      const pillIds: (string | null)[] = laneBucket?.ids ?? [];
       const selectedSlice = lanePills.map((p) => p.id === selectedPillId);
-      const dirtySlice = lanePills.map(isPillDirty);
+      const dirtySlice = laneBucket?.dirty ?? [];
       drawVideoLane({
         ctx,
         clip,
@@ -629,18 +683,22 @@ export function Timeline({
     // its arrangement segment's master-time and returns null in the gaps —
     // discontinuous master regions never smear and long-form gaps stay gaps.
     if (pyramid.levels.length > 0) {
-      const arrStarts = segmentArrStarts(arrangementSegments);
-      const segBounds = arrangementSegments.map((seg, i) => {
-        const segArrIn = arrStarts[i];
-        return {
-          segArrIn,
-          segArrOut: segArrIn + Math.max(0, seg.out - seg.in),
-          masterIn: seg.in,
-        };
-      });
+      const { segBounds } = segGeometry;
       // arrStarts are cumulative (ascending, non-overlapping) → binary search.
+      // Adjacent columns land in the same segment almost always, so try the
+      // previous hit first before searching.
+      let lastHit = -1;
       const mapXToTime = (cssX: number): number | null => {
         const arrT = viewStart + (cssX / canvasWidth) * visibleDur;
+        // Strictly-interior only — a query exactly on a shared seam falls
+        // through to the binary search so it resolves to the same segment
+        // the uncached lookup would pick.
+        if (lastHit >= 0) {
+          const b = segBounds[lastHit];
+          if (arrT > b.segArrIn && arrT < b.segArrOut) {
+            return b.masterIn + (arrT - b.segArrIn);
+          }
+        }
         let lo = 0;
         let hi = segBounds.length - 1;
         while (lo <= hi) {
@@ -648,7 +706,10 @@ export function Timeline({
           const b = segBounds[mid];
           if (arrT < b.segArrIn) hi = mid - 1;
           else if (arrT > b.segArrOut) lo = mid + 1;
-          else return b.masterIn + (arrT - b.segArrIn);
+          else {
+            lastHit = mid;
+            return b.masterIn + (arrT - b.segArrIn);
+          }
         }
         return null;
       };
@@ -678,11 +739,7 @@ export function Timeline({
       // everything between slices is the dim-region (un-trimmed
       // material). Empty slice list (trim outside all segments) → dim
       // the whole canvas.
-      const playableSlices = sliceByArrSegments(
-        trim.in,
-        trim.out,
-        arrangementSegments,
-      );
+      const { playableSlices } = trimProjection;
       ctx.fillStyle = "rgba(232,225,208,0.78)";
       let dimCursor = 0;
       for (const slice of playableSlices) {
@@ -710,8 +767,7 @@ export function Timeline({
       // Each is independently hit-testable in `classifyAudioHit`; all
       // of them drag the same master-time value, so a duplicated chunk
       // shows N handles that move together when any one is grabbed.
-      const trimInArrPositions = mastersToArrAll(trim.in, arrangementSegments);
-      const trimOutArrPositions = mastersToArrAll(trim.out, arrangementSegments);
+      const { trimInArrPositions, trimOutArrPositions } = trimProjection;
       for (const arrT of trimInArrPositions) {
         const xH = arrTToX(arrT);
         if (xH >= 0 && xH <= audioRightX) {
@@ -728,16 +784,9 @@ export function Timeline({
       // Audio-start marker — orange tick at every arr-time occurrence
       // of `audioStartS + audioStartNudgeS`. Single-take's identity
       // projection produces one tick.
-      const rawAudioStartS = jobMeta?.audioStartS ?? 0;
-      const audioNudgeS = jobMeta?.audioStartNudgeS ?? 0;
-      if (rawAudioStartS > 0 || audioNudgeS !== 0) {
-        const masterAudioStart = rawAudioStartS + audioNudgeS;
-        const arrPositions = mastersToArrAll(
-          masterAudioStart,
-          arrangementSegments,
-        );
+      if (audioStartArrPositions) {
         ctx.fillStyle = "rgba(255,107,0,0.85)";
-        for (const arrT of arrPositions) {
+        for (const arrT of audioStartArrPositions) {
           const xMark = arrTToX(arrT);
           if (xMark >= 0 && xMark <= audioRightX) {
             ctx.fillRect(Math.floor(xMark), audioBand.top, 1, audioLaneHeight);
@@ -756,7 +805,7 @@ export function Timeline({
     // single-take's single segment there are no seams to mark (start/end
     // coincide with the canvas boundary), so this is a no-op.
     if (arrangementSegments.length > 1) {
-      const arrStarts = segmentArrStarts(arrangementSegments);
+      const { arrStarts } = segGeometry;
       ctx.fillStyle = "rgba(255,87,34,0.55)";
       for (let i = 0; i < arrangementSegments.length; i++) {
         const arrIn = arrStarts[i];
@@ -891,10 +940,13 @@ export function Timeline({
     videoBands,
     snapMode,
     quantizePreview,
+    pillsByCamId,
+    selectedPillId,
+    segGeometry,
+    trimProjection,
     // Re-draw when the audio-start marker shifts (raw or user-nudged) so
     // the orange flag tracks the SyncTuner knob in real time.
-    jobMeta?.audioStartS,
-    jobMeta?.audioStartNudgeS,
+    audioStartArrPositions,
     // Re-draw when overflow toggles so the audio-lane clip-rect picks up
     // the new audioRightX. Without these, initial mount captures the
     // pre-measure {height:0, viewport:0} state and the audio lane gets
