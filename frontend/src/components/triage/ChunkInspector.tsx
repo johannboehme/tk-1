@@ -45,6 +45,7 @@ import {
 } from "../../local/triage/triage-guarded-actions";
 import { BarCountLcd } from "./BarCountLcd";
 import type { Chunk } from "../../storage/jobs-db";
+import { formatTime } from "../../lib/time-format";
 
 const CONFORM_STATUS_LABEL: Record<string, string> = {
   ok: "✓ conformed",
@@ -830,9 +831,3 @@ function Sep() {
   return <span className="text-ink-3">·</span>;
 }
 
-function formatTime(s: number): string {
-  if (!Number.isFinite(s) || s < 0) return "0:00";
-  const m = Math.floor(s / 60);
-  const sec = Math.floor(s % 60);
-  return `${m}:${sec.toString().padStart(2, "0")}`;
-}

@@ -21,6 +21,7 @@ import {
 } from "../../local/triage/triage-sequence";
 import { resolveJobAssetUrl } from "../../local/jobs";
 
+import { clampSeek } from "../../lib/clamp";
 /** Seconds before the loop wrap point at which the crossfade is
  *  armed. The idle element is `play()`'d at this point so it's
  *  running by the time the gain ramp hits. 50 ms is conservative —
@@ -470,11 +471,6 @@ function Driver({
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
-function clampSeek(target: number, duration: number): number {
-  if (!Number.isFinite(target)) return 0;
-  if (!Number.isFinite(duration) || duration <= 0) return Math.max(0, target);
-  return Math.max(0, Math.min(duration, target));
-}
 
 function scheduleCrossfade(g: AudioGraph, fromSide: "A" | "B", fireCtxT: number) {
   const fromGain = fromSide === "A" ? g.gainA : g.gainB;

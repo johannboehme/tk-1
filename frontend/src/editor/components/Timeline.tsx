@@ -55,6 +55,7 @@ import { MASTER_AUDIO_ID } from "../types";
 import { drawWaveform, EDITOR_STYLE } from "../../local/waveform/draw-waveform";
 import type { PeakPyramid } from "../../local/waveform/peak-pyramid";
 
+import { clamp } from "../../lib/clamp";
 interface CamAssetInfo {
   /** OPFS object URL for this cam's thumbnail strip (may be null). */
   framesUrl: string | null;
@@ -153,9 +154,6 @@ const MAX_ZOOM = 1024;
  *  to. Anything thinner is the user mid-drag, not a usable chunk. */
 const PILL_MIN_WINDOW_S = 0.05;
 
-function clamp(x: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, x));
-}
 /** Default lane-header column width on desktop. The narrow-viewport
  *  variant (`HEADER_W_COMPACT`) is used on phone-sized screens — see
  *  LaneHeader.tsx for the matching compact body. */

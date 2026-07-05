@@ -30,6 +30,7 @@ import {
   totalArrDuration,
 } from "../arrangement-time";
 
+import { clamp01 } from "../../lib/clamp";
 const LCD_GREEN = "#9FE08E";
 const RENDER_W = 280; // logical px (SVG viewBox); scales to container
 const RENDER_H = 80;
@@ -41,9 +42,6 @@ const PAD_Y = 5;
 /** Fallback window (no arrangement) — ~8 beats so a kick is a clear peak. */
 const FALLBACK_BEATS = 8;
 
-function clamp01(v: number): number {
-  return v < 0 ? 0 : v > 1 ? 1 : v;
-}
 
 /**
  * Filled area path, PEAK-bucketed per column: each column takes the max

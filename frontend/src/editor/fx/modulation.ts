@@ -21,6 +21,7 @@
  */
 import { envelopeAt, type ADSREnvelope } from "./envelope";
 
+import { clamp01 } from "../../lib/clamp";
 // ── LFO ──────────────────────────────────────────────────────────────
 
 export type LfoShape = "sine" | "triangle" | "saw" | "ramp" | "square";
@@ -140,9 +141,6 @@ const FREE_SLOW_S = 2.0; // period near centre (slowest free)
 const FREE_FAST_S = 0.04; // period at full left (fastest free)
 const CENTER = 0.5;
 
-function clamp01(v: number): number {
-  return v < 0 ? 0 : v > 1 ? 1 : v;
-}
 
 /** Is the bipolar rate on the beat-synced (right) half? */
 export function isSyncedRate(rate: number): boolean {

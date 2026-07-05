@@ -46,6 +46,7 @@ import { SidechainScope } from "./SidechainScope";
 import { SegmentedControl } from "./SegmentedControl";
 import { useIsNarrowViewport } from "../use-is-narrow";
 
+import { clamp } from "../../lib/clamp";
 interface PadDef {
   slotKey: string;
   kind: FxKind;
@@ -2594,9 +2595,6 @@ function snapDetent(v: number): number {
   return v;
 }
 
-function clamp(v: number, lo: number, hi: number): number {
-  return v < lo ? lo : v > hi ? hi : v;
-}
 
 // — Constants & styles ————————————————————————————————————
 

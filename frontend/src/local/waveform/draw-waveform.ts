@@ -23,6 +23,7 @@ import {
   pickLevel,
   rawPcmColumn,
 } from "./peak-pyramid";
+import { clamp } from "../../lib/clamp";
 
 export type Normalize = "absolute" | "peak";
 
@@ -70,9 +71,6 @@ export interface ColumnModel {
   colMaxCss: Float32Array;
 }
 
-function clamp(v: number, lo: number, hi: number): number {
-  return v < lo ? lo : v > hi ? hi : v;
-}
 
 /** Minimum visible half-height of the body, in CSS pixels. */
 const MIN_HALF_PX = 0.6;

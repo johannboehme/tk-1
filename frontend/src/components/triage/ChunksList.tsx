@@ -19,6 +19,7 @@ import {
 } from "../../local/triage/triage-store";
 import { buildSequence } from "../../local/triage/triage-sequence";
 import type { Chunk } from "../../storage/jobs-db";
+import { formatTime } from "../../lib/time-format";
 
 const HOT_COLOR = "#FF5722";
 const BRASS_COLOR = "#C9A95A";
@@ -336,9 +337,3 @@ function SeamStepButton({
   );
 }
 
-function formatTime(s: number): string {
-  if (!Number.isFinite(s) || s < 0) return "0:00";
-  const m = Math.floor(s / 60);
-  const sec = Math.floor(s % 60);
-  return `${m}:${sec.toString().padStart(2, "0")}`;
-}

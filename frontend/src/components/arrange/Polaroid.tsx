@@ -17,6 +17,7 @@ import type { Chunk, VideoAsset } from "../../storage/jobs-db";
 import { useChunkThumbnail } from "./useChunkThumbnail";
 import { useArrangeStore } from "../../local/arrange/arrange-store";
 import { renderMelOverlay } from "../../local/arrange/chunk-mel-render";
+import { formatTime } from "../../lib/time-format";
 
 /** Image-well column count for the screen-blended mel overlay. The
  *  well is ~108 px wide on the deployed card; 96 internal columns
@@ -338,9 +339,3 @@ function UsageDots({ count }: { count: number }) {
   );
 }
 
-function formatTime(s: number): string {
-  if (!Number.isFinite(s) || s < 0) return "0:00";
-  const m = Math.floor(s / 60);
-  const sec = Math.floor(s % 60);
-  return `${m}:${sec.toString().padStart(2, "0")}`;
-}

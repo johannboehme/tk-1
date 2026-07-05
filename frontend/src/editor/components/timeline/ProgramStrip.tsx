@@ -25,6 +25,7 @@ import { FxStripLayer } from "./FxStripLayer";
 import { tapeHeightForMode } from "./tape-height";
 import { useLongPressClear } from "./useLongPressClear";
 
+import { clamp } from "../../../lib/clamp";
 /** Hold-to-clear duration: 3 s feels deliberate (an accidental click
  *  doesn't trigger it) but not punishing. The user cancels by lifting
  *  or pressing Esc. */
@@ -774,9 +775,6 @@ function buildProgram(
   return segments;
 }
 
-function clamp(v: number, lo: number, hi: number) {
-  return Math.max(lo, Math.min(hi, v));
-}
 
 function darken(hex: string, fraction: number): string {
   const c = hex.replace("#", "");

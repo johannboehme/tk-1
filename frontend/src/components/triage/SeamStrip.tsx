@@ -33,6 +33,7 @@ import {
 import { buildPeakPyramidAsync } from "../../local/waveform/build-pyramid-async";
 import { drawWaveform, TRIAGE_STYLE } from "../../local/waveform/draw-waveform";
 import { getCachedPyramid } from "../../local/waveform/pyramid-cache";
+import { clamp } from "../../lib/clamp";
 
 const HOT = "#FF5722";
 const BRASS = "#C9A95A";
@@ -534,9 +535,6 @@ function SeamLane({
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
-function clamp(v: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, v));
-}
 
 interface LaneView {
   startS: number;
