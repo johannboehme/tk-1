@@ -255,7 +255,7 @@ describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => 
       algoOffsetMs: 0,
       driftRatio: 1,
     });
-    render(<Harness audioUrl="/x.wav" refs={refs} />);
+    const view = render(<Harness audioUrl="/x.wav" refs={refs} />);
     await flushAll();
     const mA = mockMediaElement(refs.audioA);
     const mB = mockMediaElement(refs.audioB);
@@ -265,7 +265,9 @@ describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => 
       mA.fireLoadedMetadata();
       await flushAll();
     });
-    return { mA, mB };
+    const rerenderUrl = (url: string) =>
+      view.rerender(<Harness audioUrl={url} refs={refs} />);
+    return { mA, mB, rerenderUrl };
   }
 
   it("reports loadedmetadata duration into the handle and store", async () => {
@@ -493,6 +495,57 @@ describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => 
             .calls.length > 0,
       );
       expect(ramped).toBe(true);
+    });
+
+    it("pending pre-metadata seek replays onto the ACTIVE side, even after swaps (#137)", async () => {
+      // Drive one crossfade swap so the active side is B, then change the
+      // audio URL (isReady resets), seek before metadata arrives, and let
+      // loadedmetadata replay the stashed seek. It must land on B — the
+      // element the user actually hears — not unconditionally on A.
+      const { mA, mB, rerenderUrl } = await setup();
+      const { ctx } = ctxHandle;
+      await act(async () => {
+        useEditorStore.getState().setLoop({ start: 0, end: 2 });
+        await flushAll();
+      });
+      await act(async () => {
+        useEditorStore.getState().setPlaying(true);
+        await flushAll();
+      });
+      // Arm + fire the wrap → roles swap, active becomes B.
+      await act(async () => {
+        mA.setCurrentTime(1.97);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      await act(async () => {
+        ctx.currentTime = 100;
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      await act(async () => {
+        useEditorStore.getState().setPlaying(false);
+        await flushAll();
+      });
+      // URL changes in place (job switch without unmount) — readiness
+      // resets, ping-pong state survives (graph is cached per element).
+      await act(async () => {
+        rerenderUrl("/y.wav");
+        await flushAll();
+      });
+      // Seek while metadata is pending — gets stashed.
+      await act(async () => {
+        useEditorStore.getState().seek(3.7);
+        await flushAll();
+      });
+      expect(useEditorStore.getState().playback.seekRequest).toBeNull();
+      // Metadata arrives → the stashed seek must hit the ACTIVE element (B).
+      await act(async () => {
+        mA.fireLoadedMetadata();
+        await flushAll();
+      });
+      expect(mB.getCurrentTime()).toBeCloseTo(3.7, 5);
+      // The muted idle (A) must NOT have swallowed the seek.
+      expect(mA.getCurrentTime()).not.toBeCloseTo(3.7, 5);
     });
 
     it("user seek cancels any armed crossfade", async () => {

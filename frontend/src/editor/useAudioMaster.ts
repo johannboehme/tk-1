@@ -197,10 +197,21 @@ export function useAudioMaster(
       setIsReady(true);
       const pending = pendingSeekRef.current;
       if (pending !== null) {
-        try {
-          el.currentTime = clampSeek(pending, el.duration);
-        } catch {
-          /* element not ready */
+        // Replay onto the ACTIVE side. The ping-pong state survives URL
+        // changes (the graph is cached per element), so after an odd
+        // number of crossfade swaps the audible element is B — writing
+        // the stashed seek to A would land it on the muted idle and the
+        // playhead would silently resume from B's stale position.
+        const active =
+          stateRef.current.active === "A"
+            ? refsStable.a.current
+            : refsStable.b.current;
+        if (active) {
+          try {
+            active.currentTime = clampSeek(pending, active.duration);
+          } catch {
+            /* element not ready */
+          }
         }
         pendingSeekRef.current = null;
       }
