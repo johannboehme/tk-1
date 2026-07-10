@@ -194,6 +194,11 @@ export function Timeline({
     });
   };
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  // Stacked playhead layer. During playback the ONLY per-frame pixel change
+  // is the playhead line, so it lives on its own transparent canvas above
+  // the scene canvas — the expensive multi-lane raster below redraws only
+  // on scroll/zoom/data changes, never per playback tick.
+  const overlayRef = useRef<HTMLCanvasElement>(null);
   const [canvasWidth, setCanvasWidth] = useState(800);
   const dragRef = useRef<DragKind | null>(null);
 
@@ -446,10 +451,18 @@ export function Timeline({
   }, [timelineT, currentTimeView, viewStart, viewEnd, timelineStartS, maxScroll, clampedScroll, setScrollX]);
 
   // ---- Layout offsets (canvas y-coordinates per lane) ----
-  const videoBands = clips.map((_, i) => ({
-    top: i * videoLaneHeight,
-    bottom: (i + 1) * videoLaneHeight,
-  }));
+  // Memoized: the bands are a dep of the scene draw effect, and a fresh
+  // array per render would invalidate that effect on EVERY component
+  // render (60 Hz during playback) even though the geometry only moves
+  // when lanes are added/removed or resized.
+  const videoBands = useMemo(
+    () =>
+      Array.from({ length: clips.length }, (_, i) => ({
+        top: i * videoLaneHeight,
+        bottom: (i + 1) * videoLaneHeight,
+      })),
+    [clips.length, videoLaneHeight],
+  );
   const audioBand = {
     top: clips.length * videoLaneHeight,
     bottom: clips.length * videoLaneHeight + audioLaneHeight,
@@ -912,6 +925,66 @@ export function Timeline({
       );
     }
 
+    // Playhead + quantize ghosts live on the stacked overlay canvas (see
+    // the effect below) so this scene raster never re-runs per playback
+    // frame. Deliberately NOT in the deps: playback.timelineT/currentTime.
+  }, [
+    canvasWidth,
+    canvasH,
+    audioBand.top,
+    audioLaneHeight,
+    videoLaneHeight,
+    viewStart,
+    viewEnd,
+    visibleDur,
+    pyramid,
+    arrangementSegments,
+    arrTToX,
+    loop,
+    clips,
+    cams,
+    selectedClipId,
+    camImagesReady,
+    tToX,
+    videoBands,
+    snapMode,
+    pillsByCamId,
+    selectedPillId,
+    segGeometry,
+    trimProjection,
+    // Re-draw when the audio-start marker shifts (raw or user-nudged) so
+    // the orange flag tracks the SyncTuner knob in real time.
+    audioStartArrPositions,
+    // Re-draw when overflow toggles so the audio-lane clip-rect picks up
+    // the new audioRightX. Without these, initial mount captures the
+    // pre-measure {height:0, viewport:0} state and the audio lane gets
+    // painted under the fader thumb forever.
+    laneScroll.height,
+    laneScroll.viewport,
+  ]);
+
+  // ---- Playhead overlay drawing ----
+  // Transparent canvas stacked on the scene canvas. Redraws per playback
+  // frame, but only clears + strokes one line and a 12-px grip — the
+  // per-frame raster cost of the timeline is exactly this. The scene
+  // below only redraws on scroll/zoom/data changes.
+  useEffect(() => {
+    const canvas = overlayRef.current;
+    if (!canvas || canvasWidth === 0) return;
+    const dpr = window.devicePixelRatio || 1;
+    const bsW = Math.max(1, Math.floor(canvasWidth * dpr));
+    const bsH = Math.max(1, Math.floor(canvasH * dpr));
+    // Backing-store realloc only when the geometry actually changed —
+    // assigning canvas.width clears the canvas even at the same value.
+    if (canvas.width !== bsW) canvas.width = bsW;
+    if (canvas.height !== bsH) canvas.height = bsH;
+    canvas.style.width = `${canvasWidth}px`;
+    canvas.style.height = `${canvasH}px`;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, canvasWidth, canvasH);
+
     // Playhead — spans all lanes. Snap to a half-pixel column so the
     // 1.5-px stroke renders crisply on the SAME canvas-x as the
     // BeatRuler's `Math.floor(x)` bar tick. Without the snap the
@@ -941,7 +1014,8 @@ export function Timeline({
 
     // Q-hold quantize preview: ghost markers at the snapped target
     // positions — for cuts AND fx edges, the complete quantize scope
-    // (#70). Drawn last so they overlay every lane.
+    // (#70). On the overlay (not the scene) to keep the pre-split
+    // z-order: ghosts paint over every lane and over the playhead.
     if (quantizePreview) {
       // Collect every pending target/origin position once so cuts and fx
       // edges render through the same two passes.
@@ -987,48 +1061,7 @@ export function Timeline({
       }
       ctx.restore();
     }
-  }, [
-    canvasWidth,
-    canvasH,
-    audioBand.top,
-    audioLaneHeight,
-    videoLaneHeight,
-    viewStart,
-    viewEnd,
-    visibleDur,
-    duration,
-    pyramid,
-    audioDuration,
-    trim.in,
-    trim.out,
-    arrangementSegments,
-    arrTotal,
-    arrTToX,
-    timelineT,
-    loop,
-    currentTime,
-    clips,
-    cams,
-    selectedClipId,
-    camImagesReady,
-    tToX,
-    videoBands,
-    snapMode,
-    quantizePreview,
-    pillsByCamId,
-    selectedPillId,
-    segGeometry,
-    trimProjection,
-    // Re-draw when the audio-start marker shifts (raw or user-nudged) so
-    // the orange flag tracks the SyncTuner knob in real time.
-    audioStartArrPositions,
-    // Re-draw when overflow toggles so the audio-lane clip-rect picks up
-    // the new audioRightX. Without these, initial mount captures the
-    // pre-measure {height:0, viewport:0} state and the audio lane gets
-    // painted under the fader thumb forever.
-    laneScroll.height,
-    laneScroll.viewport,
-  ]);
+  }, [canvasWidth, canvasH, timelineT, arrTToX, tToX, quantizePreview]);
 
   // ---- Hit-testing & drag ----
 
@@ -1973,7 +2006,7 @@ export function Timeline({
               </span>
             </div>
           </div>
-          <div className="flex-1" style={{ width: canvasWidth }}>
+          <div className="flex-1 relative" style={{ width: canvasWidth }}>
             <canvas
               ref={canvasRef}
               onPointerDown={onPointerDown}
@@ -2000,6 +2033,14 @@ export function Timeline({
                 WebkitUserSelect: "none",
                 userSelect: "none",
               }}
+            />
+            {/* Playhead overlay — transparent, hit-through. All pointer
+             *  interaction stays on the scene canvas below. */}
+            <canvas
+              ref={overlayRef}
+              aria-hidden
+              className="absolute left-0 top-0"
+              style={{ pointerEvents: "none", display: "block" }}
             />
           </div>
         </div>
