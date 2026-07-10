@@ -25,22 +25,52 @@ let loadPromise: Promise<FFmpeg> | null = null;
 
 export function getFfmpeg(): Promise<FFmpeg> {
   if (!loadPromise) {
-    loadPromise = (async () => {
+    const p = (async () => {
       const ffmpeg = new FFmpeg();
-      // Use the ESM core build because @ffmpeg/ffmpeg's worker creates a
-      // module-type Worker (when classWorkerURL is set) and needs a
-      // dynamically importable script, not the UMD `importScripts` flavour.
-      const [coreURL, wasmURL] = await Promise.all([
-        toBlobURL(`${BASE_URL}/ffmpeg-core-esm.js`, "text/javascript"),
-        toBlobURL(`${BASE_URL}/ffmpeg-core-esm.wasm`, "application/wasm"),
-      ]);
-      await ffmpeg.load({
-        coreURL,
-        wasmURL,
-        classWorkerURL: ffmpegWorkerUrl,
-      });
-      return ffmpeg;
+      try {
+        // Use the ESM core build because @ffmpeg/ffmpeg's worker creates a
+        // module-type Worker (when classWorkerURL is set) and needs a
+        // dynamically importable script, not the UMD `importScripts` flavour.
+        let coreURL: string;
+        let wasmURL: string;
+        try {
+          [coreURL, wasmURL] = await Promise.all([
+            toBlobURL(`${BASE_URL}/ffmpeg-core-esm.js`, "text/javascript"),
+            toBlobURL(`${BASE_URL}/ffmpeg-core-esm.wasm`, "application/wasm"),
+          ]);
+        } catch (e) {
+          // The core is ~25 MB and fetched on demand — a flaky connection
+          // (or an offline PWA that never cached it) is the realistic
+          // failure here. Name the cause so the banner is actionable.
+          const cause = e instanceof Error ? e.message : String(e);
+          throw new Error(
+            `Could not download the media decoder (~25 MB) — ` +
+              `check your connection and retry. (${cause})`,
+          );
+        }
+        await ffmpeg.load({
+          coreURL,
+          wasmURL,
+          classWorkerURL: ffmpegWorkerUrl,
+        });
+        return ffmpeg;
+      } catch (e) {
+        // Don't leave a half-initialized worker behind for the retry.
+        try {
+          ffmpeg.terminate();
+        } catch {
+          /* not spawned yet */
+        }
+        throw e;
+      }
     })();
+    loadPromise = p;
+    // A rejected load must not be memoized forever: clear the memo so the
+    // next decode retries (e.g. after connectivity returns) instead of
+    // failing instantly with the stale error until page reload.
+    p.catch(() => {
+      if (loadPromise === p) loadPromise = null;
+    });
   }
   return loadPromise;
 }
