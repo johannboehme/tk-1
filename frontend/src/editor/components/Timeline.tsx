@@ -12,6 +12,7 @@
  * playhead a single straight line spanning every lane.
  */
 import {
+  memo,
   PointerEvent as ReactPointerEvent,
   useCallback,
   useEffect,
@@ -34,6 +35,7 @@ import {
 import { trimWindowArr } from "../arrangement-loop";
 import { isPillDirty } from "../arrangement-pills";
 import { LaneHeader, type CamStatus } from "./timeline/LaneHeader";
+import { createLaneCallbacksCache } from "./timeline/lane-callbacks";
 import { AddMediaButton } from "./AddMediaButton";
 import { ProgramStrip } from "./timeline/ProgramStrip";
 import { tapeHeightForMode } from "./timeline/tape-height";
@@ -193,6 +195,11 @@ export function Timeline({
       viewport: el.clientHeight,
     });
   };
+  // Stable callback for the memo()ed VerticalFaderThumb — an inline
+  // closure would put the fader DOM back on the 60 Hz render path.
+  const faderScrollTo = useCallback((t: number) => {
+    if (laneStackRef.current) laneStackRef.current.scrollTop = t;
+  }, []);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   // Stacked playhead layer. During playback the ONLY per-frame pixel change
   // is the playhead line, so it lives on its own transparent canvas above
@@ -228,8 +235,6 @@ export function Timeline({
   const setPillRightEdgeArrEndS = useEditorStore(
     (s) => s.setPillRightEdgeArrEndS,
   );
-  const resetClipAlignment = useEditorStore((s) => s.resetClipAlignment);
-  const resetPillsForCam = useEditorStore((s) => s.resetPillsForCam);
   const resetPill = useEditorStore((s) => s.resetPill);
   const setSelectedCandidateIdx = useEditorStore(
     (s) => s.setSelectedCandidateIdx,
@@ -387,6 +392,25 @@ export function Timeline({
   );
 
   const takePromoteTimerRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+
+  // Stable per-cam LaneHeader callbacks. LaneHeader is memo()ed to stay
+  // off the 60 Hz playback render path; fresh inline closures per render
+  // would defeat that. The cache creates each cam's five handlers once
+  // and they read live state via getState() at call time. onDeleteClip
+  // is resolved through a ref so an Editor re-render swapping the prop
+  // closure doesn't invalidate the cached identities.
+  const onDeleteClipRef = useRef(onDeleteClip);
+  useEffect(() => {
+    onDeleteClipRef.current = onDeleteClip;
+  });
+  const laneCallbacksForRef = useRef<ReturnType<typeof createLaneCallbacksCache> | null>(null);
+  if (!laneCallbacksForRef.current) {
+    laneCallbacksForRef.current = createLaneCallbacksCache(
+      takePromoteTimerRef.current,
+      () => onDeleteClipRef.current,
+    );
+  }
+  const laneCallbacksFor = laneCallbacksForRef.current;
 
   const duration = jobMeta?.duration || audioDuration || 0;
   // Composed-timeline total. arrangementSegments is invariantly non-empty
@@ -1922,78 +1946,42 @@ export function Timeline({
           onScroll={updateLaneScroll}
         >
           <div className="shrink-0 flex flex-col" style={{ width: HEADER_W }}>
-            {clips.map((clip, i) => (
-              <LaneHeader
-                key={clip.id}
-                name={`Cam ${i + 1}`}
-                filename={clip.filename}
-                color={clip.color}
-                status={camStatusByCamId[clip.id] ?? "off"}
-                hotkeyLabel={i < 9 ? String(i + 1) : undefined}
-                selected={clip.id === selectedClipId}
-                pressed={holdGesture?.camId === clip.id}
-                painting={
-                  holdGesture?.camId === clip.id && holdGesture.painting
-                }
-                onSelectClip={() => setSelectedClipId(clip.id)}
-                // onTake is intentionally omitted — the cassette-rec
-                // model fires the immediate cut inside onTakeStart so a
-                // tap and a hold use one code path.
-                onTakeStart={() => {
-                  const s = useEditorStore.getState();
-                  // Single-active-hold guard: ignore if another TAKE is
-                  // already engaged (button or keyboard).
-                  if (s.holdGesture) return;
-                  const startS = s.snapTimelineTime(s.playback.timelineT);
-                  s.beginHoldGesture(clip.id, startS);
-                  s.addCut({ atTimeS: startS, camId: clip.id });
-                  const existing = takePromoteTimerRef.current.get(clip.id);
-                  if (existing) clearTimeout(existing);
-                  const t = setTimeout(() => {
-                    useEditorStore.getState().promoteHoldToPaint();
-                  }, 500);
-                  takePromoteTimerRef.current.set(clip.id, t);
-                }}
-                onTakeFinish={() => {
-                  const promoteT = takePromoteTimerRef.current.get(clip.id);
-                  if (promoteT) {
-                    clearTimeout(promoteT);
-                    takePromoteTimerRef.current.delete(clip.id);
+            {clips.map((clip, i) => {
+              const cbs = laneCallbacksFor(clip.id);
+              return (
+                <LaneHeader
+                  key={clip.id}
+                  name={`Cam ${i + 1}`}
+                  filename={clip.filename}
+                  color={clip.color}
+                  status={camStatusByCamId[clip.id] ?? "off"}
+                  hotkeyLabel={i < 9 ? String(i + 1) : undefined}
+                  selected={clip.id === selectedClipId}
+                  pressed={holdGesture?.camId === clip.id}
+                  painting={
+                    holdGesture?.camId === clip.id && holdGesture.painting
                   }
-                  const s2 = useEditorStore.getState();
-                  const hold = s2.holdGesture;
-                  // Only act on releases that match this clip's hold —
-                  // otherwise a stale onTakeFinish (after a cancelHold
-                  // via Esc) shouldn't re-apply anything.
-                  if (!hold || hold.camId !== clip.id) return;
-                  const endS = s2.snapTimelineTime(s2.playback.timelineT);
-                  if (hold.painting) {
-                    s2.applyHoldRelease(
-                      clip.id,
-                      hold.startS,
-                      endS,
-                      hold.priorCuts,
-                    );
+                  onSelectClip={cbs.onSelectClip}
+                  // onTake is intentionally omitted — the cassette-rec
+                  // model fires the immediate cut inside onTakeStart so a
+                  // tap and a hold use one code path (lane-callbacks.ts).
+                  onTakeStart={cbs.onTakeStart}
+                  onTakeFinish={cbs.onTakeFinish}
+                  canReset={
+                    isVideoClip(clip) &&
+                    (clip.syncOverrideMs !== 0 ||
+                      clip.startOffsetS !== 0 ||
+                      clip.selectedCandidateIdx !== 0 ||
+                      (pillsByCamId.get(clip.id)?.dirty.some(Boolean) ?? false))
                   }
-                  s2.endHoldGesture();
-                }}
-                canReset={
-                  isVideoClip(clip) &&
-                  (clip.syncOverrideMs !== 0 ||
-                    clip.startOffsetS !== 0 ||
-                    clip.selectedCandidateIdx !== 0 ||
-                    (pillsByCamId.get(clip.id)?.dirty.some(Boolean) ?? false))
-                }
-                onReset={() => {
-                  resetClipAlignment(clip.id);
-                  resetPillsForCam(clip.id);
-                }}
-                preparing={preparingCamIds.has(clip.id)}
-                onDelete={() => onDeleteClip?.(clip.id)}
-                height={videoLaneHeight}
-                compact={isNarrow}
-              />
-            ))}
+                  onReset={cbs.onReset}
+                  preparing={preparingCamIds.has(clip.id)}
+                  onDelete={onDeleteClip ? cbs.onDelete : undefined}
+                  height={videoLaneHeight}
+                  compact={isNarrow}
+                />
+              );
+            })}
             {/* MASTER · AUDIO header — narrower padding + abbreviated
              *  label on phone-sized viewports so the header stays inside
              *  the 64 px column. */}
@@ -2052,9 +2040,7 @@ export function Timeline({
           scrollTop={laneScroll.top}
           scrollHeight={laneScroll.height}
           viewport={laneScroll.viewport}
-          onScrollTo={(t) => {
-            if (laneStackRef.current) laneStackRef.current.scrollTop = t;
-          }}
+          onScrollTo={faderScrollTo}
         />
         </div>
 
@@ -2080,16 +2066,10 @@ export function Timeline({
               boxShadow: "inset 0 1px 2px rgba(0,0,0,0.18)",
             }}
           >
-            {/* Tick row in the track for a fader-rail feel */}
-            <div className="absolute inset-y-[3px] left-0 right-0 flex items-center justify-between pointer-events-none">
-              {Array.from({ length: 24 }).map((_, i) => (
-                <span
-                  key={i}
-                  className="w-px h-[6px] block"
-                  style={{ background: "rgba(0,0,0,0.18)" }}
-                />
-              ))}
-            </div>
+            {/* Tick row in the track for a fader-rail feel. Hoisted to a
+             *  module constant: constant element identity lets React skip
+             *  reconciling the 24 spans on every 60 Hz playback render. */}
+            {SCROLLBAR_TICK_ROW}
             <div
               className="absolute top-[2px] bottom-[2px] rounded-sm transition-opacity"
               style={{
@@ -2103,19 +2083,9 @@ export function Timeline({
                 pointerEvents: scrollbarVisible ? "auto" : "none",
               }}
             >
-              {/* Knurled grip lines on the thumb */}
-              <span
-                className="absolute inset-y-1 left-1/2 -translate-x-1/2 flex gap-[1px]"
-                style={{ width: 14 }}
-              >
-                {Array.from({ length: 5 }).map((_, i) => (
-                  <span
-                    key={i}
-                    className="w-[1px] h-full block"
-                    style={{ background: "rgba(0,0,0,0.22)" }}
-                  />
-                ))}
-              </span>
+              {/* Knurled grip lines on the thumb (constant element — see
+               *  SCROLLBAR_TICK_ROW). */}
+              {SCROLLBAR_THUMB_KNURL}
             </div>
           </div>
         </div>
@@ -2125,6 +2095,37 @@ export function Timeline({
 }
 
 // ---- helpers ----
+
+/** Static decorative rows of the hardware-mixer scrollbar. Hoisted to
+ *  module scope so their element identity is constant — React bails out
+ *  of reconciling these span rows on every Timeline render (60 Hz during
+ *  playback) instead of diffing 24 + 5 spans per frame. */
+const SCROLLBAR_TICK_ROW = (
+  <div className="absolute inset-y-[3px] left-0 right-0 flex items-center justify-between pointer-events-none">
+    {Array.from({ length: 24 }).map((_, i) => (
+      <span
+        key={i}
+        className="w-px h-[6px] block"
+        style={{ background: "rgba(0,0,0,0.18)" }}
+      />
+    ))}
+  </div>
+);
+
+const SCROLLBAR_THUMB_KNURL = (
+  <span
+    className="absolute inset-y-1 left-1/2 -translate-x-1/2 flex gap-[1px]"
+    style={{ width: 14 }}
+  >
+    {Array.from({ length: 5 }).map((_, i) => (
+      <span
+        key={i}
+        className="w-[1px] h-full block"
+        style={{ background: "rgba(0,0,0,0.22)" }}
+      />
+    ))}
+  </span>
+);
 
 /** One sub-pill of a clip — the projection of the clip's master-time
  *  range onto a single contiguous view-space window. In direct-mode there
@@ -2416,8 +2417,10 @@ function drawVideoLane({
 
 /** Hardware-fader vertical scrollbar — mirrors the horizontal one's
  *  cassette-aesthetic but rotated 90°. Visible only when the lane
- *  stack overflows. Pointer-drag the thumb to scroll. */
-function VerticalFaderThumb({
+ *  stack overflows. Pointer-drag the thumb to scroll. memo()ed (with a
+ *  stable onScrollTo from the Timeline) so plain playback renders skip
+ *  its tick/knurl DOM. */
+const VerticalFaderThumb = memo(function VerticalFaderThumb({
   scrollTop,
   scrollHeight,
   viewport,
@@ -2512,7 +2515,7 @@ function VerticalFaderThumb({
       </div>
     </div>
   );
-}
+});
 
 function drawHandle(ctx: CanvasRenderingContext2D, x: number, top: number, h: number) {
   ctx.fillStyle = "#1A1816";
