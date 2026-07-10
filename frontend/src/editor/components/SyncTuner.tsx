@@ -12,7 +12,7 @@
 import { useEditorStore } from "../store";
 import { segmentIndexAtArr, totalArrDuration } from "../arrangement-time";
 import { loopAroundPlayhead } from "../arrangement-loop";
-import { isVideoClip, MASTER_AUDIO_ID } from "../types";
+import { isVideoClip, MASTER_AUDIO_ID, type Clip } from "../types";
 import { ChunkyButton } from "./ChunkyButton";
 import { Knob } from "./Knob";
 import { MonoReadout, formatMs } from "./MonoReadout";
@@ -197,7 +197,7 @@ export function SyncTuner({ lastSyncOverrideMs }: Props) {
 
       {!selectedClip ? (
         <SelectClipHint
-          clips={clips.filter(isVideoClip)}
+          picks={camQuickPicks(clips)}
           onPick={setSelectedClipId}
           hasBpm={hasBpm}
         />
@@ -360,20 +360,36 @@ export function SyncTuner({ lastSyncOverrideMs }: Props) {
 }
 
 /**
+ * Quick-pick chip entries for the empty state: video clips only (image
+ * cams have no sync), each labeled by its position in the UNFILTERED
+ * clips array — the same `Cam ${i + 1}` numbering the timeline lane
+ * headers, this panel's own header, and the digit hotkeys use. Labeling
+ * by position (not by id suffix) keeps the chips honest after a cam
+ * removal: ids are never renumbered, lanes and hotkeys are.
+ */
+export function camQuickPicks(
+  clips: Clip[],
+): { id: string; color: string; label: string }[] {
+  return clips.flatMap((c, i) =>
+    isVideoClip(c) ? [{ id: c.id, color: c.color, label: `Cam ${i + 1}` }] : [],
+  );
+}
+
+/**
  * Empty state shown when the user hasn't picked a clip in the Timeline.
  * Lists every cam as a quick-pick chip — plus a Master-Audio chip when
  * BPM analysis ran, since the audio start can be nudged the same way.
  */
 function SelectClipHint({
-  clips,
+  picks,
   onPick,
   hasBpm,
 }: {
-  clips: ReturnType<typeof useEditorStore.getState>["clips"];
+  picks: ReturnType<typeof camQuickPicks>;
   onPick: (id: string) => void;
   hasBpm: boolean;
 }) {
-  if (clips.length === 0 && !hasBpm) {
+  if (picks.length === 0 && !hasBpm) {
     return (
       <div className="rounded-md border border-dashed border-rule px-4 py-6 text-center">
         <p className="font-mono text-xs text-ink-2 leading-relaxed">
@@ -401,29 +417,21 @@ function SelectClipHint({
             Master Audio
           </button>
         )}
-        {clips.map((c) => {
-          // Strip "cam-" prefix to keep the label in sync with the
-          // timeline lane labels (which use the master cam index, not
-          // the filtered position).
-          const label = c.id.startsWith("cam-")
-            ? `Cam ${c.id.slice(4)}`
-            : c.id;
-          return (
-            <button
-              key={c.id}
-              type="button"
-              onClick={() => onPick(c.id)}
-              className="font-display tracking-label uppercase text-[10px] rounded-md border border-rule bg-paper-hi px-2.5 py-1.5 hover:bg-paper-deep transition-colors flex items-center gap-1.5"
-              style={{ borderLeftColor: c.color, borderLeftWidth: 3 }}
-            >
-              <span
-                className="inline-block w-2 h-2 rounded-full"
-                style={{ background: c.color }}
-              />
-              {label}
-            </button>
-          );
-        })}
+        {picks.map((p) => (
+          <button
+            key={p.id}
+            type="button"
+            onClick={() => onPick(p.id)}
+            className="font-display tracking-label uppercase text-[10px] rounded-md border border-rule bg-paper-hi px-2.5 py-1.5 hover:bg-paper-deep transition-colors flex items-center gap-1.5"
+            style={{ borderLeftColor: p.color, borderLeftWidth: 3 }}
+          >
+            <span
+              className="inline-block w-2 h-2 rounded-full"
+              style={{ background: p.color }}
+            />
+            {p.label}
+          </button>
+        ))}
       </div>
     </div>
   );

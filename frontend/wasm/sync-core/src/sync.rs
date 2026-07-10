@@ -718,4 +718,48 @@ mod tests {
             r.offset_ms
         );
     }
+
+    /// End-to-end: a query with a known clock drift must come back from the
+    /// FULL pipeline with that ratio in `SyncResult.drift_ratio` — this is
+    /// the number edit.ts multiplies into every frame lookup, and sync.rs
+    /// trusts it unconditionally whenever drift refinement runs. A pipeline
+    /// that drops or never measures drift (`drift_ratio: 1.0`) must fail.
+    #[test]
+    fn pipeline_propagates_known_clock_drift() {
+        let sr = 22050u32;
+        // Aperiodic transient-rich material (see testsig) — under drift the
+        // sustained tones of `make_song` above decorrelate within the 10 s
+        // refinement windows.
+        let song = crate::testsig::make_prng_song(60.0, sr, 17);
+        let drift = 1.002f64; // ≈ 120 ms of slip over this 60 s take
+        let pad_s = 0.4f64;
+        let pad = (sr as f64 * pad_s) as usize;
+        let mut reference = vec![0.0f32; pad];
+        reference.extend_from_slice(&song);
+        let query = crate::testsig::resample_with_drift(&song, drift);
+
+        let r = sync_audio_pcm(&reference, &query, SyncOptions::default());
+
+        // Shorter take than the drift unit test → looser (but still
+        // stub-rejecting) tolerance: 6e-4 ≪ |drift − 1| = 2e-3.
+        assert!(
+            (r.drift_ratio - drift).abs() < 6e-4,
+            "drift_ratio = {} (expected ~{}), method = {}",
+            r.drift_ratio,
+            drift,
+            r.method
+        );
+        assert!(
+            r.method.contains("drift"),
+            "drift refinement did not run: method = {}",
+            r.method
+        );
+        // Offset stays anchored: expected ≈ drift · 400 ms.
+        let expected_ms = pad_s * 1000.0 * drift;
+        assert!(
+            (r.offset_ms - expected_ms).abs() < 60.0,
+            "offset_ms = {} (expected ~{expected_ms:.0})",
+            r.offset_ms
+        );
+    }
 }

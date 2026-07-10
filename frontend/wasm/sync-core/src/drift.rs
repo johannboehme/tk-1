@@ -137,33 +137,7 @@ pub fn windowed_drift_refinement(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::f32::consts::PI;
-
-    fn make_song(duration_s: f32, sr: u32, seed: u64) -> Vec<f32> {
-        // Tiny PRNG for determinism.
-        let mut state = seed;
-        let mut rand = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state as f32 / u64::MAX as f32) * 2.0 - 1.0
-        };
-        let n = (duration_s * sr as f32) as usize;
-        let mut y = vec![0.0f32; n];
-        // Random walk through a few tones for spectral entropy.
-        let scale = [220.0, 277.18, 329.63, 392.0, 466.16];
-        let note_dur = 0.25_f32;
-        for k in 0..(n / (note_dur * sr as f32) as usize + 1) {
-            let f = scale[((rand().abs() * scale.len() as f32) as usize) % scale.len()];
-            let start = (k as f32 * note_dur * sr as f32) as usize;
-            let end = ((start + (note_dur * sr as f32) as usize)).min(n);
-            for i in start..end {
-                let t = i as f32 / sr as f32;
-                y[i] = 0.5 * (2.0 * PI * f * t).sin();
-            }
-        }
-        y
-    }
+    use crate::testsig::{make_prng_song as make_song, resample_with_drift};
 
     #[test]
     fn refinement_recovers_pure_offset_no_drift() {
@@ -192,5 +166,75 @@ mod tests {
             "offset = {}",
             r.offset_samples
         );
+    }
+
+    /// The reason this module exists: recover a KNOWN non-1.0 clock drift.
+    /// Consumer phones genuinely drift on long takes — 1.0005 is ≈ 45 ms of
+    /// slip over a 90 s recording, plenty to visibly de-sync the tail — and
+    /// `drift_ratio` is trusted unconditionally downstream (sync.rs) and
+    /// applied multiplicatively to every frame lookup (edit.ts). A stub
+    /// that never measures drift and returns 1.0 must fail here.
+    ///
+    /// Tolerances are the measured honest accuracy of the default config
+    /// (8 windows × 10 s) on a 2-minute take, not wishes: across seeds the
+    /// slope error envelope is ~±2.5e-4 (per-window matches carry a
+    /// drift-proportional pivot ambiguity of up to ±win·|drift−1|), so we
+    /// assert 3e-4 — still well below the 5e-4 distance of the smallest
+    /// tested ratio from 1.0 — plus sign-and-magnitude so a "no drift"
+    /// stub fails every case.
+    #[test]
+    fn refinement_recovers_known_drift_ratios() {
+        let sr = 22050u32;
+        let song = make_song(120.0, sr, 17);
+        let pad_s = 0.2f64;
+        let pad = (sr as f64 * pad_s) as usize;
+        let mut reference = vec![0.0f32; pad];
+        reference.extend_from_slice(&song);
+
+        for &drift in &[0.9995f64, 1.0005, 1.002] {
+            // Query = the same song, played on a clock that drifts by
+            // `drift`, starting 0.2 s after the reference:
+            //   query_time = drift * (ref_time - pad_s)
+            // → fitted slope = drift, offset ≈ drift * pad samples.
+            let query = resample_with_drift(&song, drift);
+            // Coarse offset from the earlier pipeline stages — accurate to
+            // well within the ±5 s search radius.
+            let r = windowed_drift_refinement(
+                &reference,
+                &query,
+                sr,
+                pad as i64,
+                DriftConfig::default(),
+            )
+            .unwrap_or_else(|| panic!("refinement should succeed at drift {drift}"));
+
+            assert!(
+                (r.drift_ratio - drift).abs() < 3e-4,
+                "drift {} recovered as {} (err {:.2e})",
+                drift,
+                r.drift_ratio,
+                (r.drift_ratio - drift).abs()
+            );
+            // Sign + magnitude: the recovered ratio must actually move off
+            // 1.0 in the right direction, by at least 40 % of the truth.
+            assert!(
+                (r.drift_ratio - 1.0) * (drift - 1.0) > 0.0
+                    && (r.drift_ratio - 1.0).abs() >= 0.4 * (drift - 1.0).abs(),
+                "drift {} recovered as {} — no-drift-like result",
+                drift,
+                r.drift_ratio
+            );
+            // Offset: per-window pivot ambiguity puts an honest ±25 ms
+            // envelope on the intercept; the pipeline itself only trusts
+            // drift's offset when it agrees with PHAT within 50 ms.
+            let expected_offset = (pad as f64 * drift).round() as i64;
+            assert!(
+                (r.offset_samples - expected_offset).abs() < (0.03 * sr as f64) as i64,
+                "drift {}: offset = {} (expected ≈ {})",
+                drift,
+                r.offset_samples,
+                expected_offset
+            );
+        }
     }
 }
