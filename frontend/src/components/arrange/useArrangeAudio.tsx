@@ -3,49 +3,34 @@
  *
  * Walks the user's `arrangement[]` from item to item: when the active
  * chunk's master-time `endMs` is reached, hop to the next item's
- * `startMs` via the same dual-element ping-pong + WebAudio gain
- * crossfade pattern Triage uses. The crossfade buys gapless transitions
- * even when the next item is at a totally different point in the
- * master audio.
+ * `startMs` via the shared dual-element ping-pong + WebAudio gain
+ * crossfade engine (local/audio/pingpong-engine) that Triage and the
+ * Editor use too. The crossfade buys gapless transitions even when the
+ * next item is at a totally different point in the master audio.
  *
  * The hop logic doesn't care about the chunk's "logical" duration —
  * only the master-time range. The Editor's render path uses the same
- * arrangement to build a multi-segment EditSpec.
+ * arrangement to build a multi-segment EditSpec. All walker branching
+ * lives in the pure planner — see arrange-walker.ts; this driver just
+ * executes plans against the engine.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { useArrangeStore } from "../../local/arrange/arrange-store";
-import { resolveJobAssetUrl } from "../../local/jobs";
 import { planWalkerTick } from "./arrange-walker";
+import { LEAD_TIME_S } from "../../local/audio/pingpong-engine";
+import { usePingPongTransport } from "../../local/audio/use-pingpong-transport";
 
-import { clampSeek } from "../../lib/clamp";
-const LEAD_TIME_S = 0.05;
-const CROSSFADE_S = 0.008;
-
-interface AudioGraph {
-  ctx: AudioContext;
-  srcA: MediaElementAudioSourceNode;
-  srcB: MediaElementAudioSourceNode;
-  gainA: GainNode;
-  gainB: GainNode;
-  master: GainNode;
+/** Walker data attached to an armed crossfade, interpreted on fire. */
+interface ArrangeArmPayload {
+  /** True for real hops (advance / preview-loop): pause the old side
+   *  and flip roles when the crossfade fires. False for the end-of-
+   *  arrangement stop, which pauses via timeout instead (sentinel arm —
+   *  no gain ramps, no side swap). */
+  swapSides: boolean;
+  /** Item the walker advances to when the crossfade fires. Null for
+   *  preview-loops (walker stays detached) and the end-stop. */
+  nextItemId: string | null;
 }
-
-interface PingPongState {
-  active: "A" | "B";
-  armed: {
-    fireAtCtxTime: number;
-    fromSide: "A" | "B";
-    /** True for real hops (advance / preview-loop): pause the old side
-     *  and flip roles when the crossfade fires. False for the end-of-
-     *  arrangement stop, which pauses via timeout instead. */
-    swapSides: boolean;
-    /** Item the walker advances to when the crossfade fires. Null for
-     *  preview-loops (walker stays detached) and the end-stop. */
-    nextItemId: string | null;
-  } | null;
-}
-
-const graphCache = new WeakMap<HTMLAudioElement, AudioGraph>();
 
 export function ArrangeAudioMaster() {
   const aRef = useRef<HTMLAudioElement | null>(null);
@@ -72,152 +57,33 @@ function Driver({
   const tickTime = useArrangeStore((s) => s.tickTime);
   const setCurrentItemId = useArrangeStore((s) => s.setCurrentItemId);
 
-  const [audioUrl, setAudioUrl] = useState<string | null>(null);
-  const [isReady, setIsReady] = useState(false);
-  const graphRef = useRef<AudioGraph | null>(null);
-  const stateRef = useRef<PingPongState>({ active: "A", armed: null });
   const rafRef = useRef<number | null>(null);
 
-  // Resolve master audio URL.
-  useEffect(() => {
-    if (!jobId) return;
-    let cancelled = false;
-    let revokeMe: string | null = null;
-    void resolveJobAssetUrl(jobId, "audio").then((url) => {
-      if (cancelled) {
-        if (url) URL.revokeObjectURL(url);
-        return;
-      }
-      revokeMe = url;
-      setAudioUrl(url);
-    });
-    return () => {
-      cancelled = true;
-      if (revokeMe) URL.revokeObjectURL(revokeMe);
-    };
-  }, [jobId]);
-
-  useEffect(() => {
-    setIsReady(false);
-    if (audioUrl && aRef.current) aRef.current.src = audioUrl;
-    if (audioUrl && bRef.current) bRef.current.src = audioUrl;
-  }, [audioUrl, aRef, bRef]);
-
-  useEffect(() => {
-    const a = aRef.current;
-    if (!a) return;
-    function onLoaded() {
-      setIsReady(true);
-    }
-    a.addEventListener("loadedmetadata", onLoaded);
-    if (a.readyState >= 1) onLoaded();
-    return () => a.removeEventListener("loadedmetadata", onLoaded);
-  }, [aRef, audioUrl]);
-
-  // Build / reuse the WebAudio graph.
-  useEffect(() => {
-    const a = aRef.current;
-    const b = bRef.current;
-    if (!a || !b || !isReady) return;
-    if (graphRef.current) return;
-
-    const cached = graphCache.get(a);
-    if (cached) {
-      graphRef.current = cached;
-      return;
-    }
-    let ctx: AudioContext;
-    try {
-      ctx = new AudioContext();
-    } catch {
-      return;
-    }
-    let srcA: MediaElementAudioSourceNode;
-    let srcB: MediaElementAudioSourceNode;
-    try {
-      srcA = ctx.createMediaElementSource(a);
-      srcB = ctx.createMediaElementSource(b);
-    } catch {
-      try {
-        void ctx.close();
-      } catch {
-        /* ignore */
-      }
-      return;
-    }
-    const gainA = ctx.createGain();
-    const gainB = ctx.createGain();
-    const master = ctx.createGain();
-    gainA.gain.value = 1;
-    gainB.gain.value = 0;
-    master.gain.value = 1;
-    srcA.connect(gainA).connect(master);
-    srcB.connect(gainB).connect(master);
-    master.connect(ctx.destination);
-    const graph: AudioGraph = { ctx, srcA, srcB, gainA, gainB, master };
-    graphCache.set(a, graph);
-    graphRef.current = graph;
-    stateRef.current = { active: "A", armed: null };
-  }, [aRef, bRef, isReady]);
-
-  // Resume context on first play (browser autoplay policy).
-  useEffect(() => {
-    if (!isPlaying) return;
-    const g = graphRef.current;
-    if (g && g.ctx.state === "suspended") {
-      void g.ctx.resume().catch(() => undefined);
-    }
-  }, [isPlaying]);
-
-  const activeEl = useCallback(
-    (): HTMLAudioElement | null =>
-      stateRef.current.active === "A" ? aRef.current : bRef.current,
-    [aRef, bRef],
+  const subscribeExternalTime = useCallback(
+    (cb: (tS: number) => void) =>
+      useArrangeStore.subscribe((s, prev) => {
+        if (s.playback.currentTime !== prev.playback.currentTime) {
+          cb(s.playback.currentTime);
+        }
+      }),
+    [],
   );
 
-  // Mirror play/pause onto the active element.
-  useEffect(() => {
-    const el = activeEl();
-    if (!el) return;
-    if (isPlaying) {
-      void el.play().catch(() => setPlaying(false));
-    } else {
-      el.pause();
-    }
-  }, [isPlaying, activeEl, setPlaying]);
-
-  // Honor user-initiated seeks by syncing the active element.
-  useEffect(() => {
-    const unsub = useArrangeStore.subscribe((s, prev) => {
-      if (s.playback.currentTime === prev.playback.currentTime) return;
-      const el = activeEl();
-      if (!el) return;
-      if (
-        Math.abs(el.currentTime - s.playback.currentTime) > 0.05 &&
-        Number.isFinite(el.duration)
-      ) {
-        try {
-          el.currentTime = clampSeek(s.playback.currentTime, el.duration);
-        } catch {
-          /* ignore */
-        }
-        cancelArmed(graphRef.current, stateRef.current);
-      }
-    });
-    return unsub;
-  }, [activeEl]);
+  const { engineRef } = usePingPongTransport<ArrangeArmPayload>({
+    aRef,
+    bRef,
+    jobId,
+    isPlaying,
+    onPlayRejected: () => setPlaying(false),
+    subscribeExternalTime,
+  });
 
   // Main RAF loop: broadcast time, walk arrangement, arm crossfades.
   useEffect(() => {
     function tick() {
-      const g = graphRef.current;
-      const a = aRef.current;
-      const b = bRef.current;
-      if (g && a && b) {
-        const cur = stateRef.current;
-        const active = cur.active === "A" ? a : b;
-        const idle = cur.active === "A" ? b : a;
-        const t = active.currentTime;
+      const eng = engineRef.current;
+      if (eng) {
+        const t = eng.activeEl.currentTime;
 
         const state = useArrangeStore.getState();
         // Broadcast time.
@@ -235,7 +101,7 @@ function Driver({
         // lives in the pure planner — see arrange-walker.ts.
         const plan = planWalkerTick({
           isPlaying: state.playback.isPlaying,
-          hasArmed: cur.armed !== null,
+          hasArmed: eng.isArmed,
           tS: t,
           arrangement: state.arrangement,
           chunks: state.chunks,
@@ -253,48 +119,38 @@ function Driver({
           // ITEM ID — that's what advances `currentItemId` when the
           // crossfade fires, not whatever happens to match `t * 1000`
           // afterwards. Preview-loops keep the walker detached.
-          try {
-            idle.currentTime = clampSeek(plan.hopToS, idle.duration);
-          } catch {
-            /* ignore */
-          }
-          void idle.play().catch(() => undefined);
-          const fireCtxT = g.ctx.currentTime + plan.remainingS;
-          scheduleCrossfade(g, cur.active, fireCtxT);
-          cur.armed = {
-            fireAtCtxTime: fireCtxT,
-            fromSide: cur.active,
-            swapSides: true,
-            nextItemId: plan.kind === "arm-advance" ? plan.nextItemId : null,
-          };
+          eng.armCrossfade({
+            distS: plan.remainingS,
+            targetS: plan.hopToS,
+            payload: {
+              swapSides: true,
+              nextItemId:
+                plan.kind === "arm-advance" ? plan.nextItemId : null,
+            },
+          });
         } else if (plan.kind === "arm-end") {
           // Last item — stop at end (don't loop in arrange).
           // Schedule a pause that fires after the current chunk end.
+          // Sentinel arm only (no gain ramps): a fake crossfade would
+          // kick the idle — parked at an earlier master-time — onto
+          // PROGRAM and snap the playhead backwards.
           window.setTimeout(() => {
             setPlaying(false);
           }, Math.max(0, plan.remainingS * 1000));
-          cur.armed = {
-            fireAtCtxTime: g.ctx.currentTime + plan.remainingS,
-            fromSide: cur.active,
-            swapSides: false,
-            nextItemId: null,
-          };
+          eng.armWithoutCrossfade({
+            distS: plan.remainingS,
+            payload: { swapSides: false, nextItemId: null },
+          });
         }
 
         // Crossfade fired — swap roles and (for advances) walk on.
-        if (
-          cur.armed &&
-          g.ctx.currentTime >= cur.armed.fireAtCtxTime + CROSSFADE_S
-        ) {
-          if (cur.armed.swapSides) {
-            active.pause();
-            cur.active = cur.active === "A" ? "B" : "A";
-            if (cur.armed.nextItemId !== null) {
-              // Walker advance: explicit, not via time-match.
-              setCurrentItemId(cur.armed.nextItemId);
-            }
+        const fired = eng.consumeFired();
+        if (fired && fired.payload.swapSides) {
+          eng.swapSides();
+          if (fired.payload.nextItemId !== null) {
+            // Walker advance: explicit, not via time-match.
+            setCurrentItemId(fired.payload.nextItemId);
           }
-          cur.armed = null;
         }
       }
       rafRef.current = window.requestAnimationFrame(tick);
@@ -305,37 +161,7 @@ function Driver({
         window.cancelAnimationFrame(rafRef.current);
       }
     };
-  }, [aRef, bRef, tickTime, setCurrentItemId, setPlaying]);
+  }, [engineRef, tickTime, setCurrentItemId, setPlaying]);
 
   return null;
-}
-
-
-function scheduleCrossfade(g: AudioGraph, fromSide: "A" | "B", fireCtxT: number) {
-  const fromGain = fromSide === "A" ? g.gainA : g.gainB;
-  const toGain = fromSide === "A" ? g.gainB : g.gainA;
-  fromGain.gain.cancelScheduledValues(fireCtxT);
-  toGain.gain.cancelScheduledValues(fireCtxT);
-  fromGain.gain.setValueAtTime(1, fireCtxT);
-  toGain.gain.setValueAtTime(0, fireCtxT);
-  fromGain.gain.linearRampToValueAtTime(0, fireCtxT + CROSSFADE_S);
-  toGain.gain.linearRampToValueAtTime(1, fireCtxT + CROSSFADE_S);
-}
-
-function cancelArmed(graph: AudioGraph | null, state: PingPongState) {
-  if (!graph || !state.armed) {
-    state.armed = null;
-    return;
-  }
-  const t = graph.ctx.currentTime;
-  graph.gainA.gain.cancelScheduledValues(t);
-  graph.gainB.gain.cancelScheduledValues(t);
-  if (state.active === "A") {
-    graph.gainA.gain.setValueAtTime(1, t);
-    graph.gainB.gain.setValueAtTime(0, t);
-  } else {
-    graph.gainA.gain.setValueAtTime(0, t);
-    graph.gainB.gain.setValueAtTime(1, t);
-  }
-  state.armed = null;
 }
