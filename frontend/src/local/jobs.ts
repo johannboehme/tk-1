@@ -68,7 +68,7 @@ import { extractTimelineFrames } from "./render/frames";
 import type { TextOverlay } from "./render/ass-builder";
 import {
   installRenderUnloadGuard,
-  pruneIfQuotaTight,
+  maybePromptQuotaPrune,
   removeRenderUnloadGuard,
   requestPersistentStorage,
   sweepOrphanJobDirs,
@@ -244,11 +244,12 @@ export async function createJob(
 
   // Best-effort housekeeping before we commit big new files: ask for
   // persistent storage (so the browser doesn't evict OPFS under pressure),
-  // reclaim orphaned OPFS dirs from failed past uploads (#119), and prune
-  // old jobs if we're close to the quota.
+  // reclaim orphaned OPFS dirs from failed past uploads (#119), and — when
+  // storage is tight — offer to delete old finished projects. The user
+  // decides; nothing is pruned without consent (#64).
   void requestPersistentStorage();
   await sweepOrphanJobDirs().catch(() => undefined);
-  await pruneIfQuotaTight().catch(() => undefined);
+  await maybePromptQuotaPrune().catch(() => undefined);
 
   const jobId = generateJobId();
   const audioExt = fileExtension(audioPick.file, "wav");
