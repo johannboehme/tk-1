@@ -1,10 +1,15 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { RuleStrip } from "../editor/components/RuleStrip";
 import { formatBytes } from "../components/ProgressBar";
 import { createJob } from "../local/jobs";
 import type { JobMode } from "../local/jobs";
 import type { PickedAsset } from "../local/asset-source";
+import {
+  dataTransferHasFiles,
+  partitionDroppedAssets,
+  readDroppedAssets,
+} from "./upload-drop";
 import {
   pickAudioFile,
   pickVideoFiles,
@@ -23,6 +28,12 @@ export default function Upload() {
   const [title, setTitle] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  /** True while a files-drag hovers anywhere over the window — both
+   *  zones light up as valid targets. */
+  const [dragActive, setDragActive] = useState(false);
+  /** Which zone the drag currently hovers (stronger highlight). Purely
+   *  visual — routing is always by media type, not by drop position. */
+  const [dragZone, setDragZone] = useState<"audio" | "video" | null>(null);
 
   // Snapshot once at mount: capabilities are static within a tab.
   const caps = useMemo(getCapabilities, []);
@@ -30,6 +41,103 @@ export default function Upload() {
   const usesHandles = supportsHandlePicker();
 
   const ready = audio !== null && videos.length > 0 && !busy;
+
+  // Window-level safety net: a stray drop must NEVER replace the SPA
+  // with the raw media file. `dragover` needs preventDefault too —
+  // without it the browser refuses the drop and still navigates.
+  // Also drives the "both zones light up" drag state.
+  useEffect(() => {
+    let depth = 0;
+    const onDragEnter = (e: DragEvent) => {
+      if (!dataTransferHasFiles(e.dataTransfer)) return;
+      depth++;
+      setDragActive(true);
+    };
+    const onDragOver = (e: DragEvent) => {
+      e.preventDefault();
+    };
+    const onDragLeave = (e: DragEvent) => {
+      if (!dataTransferHasFiles(e.dataTransfer)) return;
+      depth = Math.max(0, depth - 1);
+      if (depth === 0) {
+        setDragActive(false);
+        setDragZone(null);
+      }
+    };
+    const onDrop = (e: DragEvent) => {
+      e.preventDefault();
+      depth = 0;
+      setDragActive(false);
+      setDragZone(null);
+    };
+    window.addEventListener("dragenter", onDragEnter);
+    window.addEventListener("dragover", onDragOver);
+    window.addEventListener("dragleave", onDragLeave);
+    window.addEventListener("drop", onDrop);
+    return () => {
+      window.removeEventListener("dragenter", onDragEnter);
+      window.removeEventListener("dragover", onDragOver);
+      window.removeEventListener("dragleave", onDragLeave);
+      window.removeEventListener("drop", onDrop);
+    };
+  }, []);
+
+  /** Route a dropped batch by media type: first audio file → song slot
+   *  (replacing any previous pick), all video files → cam list. Runs
+   *  the same size guard as the click-to-pick path. */
+  function acceptDroppedAssets(dropped: PickedAsset[]) {
+    const { audio: audioPicks, videos: videoPicks } = partitionDroppedAssets(dropped);
+    if (audioPicks.length === 0 && videoPicks.length === 0) {
+      setErr(
+        "That drop had no audio or video files. Drop the song (WAV/MP3/FLAC/…) " +
+          "and your takes (MP4/MOV/…).",
+      );
+      return;
+    }
+    const nextAudio = audioPicks[0] ?? null;
+    if (nextAudio) {
+      const msg = rejectIfTooBigForBrowser(nextAudio.file, "audio");
+      if (msg) {
+        setErr(msg);
+        return;
+      }
+    }
+    for (const v of videoPicks) {
+      const msg = rejectIfTooBigForBrowser(v.file, "video");
+      if (msg) {
+        setErr(msg);
+        return;
+      }
+    }
+    setErr(null);
+    if (nextAudio) setAudio(nextAudio);
+    if (videoPicks.length > 0) setVideos((prev) => [...prev, ...videoPicks]);
+  }
+
+  /** Page-level drop target: a drop anywhere on the Upload page is
+   *  accepted, so the headline's promise ("Drop the song. Drop your
+   *  videos.") holds even outside the dashed zones. */
+  function onPageDrop(e: React.DragEvent) {
+    e.preventDefault();
+    setDragActive(false);
+    setDragZone(null);
+    if (!e.dataTransfer) return;
+    const hadFiles =
+      dataTransferHasFiles(e.dataTransfer) || (e.dataTransfer.files?.length ?? 0) > 0;
+    // Capture handles/files synchronously (the item list dies with the
+    // event), then route async.
+    void readDroppedAssets(e.dataTransfer)
+      .then((dropped) => {
+        if (dropped.length > 0 || hadFiles) acceptDroppedAssets(dropped);
+      })
+      .catch(() => {
+        setErr("Could not read the dropped files");
+      });
+  }
+
+  function onPageDragOver(e: React.DragEvent) {
+    e.preventDefault();
+  }
 
   function rejectIfTooBigForBrowser(file: File, kind: "audio" | "video"): string | null {
     if (supportsBig) return null;
@@ -104,7 +212,11 @@ export default function Upload() {
   }
 
   return (
-    <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6 sm:py-10">
+    <main
+      className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6 sm:py-10"
+      onDrop={onPageDrop}
+      onDragOver={onPageDragOver}
+    >
       <header className="grid lg:grid-cols-[1.4fr_1fr] gap-6 lg:gap-12 mb-8 lg:mb-12">
         <div>
           <div className="flex items-center gap-3 mb-3">
@@ -147,8 +259,23 @@ export default function Upload() {
         className="flex flex-col gap-6"
       >
         <div className="grid lg:grid-cols-[1fr_1.6fr] gap-3 items-stretch">
-          <AudioDropZone picked={audio} onPick={pickAudioGuarded} />
-          <VideoDropList picks={videos} onAdd={pickVideosGuarded} onRemove={removeVideo} />
+          <AudioDropZone
+            picked={audio}
+            onPick={pickAudioGuarded}
+            dragActive={dragActive}
+            dragHover={dragZone === "audio"}
+            onZoneDragOver={() => setDragZone("audio")}
+            onZoneDragLeave={() => setDragZone(null)}
+          />
+          <VideoDropList
+            picks={videos}
+            onAdd={pickVideosGuarded}
+            onRemove={removeVideo}
+            dragActive={dragActive}
+            dragHover={dragZone === "video"}
+            onZoneDragOver={() => setDragZone("video")}
+            onZoneDragLeave={() => setDragZone(null)}
+          />
         </div>
         {usesHandles && (
           <p className="font-mono text-[10px] text-ink-3 tracking-label uppercase">
@@ -232,23 +359,53 @@ export default function Upload() {
   );
 }
 
+interface ZoneDragProps {
+  /** A files-drag hovers somewhere over the window. */
+  dragActive: boolean;
+  /** The drag hovers this specific zone. */
+  dragHover: boolean;
+  onZoneDragOver: () => void;
+  onZoneDragLeave: () => void;
+}
+
+/** Zone border/background per drag state. Routing is type-based, so
+ *  both zones advertise readiness while a files-drag is anywhere over
+ *  the window; the hovered zone gets the strongest treatment. */
+function zoneDragClasses(dragHover: boolean, dragActive: boolean): string | null {
+  if (dragHover) return "border-hot bg-hot/10";
+  if (dragActive) return "border-cobalt bg-paper-hi";
+  return null;
+}
+
 function AudioDropZone({
   picked,
   onPick,
+  dragActive,
+  dragHover,
+  onZoneDragOver,
+  onZoneDragLeave,
 }: {
   picked: PickedAsset | null;
   onPick: () => void;
-}) {
+} & ZoneDragProps) {
   const filled = picked !== null;
   return (
     <button
       type="button"
       id="picker-audio"
       onClick={onPick}
+      onDragOver={(e) => {
+        e.preventDefault();
+        onZoneDragOver();
+      }}
+      onDragLeave={onZoneDragLeave}
       className={[
         "relative block rounded-lg cursor-pointer transition-colors group text-left w-full",
         "border-2 border-dashed min-h-[220px]",
-        filled ? "bg-hot/10 border-hot text-ink" : "bg-paper-hi border-rule hover:border-ink-2 hover:bg-paper-deep",
+        zoneDragClasses(dragHover, dragActive) ??
+          (filled
+            ? "bg-hot/10 border-hot text-ink"
+            : "bg-paper-hi border-rule hover:border-ink-2 hover:bg-paper-deep"),
       ].join(" ")}
     >
       <div className="absolute top-4 left-5 right-5 flex items-center justify-between">
@@ -291,13 +448,27 @@ function VideoDropList({
   picks,
   onAdd,
   onRemove,
+  dragActive,
+  dragHover,
+  onZoneDragOver,
+  onZoneDragLeave,
 }: {
   picks: PickedAsset[];
   onAdd: () => void;
   onRemove: (idx: number) => void;
-}) {
+} & ZoneDragProps) {
   return (
-    <div className="rounded-lg border-2 border-dashed border-rule bg-paper-hi p-3 sm:p-4 flex flex-col gap-2 min-h-[220px]">
+    <div
+      onDragOver={(e) => {
+        e.preventDefault();
+        onZoneDragOver();
+      }}
+      onDragLeave={onZoneDragLeave}
+      className={[
+        "rounded-lg border-2 border-dashed p-3 sm:p-4 flex flex-col gap-2 min-h-[220px] transition-colors",
+        zoneDragClasses(dragHover, dragActive) ?? "border-rule bg-paper-hi",
+      ].join(" ")}
+    >
       <div className="flex items-center justify-between mb-1">
         <span className="font-display tracking-label uppercase text-[11px] text-ink-2">
           02 · Video sources

@@ -100,6 +100,106 @@ describe("Upload page — large-file capability handling", () => {
   });
 });
 
+describe("Upload page — drag & drop", () => {
+  function dt(files: File[]): { files: File[]; types: string[] } {
+    return { files, types: ["Files"] };
+  }
+
+  it("prevents the browser default on dragover of a drop zone", () => {
+    vi.spyOn(caps, "getCapabilities").mockReturnValue(FULL_SUPPORT);
+    renderPage();
+    const zone = document.getElementById("picker-audio") as HTMLButtonElement;
+    const notCancelled = fireEvent.dragOver(zone, { dataTransfer: dt([]) });
+    // fireEvent returns false when preventDefault() was called.
+    expect(notCancelled).toBe(false);
+  });
+
+  it("adds a dropped video file to the video list without navigating", async () => {
+    vi.spyOn(caps, "getCapabilities").mockReturnValue(FULL_SUPPORT);
+    renderPage();
+    const main = screen.getByRole("main");
+    const file = makeSyntheticFile("clip.mp4", 1000, "video/mp4");
+    const notCancelled = fireEvent.drop(main, { dataTransfer: dt([file]) });
+    expect(notCancelled).toBe(false); // default (navigate-to-file) prevented
+    await waitFor(() => {
+      expect(screen.getByText("clip.mp4")).toBeInTheDocument();
+    });
+  });
+
+  it("routes a mixed drop by type: audio → song slot, videos → list", async () => {
+    vi.spyOn(caps, "getCapabilities").mockReturnValue(FULL_SUPPORT);
+    renderPage();
+    const main = screen.getByRole("main");
+    const song = makeSyntheticFile("song.wav", 1000, "audio/wav");
+    const v1 = makeSyntheticFile("cam1.mp4", 1000, "video/mp4");
+    const v2 = makeSyntheticFile("cam2.mov", 1000, "video/quicktime");
+    fireEvent.drop(main, { dataTransfer: dt([v1, song, v2]) });
+    await waitFor(() => {
+      expect(screen.getByText("song.wav")).toBeInTheDocument();
+      expect(screen.getByText("cam1.mp4")).toBeInTheDocument();
+      expect(screen.getByText("cam2.mov")).toBeInTheDocument();
+    });
+  });
+
+  it("replaces the song when a new audio file is dropped", async () => {
+    vi.spyOn(caps, "getCapabilities").mockReturnValue(FULL_SUPPORT);
+    renderPage();
+    const main = screen.getByRole("main");
+    fireEvent.drop(main, {
+      dataTransfer: dt([makeSyntheticFile("first.wav", 1000, "audio/wav")]),
+    });
+    await waitFor(() => {
+      expect(screen.getByText("first.wav")).toBeInTheDocument();
+    });
+    fireEvent.drop(main, {
+      dataTransfer: dt([makeSyntheticFile("second.wav", 1000, "audio/wav")]),
+    });
+    await waitFor(() => {
+      expect(screen.getByText("second.wav")).toBeInTheDocument();
+    });
+    expect(screen.queryByText("first.wav")).toBeNull();
+  });
+
+  it("shows an error when the drop contains nothing usable", async () => {
+    vi.spyOn(caps, "getCapabilities").mockReturnValue(FULL_SUPPORT);
+    renderPage();
+    const main = screen.getByRole("main");
+    fireEvent.drop(main, {
+      dataTransfer: dt([makeSyntheticFile("notes.txt", 10, "text/plain")]),
+    });
+    await waitFor(() => {
+      expect(screen.getByText(/audio or video/i)).toBeInTheDocument();
+    });
+    expect(screen.queryByText("notes.txt")).toBeNull();
+  });
+
+  it("rejects an oversize dropped video on legacy browsers", async () => {
+    vi.spyOn(caps, "getCapabilities").mockReturnValue(NO_WEBCODECS);
+    renderPage();
+    const main = screen.getByRole("main");
+    const big = makeSyntheticFile("huge.mp4", 3 * 1024 * 1024 * 1024, "video/mp4");
+    fireEvent.drop(main, { dataTransfer: dt([big]) });
+    await waitFor(() => {
+      expect(screen.getByText(/Try Chrome \/ Edge \/ Brave/i)).toBeInTheDocument();
+    });
+    expect(screen.queryByText("huge.mp4")).toBeNull();
+  });
+
+  it("prevents navigation for a stray drop outside the drop zones", () => {
+    vi.spyOn(caps, "getCapabilities").mockReturnValue(FULL_SUPPORT);
+    renderPage();
+    // Window-level safety net: a drop anywhere must never replace the SPA.
+    const notCancelledOver = fireEvent.dragOver(document.body, {
+      dataTransfer: dt([makeSyntheticFile("a.mp4", 10, "video/mp4")]),
+    });
+    expect(notCancelledOver).toBe(false);
+    const notCancelledDrop = fireEvent.drop(document.body, {
+      dataTransfer: dt([makeSyntheticFile("a.mp4", 10, "video/mp4")]),
+    });
+    expect(notCancelledDrop).toBe(false);
+  });
+});
+
 /** Build a File whose `.size` reports an arbitrary value without
  *  allocating that many bytes. We never read the bytes in this test —
  *  Upload only inspects `.size` and `.name`. */
