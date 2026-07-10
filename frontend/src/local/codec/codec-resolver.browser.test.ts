@@ -100,6 +100,60 @@ describe("codec resolver: decodeAudioToMonoPcm (real Chromium)", () => {
   );
 });
 
+describe("codec resolver: failure-triggered fallback ladder (#127)", () => {
+  it(
+    "auto-routes ALAC-in-M4A down the full ladder to ffmpeg.wasm (no forceBackend)",
+    async () => {
+      // tone-alac.m4a: 3 s, 440 Hz sine, ALAC (generated with
+      // `ffmpeg -f lavfi -t 3 -i sine=frequency=440:sample_rate=44100
+      //  -c:a alac`). Chromium decodes ALAC neither via WebCodecs
+      // AudioDecoder (streaming path) nor via decodeAudioData
+      // (whole-file path) — only the ffmpeg.wasm rung can, which is
+      // exactly the failure-triggered route real odd recordings take.
+      const r = await fetch("/__test_fixtures__/tone-alac.m4a");
+      const blob = await r.blob();
+      const result = await decodeAudioToMonoPcm(blob, 22050);
+      expect(result.backend).toBe("ffmpeg-wasm");
+      expect(result.pcm.length).toBeGreaterThan(22050 * 2.5);
+      // Prove it actually decoded the audio: 440 Hz fundamental.
+      const zc = zeroCrossings(result.pcm.slice(22050, 22050 * 2));
+      expect(zc).toBeGreaterThan(420);
+      expect(zc).toBeLessThan(460);
+    },
+    120_000,
+  );
+
+  it(
+    "moov-less truncated recording fails with the aggregated three-backend error (no hang)",
+    async () => {
+      // ftyp + partial mdat, no moov — the classic crashed-phone
+      // recording. No backend can decode it; the user-facing error must
+      // name every attempted backend (this is what the JobPage banner
+      // shows) and mention the actual cause (missing moov).
+      const full = await fetchFixture();
+      const bytes = new Uint8Array(await full.arrayBuffer());
+      const truncated = new Blob([
+        bytes.subarray(0, 32), // ftyp
+        bytes.subarray(3990, 3990 + 30_000), // partial mdat, no moov
+      ]);
+      let err: unknown;
+      try {
+        await decodeAudioToMonoPcm(truncated, 22050);
+      } catch (e) {
+        err = e;
+      }
+      expect(err).toBeInstanceOf(Error);
+      const msg = (err as Error).message;
+      expect(msg).toContain("Audio decode failed");
+      expect(msg).toContain("ffmpeg:");
+      expect(msg).toContain("webcodecs:");
+      expect(msg).toContain("streaming:");
+      expect(msg).toMatch(/moov/i);
+    },
+    120_000,
+  );
+});
+
 function rms(buf: Float32Array): number {
   let s = 0;
   for (const v of buf) s += v * v;
