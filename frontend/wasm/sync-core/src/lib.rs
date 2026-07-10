@@ -18,6 +18,8 @@ pub mod phat;
 pub mod salience;
 pub mod silence;
 pub mod sync;
+#[cfg(test)]
+pub mod testsig;
 pub mod util;
 pub mod xcorr;
 
