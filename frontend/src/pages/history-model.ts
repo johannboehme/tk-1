@@ -49,6 +49,18 @@ export function jobBadge(job: LocalJob, ops: JobOps | undefined): BadgeKind {
   return "needs-sync";
 }
 
+/**
+ * Duration to print on the tile (#144): the master audio defines the
+ * project (and output) length, so prefer its duration from the cached
+ * audio analysis; `job.durationS` mirrors only the first video's length.
+ */
+export function preferredTileDurationS(
+  audioDurationS: number | null | undefined,
+  jobDurationS: number | undefined,
+): number | undefined {
+  return audioDurationS ?? jobDurationS;
+}
+
 /** Progress to show on the card — only for ops that are actually moving.
  *  Terminal ops (done / errored) return null so no frozen bar lingers. */
 export function activePct(ops: JobOps | undefined): number | null {

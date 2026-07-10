@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { LocalJob } from "../storage/jobs-db";
 import type { JobOps } from "../local/ops-store";
-import { activePct, jobBadge } from "./history-model";
+import { activePct, jobBadge, preferredTileDurationS } from "./history-model";
 
 function makeJob(overrides: Partial<LocalJob> = {}): LocalJob {
   const sync = { offsetMs: 12, driftRatio: 1, confidence: 0.9 };
@@ -67,6 +67,21 @@ describe("jobBadge (#92)", () => {
     const unsynced = makeJob();
     delete (unsynced.videos![0] as { sync?: unknown }).sync;
     expect(jobBadge(unsynced, undefined)).toBe("needs-sync");
+  });
+});
+
+describe("preferredTileDurationS (#144)", () => {
+  it("prefers the master-audio duration — that's the output duration", () => {
+    expect(preferredTileDurationS(30, 12)).toBe(30);
+  });
+
+  it("falls back to the job's (first video) duration without analysis", () => {
+    expect(preferredTileDurationS(undefined, 12)).toBe(12);
+    expect(preferredTileDurationS(null, 12)).toBe(12);
+  });
+
+  it("returns undefined when nothing is known", () => {
+    expect(preferredTileDurationS(undefined, undefined)).toBeUndefined();
   });
 });
 

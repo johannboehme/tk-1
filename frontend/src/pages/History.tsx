@@ -6,8 +6,14 @@ import { TrashIcon } from "../editor/components/icons";
 import { formatDuration } from "../components/ProgressBar";
 import { jobsDb, deleteJob, jobEvents, type LocalJob } from "../local/jobs";
 import { useOpsStore } from "../local/ops-store";
+import { getCachedAnalysis } from "../local/render/audio-analysis";
 import { confirmDestructive } from "../lib/confirm";
-import { activePct, jobBadge, type BadgeKind } from "./history-model";
+import {
+  activePct,
+  jobBadge,
+  preferredTileDurationS,
+  type BadgeKind,
+} from "./history-model";
 
 export default function History() {
   const [jobs, setJobs] = useState<LocalJob[] | null>(null);
@@ -103,6 +109,22 @@ function JobCard({ job, onDelete }: { job: LocalJob; onDelete: () => void }) {
   const ops = useOpsStore((s) => s.ops[job.id]);
   const pct = activePct(ops);
   const badge = jobBadge(job, ops);
+  // The tile shows the project duration = master-audio duration (#144).
+  // job.durationS only mirrors the first video take. The audio duration
+  // lives in the per-job analysis cache; fetch is cheap (IDB read).
+  const [audioDurationS, setAudioDurationS] = useState<number | null>(null);
+  useEffect(() => {
+    let active = true;
+    getCachedAnalysis(job.id)
+      .then((a) => {
+        if (active && a) setAudioDurationS(a.duration);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [job.id]);
+  const durationS = preferredTileDurationS(audioDurationS, job.durationS);
   return (
     <li className="group relative bg-paper-hi border border-rule rounded-lg overflow-hidden hover:border-ink-2 transition-colors">
       <Link to={`/job/${job.id}`} className="block">
@@ -110,9 +132,9 @@ function JobCard({ job, onDelete }: { job: LocalJob; onDelete: () => void }) {
           <div className="absolute top-2 left-2 flex items-center gap-1.5">
             <StatusBadge kind={badge} />
           </div>
-          {job.durationS != null && (
+          {durationS != null && (
             <span className="absolute bottom-2 right-2 font-mono text-[10px] tabular tracking-label uppercase text-paper-hi bg-sunken/70 px-1.5 py-0.5 rounded-sm">
-              {formatDuration(job.durationS)}
+              {formatDuration(durationS)}
             </span>
           )}
         </div>

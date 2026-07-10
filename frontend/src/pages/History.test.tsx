@@ -4,6 +4,8 @@ import { MemoryRouter } from "react-router-dom";
 import History from "./History";
 import ConfirmDialogHost from "../components/ConfirmDialogHost";
 import { deleteJob, jobsDb } from "../local/jobs";
+import { getCachedAnalysis } from "../local/render/audio-analysis";
+import type { AudioAnalysis } from "../local/render/audio-analysis";
 import type { LocalJob } from "../storage/jobs-db";
 
 vi.mock("../local/jobs", () => ({
@@ -12,7 +14,12 @@ vi.mock("../local/jobs", () => ({
   deleteJob: vi.fn(),
 }));
 
+vi.mock("../local/render/audio-analysis", () => ({
+  getCachedAnalysis: vi.fn(),
+}));
+
 const listJobsMock = vi.mocked(jobsDb.listJobs);
+const getCachedAnalysisMock = vi.mocked(getCachedAnalysis);
 
 function makeJob(overrides: Partial<LocalJob> = {}): LocalJob {
   const sync = { offsetMs: 12, driftRatio: 1, confidence: 0.9 };
@@ -53,6 +60,27 @@ beforeEach(() => {
   vi.clearAllMocks();
   listJobsMock.mockResolvedValue([makeJob()]);
   vi.mocked(deleteJob).mockResolvedValue(undefined);
+  getCachedAnalysisMock.mockResolvedValue(undefined);
+});
+
+describe("History — tile duration (#144)", () => {
+  it("shows the master-audio duration, not the first video's", async () => {
+    listJobsMock.mockResolvedValue([makeJob({ durationS: 12 })]);
+    getCachedAnalysisMock.mockResolvedValue({
+      duration: 30,
+    } as AudioAnalysis);
+
+    renderHistory();
+    expect(await screen.findByText("0:30")).toBeTruthy();
+    expect(screen.queryByText("0:12")).toBeNull();
+  });
+
+  it("falls back to the job duration when no analysis is cached", async () => {
+    listJobsMock.mockResolvedValue([makeJob({ durationS: 12 })]);
+
+    renderHistory();
+    expect(await screen.findByText("0:12")).toBeTruthy();
+  });
 });
 
 describe("History — delete affordance (#133)", () => {
