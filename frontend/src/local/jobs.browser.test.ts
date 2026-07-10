@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
   addVideoToJob,
   createJob,
   jobEvents,
+  retrySync,
   runQuickRender,
   deleteJob,
   resolveJobAssetUrl,
@@ -345,4 +346,134 @@ describe("addVideoToJob", () => {
     const after = await jobsDb.getJob(jobId);
     expect(after!.videos!.map((v) => v.id)).toEqual(["cam-1", "cam-2", "cam-3"]);
   }, 180_000);
+});
+
+// -----------------------------------------------------------------------------
+// #119 — createJob must not leave orphaned OPFS bytes when a persist fails
+// -----------------------------------------------------------------------------
+
+describe("createJob cleanup on persist failure (#119)", () => {
+  beforeEach(async () => {
+    await jobsDb.wipeAll();
+    await opfs.wipeAll();
+  });
+
+  it("deletes already-written files when a later copy fails, and creates no IDB row", async () => {
+    const v1 = await fetchVideoFile();
+    const v2 = await fetchVideoFile();
+    const audio = new File([makeWavBlob()], "studio.wav", { type: "audio/wav" });
+
+    // Fail the third OPFS copy (audio → cam-1 → cam-2) the way a full
+    // disk would: with a QuotaExceededError.
+    const original = opfs.writeFile.bind(opfs);
+    let calls = 0;
+    const spy = vi
+      .spyOn(opfs, "writeFile")
+      .mockImplementation(async (path, data) => {
+        calls++;
+        if (calls >= 3) {
+          throw new DOMException("Quota exceeded", "QuotaExceededError");
+        }
+        return original(path, data);
+      });
+
+    try {
+      await expect(
+        createJob([pick(v1), pick(v2)], pick(audio)),
+      ).rejects.toMatchObject({ name: "QuotaExceededError" });
+    } finally {
+      spy.mockRestore();
+    }
+
+    // The partially-written jobs/{id} directory is gone…
+    const leftover = (await opfs.list("jobs")).filter((e) => e.endsWith("/"));
+    expect(leftover).toEqual([]);
+    // …and no job row exists that could reference it.
+    expect(await jobsDb.listJobs()).toEqual([]);
+  }, 60_000);
+});
+
+// -----------------------------------------------------------------------------
+// #65 — retrySync: re-run sync from persisted assets after a reload/failure
+// -----------------------------------------------------------------------------
+
+describe("retrySync (#65)", () => {
+  beforeEach(async () => {
+    await jobsDb.wipeAll();
+    await opfs.wipeAll();
+  });
+
+  it("re-runs sync on a job stranded at 'needs sync' after a reload mid-sync", async () => {
+    const video = await fetchVideoFile();
+    const audio = new File([makeWavBlob()], "studio.wav", { type: "audio/wav" });
+    const jobId = await createJob([pick(video)], pick(audio));
+    await waitForSyncDone(jobId);
+
+    // Simulate the post-reload state: assets persisted, but no cam prep
+    // results ever landed and the ops store is empty.
+    const job = await jobsDb.getJob(jobId);
+    const stripped = job!.videos!.map((v) => ({
+      ...v,
+      sync: undefined,
+      framesPath: undefined,
+      framesOrientation: undefined,
+    }));
+    await jobsDb.updateJob(jobId, {
+      videos: stripped,
+      sync: undefined,
+      hasFrames: undefined,
+    });
+
+    await retrySync(jobId);
+    await waitForSyncDone(jobId);
+
+    const after = await jobsDb.getJob(jobId);
+    const cam = asVideo(after!.videos![0]);
+    expect(cam.sync).toBeDefined();
+    expect(cam.framesPath).toBeDefined();
+    expect(after!.sync).toBeDefined();
+  }, 120_000);
+
+  it("resumes instead of redoing: already-prepped cams are not re-matched", async () => {
+    const video = await fetchVideoFile();
+    const audio = new File([makeWavBlob()], "studio.wav", { type: "audio/wav" });
+    const jobId = await createJob([pick(video)], pick(audio));
+    await waitForSyncDone(jobId);
+
+    const before = await jobsDb.getJob(jobId);
+    const camBefore = asVideo(before!.videos![0]);
+    // Only the top-level mirror is missing (e.g. reload killed the final
+    // batch write) — the cam itself is fully prepped.
+    await jobsDb.updateJob(jobId, { sync: undefined });
+
+    // Watch the ops store: a resumed run must never enter a per-cam
+    // "syncing-*" stage for the already-prepped cam.
+    const stages: string[] = [];
+    const unsub = useOpsStore.subscribe((s) => {
+      const stage = s.ops[jobId]?.sync?.stage;
+      if (stage) stages.push(stage);
+    });
+    try {
+      await retrySync(jobId);
+      await waitForSyncDone(jobId);
+    } finally {
+      unsub();
+    }
+
+    expect(stages.some((s) => s.startsWith("syncing-"))).toBe(false);
+    const after = await jobsDb.getJob(jobId);
+    expect(after!.sync).toEqual(camBefore.sync);
+    expect(asVideo(after!.videos![0]).sync).toEqual(camBefore.sync);
+  }, 120_000);
+
+  it("is a no-op while a sync op is already in flight", async () => {
+    const video = await fetchVideoFile();
+    const audio = new File([makeWavBlob()], "studio.wav", { type: "audio/wav" });
+    const jobId = await createJob([pick(video)], pick(audio));
+    // createJob just kicked off a sync — retry must not start a second.
+    await retrySync(jobId);
+    await waitForSyncDone(jobId);
+    const after = await jobsDb.getJob(jobId);
+    expect(asVideo(after!.videos![0]).sync).toBeDefined();
+  }, 120_000);
 });

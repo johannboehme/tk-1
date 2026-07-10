@@ -7,6 +7,7 @@ import {
   deleteJob,
   jobsDb,
   resolveJobAssetUrl,
+  retrySync,
   runQuickRender,
   type LocalJob,
 } from "../local/jobs";
@@ -16,11 +17,13 @@ vi.mock("../local/jobs", () => ({
   jobsDb: { getJob: vi.fn(), updateJob: vi.fn() },
   deleteJob: vi.fn(),
   resolveJobAssetUrl: vi.fn(),
+  retrySync: vi.fn(),
   runQuickRender: vi.fn(),
 }));
 
 const getJobMock = vi.mocked(jobsDb.getJob);
 const resolveUrlMock = vi.mocked(resolveJobAssetUrl);
+const retrySyncMock = vi.mocked(retrySync);
 const runQuickRenderMock = vi.mocked(runQuickRender);
 
 function makeJob(overrides: Partial<LocalJob> = {}): LocalJob {
@@ -251,5 +254,75 @@ describe("JobPage — quick-render error handling (#90)", () => {
     await waitFor(() => {
       expect(screen.queryByText("Render exploded")).toBeNull();
     });
+  });
+});
+
+// -----------------------------------------------------------------------------
+// #65 — a job stuck at "needs sync" (reload mid-sync, ops store empty) must
+// offer a way out: a Run-sync affordance and an always-available Delete.
+// -----------------------------------------------------------------------------
+
+/** A job as it looks after a reload mid-sync: cams persisted, no sync
+ *  result anywhere, nothing in the ops store. */
+function makeUnsyncedJob(): LocalJob {
+  return makeJob({
+    sync: undefined,
+    videos: [
+      {
+        kind: "video",
+        id: "cam-1",
+        filename: "take-1.mp4",
+        opfsPath: "jobs/job-1/cam-1.mp4",
+        color: "#dd4a1f",
+      },
+    ],
+  });
+}
+
+describe("JobPage — sync re-run affordance (#65)", () => {
+  it("shows a Run sync button when the job lacks sync data and nothing is in flight", async () => {
+    getJobMock.mockResolvedValue(makeUnsyncedJob());
+    renderPage();
+
+    const btn = await screen.findByRole("button", { name: /run sync/i });
+    fireEvent.click(btn);
+    expect(retrySyncMock).toHaveBeenCalledWith("job-1");
+  });
+
+  it("labels the affordance Retry sync when the last attempt failed without data", async () => {
+    getJobMock.mockResolvedValue(makeUnsyncedJob());
+    renderPage();
+    await screen.findByText("My Song");
+
+    act(() => {
+      useOpsStore.getState().startSyncOp("job-1", { pct: 10, stage: "loading" });
+      useOpsStore.getState().failSyncOp("job-1", "decode exploded");
+    });
+
+    const btn = await screen.findByRole("button", { name: /retry sync/i });
+    fireEvent.click(btn);
+    expect(retrySyncMock).toHaveBeenCalledWith("job-1");
+    // Delete stays available next to it.
+    expect(screen.getByRole("button", { name: /delete/i })).toBeTruthy();
+  });
+
+  it("offers Delete in every phase — even while a sync op is running", async () => {
+    getJobMock.mockResolvedValue(makeUnsyncedJob());
+    renderPage();
+    await screen.findByText("My Song");
+
+    act(() => {
+      useOpsStore.getState().startSyncOp("job-1", { pct: 10, stage: "loading" });
+    });
+
+    expect(await screen.findByRole("button", { name: /delete/i })).toBeTruthy();
+    // No Run-sync while one is already in flight.
+    expect(screen.queryByRole("button", { name: /run sync/i })).toBeNull();
+  });
+
+  it("shows no Run sync button when the job already has sync data", async () => {
+    renderPage();
+    await screen.findByRole("button", { name: /quick render/i });
+    expect(screen.queryByRole("button", { name: /run sync/i })).toBeNull();
   });
 });
