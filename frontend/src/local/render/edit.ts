@@ -49,6 +49,7 @@ import { CamFrameStream } from "./cam-frame-stream";
 import { makeTestPatternCanvas } from "./test-pattern";
 import { activeCamAt } from "../../editor/cuts";
 import { activeCamAtArr as activeCamAtArrLocal } from "../../editor/arrangement-pills";
+import { planSegmentFrames, outputTimestampUs } from "./frame-timing";
 import type { Cut } from "../../storage/jobs-db";
 import type { PunchFx } from "../../editor/fx/types";
 import type { GradeParams } from "../../editor/fx/looks";
@@ -874,8 +875,15 @@ export async function editRenderMulti(
     input.segments.length > 0
       ? input.segments
       : [{ in: 0, out: masterDurationS }];
-  const totalKept = intervals.reduce((acc, s) => acc + (s.out - s.in), 0);
-  const totalFrames = Math.max(1, Math.round(totalKept * fps));
+  // Frame counts come from CUMULATIVE kept-duration targets so the
+  // per-segment rounding errors cancel instead of accumulating against
+  // the sample-exact audio concatenation (issue #107) — see
+  // frame-timing.ts for the failure math.
+  const segFramesPlan = planSegmentFrames(intervals, fps);
+  const totalFrames = Math.max(
+    1,
+    segFramesPlan.reduce((acc, n) => acc + n, 0),
+  );
   const frameDurationUs = Math.round(1_000_000 / fps);
   // Force a keyframe every ~2s so players can scrub without decoding
   // thousands of P-frames from the segment start.
@@ -907,11 +915,12 @@ export async function editRenderMulti(
     // leading arr-time, so re-accumulating from 0 would shift every
     // lookup by the trimmed duration (issue #79).
     let arrCursorPerSeg = 0;
-    for (const seg of intervals) {
+    for (let segIdx = 0; segIdx < intervals.length; segIdx++) {
+      const seg = intervals[segIdx];
       const segStartFrame = framesEmitted;
       framesSinceKeyframe = 0;
       const segArrStartS = seg.arrStartS ?? arrCursorPerSeg;
-      const segFrames = Math.max(0, Math.round((seg.out - seg.in) * fps));
+      const segFrames = segFramesPlan[segIdx];
       for (let i = 0; i < segFrames; i++) {
         if (pendingError) throw pendingError;
         const tMaster = seg.in + i / fps;
@@ -1074,7 +1083,10 @@ export async function editRenderMulti(
             transform: {},
           };
         }
-        const outTimestampUs = framesEmitted * frameDurationUs;
+        // Exact per-frame stamp — NOT framesEmitted * frameDurationUs:
+        // the pre-rounded 33333 µs cadence drifts ~18 ms per 30 min at
+        // 30 fps against the audio's exact sample clock (issue #107).
+        const outTimestampUs = outputTimestampUs(framesEmitted, fps);
         const isFirstInSeg = framesEmitted === segStartFrame;
         const isKeyframe =
           isFirstInSeg || framesSinceKeyframe >= KEYFRAME_INTERVAL_FRAMES;
