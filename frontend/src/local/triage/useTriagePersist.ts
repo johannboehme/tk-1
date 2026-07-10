@@ -7,8 +7,10 @@
  * that.
  *
  * Persisted: chunks, silenceConfig, jobBpm (→ job.bpm), beatsPerBar,
- * snapMode (→ job.ui.snapMode, shared with editor), per-cam
- * syncOverrideMs.
+ * snapMode (→ job.ui.snapMode, shared with editor), minChunkBars
+ * (→ job.ui.minChunkBars — the MIN LCD filter feeds the Continue
+ * handoff, so losing it on reload would silently change which chunks
+ * ship), per-cam syncOverrideMs.
  *
  * Downstream propagation (non-destructive): a chunk-list mutation
  * applies a diff to the persisted `arrangement` (drop items whose
@@ -58,6 +60,7 @@ export function useTriagePersist() {
         jobBpm: s.jobBpm,
         beatsPerBar: s.beatsPerBar,
         snapMode: s.snapMode,
+        minChunkBars: s.minChunkBars,
         camSync: s.cams.map((c) => [c.id, c.syncOverrideMs ?? 0]),
       });
       if (fingerprint === lastWrittenRef.current) return;
@@ -105,7 +108,11 @@ export function useTriagePersist() {
         silenceConfig: s.silenceConfig,
         bpm: bpmPayload,
         beatsPerBar: s.beatsPerBar,
-        ui: { ...(job.ui ?? {}), snapMode: s.snapMode },
+        ui: {
+          ...(job.ui ?? {}),
+          snapMode: s.snapMode,
+          minChunkBars: s.minChunkBars,
+        },
         videos: updatedVideos,
         ...(arrangementChanged && nextArrangement !== null
           ? { arrangement: nextArrangement }
@@ -131,6 +138,7 @@ export function useTriagePersist() {
         jobBpm: st.jobBpm,
         beatsPerBar: st.beatsPerBar,
         snapMode: st.snapMode,
+        minChunkBars: st.minChunkBars,
         camSync: st.cams.map((c) => c.syncOverrideMs ?? 0).join(","),
       });
       const cur = watched(s);
@@ -156,6 +164,7 @@ export function useTriagePersist() {
         cur.jobBpm !== old.jobBpm ||
         cur.beatsPerBar !== old.beatsPerBar ||
         cur.snapMode !== old.snapMode ||
+        cur.minChunkBars !== old.minChunkBars ||
         cur.camSync !== old.camSync
       ) {
         scheduleWrite();

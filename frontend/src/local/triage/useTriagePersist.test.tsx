@@ -110,6 +110,33 @@ describe("useTriagePersist — debounced writes", () => {
     });
   });
 
+  it("round-trips minChunkBars into job.ui (next to snapMode)", async () => {
+    // The MIN LCD filter feeds the Continue handoff (isChunkEffectively-
+    // Accepted) — losing it on reload silently changes which chunks
+    // ship on the next Continue. It must persist like snapMode does.
+    getJobMock.mockResolvedValue({
+      id: "job-1",
+      videos: [],
+      arrangement: [],
+      ui: { snapMode: "1", lanesLocked: true },
+    } as never);
+    const { unmount } = renderHook(() => useTriagePersist());
+    act(() => seedStore([makeChunk({ id: "c1", startMs: 0, endMs: 5000 })]));
+    await flush(300);
+    updateJobMock.mockClear();
+
+    act(() => {
+      useTriageStore.getState().setMinChunkBars(4);
+    });
+    await flush(300);
+
+    expect(updateJobMock).toHaveBeenCalledTimes(1);
+    expect(updateJobMock.mock.calls[0][1]).toMatchObject({
+      ui: { snapMode: "1", lanesLocked: true, minChunkBars: 4 },
+    });
+    unmount();
+  });
+
   it("does not write on unmount when nothing is pending", async () => {
     const { unmount } = renderHook(() => useTriagePersist());
     act(() => seedStore([makeChunk({ id: "c1", startMs: 0, endMs: 5000 })]));
