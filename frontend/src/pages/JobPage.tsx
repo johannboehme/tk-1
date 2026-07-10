@@ -10,6 +10,7 @@ import {
   jobEvents,
   jobsDb,
   resolveJobAssetUrl,
+  retrySync,
   runQuickRender,
   type EditSpecLocal,
   type LocalJob,
@@ -137,6 +138,16 @@ export default function JobPage() {
     navigate("/jobs");
   }
 
+  async function onRunSync() {
+    if (!job) return;
+    setErr(null);
+    try {
+      await retrySync(job.id);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Could not start sync");
+    }
+  }
+
   if (!job) {
     return (
       <main className="flex-1 flex items-center justify-center">
@@ -154,6 +165,10 @@ export default function JobPage() {
   // — the sync data lets the user re-enter the editor or kick off
   // another render attempt without redoing the upload + analysis.
   const canRetry = syncFailed && hasSyncData;
+  // No sync data and nothing in flight — either a reload killed the
+  // in-memory sync op mid-run, or the run failed outright. Both used to
+  // dead-end with zero buttons (#65); now they get a Run-sync primary.
+  const needsSync = !hasSyncData && !isSyncing;
   // Quick render is the "drop video + audio → aligned MP4" shortcut —
   // skips the editor entirely. Doesn't fit the long-form workflow
   // (chunks need to be triaged, arranged, then composed in the editor),
@@ -287,61 +302,64 @@ export default function JobPage() {
         </section>
       )}
 
-      {(isDone || canRetry) && (
-        <div className="flex flex-wrap gap-3 border-t border-rule pt-5">
-          {showQuickRender && (
-            <ChunkyButton
-              variant="primary"
-              size="lg"
-              onClick={onQuickRender}
-              disabled={renderBusy}
-            >
-              {renderBusy
-                ? `Rendering… ${Math.round(renderOp?.pct ?? 0)}%`
-                : canRetry
-                  ? "Retry quick render"
-                  : "Quick render"}
-            </ChunkyButton>
-          )}
-          {job.mode === "longform" ? (
-            <LongformStageButtons
-              job={job}
-              isPrimary={!showQuickRender}
-              onNavigate={(route) => navigate(jobRoutePath(job.id, route))}
-            />
-          ) : (
-            <ChunkyButton
-              variant={showQuickRender ? "secondary" : "primary"}
-              size="lg"
-              onClick={() => navigate(jobRoutePath(job.id, nextRouteForJob(job)))}
-            >
-              {nextRouteLabel(nextRouteForJob(job))}
-            </ChunkyButton>
-          )}
-          {downloadUrl && (
-            <a
-              href={downloadUrl}
-              download={downloadName}
-              className="inline-flex items-center gap-2 h-12 px-5 rounded-md bg-cobalt text-paper-hi font-display tracking-label uppercase text-xs hover:bg-cobalt/90"
-            >
-              <DownloadIcon className="w-4 h-4" />
-              Download MP4
-            </a>
-          )}
-          <ChunkyButton variant="ghost" size="lg" onClick={onDelete}>
-            Delete
+      <div className="flex flex-wrap gap-3 border-t border-rule pt-5">
+        {/* Re-run affordance (#65): a job without sync data (reload
+            mid-sync, or a failed run) gets a primary way forward instead
+            of a dead end. retrySync resumes from the persisted assets. */}
+        {needsSync && (
+          <ChunkyButton variant="primary" size="lg" onClick={onRunSync}>
+            {syncFailed ? "Retry sync" : "Run sync"}
           </ChunkyButton>
-        </div>
-      )}
-
-      {/* Sync failed without producing any data — only recovery is to delete and retry. */}
-      {syncFailed && !hasSyncData && (
-        <div className="flex flex-wrap gap-3 border-t border-rule pt-5">
-          <ChunkyButton variant="ghost" size="lg" onClick={onDelete}>
-            Delete and start over
-          </ChunkyButton>
-        </div>
-      )}
+        )}
+        {(isDone || canRetry) && (
+          <>
+            {showQuickRender && (
+              <ChunkyButton
+                variant="primary"
+                size="lg"
+                onClick={onQuickRender}
+                disabled={renderBusy}
+              >
+                {renderBusy
+                  ? `Rendering… ${Math.round(renderOp?.pct ?? 0)}%`
+                  : canRetry
+                    ? "Retry quick render"
+                    : "Quick render"}
+              </ChunkyButton>
+            )}
+            {job.mode === "longform" ? (
+              <LongformStageButtons
+                job={job}
+                isPrimary={!showQuickRender}
+                onNavigate={(route) => navigate(jobRoutePath(job.id, route))}
+              />
+            ) : (
+              <ChunkyButton
+                variant={showQuickRender ? "secondary" : "primary"}
+                size="lg"
+                onClick={() => navigate(jobRoutePath(job.id, nextRouteForJob(job)))}
+              >
+                {nextRouteLabel(nextRouteForJob(job))}
+              </ChunkyButton>
+            )}
+            {downloadUrl && (
+              <a
+                href={downloadUrl}
+                download={downloadName}
+                className="inline-flex items-center gap-2 h-12 px-5 rounded-md bg-cobalt text-paper-hi font-display tracking-label uppercase text-xs hover:bg-cobalt/90"
+              >
+                <DownloadIcon className="w-4 h-4" />
+                Download MP4
+              </a>
+            )}
+          </>
+        )}
+        {/* Delete is available in every phase — a stuck or unwanted job
+            must never require spelunking through History to remove. */}
+        <ChunkyButton variant="ghost" size="lg" onClick={onDelete}>
+          Delete
+        </ChunkyButton>
+      </div>
     </main>
   );
 }

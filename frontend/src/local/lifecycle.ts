@@ -1,9 +1,9 @@
 /**
  * Cross-cutting lifecycle helpers for the local-jobs runtime:
  *
- *   1. `installRenderUnloadGuard` / `removeRenderUnloadGuard` — manage a
- *      `beforeunload` listener that warns the user if they try to leave
- *      while a render is running.
+ *   1. `installRenderUnloadGuard` / `removeRenderUnloadGuard` (and the
+ *      sync twins) — manage a `beforeunload` listener that warns the
+ *      user if they try to leave while a render or sync is running.
  *
  *   2. `requestPersistentStorage` — asks the browser to mark our OPFS
  *      bucket as "persistent" so it doesn't get evicted under storage
@@ -28,17 +28,20 @@ const HIGH_WATER = 0.8; // start pruning above 80% used
 const LOW_WATER = 0.6; // prune down to 60%
 
 const ACTIVE_RENDER_JOBS = new Set<string>();
+const ACTIVE_SYNC_JOBS = new Set<string>();
 let unloadHandler: ((e: BeforeUnloadEvent) => void) | null = null;
 
 function ensureUnloadHandler(): void {
   if (unloadHandler) return;
   unloadHandler = (e: BeforeUnloadEvent) => {
-    if (ACTIVE_RENDER_JOBS.size === 0) return;
+    if (ACTIVE_RENDER_JOBS.size === 0 && ACTIVE_SYNC_JOBS.size === 0) return;
     e.preventDefault();
     // Modern browsers ignore the message but show a generic warning.
     // We set returnValue for older Chromium / Safari compatibility.
     e.returnValue =
-      "A render is still running — leaving will discard the result.";
+      ACTIVE_RENDER_JOBS.size > 0
+        ? "A render is still running — leaving will discard the result."
+        : "A sync is still running — leaving will discard its progress.";
     return e.returnValue;
   };
   window.addEventListener("beforeunload", unloadHandler);
@@ -55,6 +58,22 @@ export function removeRenderUnloadGuard(jobId: string): void {
 
 export function activeRenderJobsForTest(): ReadonlySet<string> {
   return ACTIVE_RENDER_JOBS;
+}
+
+/** Same warn-on-leave mechanism for syncs (#65): a multi-minute sync
+ *  lives only in the in-memory ops store, so an accidental reload used
+ *  to silently discard it (and strand the job at "needs sync"). */
+export function installSyncUnloadGuard(jobId: string): void {
+  ACTIVE_SYNC_JOBS.add(jobId);
+  ensureUnloadHandler();
+}
+
+export function removeSyncUnloadGuard(jobId: string): void {
+  ACTIVE_SYNC_JOBS.delete(jobId);
+}
+
+export function activeSyncJobsForTest(): ReadonlySet<string> {
+  return ACTIVE_SYNC_JOBS;
 }
 
 /**
