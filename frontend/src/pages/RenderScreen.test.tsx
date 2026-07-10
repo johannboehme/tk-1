@@ -34,6 +34,46 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+describe("RenderScreen — no render in progress (#93)", () => {
+  it("shows an explicit empty state instead of fake perpetual progress", async () => {
+    vi.useFakeTimers();
+    renderPage(); // ops store is empty — nothing is rendering
+
+    await act(async () => {
+      vi.advanceTimersByTime(2500); // let the grace window elapse
+    });
+
+    expect(screen.getByText(/no render in progress/i)).toBeTruthy();
+    // No fake progress console, no ghost cancel button.
+    expect(screen.queryByText("Rendering…")).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /cancel render/i }),
+    ).toBeNull();
+
+    // Primary exit takes the user back to the editor.
+    fireEvent.click(screen.getByRole("button", { name: /back to editor/i }));
+    expect(screen.getByText("editor")).toBeTruthy();
+  });
+
+  it("keeps the live progress console when an op appears in time", async () => {
+    vi.useFakeTimers();
+    renderPage();
+    act(() => {
+      useOpsStore
+        .getState()
+        .startRenderOp("job-1", { pct: 10, stage: "render-prep" });
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(3000);
+    });
+    expect(screen.queryByText(/no render in progress/i)).toBeNull();
+    expect(screen.getByText("Rendering…")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: /cancel render/i }),
+    ).toBeTruthy();
+  });
+});
+
 describe("RenderScreen — op lifecycle (#92)", () => {
   it("clears the render op when auto-navigating after done", async () => {
     useOpsStore.getState().startRenderOp("job-1", { pct: 90, stage: "writing" });
