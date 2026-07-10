@@ -86,12 +86,28 @@ export async function decodeMp4AudioStreaming(
   // Promise that resolves once mp4box has parsed the moov box and we've
   // configured the decoder. We MUST wait for this before flushing — sample
   // callbacks before configuration would silently drop frames.
+  //
+  // CAUTION: mp4box does NOT report a missing/truncated moov via onError —
+  // a cleanly truncated file parks the parser in ERR_NOT_ENOUGH_DATA and
+  // never fires onReady OR onError (onError only fires on invalid box
+  // data). So this promise can stay pending forever; `readySettled` lets
+  // us detect that after EOF and fail instead of hanging (#81).
   let resolveReady: () => void;
   let rejectReady: (e: Error) => void;
+  let readySettled = false;
   const ready = new Promise<void>((res, rej) => {
-    resolveReady = res;
-    rejectReady = rej;
+    resolveReady = () => {
+      readySettled = true;
+      res();
+    };
+    rejectReady = (e: Error) => {
+      readySettled = true;
+      rej(e);
+    };
   });
+  // The fail-fast paths below throw without awaiting `ready`; if mp4box
+  // rejects it afterwards, that rejection must not surface as unhandled.
+  ready.catch(() => {});
 
   file.onError = (err: string) => {
     state.mp4boxError = new Error(`mp4box: ${err}`);
@@ -182,14 +198,25 @@ export async function decodeMp4AudioStreaming(
     await source.slice(0, Math.min(HEAD_PROBE_BYTES, source.size)).arrayBuffer(),
   );
   const moov = await locateMoov(source);
-  const moovIsAfterHead = moov !== null && moov.offset >= head.length;
+  if (moov === null) {
+    // No moov anywhere in the box tree — the classic truncated phone
+    // recording (app crashed / battery died before the moov trailer was
+    // written). mp4box would wait silently forever on such a file (see
+    // CAUTION above), so fail fast before streaming a potentially huge
+    // body. Same guard as the video demuxer (webcodecs/demux.ts).
+    throw new Error(
+      "mp4box: moov box not found in source — the recording is likely " +
+        "truncated (it never got finalized)",
+    );
+  }
+  const moovIsAfterHead = moov.offset >= head.length;
 
   // Always feed the head first (covers ftyp + moov-first files entirely).
   appendBytes(file, head, 0);
 
   // For moov-last files, also feed moov out-of-order so onReady fires
   // before we stream the giant mdat body.
-  if (moov && moovIsAfterHead) {
+  if (moovIsAfterHead) {
     appendBytes(file, moov.bytes, moov.offset);
   }
 
@@ -199,7 +226,7 @@ export async function decodeMp4AudioStreaming(
   // the moov range we already fed (no harm in re-feeding overlapping
   // bytes, but it's wasted disk read on a multi-GB file).
   const bodyStart = head.length;
-  const bodyEnd = moov && moovIsAfterHead ? moov.offset : source.size;
+  const bodyEnd = moovIsAfterHead ? moov.offset : source.size;
   const reader = chunkedReader(source.slice(bodyStart, bodyEnd));
   try {
     const sourceSize = source.size;
@@ -229,6 +256,16 @@ export async function decodeMp4AudioStreaming(
 
   // If onReady never fired (file had no parsable moov), bail out.
   if (state.mp4boxError) throw state.mp4boxError;
+  if (!readySettled) {
+    // We fed the whole file and flushed, yet mp4box neither finished the
+    // moov (onReady) nor reported an error (onError) — it is parked in
+    // its silent ERR_NOT_ENOUGH_DATA state (e.g. a moov cut off mid-box).
+    // Awaiting `ready` now would hang forever, so surface a real error.
+    throw new Error(
+      "mp4box: reached end of file but the moov box never became " +
+        "parseable — the recording is likely truncated or corrupt",
+    );
+  }
   await ready; // resolves once onReady ran (or already did)
   const dec = state.decoder;
   if (!dec || !state.trackInfo) {

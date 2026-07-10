@@ -1,7 +1,21 @@
 /// <reference types="vitest" />
+import { readFileSync } from "node:fs";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 import { VitePWA } from "vite-plugin-pwa";
+
+// The ffmpeg core files live at unversioned URLs (/ffmpeg-core/*) and are
+// runtime-cached CacheFirst for a year. The loader appends ?v=<version> so
+// a core upgrade actually reaches existing clients (new URL → cache miss)
+// instead of pinning a stale core against an updated wrapper forever.
+// (@ffmpeg/core's exports map blocks `require("@ffmpeg/core/package.json")`,
+// hence the direct file read.)
+const ffmpegCoreVersion: string = JSON.parse(
+  readFileSync(
+    new URL("./node_modules/@ffmpeg/core/package.json", import.meta.url),
+    "utf-8",
+  ),
+).version;
 
 // COOP/COEP-Header sind Pflicht für SharedArrayBuffer und damit für
 // WASM-Threads und ffmpeg.wasm. Sie werden im Dev-Server (hier) und im
@@ -18,17 +32,37 @@ export default defineConfig({
   // truth for both `npm run dev` (here) and the Docker build (which reads
   // the same .env to populate VITE_* build args).
   envDir: "..",
+  define: {
+    __FFMPEG_CORE_VERSION__: JSON.stringify(ffmpegCoreVersion),
+  },
   plugins: [
     react(),
     VitePWA({
-      registerType: "autoUpdate",
+      // "prompt" (not "autoUpdate"): autoUpdate generates a SW with
+      // skipWaiting + clientsClaim, so a deploy landing mid-session
+      // activates the new SW immediately and purges the old hashed lazy
+      // chunks from the precache (cleanupOutdatedCaches) — the server no
+      // longer has them either, so the next Export / add-cam / ffmpeg
+      // fallback dies with "Failed to fetch dynamically imported module"
+      // in the middle of an editing session. With "prompt" the new SW
+      // stays waiting until every tab of the old session is closed: live
+      // sessions keep their fully-precached old build, fresh sessions get
+      // the new one.
+      registerType: "prompt",
       injectRegister: "auto",
       workbox: {
         // Precache the app shell only — ffmpeg-core (~31 MB ESM, ~62 MB
         // incl. UMD) is deliberately excluded so first contact stays fast.
         // It's served via runtimeCaching below: fetched on demand the first
         // time a render needs it, then cached for offline reuse.
-        globPatterns: ["**/*.{js,css,html,svg,ico,woff2}"],
+        //
+        // `wasm` is in the glob for the Rust sync core (~330 KB hashed
+        // asset fetched by wasm-bindgen glue inside the sync worker):
+        // without it, an installed PWA opened offline gets through upload
+        // and job creation, then bricks at the sync phase. `png` covers
+        // the manifest icons. ffmpeg-core's .wasm stays out via
+        // globIgnores above/below.
+        globPatterns: ["**/*.{js,css,html,svg,ico,woff2,wasm,png}"],
         globIgnores: ["**/__test_fixtures__/**", "ffmpeg-core/**"],
         navigateFallback: "/index.html",
         navigateFallbackDenylist: [/^\/ffmpeg-core/],

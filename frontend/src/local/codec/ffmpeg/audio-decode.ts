@@ -13,6 +13,10 @@
 import type { DecodedAudio } from "../webcodecs/audio-decode";
 import { getFfmpeg } from "./ffmpeg-loader";
 
+/** How many trailing ffmpeg log lines to keep for error reporting. The
+ *  interesting part (why the transcode failed) is always at the end. */
+const LOG_TAIL_LINES = 12;
+
 export async function decodeAudioToMonoPcmFfmpeg(
   source: Blob | ArrayBuffer,
   targetSampleRate: number,
@@ -24,37 +28,66 @@ export async function decodeAudioToMonoPcmFfmpeg(
   const inputName = `input-${Date.now()}.bin`;
   const outputName = `output-${Date.now()}.wav`;
 
-  // We deliberately avoid @ffmpeg/util's `fetchFile` here: it routes through
-  // a legacy `FileReader.readAsArrayBuffer`, which on some Chromium builds
-  // rejects OPFS-backed Files with the opaque "File could not be read!
-  // Code=-1". `Blob.arrayBuffer()` (Streams API) handles OPFS Files
-  // reliably and is what the WebCodecs path already uses on the same source.
-  const data =
-    source instanceof ArrayBuffer
-      ? new Uint8Array(source)
-      : new Uint8Array(await source.arrayBuffer());
-  await ffmpeg.writeFile(inputName, data);
+  // Capture ffmpeg's stderr/stdout so a failed transcode can surface the
+  // real reason ("Invalid data found…", "moov atom not found", …) instead
+  // of an opaque downstream FS error.
+  const logTail: string[] = [];
+  const onLog = ({ message }: { message: string }) => {
+    logTail.push(message);
+    if (logTail.length > LOG_TAIL_LINES) logTail.shift();
+  };
+  ffmpeg.on("log", onLog);
 
-  // Transcode to mono 32-bit float WAV at target sample rate.
-  await ffmpeg.exec([
-    "-y",
-    "-i",
-    inputName,
-    "-vn",
-    "-ac",
-    "1",
-    "-ar",
-    String(targetSampleRate),
-    "-c:a",
-    "pcm_f32le",
-    outputName,
-  ]);
+  let inputWritten = false;
+  try {
+    // We deliberately avoid @ffmpeg/util's `fetchFile` here: it routes through
+    // a legacy `FileReader.readAsArrayBuffer`, which on some Chromium builds
+    // rejects OPFS-backed Files with the opaque "File could not be read!
+    // Code=-1". `Blob.arrayBuffer()` (Streams API) handles OPFS Files
+    // reliably and is what the WebCodecs path already uses on the same source.
+    const data =
+      source instanceof ArrayBuffer
+        ? new Uint8Array(source)
+        : new Uint8Array(await source.arrayBuffer());
+    await ffmpeg.writeFile(inputName, data);
+    inputWritten = true;
 
-  const wavBytes = (await ffmpeg.readFile(outputName)) as Uint8Array;
-  await ffmpeg.deleteFile(inputName);
-  await ffmpeg.deleteFile(outputName);
+    // Transcode to mono 32-bit float WAV at target sample rate.
+    // @ffmpeg/ffmpeg's exec() resolves with ffmpeg's exit code — it does
+    // NOT reject on failure, so the code must be checked explicitly.
+    const rc = await ffmpeg.exec([
+      "-y",
+      "-i",
+      inputName,
+      "-vn",
+      "-ac",
+      "1",
+      "-ar",
+      String(targetSampleRate),
+      "-c:a",
+      "pcm_f32le",
+      outputName,
+    ]);
+    if (rc !== 0) {
+      const detail =
+        logTail.length > 0
+          ? ` — ffmpeg says: ${logTail.join(" | ")}`
+          : " (no ffmpeg log output captured)";
+      throw new Error(`ffmpeg.wasm: transcode failed (exit code ${rc})${detail}`);
+    }
 
-  return parseWavFloat32(wavBytes, targetSampleRate);
+    const wavBytes = (await ffmpeg.readFile(outputName)) as Uint8Array;
+    return parseWavFloat32(wavBytes, targetSampleRate);
+  } finally {
+    ffmpeg.off("log", onLog);
+    // Always drop the temp files — getFfmpeg() is a process-wide singleton,
+    // so anything left in MEMFS (potentially hundreds of MB of input bytes)
+    // would stay resident for the tab's lifetime, growing on every retry.
+    // Each delete is best-effort: the file may not exist depending on where
+    // the failure happened.
+    if (inputWritten) await ffmpeg.deleteFile(inputName).catch(() => {});
+    await ffmpeg.deleteFile(outputName).catch(() => {});
+  }
 }
 
 function parseWavFloat32(bytes: Uint8Array, expectedSampleRate: number): DecodedAudio {
