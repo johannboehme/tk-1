@@ -103,6 +103,29 @@ export interface CompositorOptions {
 // don't reintroduce a local letterbox helper here. The two pipelines
 // MUST stay byte-identical on placement.
 
+/**
+ * The two SEMANTIC time axes of a composited frame. `timestampUs` (the
+ * output-relative muxer timestamp, restarts at 0) is deliberately NOT
+ * part of this struct — it is a container detail and must never be used
+ * for FX / modulation / visualizer lookups. Both fields are required so
+ * a segments-style caller can't silently fall back to output time (the
+ * bug class that shipped once: every punch-in FX vanished from exports).
+ *
+ * Mirrors the live preview's `buildFrameDescriptor(tMaster, tTimeline)`
+ * split (editor/render/build-descriptor.ts).
+ */
+export interface FrameTimes {
+  /** Timeline-time (arrangement/song axis, seconds). FX in/out windows
+   *  and the region-local ADSR envelope live here. In direct mode this
+   *  equals master-time. */
+  tTimelineS: number;
+  /** Master-audio time (seconds) of the audio audible at this output
+   *  frame. The beat grid (`beatPhaseS`), the sidechain loudness curve
+   *  (`audioEnv`), visualizer PCM/energy and overlay windows are all
+   *  anchored here. */
+  tMasterS: number;
+}
+
 export class Compositor {
   /** Final 2D output canvas — blitted backend output + visualizers +
    *  overlays end up here, gets wrapped in the VideoFrame. */
@@ -168,24 +191,27 @@ export class Compositor {
     return this.assBlob;
   }
 
-  /** Composite `frame` for `timestampUs` and return a fresh VideoFrame whose
-   *  caller MUST `.close()` after encoding. */
-  composite(frame: VideoFrame, timestampUs: number): Promise<VideoFrame> {
-    return this.compositeImage(
-      frame as unknown as CanvasImageSource,
-      this.opts.sourceWidth ?? frame.codedWidth,
-      this.opts.sourceHeight ?? frame.codedHeight,
-      timestampUs,
-      frame.duration ?? 0,
-    );
-  }
-
+  /**
+   * Composite one output frame.
+   *
+   * `timestampUs` is the OUTPUT-relative muxer timestamp (restarts at 0,
+   * concatenated across segments) — used only to stamp the returned
+   * VideoFrame. All FX / modulation lookups read from `times`, the
+   * explicit semantic time axes: `times.tTimelineS` for FX windows +
+   * envelopes, `times.tMasterS` for the beat grid + sidechain follower
+   * + visualizers + overlays. `times` is REQUIRED: an earlier optional
+   * variant silently fell back to `timestampUs / 1e6`, which made every
+   * punch-in FX vanish from segment exports.
+   *
+   * Returns a fresh VideoFrame the caller MUST `.close()` after encoding.
+   */
   async compositeImage(
     source: CanvasImageSource,
     srcW: number,
     srcH: number,
     timestampUs: number,
     durationUs: number,
+    times: FrameTimes,
     rotationDeg: 0 | 90 | 180 | 270 = 0,
     userTransform: {
       rotation?: number;
@@ -196,16 +222,6 @@ export class Compositor {
        *  two pipelines never drift on placement. */
       viewportTransform?: ViewportTransform;
     } = {},
-    /**
-     * Timeline-time in seconds for FX lookup. **Must be passed by
-     * callers that use segments**, because `timestampUs` is the
-     * output-relative timestamp (starts at 0 each segment) — looking
-     * up FX with that ignores the song-position offset and the FX
-     * never fire in the export. When omitted, falls back to
-     * `timestampUs / 1e6` (only correct for whole-video renders).
-     * Historically named `tMasterS` for compat — semantics flipped to
-     * timeline-time when FX moved off the master axis. */
-    tMasterS?: number,
   ): Promise<VideoFrame> {
     const intrinsic = rotationDeg % 360;
     const userRot =
@@ -222,12 +238,12 @@ export class Compositor {
       userTransform.viewportTransform ?? DEFAULT_VIEWPORT_TRANSFORM,
     );
 
-    const t = timestampUs / 1_000_000;
-    // FX live on the master timeline (e.g. fx.inS = 13.43s). When the
-    // export uses segments, `timestampUs` is segment-relative and lookups
-    // with it would miss every FX. Callers pass `tMasterS` for the
-    // correct master-time FX query.
-    const tFx = tMasterS ?? t;
+    // The two semantic axes — see FrameTimes. FX in/out windows live in
+    // timeline-time (e.g. fx.inS = 13.43s on the song axis); beat grid +
+    // sidechain loudness live in master-audio time. `timestampUs` is
+    // output-relative and never valid for either lookup.
+    const tTimeline = times.tTimelineS;
+    const tMaster = times.tMasterS;
 
     const layer: FrameLayer = {
       layerId: "src",
@@ -241,16 +257,18 @@ export class Compositor {
       displayH: dispH,
     };
 
-    // Uniform engine, same as the live preview's buildFx: global grade +
-    // opinionated filters first (the "film stock"), then punch-in accents on
-    // top. Export uses `tFx` for the envelope + audio/beat-sync axes (tFx ==
-    // master time for whole-video renders, so beat-sync + sidechain line up).
+    // Uniform engine, same as the live preview's buildFx (build-
+    // descriptor.ts): global grade + opinionated filters first (the
+    // "film stock"), then punch-in accents on top. Active-FX lookup and
+    // the envelope run on the timeline axis; beat-sync + sidechain run
+    // on the master axis — identical to the preview, so modulated FX
+    // land on the audible beat in every export.
     const bpm = this.opts.bpm ?? null;
     const beatPhaseS = this.opts.beatPhaseS ?? 0;
     const beatsPerBar = this.opts.beatsPerBar ?? 4;
     const audioEnv = this.opts.audioEnv ?? null;
     const punchFx: FrameFx[] = this.opts.fx
-      ? activeFxAt(this.opts.fx, tFx)
+      ? activeFxAt(this.opts.fx, tTimeline)
           .map((fx) => {
             const def = fxCatalog[fx.kind];
             const env = fx.modulation?.envelope ?? fx.envelope ?? INSTANT_ENVELOPE;
@@ -258,8 +276,8 @@ export class Compositor {
             const sidechainCurve =
               mod.timeMod === "sidechain" ? followerFor(audioEnv, mod.side) : null;
             const { level, phase } = computeIntensity(mod, {
-              tMasterS: tFx,
-              tTimelineS: tFx,
+              tMasterS: tMaster,
+              tTimelineS: tTimeline,
               regionInS: fx.inS,
               regionDurS: fx.outS - fx.inS,
               holding: false,
@@ -284,7 +302,7 @@ export class Compositor {
     ];
 
     const descriptor: FrameDescriptor = {
-      tMaster: tFx,
+      tMaster,
       output: { w: this.opts.width, h: this.opts.height },
       layers: [layer],
       fx: fxFrame,
@@ -341,6 +359,7 @@ export class Compositor {
     }
 
     // 3. Visualizer + Overlays auf den finalen 2D-Context.
+    const t = timestampUs / 1_000_000;
     if (this.opts.visualizers && this.opts.visualizers.length > 0) {
       for (const v of this.opts.visualizers) {
         v.draw(this.ctx, t, this.opts.width, this.opts.height);

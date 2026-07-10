@@ -356,11 +356,10 @@ export async function editRender(input: EditRenderInput): Promise<EditRenderResu
             frame.codedHeight,
             outTs,
             frame.duration ?? 0,
+            // Single-cam pipeline: no arrangement, so timeline-time ==
+            // master-time == the source frame's timestamp.
+            { tTimelineS: tS, tMasterS: tS },
             srcRot,
-            undefined,
-            // FX live on the master timeline; tS is the source-frame's
-            // master time (single-cam pipeline = master time).
-            tS,
           );
           const keyFrame =
             firstFrameInGop || framesSinceKeyframe >= KEYFRAME_INTERVAL_FRAMES;
@@ -1068,7 +1067,18 @@ export async function editRenderMulti(
           src,
           outTs: outTimestampUs,
           isKeyframe,
-          tArr,
+          // Semantic frame times for the compositor (see FrameTimes).
+          // Timeline axis: in pill mode the arrangement axis the editor
+          // anchors FX/cuts/pills against; in direct mode there is no
+          // arrangement, so timeline == master (a trimmed direct export
+          // re-accumulating from 0 would fire every FX late by the
+          // leading-trim duration). Master axis: the audio position the
+          // encoder made audible at this output frame — beat grid +
+          // sidechain + visualizers are anchored there.
+          times: {
+            tTimelineS: pillMode ? tArr : tMaster,
+            tMasterS: tMaster,
+          },
         };
         framesEmitted++;
         chainInFlight++;
@@ -1083,12 +1093,9 @@ export async function editRenderMulti(
               captured.src.h,
               captured.outTs,
               frameDurationUs,
+              captured.times,
               captured.src.rot,
               captured.src.transform,
-              // FX live in timeline-time (= arrangement-time). Pass tArr
-              // so the FX-active query lines up with the editor: a recording
-              // at the duplicate-pill slot fires there and only there.
-              captured.tArr,
             );
             encoder.pushFrame(composed, { keyFrame: captured.isKeyframe });
             composed.close();

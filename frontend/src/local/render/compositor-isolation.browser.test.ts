@@ -104,9 +104,13 @@ async function runIsolationTest(caps: BackendCapabilities): Promise<void> {
   const greenBitmap = await makeFilledBitmap(W, H, GREEN);
 
   // 1. Composite red frame.
-  const v1 = await compositor.compositeImage(redBitmap, W, H, 0, 33333, 0, {});
+  const v1 = await compositor.compositeImage(
+    redBitmap, W, H, 0, 33333, { tTimelineS: 0, tMasterS: 0 },
+  );
   // 2. Composite green frame — this MUST NOT corrupt v1's content.
-  const v2 = await compositor.compositeImage(greenBitmap, W, H, 33333, 33333, 0, {});
+  const v2 = await compositor.compositeImage(
+    greenBitmap, W, H, 33333, 33333, { tTimelineS: 0.033333, tMasterS: 0.033333 },
+  );
 
   // Read both. Note: order matters — we read v1 AFTER v2 was created,
   // mirroring the encoder's async-consume pattern.
@@ -177,7 +181,13 @@ async function runSequenceTest(caps: BackendCapabilities): Promise<void> {
   const frames: VideoFrame[] = [];
   for (let i = 0; i < N; i++) {
     const ts = i * 33333;
-    frames.push(await compositor.compositeImage(bitmaps[i], W, H, ts, 33333, 0, {}));
+    const tS = ts / 1_000_000;
+    frames.push(
+      await compositor.compositeImage(bitmaps[i], W, H, ts, 33333, {
+        tTimelineS: tS,
+        tMasterS: tS,
+      }),
+    );
   }
   // Now read all of them. If VideoFrame holds a stale canvas reference,
   // every frame would read the LAST composite's content (= last red value).
