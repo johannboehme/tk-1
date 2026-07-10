@@ -67,6 +67,11 @@ beforeEach(() => {
   getJobMock.mockResolvedValue(makeJob());
   resolveUrlMock.mockResolvedValue(null);
   vi.mocked(deleteJob).mockResolvedValue(undefined);
+  // jsdom ships createObjectURL/revokeObjectURL-less URL — the page's
+  // object-URL cleanup must not explode on unmount.
+  if (typeof URL.revokeObjectURL !== "function") {
+    URL.revokeObjectURL = () => undefined;
+  }
 });
 
 describe("JobPage — quick render feedback + double-start guard (#91)", () => {
@@ -113,6 +118,29 @@ describe("JobPage — quick render feedback + double-start guard (#91)", () => {
           .disabled,
       ).toBe(false);
     });
+  });
+});
+
+describe("JobPage — inline player for the rendered video (#132)", () => {
+  it("shows an inline <video> fed by the output URL next to Download", async () => {
+    getJobMock.mockResolvedValue(
+      makeJob({ lastRender: { completedAt: Date.now(), outputBytes: 1234 } }),
+    );
+    resolveUrlMock.mockResolvedValue("blob:fake-output");
+
+    const { container } = renderPage();
+    await screen.findByText(/download mp4/i);
+
+    const video = container.querySelector("video");
+    expect(video).toBeTruthy();
+    expect(video!.getAttribute("src")).toBe("blob:fake-output");
+    expect(video!.hasAttribute("controls")).toBe(true);
+  });
+
+  it("shows no player when the job has no render output", async () => {
+    const { container } = renderPage();
+    await screen.findByRole("button", { name: /quick render/i });
+    expect(container.querySelector("video")).toBeNull();
   });
 });
 

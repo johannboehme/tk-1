@@ -212,6 +212,31 @@ export default function JobPage() {
         <Banner kind="error" text={err} onDismiss={() => setErr(null)} />
       )}
 
+      {/* The point of the whole exercise: watch the cut without leaving
+          the app. Reuses the OPFS object URL that also feeds Download. */}
+      {hasOutput && downloadUrl && (
+        <section className="mb-6">
+          <div className="flex items-center gap-3 mb-2">
+            <span className="font-mono text-xs tracking-label uppercase text-ink-2">
+              OUTPUT
+            </span>
+            <RuleStrip count={32} className="text-rule flex-1 max-w-[200px]" />
+            {job.lastRender && (
+              <span className="font-mono text-[10px] tabular text-ink-2">
+                {new Date(job.lastRender.completedAt).toLocaleString()}
+              </span>
+            )}
+          </div>
+          <video
+            src={downloadUrl}
+            controls
+            playsInline
+            preload="metadata"
+            className="w-full max-h-[420px] bg-sunken border border-rule rounded-md"
+          />
+        </section>
+      )}
+
       {(isDone || canRetry) && (
         <div className="flex flex-wrap gap-3 border-t border-rule pt-5">
           {showQuickRender && (
