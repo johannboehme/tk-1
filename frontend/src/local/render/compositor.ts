@@ -308,13 +308,36 @@ export class Compositor {
       fx: fxFrame,
     };
 
+    // Canvas sources must be snapshotted into an ImageBitmap before the
+    // backend upload: the WebGL2 backend relies on UNPACK_FLIP_Y_WEBGL
+    // for `kind: "image"` sources, which ImageBitmap honours but
+    // Chrome's GPU fast path for canvas uploads IGNORES — a raw
+    // OffscreenCanvas source (the NO-SIGNAL test pattern) rendered
+    // vertically flipped in WebGL2 exports (issue #141). Hot callers
+    // should hand in an ImageBitmap themselves (see
+    // makeTestPatternBitmap) — this per-frame snapshot is the safety
+    // net for arbitrary canvas sources.
+    let canvasSnapshot: ImageBitmap | null = null;
+    const isCanvasSource =
+      (typeof OffscreenCanvas !== "undefined" &&
+        source instanceof OffscreenCanvas) ||
+      (typeof HTMLCanvasElement !== "undefined" &&
+        source instanceof HTMLCanvasElement);
+    if (isCanvasSource) {
+      canvasSnapshot = await createImageBitmap(
+        source as OffscreenCanvas | HTMLCanvasElement,
+      );
+    }
     const sources: SourcesMap = new Map<string, LayerSource>([
-      ["src", classifySource(source)],
+      ["src", classifySource(canvasSnapshot ?? source)],
     ]);
 
     // 1. Backend rendert Layer + FX in den internen backendCanvas
     //    (oder, im WebGPU-Fall, in den internen renderTarget).
     this.backend.drawFrame(descriptor, sources);
+    // drawFrame has uploaded the pixels; the snapshot is no longer
+    // needed.
+    canvasSnapshot?.close();
 
     // 2. Backend-Output → finalCanvas.
     //

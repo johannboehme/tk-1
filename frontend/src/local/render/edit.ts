@@ -47,7 +47,7 @@ import {
 import { Compositor } from "./compositor";
 import type { BackendCapabilities } from "../../editor/render/factory";
 import { CamFrameStream } from "./cam-frame-stream";
-import { makeTestPatternCanvas } from "./test-pattern";
+import { makeTestPatternBitmap } from "./test-pattern";
 import { activeCamAt } from "../../editor/cuts";
 import { activeCamAtArr as activeCamAtArrLocal } from "../../editor/arrangement-pills";
 import { planSegmentFrames, outputTimestampUs } from "./frame-timing";
@@ -764,7 +764,9 @@ export async function editRenderMulti(
   const masterDurationS =
     input.masterDurationS ??
     Math.max(...camRanges.map((r) => r.endS), 0);
-  const testPattern = makeTestPatternCanvas(outputWidth, outputHeight);
+  // ImageBitmap, not the raw canvas: WebGL2 canvas uploads ignore
+  // UNPACK_FLIP_Y_WEBGL and rendered the pattern upside-down (#141).
+  const testPattern = makeTestPatternBitmap(outputWidth, outputHeight);
 
   // Compositor (overlays + visualizers + fx shared across cams).
   const compositor = await Compositor.create(
@@ -1226,6 +1228,7 @@ export async function editRenderMulti(
     };
   } finally {
     compositor.destroy();
+    testPattern.close();
     for (const d of demuxResults) {
       if (d.kind === "video") d.stream.close();
       else d.bitmap.close();
