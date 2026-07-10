@@ -121,6 +121,22 @@ describe("JobPage — quick render feedback + double-start guard (#91)", () => {
   });
 });
 
+describe("JobPage — download filename (#142)", () => {
+  it("does not double the extension when the title is a filename", async () => {
+    getJobMock.mockResolvedValue(
+      makeJob({
+        title: "take-1.mp4",
+        lastRender: { completedAt: Date.now(), outputBytes: 1234 },
+      }),
+    );
+    resolveUrlMock.mockResolvedValue("blob:fake-output");
+
+    renderPage();
+    const link = await screen.findByRole("link", { name: /download mp4/i });
+    expect(link.getAttribute("download")).toBe("take-1.mp4");
+  });
+});
+
 describe("JobPage — inline player for the rendered video (#132)", () => {
   it("shows an inline <video> fed by the output URL next to Download", async () => {
     getJobMock.mockResolvedValue(

@@ -18,6 +18,7 @@ import { jobRoutePath, nextRouteForJob } from "../local/jobs-routing";
 import { useOpsStore, useRenderOp, useSyncOp } from "../local/ops-store";
 import { isVideoAsset } from "../storage/jobs-db";
 import { SyncPatchPanel } from "../components/sync/SyncPatchPanel";
+import { downloadFilename } from "../lib/filenames";
 import { renderStageLabel } from "./render-stages";
 
 export default function JobPage() {
@@ -46,12 +47,13 @@ export default function JobPage() {
   const renderBusy = renderPending || isRendering;
 
   // Download filename: prefer the custom name the user set in the export panel
-  // (persisted on the last render's editSpec), falling back to the project title.
+  // (persisted on the last render's editSpec), falling back to the project
+  // title. Titles may themselves be filenames — strip any extension before
+  // appending .mp4 so the saved file isn't `take-1.mp4.mp4` (#142).
   const downloadName = useMemo(() => {
     const custom = (job?.editSpec as EditSpecLocal | undefined)?.outputFilename
       ?.trim();
-    const base = custom || job?.title || job?.id || "export";
-    return `${base}.mp4`;
+    return downloadFilename(custom || job?.title || job?.id || "export");
   }, [job?.editSpec, job?.title, job?.id]);
 
   useEffect(() => {
