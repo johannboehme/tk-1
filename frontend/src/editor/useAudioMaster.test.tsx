@@ -802,17 +802,53 @@ describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => 
       expect(useEditorStore.getState().playback.isPlaying).toBe(true);
     });
 
+    it("loop.end exactly on a chunk seam — arms the WRAP, not a hop into the next chunk (#89)", async () => {
+      const segs = [
+        { in: 10, out: 15 }, // arr [0..5]
+        { in: 30, out: 35 }, // arr [5..10]
+      ];
+      const { mA, mB } = await setup(60);
+      useEditorStore.getState().setArrangementSegments(segs);
+      useEditorStore.getState().seek(10, { segmentIdxHint: 0 });
+      // Loop = whole chunk A = arr [0, 5]; end sits exactly on the A/B seam.
+      await act(async () => {
+        useEditorStore.getState().setLoop({ start: 0, end: 5 });
+        await flushAll();
+      });
+      await act(async () => {
+        useEditorStore.getState().setPlaying(true);
+        await flushAll();
+      });
+      await act(async () => {
+        mA.setCurrentTime(14.97);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      // Idle parked at the LOOP target (master 10), never at chunk B's
+      // head (master 30) — the seam-aligned loop must not hop into B.
+      expect(mB.getCurrentTime()).toBeCloseTo(10, 1);
+      expect(mB.playSpy).toHaveBeenCalled();
+    });
+
     it("duplicate chunks — wrap fires only at user-marked output position", async () => {
       // Same master range used twice. Arr-time loop {1, 5} maps to:
       //   arr=1 → seg 0 master 6 (wrap target)
       //   arr=5 → seg 1 master 7 (wrap point — 5 - 3 = 2 into seg 1)
       // The wrap MUST NOT fire while still in seg 0 even though seg 0's
       // master crosses 7 too.
+      //
+      // The tail chunk matters: setLoop clamps through the master-trim
+      // projection, and masterToArr's edge fallback always lands on the
+      // FIRST occurrence of a duplicated chunk — without a distinct chunk
+      // after the duplicates, trim {0, duration} pins loop.end to arr 3
+      // (the seam) and the loop under test silently becomes a different
+      // shape than the comment claims.
       const segs = [
         { in: 5, out: 8 }, // arr [0..3]
         { in: 5, out: 8 }, // arr [3..6]
+        { in: 50, out: 60 }, // arr [6..16]
       ];
-      const { mA, mB } = await setup(20);
+      const { mA, mB } = await setup(60);
       useEditorStore.getState().setArrangementSegments(segs);
       useEditorStore.getState().seek(5, { segmentIdxHint: 0 });
       await act(async () => {

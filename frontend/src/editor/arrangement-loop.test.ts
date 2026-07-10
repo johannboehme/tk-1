@@ -127,6 +127,53 @@ describe("nextLoopWrapMasterT", () => {
     });
   });
 
+  test("loop.end exactly on an interior chunk seam → wraps at the PREVIOUS segment's out", () => {
+    // A [0,30) B [30,60) C [60,90) in arr-time. Loop = whole chunk B.
+    // The half-open segmentIndexAtArr would resolve arr=60 into chunk C
+    // and park the wrap at C's first sample — every pass would bleed
+    // chunk C's head and then double-crossfade back. The loop's last
+    // audible sample lives in B, so the wrap must fire at B's out.
+    const segs: Segment[] = [
+      { in: 100, out: 130 },
+      { in: 200, out: 230 },
+      { in: 300, out: 330 },
+    ];
+    expect(nextLoopWrapMasterT({ start: 30, end: 60 }, segs)).toEqual({
+      wrapAtMasterT: 230,
+      wrapTargetMasterT: 200,
+      wrapInSegIdx: 1,
+      targetSegIdx: 1,
+    });
+  });
+
+  test("loop.end on the FIRST interior seam (loop covers only chunk A)", () => {
+    const segs: Segment[] = [
+      { in: 10, out: 15 },
+      { in: 30, out: 35 },
+    ];
+    // Loop = whole chunk A = arr [0, 5]. arr=5 is the A/B seam.
+    expect(nextLoopWrapMasterT({ start: 0, end: 5 }, segs)).toEqual({
+      wrapAtMasterT: 15,
+      wrapTargetMasterT: 10,
+      wrapInSegIdx: 0,
+      targetSegIdx: 0,
+    });
+  });
+
+  test("loop.end strictly inside a segment is NOT treated as a seam", () => {
+    const segs: Segment[] = [
+      { in: 10, out: 15 },
+      { in: 30, out: 35 },
+    ];
+    // arr=5.5 is 0.5 into seg 1 → wrap fires in seg 1 at master 30.5.
+    expect(nextLoopWrapMasterT({ start: 0, end: 5.5 }, segs)).toEqual({
+      wrapAtMasterT: 30.5,
+      wrapTargetMasterT: 10,
+      wrapInSegIdx: 1,
+      targetSegIdx: 0,
+    });
+  });
+
   test("empty segments → null (defensive — walker should never call with empty)", () => {
     expect(nextLoopWrapMasterT({ start: 0, end: 1 }, [])).toBeNull();
   });

@@ -15,9 +15,16 @@ import { clampLoopRegion } from "./OffsetScheduler";
 import {
   arrToMaster,
   masterToArr,
+  segmentArrStarts,
   segmentIndexAtArr,
   totalArrDuration,
 } from "./arrangement-time";
+
+/** Float tolerance for "loop.end sits exactly on a segment seam". Arr-times
+ *  are accumulated float sums; a UI-derived loop.end that means "the seam"
+ *  can differ from the walker's own sum by a few ulps. Anything a real user
+ *  can place is far coarser than a nanosecond. */
+const SEAM_EPS_S = 1e-9;
 
 export interface LoopWrapGeometry {
   /** Master-time at which the wrap fires (= arr-time of `loop.end`
@@ -53,14 +60,32 @@ export function nextLoopWrapMasterT(
   // value side correctly (clamps to `last.out`).
   let wrapInSegIdx = segmentIndexAtArr(loop.end, segments);
   if (wrapInSegIdx === -1) wrapInSegIdx = segments.length - 1;
+  let wrapAtMasterT = arrToMaster(loop.end, segments);
+
+  // loop.end exactly on an INTERIOR seam: the half-open lookup resolves
+  // it into the FOLLOWING segment, i.e. wrapAtMasterT = nextSeg.in — the
+  // first sample of a chunk the loop doesn't contain. The walker would
+  // then hop INTO that chunk (wrapHere is false while playing the loop's
+  // true last segment), bleed its head every pass, and only wrap back on
+  // the next tick with a zero-lead crossfade. The loop's last audible
+  // sample lives in the PREVIOUS segment, so wrap at its `out` instead.
+  if (wrapInSegIdx > 0) {
+    const arrStartOfWrapSeg = segmentArrStarts(segments)[wrapInSegIdx];
+    if (loop.end - arrStartOfWrapSeg < SEAM_EPS_S) {
+      wrapInSegIdx -= 1;
+      wrapAtMasterT = segments[wrapInSegIdx].out;
+    }
+  }
 
   let targetSegIdx = segmentIndexAtArr(loop.start, segments);
   // Symmetric guard — loop.start clamped to 0 should map to seg 0; this
   // is only here so a caller passing an unclamped loop doesn't crash.
+  // (A loop.start ON a seam is correct as-is: the loop re-enters at the
+  // FOLLOWING segment's first sample, which is what half-open gives us.)
   if (targetSegIdx === -1) targetSegIdx = 0;
 
   return {
-    wrapAtMasterT: arrToMaster(loop.end, segments),
+    wrapAtMasterT,
     wrapTargetMasterT: arrToMaster(loop.start, segments),
     wrapInSegIdx,
     targetSegIdx,
