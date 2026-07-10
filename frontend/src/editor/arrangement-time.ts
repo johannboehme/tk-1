@@ -205,6 +205,67 @@ export function mastersToArrAll(
   return result;
 }
 
+/** Arr-time positions of the master-trim's IN and OUT handles.
+ *
+ *  Unlike `mastersToArrAll` (a strictly half-open point projection), this
+ *  treats the trim endpoints as RANGE endpoints:
+ *    - the in-marker occurs where `trimIn ∈ [seg.in, seg.out)` (a range
+ *      START on a segment's end is not inside it),
+ *    - the out-marker occurs where `trimOut ∈ (seg.in, seg.out]` (a range
+ *      END exactly on a segment's end still bounds material inside it).
+ *
+ *  The inclusive out-test matters in the DEFAULT state: loadJob sets
+ *  trim.out = meta.duration === seg.out, and the half-open projection
+ *  returned zero occurrences — the OUT handle was neither drawn nor
+ *  grabbable until the user moved it via the O hotkey.
+ *
+ *  Endpoints with no occurrence (they sit in a gap or outside every
+ *  segment — e.g. long-form trim.in = 0 when no chunk starts at master 0)
+ *  fall back to the playable window's hull: the first / last slice of
+ *  `sliceByArrSegments(trimIn, trimOut)`, or arr 0 / totalArrDuration
+ *  when the trim intersects nothing. The handle then sits exactly on the
+ *  boundary between dimmed and playable material, which is where the
+ *  user expects to grab it.
+ *
+ *  Empty `segments` → identity passthrough, like the other helpers. */
+export function trimHandlesArr(
+  trimIn: number,
+  trimOut: number,
+  segments: readonly Segment[],
+): { inPositions: number[]; outPositions: number[] } {
+  if (segments.length === 0) {
+    return { inPositions: [trimIn], outPositions: [trimOut] };
+  }
+  const inPositions: number[] = [];
+  const outPositions: number[] = [];
+  let cursor = 0;
+  for (const seg of segments) {
+    const len = Math.max(0, seg.out - seg.in);
+    if (len > 0) {
+      if (trimIn >= seg.in && trimIn < seg.out) {
+        inPositions.push(cursor + (trimIn - seg.in));
+      }
+      if (trimOut > seg.in && trimOut <= seg.out) {
+        outPositions.push(cursor + (trimOut - seg.in));
+      }
+    }
+    cursor += len;
+  }
+  if (inPositions.length > 0 && outPositions.length > 0) {
+    return { inPositions, outPositions };
+  }
+  const slices = sliceByArrSegments(trimIn, trimOut, segments);
+  if (inPositions.length === 0) {
+    inPositions.push(slices.length > 0 ? slices[0].arrStartS : 0);
+  }
+  if (outPositions.length === 0) {
+    outPositions.push(
+      slices.length > 0 ? slices[slices.length - 1].arrEndS : cursor,
+    );
+  }
+  return { inPositions, outPositions };
+}
+
 /** A slice of a master-time range projected onto arrangement-time.
  *  `arrStartS`/`arrEndS` is contiguous (no gaps inside a segment), so a
  *  consumer can draw it as a single rectangle on a piece-wise-linear

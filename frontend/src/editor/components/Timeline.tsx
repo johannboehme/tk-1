@@ -29,6 +29,7 @@ import {
   segmentIndexAtArr,
   sliceByArrSegments,
   totalArrDuration,
+  trimHandlesArr,
 } from "../arrangement-time";
 import { trimWindowArr } from "../arrangement-loop";
 import { isPillDirty } from "../arrangement-pills";
@@ -311,14 +312,18 @@ export function Timeline({
   // Trim window + audio-start marker projected into arr-time. Both are
   // master-time values that rarely change; projecting them per redraw
   // (60 Hz during playback) re-scans the whole segment list for nothing.
-  const trimProjection = useMemo(
-    () => ({
+  const trimProjection = useMemo(() => {
+    // Handle positions use the range-endpoint projector: trim.out equal
+    // to a segment's end (the loadJob default) still yields a handle,
+    // and endpoints in gaps clamp to the playable window's boundary —
+    // `mastersToArrAll`'s half-open point test would drop both (#101).
+    const handles = trimHandlesArr(trim.in, trim.out, arrangementSegments);
+    return {
       playableSlices: sliceByArrSegments(trim.in, trim.out, arrangementSegments),
-      trimInArrPositions: mastersToArrAll(trim.in, arrangementSegments),
-      trimOutArrPositions: mastersToArrAll(trim.out, arrangementSegments),
-    }),
-    [trim.in, trim.out, arrangementSegments],
-  );
+      trimInArrPositions: handles.inPositions,
+      trimOutArrPositions: handles.outPositions,
+    };
+  }, [trim.in, trim.out, arrangementSegments]);
   // Stable ProgramStrip callbacks — the strip is memo()ed, so handing it
   // fresh closures every render would defeat that and put its DOM
   // reconciliation back on the 60 Hz playback path.
@@ -1099,13 +1104,13 @@ export function Timeline({
     // Trim handles render at every arr-time occurrence of trim.in /
     // trim.out — a chunk repeated in long-form yields N draggable
     // handles that all wire to the same master-time value. Hit-test
-    // every occurrence so any of them can start a drag.
-    const trimInArr = mastersToArrAll(trim.in, arrangementSegments);
-    for (const arrT of trimInArr) {
+    // every occurrence so any of them can start a drag. Reuses the
+    // memoized projection the draw pass renders from, so what's drawn
+    // and what's grabbable can never diverge.
+    for (const arrT of trimProjection.trimInArrPositions) {
       if (Math.abs(x - arrTToX(arrT)) <= HANDLE_HIT) return "trim-in";
     }
-    const trimOutArr = mastersToArrAll(trim.out, arrangementSegments);
-    for (const arrT of trimOutArr) {
+    for (const arrT of trimProjection.trimOutArrPositions) {
       if (Math.abs(x - arrTToX(arrT)) <= HANDLE_HIT) return "trim-out";
     }
     if (Math.abs(x - xp) <= HANDLE_HIT) return "playhead";
