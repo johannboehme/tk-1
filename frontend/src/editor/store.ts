@@ -1052,14 +1052,40 @@ function restorePillBaseline(p: Pill): Pill {
   };
 }
 
-/** Shift a pill's source-trim by `deltaS`, clamped against zero +
- *  minimum window. Shared by `nudgePillSourceMs` and
- *  `nudgeCamSourceMs` (which fans this out across the cam's pills). */
+/** Clamp a source-shift so `inS + deltaS` can't go negative, then return
+ *  the APPLIED delta. Both window edges must move by this same applied
+ *  amount — clamping the edges independently (the old pattern) moved
+ *  them by different deltas, silently shrinking the source window while
+ *  the pill's arr window stayed put: the 1:1 arr↔source mapping broke
+ *  and playback ran off-rate with drifting alignment (#103). */
+function clampSourceShift(inS: number, deltaS: number): number {
+  return Math.max(deltaS, -inS);
+}
+
+/** Shift a pill's source-trim by `deltaS`, clamped against zero while
+ *  ALWAYS preserving the window length. Shared by `nudgePillSourceMs`
+ *  and `nudgeCamSourceMs` (which fans this out across the cam's
+ *  pills). */
 function shiftPillSource(p: Pill, deltaS: number): Pill {
+  const applied = clampSourceShift(p.sourceInS, deltaS);
   return {
     ...p,
-    sourceInS: Math.max(0, p.sourceInS + deltaS),
-    sourceOutS: Math.max(p.sourceInS + 0.05, p.sourceOutS + deltaS),
+    sourceInS: p.sourceInS + applied,
+    sourceOutS: p.sourceOutS + applied,
+  };
+}
+
+/** Shift a pill's ORIGINAL source bounds (the RESET baseline) by
+ *  `deltaS` with the same length-preserving clamp as
+ *  `shiftPillSource`. Used by the cam-anchor mutations
+ *  (`setClipSyncOverride`, `setSelectedCandidateIdx`) so a per-pill
+ *  RESET restores a baseline that's consistent with the new anchor. */
+function shiftPillOriginalSource(p: Pill, deltaS: number): Pill {
+  const applied = clampSourceShift(p.originalSourceInS, deltaS);
+  return {
+    ...p,
+    originalSourceInS: p.originalSourceInS + applied,
+    originalSourceOutS: p.originalSourceOutS + applied,
   };
 }
 
@@ -1854,14 +1880,9 @@ export const useEditorStore = create<EditorState>()(
       if (Math.abs(deltaMs) > 1e-6) {
         const deltaS = deltaMs / 1000;
         set({
-          pills: mutatePillsForCam(get().pills, camId, (p) => ({
-            ...shiftPillSource(p, deltaS),
-            originalSourceInS: Math.max(0, p.originalSourceInS + deltaS),
-            originalSourceOutS: Math.max(
-              p.originalSourceInS + 0.05,
-              p.originalSourceOutS + deltaS,
-            ),
-          })),
+          pills: mutatePillsForCam(get().pills, camId, (p) =>
+            shiftPillOriginalSource(shiftPillSource(p, deltaS), deltaS),
+          ),
         });
       }
     },
@@ -1999,15 +2020,18 @@ export const useEditorStore = create<EditorState>()(
     setPillSourceOffsetMs(id, offsetMs) {
       const offsetS = offsetMs / 1000;
       set({
-        pills: mutatePill(get().pills, id, (p) => ({
-          ...p,
-          sourceInS: Math.max(0, p.originalSourceInS + offsetS),
-          sourceOutS: Math.max(
-            p.originalSourceInS + offsetS + 0.05,
-            p.originalSourceOutS + offsetS,
-          ),
-          userEdited: true,
-        })),
+        pills: mutatePill(get().pills, id, (p) => {
+          // Clamp the OFFSET (not the edges independently) so the window
+          // length always survives — same invariant as shiftPillSource
+          // (#103).
+          const applied = clampSourceShift(p.originalSourceInS, offsetS);
+          return {
+            ...p,
+            sourceInS: p.originalSourceInS + applied,
+            sourceOutS: p.originalSourceOutS + applied,
+            userEdited: true,
+          };
+        }),
       });
     },
     nudgePillArrMs(id, deltaMs) {
@@ -2049,14 +2073,9 @@ export const useEditorStore = create<EditorState>()(
       if (Math.abs(deltaMs) > 1e-6) {
         const deltaS = deltaMs / 1000;
         set({
-          pills: mutatePillsForCam(get().pills, camId, (p) => ({
-            ...shiftPillSource(p, deltaS),
-            originalSourceInS: Math.max(0, p.originalSourceInS + deltaS),
-            originalSourceOutS: Math.max(
-              p.originalSourceInS + 0.05,
-              p.originalSourceOutS + deltaS,
-            ),
-          })),
+          pills: mutatePillsForCam(get().pills, camId, (p) =>
+            shiftPillOriginalSource(shiftPillSource(p, deltaS), deltaS),
+          ),
         });
       }
       // Mirror cam-1 changes into legacy offset slice (SyncTuner).
