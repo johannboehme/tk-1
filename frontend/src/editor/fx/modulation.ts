@@ -363,6 +363,14 @@ export function legacyModulation(envelope: ADSREnvelope): Modulation {
 // rebuild the whole curve every frame. Keyed by the audio-env object
 // identity, then by the sidechain config signature. Observationally pure
 // (same inputs → same curve).
+//
+// The inner map is a bounded LRU: a macro-knob drag streams a distinct
+// config per pointermove, and each curve spans the full master track
+// (~1.7 MB for an hour-long job) — unbounded, a few seconds of dragging
+// would pin tens of MB until the job is reloaded. The cap covers every
+// concurrently active sidechain FX (one curve each) plus headroom; the
+// stale intermediate drag configs are the entries that fall out.
+export const FOLLOWER_MEMO_MAX = 8;
 const followerMemo = new WeakMap<AudioEnvelope, Map<string, AudioEnvelope>>();
 
 /** Get (memoized) the sidechain follower curve for an audio env + config. */
@@ -378,9 +386,19 @@ export function followerFor(
   }
   const key = `${side.threshold}|${side.attackS}|${side.releaseS}|${side.invert}`;
   let curve = inner.get(key);
-  if (!curve) {
-    curve = buildFollowerCurve(audio, side);
+  if (curve) {
+    // Refresh recency — Map iterates in insertion order, so delete +
+    // re-set moves this entry to the back of the eviction queue.
+    inner.delete(key);
     inner.set(key, curve);
+    return curve;
+  }
+  curve = buildFollowerCurve(audio, side);
+  inner.set(key, curve);
+  if (inner.size > FOLLOWER_MEMO_MAX) {
+    // Evict the least-recently-used entry (first in insertion order).
+    const oldest = inner.keys().next().value;
+    if (oldest !== undefined) inner.delete(oldest);
   }
   return curve;
 }
