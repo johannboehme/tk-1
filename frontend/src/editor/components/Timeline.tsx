@@ -30,6 +30,7 @@ import {
   sliceByArrSegments,
   totalArrDuration,
 } from "../arrangement-time";
+import { trimWindowArr } from "../arrangement-loop";
 import { isPillDirty } from "../arrangement-pills";
 import { LaneHeader, type CamStatus } from "./timeline/LaneHeader";
 import { AddMediaButton } from "./AddMediaButton";
@@ -1441,22 +1442,16 @@ export function Timeline({
     } else if (drag.kind === "loop" && loop) {
       // Loop drag operates in arr-time (the composed tape). Clamp to the
       // master-trim window projected through `arrangementSegments` so
-      // the loop can't escape the export region — same trim-universal
-      // contract clampLoopToBounds enforces on the store side.
+      // the loop can't escape the export region — the SAME projection
+      // clampLoopToBounds uses on the store side (`trimWindowArr`), so
+      // drag bounds can never diverge from what setLoop/moveLoop accept.
       const len = loop.end - loop.start;
       const arrAtPointer = viewStart + (x / canvasWidth) * visibleDur;
-      const arrTotalLocal = totalArrDuration(arrangementSegments);
-      const trimInArr = Math.max(
-        0,
-        Math.min(arrTotalLocal, masterToArr(trim.in, arrangementSegments)),
-      );
-      const trimOutArr = Math.max(
-        trimInArr,
-        Math.min(arrTotalLocal, masterToArr(trim.out, arrangementSegments)),
-      );
+      const window = trimWindowArr(trim, arrangementSegments);
+      if (!window) return;
       const newStartRaw = Math.max(
-        trimInArr,
-        Math.min(trimOutArr - len, arrAtPointer - drag.offset),
+        window.startArr,
+        Math.min(window.endArr - len, arrAtPointer - drag.offset),
       );
       // Loop bounds live in arr-time; snap against the master-bar-grid
       // anchored into arr-time so a long-form arrangement still snaps
