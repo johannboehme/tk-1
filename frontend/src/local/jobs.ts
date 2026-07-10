@@ -30,6 +30,7 @@ import {
   type VideoAsset,
 } from "../storage/jobs-db";
 import { useOpsStore } from "./ops-store";
+import { nextCamIndex } from "./cam-ids";
 import { defaultJobTitle } from "../lib/filenames";
 import type { GradeParams } from "../editor/fx/looks";
 import { camColorAt } from "../storage/migrations";
@@ -659,7 +660,10 @@ export async function addVideoToJob(
   if (!job) throw new Error(`Job ${jobId} not found`);
 
   const existing = job.videos ?? [];
-  const newCam = await persistVideoCam(jobId, picked, existing.length);
+  // Collision-free slot: removeCamFromJob keeps survivor ids stable (no
+  // renumbering), so `existing.length` would re-issue a live id after a
+  // delete-then-add and corrupt that cam's lane + OPFS media (#68).
+  const newCam = await persistVideoCam(jobId, picked, nextCamIndex(existing));
   const camId = newCam.id;
 
   // Probe dimensions BEFORE the first persist so the editor lane appears
@@ -762,10 +766,11 @@ export async function addImageToJob(
 
   const existing = job.videos ?? [];
   const durationS = opts.durationS ?? DEFAULT_IMAGE_DURATION_S;
+  // Same collision-free slot rule as addVideoToJob (#68).
   const newAsset = await persistImageCam(
     jobId,
     picked,
-    existing.length,
+    nextCamIndex(existing),
     durationS,
   );
 
