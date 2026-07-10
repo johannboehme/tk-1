@@ -11,6 +11,11 @@ import {
   readDroppedAssets,
 } from "./upload-drop";
 import {
+  canSynthesizeDemo,
+  createDemoJob,
+  type DemoProgress,
+} from "../local/demo/demo-project";
+import {
   pickAudioFile,
   pickVideoFiles,
   supportsHandlePicker,
@@ -34,6 +39,8 @@ export default function Upload() {
   /** Which zone the drag currently hovers (stronger highlight). Purely
    *  visual — routing is always by media type, not by drop position. */
   const [dragZone, setDragZone] = useState<"audio" | "video" | null>(null);
+  /** Demo synthesis in flight; holds the current stage for the button. */
+  const [demoStage, setDemoStage] = useState<DemoProgress | null>(null);
 
   // Snapshot once at mount: capabilities are static within a tab.
   const caps = useMemo(getCapabilities, []);
@@ -41,6 +48,21 @@ export default function Upload() {
   const usesHandles = supportsHandlePicker();
 
   const ready = audio !== null && videos.length > 0 && !busy;
+  const demoSupported = canSynthesizeDemo(caps);
+  const demoBusy = demoStage !== null;
+
+  async function runDemo() {
+    if (demoBusy || busy || !demoSupported) return;
+    setErr(null);
+    setDemoStage({ stage: "song", detail: "song" });
+    try {
+      const jobId = await createDemoJob({ onProgress: setDemoStage });
+      navigate(`/job/${jobId}`);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Could not build the demo session");
+      setDemoStage(null);
+    }
+  }
 
   // Window-level safety net: a stray drop must NEVER replace the SPA
   // with the raw media file. `dragover` needs preventDefault too —
@@ -353,9 +375,68 @@ export default function Upload() {
               busy={busy}
             />
           </div>
+
+          <DemoStrip
+            supported={demoSupported}
+            stage={demoStage}
+            disabled={!demoSupported || demoBusy || busy}
+            onRun={runDemo}
+          />
         </div>
       </form>
     </main>
+  );
+}
+
+/** "No footage yet?" strip — synthesizes a tiny demo session client-side
+ *  and pushes it through the normal createJob → sync → editor flow. */
+function DemoStrip({
+  supported,
+  stage,
+  disabled,
+  onRun,
+}: {
+  supported: boolean;
+  stage: DemoProgress | null;
+  disabled: boolean;
+  onRun: () => void;
+}) {
+  const stageLabel =
+    stage === null
+      ? null
+      : stage.stage === "song"
+        ? "SYNTH · SONG"
+        : stage.stage === "cam"
+          ? `SYNTH · ${stage.detail}`
+          : "STARTING…";
+  return (
+    <div className="flex flex-col sm:flex-row sm:items-center gap-3 border border-rule rounded-md px-4 py-3 bg-paper-hi">
+      <div className="flex-1 min-w-0">
+        <span className="font-display tracking-label uppercase text-[11px] text-ink-2 block">
+          No footage yet?
+        </span>
+        <p className="font-mono text-xs text-ink-3 mt-0.5 leading-relaxed">
+          {supported
+            ? "A 17-second song + two cams, synthesized right here, then run " +
+              "through the real sync — nothing to download."
+            : "The demo session needs WebCodecs encoders — try Chrome, Edge or Brave."}
+        </p>
+      </div>
+      <button
+        type="button"
+        id="demo-button"
+        onClick={onRun}
+        disabled={disabled}
+        className={[
+          "h-11 px-5 shrink-0 rounded-md font-display tracking-label uppercase text-[12px] transition-all",
+          disabled
+            ? "bg-paper-deep text-ink-3 cursor-not-allowed"
+            : "bg-paper-hi text-ink shadow-emboss hover:bg-paper-deep active:shadow-pressed active:translate-y-[1px] cursor-pointer",
+        ].join(" ")}
+      >
+        {stageLabel ?? "Try the demo"}
+      </button>
+    </div>
   );
 }
 

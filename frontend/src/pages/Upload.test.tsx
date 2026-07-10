@@ -1,12 +1,22 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import Upload from "./Upload";
 import * as caps from "../local/capabilities";
 import * as picker from "../local/file-picker";
 
 vi.mock("../local/jobs", () => ({
   createJob: vi.fn(),
+}));
+
+const demo = vi.hoisted(() => ({
+  supported: true,
+  createDemoJob: vi.fn<(opts?: unknown) => Promise<string>>(),
+}));
+
+vi.mock("../local/demo/demo-project", () => ({
+  canSynthesizeDemo: () => demo.supported,
+  createDemoJob: (opts?: unknown) => demo.createDemoJob(opts),
 }));
 
 const FULL_SUPPORT: caps.Capabilities = {
@@ -39,6 +49,8 @@ function renderPage() {
 
 beforeEach(() => {
   vi.restoreAllMocks();
+  demo.supported = true;
+  demo.createDemoJob.mockReset();
 });
 afterEach(() => {
   vi.restoreAllMocks();
@@ -197,6 +209,54 @@ describe("Upload page — drag & drop", () => {
       dataTransfer: dt([makeSyntheticFile("a.mp4", 10, "video/mp4")]),
     });
     expect(notCancelledDrop).toBe(false);
+  });
+});
+
+describe("Upload page — demo session", () => {
+  function renderWithJobRoute() {
+    return render(
+      <MemoryRouter initialEntries={["/"]}>
+        <Routes>
+          <Route path="/" element={<Upload />} />
+          <Route path="/job/:id" element={<div>JOB PAGE STUB</div>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  it("offers a one-click demo that runs through the normal job flow", async () => {
+    vi.spyOn(caps, "getCapabilities").mockReturnValue(FULL_SUPPORT);
+    demo.createDemoJob.mockResolvedValue("demo42");
+    renderWithJobRoute();
+    const button = screen.getByRole("button", { name: /try the demo/i });
+    expect(button).toBeEnabled();
+    fireEvent.click(button);
+    await waitFor(() => {
+      expect(screen.getByText("JOB PAGE STUB")).toBeInTheDocument();
+    });
+    expect(demo.createDemoJob).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces synthesis failures without leaving the page", async () => {
+    vi.spyOn(caps, "getCapabilities").mockReturnValue(FULL_SUPPORT);
+    demo.createDemoJob.mockRejectedValue(new Error("encoder exploded"));
+    renderWithJobRoute();
+    fireEvent.click(screen.getByRole("button", { name: /try the demo/i }));
+    await waitFor(() => {
+      expect(screen.getByText(/encoder exploded/i)).toBeInTheDocument();
+    });
+    // Still on the Upload page, button usable again.
+    expect(
+      screen.getByRole("button", { name: /try the demo/i }),
+    ).toBeEnabled();
+  });
+
+  it("disables the demo when the browser lacks WebCodecs encoders", () => {
+    vi.spyOn(caps, "getCapabilities").mockReturnValue(FULL_SUPPORT);
+    demo.supported = false;
+    renderWithJobRoute();
+    expect(screen.getByRole("button", { name: /try the demo/i })).toBeDisabled();
+    expect(screen.getByText(/Chrome, Edge or Brave/i)).toBeInTheDocument();
   });
 });
 
