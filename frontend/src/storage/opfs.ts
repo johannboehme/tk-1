@@ -58,19 +58,64 @@ async function getFileHandle(
   }
 }
 
-async function writeFile(path: string, data: WritablePayload): Promise<void> {
-  const handle = await getFileHandle(path, { create: true });
-  if (!handle) throw new Error(`Failed to create file handle for "${path}"`);
+/** Minimal writable shape — the subset of FileSystemWritableFileStream
+ *  that `writeAndClose` needs. Kept structural so tests can pass fakes. */
+export interface WritableLike {
+  write(data: Blob | BufferSource): Promise<void>;
+  close(): Promise<void>;
+  abort?(reason?: unknown): Promise<void>;
+}
 
-  const writable = await handle.createWritable({ keepExistingData: false });
+/**
+ * Write `data` to a writable stream and close it, WITHOUT masking the
+ * write error (#119): when `write()` rejects (typically
+ * QuotaExceededError on a full disk), closing the errored stream rejects
+ * again — a naive `finally { close() }` would replace the actionable
+ * quota error with a generic stream error. Here the original write error
+ * always wins; the stream is aborted (discarding the partial file) on a
+ * best-effort basis.
+ *
+ * On the happy path, `close()` errors DO propagate — close is where the
+ * bytes are flushed to disk, so a quota error there is just as real.
+ *
+ * Exported for unit tests.
+ */
+export async function writeAndClose(
+  writable: WritableLike,
+  data: WritablePayload,
+): Promise<void> {
   try {
     // The DOM type for write() rejects SharedArrayBuffer-backed views; in
     // practice the underlying API accepts any BufferSource. We cast here
     // because callers can legitimately pass typed arrays from any source.
     await writable.write(data as Blob | BufferSource);
-  } finally {
-    await writable.close();
+  } catch (err) {
+    if (typeof writable.abort === "function") {
+      // abort() discards the partial write. Its own rejection (stream
+      // already errored) must not shadow the original failure.
+      try {
+        await writable.abort(err);
+      } catch {
+        // keep the original error
+      }
+    } else {
+      try {
+        await writable.close();
+      } catch {
+        // keep the original error
+      }
+    }
+    throw err;
   }
+  await writable.close();
+}
+
+async function writeFile(path: string, data: WritablePayload): Promise<void> {
+  const handle = await getFileHandle(path, { create: true });
+  if (!handle) throw new Error(`Failed to create file handle for "${path}"`);
+
+  const writable = await handle.createWritable({ keepExistingData: false });
+  await writeAndClose(writable, data);
 }
 
 async function createWritable(path: string): Promise<FileSystemWritableFileStream> {
@@ -133,6 +178,40 @@ async function list(path: string): Promise<string[]> {
   return names;
 }
 
+/** Aggregate stats for a directory subtree: total bytes and the newest
+ *  file modification time (null when the tree holds no files). Cheap —
+ *  `getFile()` returns size/lastModified without reading content. Missing
+ *  paths report zero. */
+async function dirStats(
+  path: string,
+): Promise<{ bytes: number; newestModifiedMs: number | null }> {
+  const segments = path.split("/").filter((p) => p.length > 0);
+  const dir = await resolveDir(segments, { create: false });
+  if (!dir) return { bytes: 0, newestModifiedMs: null };
+
+  let bytes = 0;
+  let newest: number | null = null;
+  async function walk(d: FileSystemDirectoryHandle): Promise<void> {
+    for await (const [, handle] of (
+      d as FileSystemDirectoryHandle & {
+        entries: () => AsyncIterableIterator<[string, FileSystemHandle]>;
+      }
+    ).entries()) {
+      if (handle.kind === "directory") {
+        await walk(handle as FileSystemDirectoryHandle);
+      } else {
+        const file = await (handle as FileSystemFileHandle).getFile();
+        bytes += file.size;
+        if (newest === null || file.lastModified > newest) {
+          newest = file.lastModified;
+        }
+      }
+    }
+  }
+  await walk(dir);
+  return { bytes, newestModifiedMs: newest };
+}
+
 async function objectUrl(path: string): Promise<string> {
   const file = await readFile(path);
   return URL.createObjectURL(file);
@@ -165,6 +244,7 @@ export const opfs = {
   deleteFile,
   deletePath,
   list,
+  dirStats,
   objectUrl,
   estimate,
   wipeAll,

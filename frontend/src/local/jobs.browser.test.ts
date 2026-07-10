@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
   addVideoToJob,
   createJob,
@@ -345,4 +345,49 @@ describe("addVideoToJob", () => {
     const after = await jobsDb.getJob(jobId);
     expect(after!.videos!.map((v) => v.id)).toEqual(["cam-1", "cam-2", "cam-3"]);
   }, 180_000);
+});
+
+// -----------------------------------------------------------------------------
+// #119 — createJob must not leave orphaned OPFS bytes when a persist fails
+// -----------------------------------------------------------------------------
+
+describe("createJob cleanup on persist failure (#119)", () => {
+  beforeEach(async () => {
+    await jobsDb.wipeAll();
+    await opfs.wipeAll();
+  });
+
+  it("deletes already-written files when a later copy fails, and creates no IDB row", async () => {
+    const v1 = await fetchVideoFile();
+    const v2 = await fetchVideoFile();
+    const audio = new File([makeWavBlob()], "studio.wav", { type: "audio/wav" });
+
+    // Fail the third OPFS copy (audio → cam-1 → cam-2) the way a full
+    // disk would: with a QuotaExceededError.
+    const original = opfs.writeFile.bind(opfs);
+    let calls = 0;
+    const spy = vi
+      .spyOn(opfs, "writeFile")
+      .mockImplementation(async (path, data) => {
+        calls++;
+        if (calls >= 3) {
+          throw new DOMException("Quota exceeded", "QuotaExceededError");
+        }
+        return original(path, data);
+      });
+
+    try {
+      await expect(
+        createJob([pick(v1), pick(v2)], pick(audio)),
+      ).rejects.toMatchObject({ name: "QuotaExceededError" });
+    } finally {
+      spy.mockRestore();
+    }
+
+    // The partially-written jobs/{id} directory is gone…
+    const leftover = (await opfs.list("jobs")).filter((e) => e.endsWith("/"));
+    expect(leftover).toEqual([]);
+    // …and no job row exists that could reference it.
+    expect(await jobsDb.listJobs()).toEqual([]);
+  }, 60_000);
 });

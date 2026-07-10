@@ -55,6 +55,53 @@ export function activeRenderJobsForTest(): ReadonlySet<string> {
   return ACTIVE_RENDER_JOBS;
 }
 
+/**
+ * Delete `jobs/*` OPFS directories that no IndexedDB row references
+ * (#119). Such orphans appear when a createJob failed mid-copy in an
+ * older build, or when the row write itself failed — they are invisible
+ * in History, unreachable by deleteJob, and permanently eat quota.
+ *
+ * Directories whose newest file is younger than `ORPHAN_MIN_AGE_MS` are
+ * spared: they may belong to a createJob currently copying files in
+ * another tab (the row is only written after all copies finish).
+ *
+ * Returns the number of directories removed. Best-effort per directory.
+ */
+const ORPHAN_MIN_AGE_MS = 60 * 60 * 1000;
+
+export async function sweepOrphanJobDirs(nowMs = Date.now()): Promise<number> {
+  let entries: string[];
+  try {
+    entries = await opfs.list("jobs");
+  } catch {
+    return 0;
+  }
+  const dirs = entries
+    .filter((e) => e.endsWith("/"))
+    .map((e) => e.slice(0, -1));
+  if (dirs.length === 0) return 0;
+
+  const known = new Set((await jobsDb.listJobs()).map((j) => j.id));
+  let removed = 0;
+  for (const dir of dirs) {
+    if (known.has(dir)) continue;
+    try {
+      const { newestModifiedMs } = await opfs.dirStats(`jobs/${dir}`);
+      if (
+        newestModifiedMs !== null &&
+        nowMs - newestModifiedMs < ORPHAN_MIN_AGE_MS
+      ) {
+        continue; // possibly mid-createJob in another tab
+      }
+      await opfs.deletePath(`jobs/${dir}`);
+      removed++;
+    } catch {
+      // best-effort — skip this dir, try the others
+    }
+  }
+  return removed;
+}
+
 let persistRequested = false;
 
 export async function requestPersistentStorage(): Promise<boolean> {

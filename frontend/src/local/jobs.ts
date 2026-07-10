@@ -71,6 +71,7 @@ import {
   pruneIfQuotaTight,
   removeRenderUnloadGuard,
   requestPersistentStorage,
+  sweepOrphanJobDirs,
 } from "./lifecycle";
 import { emitJobUpdate, jobEvents } from "./jobs-events";
 
@@ -242,19 +243,32 @@ export async function createJob(
   }
 
   // Best-effort housekeeping before we commit big new files: ask for
-  // persistent storage (so the browser doesn't evict OPFS under pressure)
-  // and prune old jobs if we're close to the quota.
+  // persistent storage (so the browser doesn't evict OPFS under pressure),
+  // reclaim orphaned OPFS dirs from failed past uploads (#119), and prune
+  // old jobs if we're close to the quota.
   void requestPersistentStorage();
+  await sweepOrphanJobDirs().catch(() => undefined);
   await pruneIfQuotaTight().catch(() => undefined);
 
   const jobId = generateJobId();
   const audioExt = fileExtension(audioPick.file, "wav");
   const audioOpfsPath = audioPath(jobId, audioExt);
-  const audioSource = await persistPickedAsset(audioPick, audioOpfsPath);
 
+  // Persist all picks before the job row exists. If any copy fails
+  // (QuotaExceededError on Safari/Firefox where picks are byte copies),
+  // remove everything written so far — otherwise the orphaned bytes are
+  // invisible to History/delete/prune and make the quota problem that
+  // caused the failure permanently worse (#119).
+  let audioSource: AssetSource;
   const videos: VideoAsset[] = [];
-  for (let i = 0; i < videoPicks.length; i++) {
-    videos.push(await persistVideoCam(jobId, videoPicks[i], i));
+  try {
+    audioSource = await persistPickedAsset(audioPick, audioOpfsPath);
+    for (let i = 0; i < videoPicks.length; i++) {
+      videos.push(await persistVideoCam(jobId, videoPicks[i], i));
+    }
+  } catch (err) {
+    await opfs.deletePath(`jobs/${jobId}`).catch(() => undefined);
+    throw err;
   }
 
   const firstVideo = videoPicks[0].file;

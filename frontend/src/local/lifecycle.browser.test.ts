@@ -5,6 +5,7 @@ import {
   activeRenderJobsForTest,
   pruneIfQuotaTight,
   requestPersistentStorage,
+  sweepOrphanJobDirs,
 } from "./lifecycle";
 import { jobsDb, type LocalJob } from "../storage/jobs-db";
 import { opfs } from "../storage/opfs";
@@ -117,5 +118,36 @@ describe("pruneIfQuotaTight", () => {
     } finally {
       (navigator.storage as { estimate: typeof origEstimate }).estimate = origEstimate;
     }
+  });
+});
+
+describe("sweepOrphanJobDirs (#119)", () => {
+  beforeEach(async () => {
+    await jobsDb.wipeAll();
+    await opfs.wipeAll();
+  });
+
+  it("deletes stale jobs/* dirs without a DB row, keeps tracked dirs", async () => {
+    await opfs.writeFile("jobs/orphan-1/cam-1.mp4", new Blob([new Uint8Array(64)]));
+    await opfs.writeFile("jobs/tracked/cam-1.mp4", new Blob([new Uint8Array(64)]));
+    await jobsDb.saveJob(makeJob({ id: "tracked" }));
+
+    // Pass a future "now": freshly-written dirs are otherwise protected
+    // by the min-age guard below.
+    const removed = await sweepOrphanJobDirs(Date.now() + 2 * 60 * 60 * 1000);
+    expect(removed).toBe(1);
+    expect(await opfs.exists("jobs/orphan-1/cam-1.mp4")).toBe(false);
+    expect(await opfs.exists("jobs/tracked/cam-1.mp4")).toBe(true);
+  });
+
+  it("spares fresh orphan dirs — they may belong to a createJob in flight", async () => {
+    await opfs.writeFile("jobs/mid-create/audio.wav", new Blob([new Uint8Array(64)]));
+    const removed = await sweepOrphanJobDirs();
+    expect(removed).toBe(0);
+    expect(await opfs.exists("jobs/mid-create/audio.wav")).toBe(true);
+  });
+
+  it("is a no-op when the jobs/ dir does not exist", async () => {
+    expect(await sweepOrphanJobDirs()).toBe(0);
   });
 });
