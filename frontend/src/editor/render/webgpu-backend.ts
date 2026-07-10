@@ -19,6 +19,7 @@
  * HTMLVideoElement, VideoFrame). `importExternalTexture` als
  * Zero-Copy-Optimierung für Video ist ein Phase-2/3-Follow-up.
  */
+import { markWebGPUUnavailable } from "../../local/capabilities";
 import { fxCatalog } from "../fx/catalog";
 import { FX_WEBGPU_SPECS } from "../fx/webgpu/registry";
 import type { PunchFx } from "../fx/types";
@@ -51,6 +52,10 @@ const CANVAS_FORMAT: GPUTextureFormat = "bgra8unorm";
 export class WebGPUBackend implements CompositorBackend {
   readonly id = "webgpu" as const;
 
+  /** See CompositorBackend.onContextLost — invoked on async device
+   *  loss (NOT on dispose()). Assigned by the owner after init(). */
+  onContextLost?: (info: { reason: string; message: string }) => void;
+
   private canvas: AnyCanvas | null = null;
   private device: GPUDevice | null = null;
   private context: GPUCanvasContext | null = null;
@@ -65,12 +70,18 @@ export class WebGPUBackend implements CompositorBackend {
   private layerPipeline: GPURenderPipeline | null = null;
   private layerBindGroupLayout: GPUBindGroupLayout | null = null;
   private layerSampler: GPUSampler | null = null;
-  /** Wiederverwendete Layer-Source-Texture, lazy-resized auf das aktuelle
-   *  Source-Pixel-Format. Mirrors WebGL2's `layerTexture` Mapping. */
-  private layerTex: GPUTexture | null = null;
-  private layerTexW = 0;
-  private layerTexH = 0;
-  private layerUniformBuffer: GPUBuffer | null = null;
+  /** Per-LAYER-SLOT source textures + uniform buffers, reused across
+   *  frames and lazily grown/resized. One entry per drawn layer of a
+   *  frame — NOT one shared texture/buffer: queue-timeline ops
+   *  (copyExternalImageToTexture / writeBuffer) execute at call time,
+   *  before the encoder's recorded draws run at submit. With shared
+   *  resources every recorded draw would sample the LAST layer's pixels
+   *  and fitRect/uvMat, and a mid-loop resize would destroy a texture a
+   *  previous bind group still references (issue #138). Pool size is
+   *  bounded by the max simultaneous layers per frame (1-2 today,
+   *  crossfade/PiP-sized tomorrow). */
+  private layerTexPool: { tex: GPUTexture; w: number; h: number }[] = [];
+  private layerUniformPool: GPUBuffer[] = [];
   /** Scratch-Float32Array für die Uniform-Writes. Wiederverwendet pro Frame. */
   private layerUniformScratch = new Float32Array(LAYER_UNIFORM_SIZE / 4);
 
@@ -121,6 +132,36 @@ export class WebGPUBackend implements CompositorBackend {
       );
     }
     this.device = device;
+
+    // Observe async device loss (GPU-process crash, driver reset,
+    // dGPU/iGPU switch mid-session). Without this, drawFrame silently
+    // no-ops on the dead device and the preview freezes on the last
+    // frame with no message and no fallback (issue #115).
+    // `reason === "destroyed"` is the intentional dispose() path.
+    void device.lost.then((info) => {
+      if (info.reason === "destroyed") return;
+      console.warn(
+        `[compositor] WebGPU device lost (${info.reason}): ${info.message}`,
+      );
+      // Downgrade the session capability BEFORE notifying, so the
+      // owner's rebuild path already sees webgpu=false.
+      markWebGPUUnavailable();
+      this.onContextLost?.({
+        reason: String(info.reason),
+        message: info.message,
+      });
+    });
+    // Surface validation/OOM errors that escape every error scope —
+    // otherwise they only appear on the browser's dev console.
+    if (typeof device.addEventListener === "function") {
+      device.addEventListener("uncapturederror", (ev) => {
+        const err = (ev as GPUUncapturedErrorEvent).error;
+        console.error(
+          "[compositor] WebGPU uncaptured error:",
+          err?.message ?? ev,
+        );
+      });
+    }
 
     const context = canvas.getContext("webgpu") as GPUCanvasContext | null;
     if (!context) {
@@ -228,15 +269,13 @@ export class WebGPUBackend implements CompositorBackend {
     const pipeline = this.layerPipeline;
     const layerBindGroupLayout = this.layerBindGroupLayout;
     const layerSampler = this.layerSampler;
-    const layerUniformBuffer = this.layerUniformBuffer;
     if (
       !device ||
       !context ||
       !renderTarget ||
       !pipeline ||
       !layerBindGroupLayout ||
-      !layerSampler ||
-      !layerUniformBuffer
+      !layerSampler
     ) {
       return;
     }
@@ -260,11 +299,15 @@ export class WebGPUBackend implements CompositorBackend {
 
     if (d.output) {
       layerPass.setPipeline(pipeline);
+      // Slot index — each drawn layer gets its OWN texture + uniform
+      // buffer so the recorded draws capture their own state (see the
+      // pool comment on the fields).
+      let slot = 0;
       for (const layer of d.layers) {
         if (layer.weight <= 0) continue;
         const src = sources.get(layer.layerId);
         if (!src || src.kind === "test-pattern") continue;
-        const upload = this.uploadSource(device, src);
+        const upload = this.uploadSource(device, src, slot);
         if (!upload) continue;
 
         // Uniforms schreiben.
@@ -279,8 +322,9 @@ export class WebGPUBackend implements CompositorBackend {
           // browser-driver-Workaround wie in WebGL2 nötig.
           false,
         );
+        const uniformBuffer = this.uniformBufferForSlot(device, slot);
         device.queue.writeBuffer(
-          layerUniformBuffer,
+          uniformBuffer,
           0,
           this.layerUniformScratch.buffer,
           this.layerUniformScratch.byteOffset,
@@ -292,11 +336,12 @@ export class WebGPUBackend implements CompositorBackend {
           entries: [
             { binding: 0, resource: layerSampler },
             { binding: 1, resource: upload.createView() },
-            { binding: 2, resource: { buffer: layerUniformBuffer } },
+            { binding: 2, resource: { buffer: uniformBuffer } },
           ],
         });
         layerPass.setBindGroup(0, bindGroup);
         layerPass.draw(4);
+        slot++;
       }
     }
     layerPass.end();
@@ -375,8 +420,8 @@ export class WebGPUBackend implements CompositorBackend {
     if (this.fxPipelineCache) this.fxPipelineCache.dispose();
     if (this.renderTarget) this.renderTarget.destroy();
     if (this.snapshotTex) this.snapshotTex.destroy();
-    if (this.layerTex) this.layerTex.destroy();
-    if (this.layerUniformBuffer) this.layerUniformBuffer.destroy();
+    for (const entry of this.layerTexPool) entry.tex.destroy();
+    for (const buf of this.layerUniformPool) buf.destroy();
     if (this.readbackBuffer) this.readbackBuffer.destroy();
     this.readbackBuffer = null;
     this.readbackRgba = null;
@@ -391,10 +436,8 @@ export class WebGPUBackend implements CompositorBackend {
     this.layerPipeline = null;
     this.layerBindGroupLayout = null;
     this.layerSampler = null;
-    this.layerTex = null;
-    this.layerTexW = 0;
-    this.layerTexH = 0;
-    this.layerUniformBuffer = null;
+    this.layerTexPool = [];
+    this.layerUniformPool = [];
     this.fxPipelineCache = null;
     this.fxDrawContext = null;
     this.fxSampler = null;
@@ -644,15 +687,13 @@ export class WebGPUBackend implements CompositorBackend {
       addressModeU: "clamp-to-edge",
       addressModeV: "clamp-to-edge",
     });
-    this.layerUniformBuffer = device.createBuffer({
-      label: "layer-blit uniforms",
-      size: LAYER_UNIFORM_SIZE,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
+    // Layer uniform buffers are allocated lazily per layer slot in
+    // drawFrame (uniformBufferForSlot) — one per simultaneous layer.
   }
 
-  /** Lädt die Source-Pixel in `this.layerTex` und gibt das Texture
-   *  zurück; null wenn die Source noch nicht ready ist (Video-readyState).
+  /** Lädt die Source-Pixel in die Slot-Texture aus `layerTexPool` und
+   *  gibt sie zurück; null wenn die Source noch nicht ready ist
+   *  (Video-readyState).
    *
    *  Phase 1: alle Source-Kinds via `copyExternalImageToTexture`.
    *  importExternalTexture für Video-Zero-Copy ist eine künftige
@@ -660,6 +701,7 @@ export class WebGPUBackend implements CompositorBackend {
   private uploadSource(
     device: GPUDevice,
     src: LayerSource,
+    slot: number,
   ): GPUTexture | null {
     let imageSource: HTMLVideoElement | VideoFrame | ImageBitmap | HTMLImageElement;
     let srcW: number;
@@ -698,30 +740,48 @@ export class WebGPUBackend implements CompositorBackend {
         return null;
     }
 
-    if (
-      !this.layerTex ||
-      this.layerTexW !== srcW ||
-      this.layerTexH !== srcH
-    ) {
-      if (this.layerTex) this.layerTex.destroy();
-      this.layerTex = device.createTexture({
-        label: "webgpu-backend layerTex",
-        size: { width: srcW, height: srcH, depthOrArrayLayers: 1 },
-        format: "rgba8unorm",
-        usage:
-          GPUTextureUsage.TEXTURE_BINDING |
-          GPUTextureUsage.COPY_DST |
-          GPUTextureUsage.RENDER_ATTACHMENT,
-      });
-      this.layerTexW = srcW;
-      this.layerTexH = srcH;
+    let entry = this.layerTexPool[slot];
+    if (!entry || entry.w !== srcW || entry.h !== srcH) {
+      // Only THIS slot's texture is replaced — earlier slots' bind
+      // groups (already recorded) keep their live textures.
+      if (entry) entry.tex.destroy();
+      entry = {
+        tex: device.createTexture({
+          label: `webgpu-backend layerTex[${slot}]`,
+          size: { width: srcW, height: srcH, depthOrArrayLayers: 1 },
+          format: "rgba8unorm",
+          usage:
+            GPUTextureUsage.TEXTURE_BINDING |
+            GPUTextureUsage.COPY_DST |
+            GPUTextureUsage.RENDER_ATTACHMENT,
+        }),
+        w: srcW,
+        h: srcH,
+      };
+      this.layerTexPool[slot] = entry;
     }
 
     device.queue.copyExternalImageToTexture(
       { source: imageSource, flipY: false },
-      { texture: this.layerTex },
+      { texture: entry.tex },
       { width: srcW, height: srcH, depthOrArrayLayers: 1 },
     );
-    return this.layerTex;
+    return entry.tex;
+  }
+
+  /** Get-or-create the uniform buffer for layer slot `slot`. Buffers
+   *  are tiny (LAYER_UNIFORM_SIZE bytes) and live for the backend's
+   *  lifetime once created. */
+  private uniformBufferForSlot(device: GPUDevice, slot: number): GPUBuffer {
+    let buf = this.layerUniformPool[slot];
+    if (!buf) {
+      buf = device.createBuffer({
+        label: `layer-blit uniforms[${slot}]`,
+        size: LAYER_UNIFORM_SIZE,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      this.layerUniformPool[slot] = buf;
+    }
+    return buf;
   }
 }

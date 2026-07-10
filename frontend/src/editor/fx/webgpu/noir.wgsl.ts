@@ -1,8 +1,14 @@
 // NOIR — WGSL port (parity with noir.frag.ts).
 import type { FxWebGPUSpec } from "../../render/webgpu/pipeline-cache";
 
+// NOTE: the catalog param id is "filter", but `filter` is a RESERVED
+// WORD in WGSL — using it as a struct member made the whole module fail
+// to compile, so the noir filter silently never rendered on WebGPU
+// (found by fx-parity.browser.test.ts). The member is therefore named
+// `colorFilter`; the JS-side uniform name stays "filter" (uniformFields
+// below), which only drives the byte-offset layout, not WGSL identifiers.
 export const NOIR_WGSL = `struct Uniforms {
-  filter: f32,
+  colorFilter: f32,
   contrast: f32,
   grain: f32,
   vignette: f32,
@@ -44,8 +50,8 @@ const LUMA = vec3f(0.299, 0.587, 0.114);
 
 fn noir(cin: vec3f, uv: vec2f) -> vec3f {
   // 1. Colour-filter response.
-  let warm = max(-u.filter, 0.0);
-  let cool = max( u.filter, 0.0);
+  let warm = max(-u.colorFilter, 0.0);
+  let cool = max( u.colorFilter, 0.0);
   var w = LUMA;
   w.r = w.r + warm * 0.55 - cool * 0.22;
   w.b = w.b + cool * 0.55 - warm * 0.22;

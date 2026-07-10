@@ -1,10 +1,15 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   detectCapabilities,
+  getCapabilities,
+  initCapabilities,
+  markWebGPUUnavailable,
   meetsMinRequirements,
+  probeWebGPU,
   probeWebGPUVideoFrameUpload,
   supportsLargeMediaFiles,
   LEGACY_BROWSER_MAX_FILE_BYTES,
+  _resetWebGPUProbeForTest,
   type Capabilities,
 } from "./capabilities";
 
@@ -289,8 +294,9 @@ describe("probeWebGPUVideoFrameUpload", () => {
     vi.stubGlobal("OffscreenCanvas", FakeOffscreenCanvas);
     vi.stubGlobal("VideoFrame", FakeVideoFrame);
     vi.stubGlobal("GPUTextureUsage", {
-      COPY_DST: 1,
+      COPY_DST: 2,
       TEXTURE_BINDING: 4,
+      RENDER_ATTACHMENT: 16,
     });
   });
 
@@ -308,5 +314,112 @@ describe("probeWebGPUVideoFrameUpload", () => {
     vi.stubGlobal("VideoFrame", undefined);
     const adapter = makeAdapter({ uploadThrows: false });
     expect(await probeWebGPUVideoFrameUpload(adapter)).toBe(false);
+  });
+});
+
+describe("probeWebGPUVideoFrameUpload — spec-conformant validation", () => {
+  // Models real Chrome: `copyExternalImageToTexture` requires the
+  // destination texture to carry COPY_DST *and* RENDER_ATTACHMENT usage
+  // (WebGPU spec § copyExternalImageToTexture validation). A probe
+  // texture missing RENDER_ATTACHMENT pops a validation error in every
+  // conformant implementation — which used to silently disable the
+  // WebGPU tier app-wide (issue #87).
+
+  // Real spec bit values (GPUTextureUsage namespace).
+  const SPEC_USAGE = {
+    COPY_SRC: 0x01,
+    COPY_DST: 0x02,
+    TEXTURE_BINDING: 0x04,
+    STORAGE_BINDING: 0x08,
+    RENDER_ATTACHMENT: 0x10,
+  } as const;
+
+  const FakeOffscreenCanvas = class {
+    constructor(
+      public width: number,
+      public height: number,
+    ) {}
+    getContext() {
+      return { fillStyle: "", fillRect: () => undefined };
+    }
+  };
+  const FakeVideoFrame = class {
+    close() {}
+  };
+
+  function makeSpecConformantAdapter(): GPUAdapter {
+    let pendingError: { message: string } | null = null;
+    const fakeDevice = {
+      queue: {
+        copyExternalImageToTexture: (
+          _src: unknown,
+          dst: { texture: { usage: number } },
+        ) => {
+          const required =
+            SPEC_USAGE.COPY_DST | SPEC_USAGE.RENDER_ATTACHMENT;
+          if ((dst.texture.usage & required) !== required) {
+            pendingError = {
+              message:
+                "Destination texture needs to have CopyDst and RenderAttachment usage",
+            };
+          }
+        },
+      },
+      pushErrorScope: () => undefined,
+      popErrorScope: async () => {
+        const e = pendingError;
+        pendingError = null;
+        return e;
+      },
+      createTexture: (desc: { usage: number }) => ({
+        usage: desc.usage,
+        destroy: () => undefined,
+      }),
+      destroy: () => undefined,
+    };
+    return { requestDevice: async () => fakeDevice } as unknown as GPUAdapter;
+  }
+
+  beforeEach(() => {
+    vi.stubGlobal("OffscreenCanvas", FakeOffscreenCanvas);
+    vi.stubGlobal("VideoFrame", FakeVideoFrame);
+    vi.stubGlobal("GPUTextureUsage", SPEC_USAGE);
+  });
+
+  it("passes against a device that enforces COPY_DST|RENDER_ATTACHMENT on the destination", async () => {
+    const adapter = makeSpecConformantAdapter();
+    expect(await probeWebGPUVideoFrameUpload(adapter)).toBe(true);
+  });
+
+  describe("markWebGPUUnavailable — session capability downgrade (issue #115)", () => {
+    beforeEach(() => {
+      _resetWebGPUProbeForTest();
+      vi.stubGlobal("navigator", {
+        ...globalThis.navigator,
+        gpu: { requestAdapter: async () => makeSpecConformantAdapter() },
+      });
+    });
+
+    afterEach(() => {
+      _resetWebGPUProbeForTest();
+    });
+
+    it("flips the initialised singleton to webgpu=false and poisons the probe cache", async () => {
+      const before = await initCapabilities();
+      expect(before.webgpu).toBe(true);
+
+      markWebGPUUnavailable();
+
+      expect(getCapabilities().webgpu).toBe(false);
+      // Re-probing must not resurrect the tier for this session.
+      expect(await probeWebGPU()).toBe(false);
+      expect((await initCapabilities()).webgpu).toBe(false);
+    });
+
+    it("is safe to call before initCapabilities (probe stays false)", async () => {
+      markWebGPUUnavailable();
+      expect(await probeWebGPU()).toBe(false);
+      expect((await initCapabilities()).webgpu).toBe(false);
+    });
   });
 });

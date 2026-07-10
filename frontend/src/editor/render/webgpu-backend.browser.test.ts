@@ -331,6 +331,110 @@ d("WebGPUBackend — multi-FX serial composition", () => {
   });
 });
 
+d("WebGPUBackend — multi-layer frames (issue #138)", () => {
+  // Queue-timeline ops (copyExternalImageToTexture / writeBuffer)
+  // execute at call time, BEFORE the encoder's recorded draws submit.
+  // With a single shared layerTex + uniform buffer, every recorded draw
+  // sampled the LAST layer's pixels and placement. These tests pin the
+  // fixed per-layer-resource behaviour — and the WebGL2 semantics.
+
+  /** Solid-colour ImageBitmap. */
+  async function solidBitmap(
+    w: number,
+    h: number,
+    rgb: [number, number, number],
+  ): Promise<ImageBitmap> {
+    const off = new OffscreenCanvas(w, h);
+    const ctx = off.getContext("2d")!;
+    ctx.fillStyle = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
+    ctx.fillRect(0, 0, w, h);
+    return createImageBitmap(off);
+  }
+
+  function twoLayerDescriptor(
+    dimsA: { w: number; h: number },
+    dimsB: { w: number; h: number },
+  ): FrameDescriptor {
+    return {
+      tMaster: 0,
+      output: { w: 100, h: 100 },
+      layers: [
+        {
+          layerId: "a",
+          source: { kind: "video", clipId: "a", sourceTimeS: 0, sourceDurS: 1 },
+          weight: 1,
+          fitRect: { x: 0, y: 0, w: 50, h: 100 },
+          rotationDeg: 0,
+          flipX: false,
+          flipY: false,
+          displayW: dimsA.w,
+          displayH: dimsA.h,
+        },
+        {
+          layerId: "b",
+          source: { kind: "video", clipId: "b", sourceTimeS: 0, sourceDurS: 1 },
+          weight: 1,
+          fitRect: { x: 50, y: 0, w: 50, h: 100 },
+          rotationDeg: 0,
+          flipX: false,
+          flipY: false,
+          displayW: dimsB.w,
+          displayH: dimsB.h,
+        },
+      ],
+      fx: [],
+    };
+  }
+
+  it("two same-size layers each draw their OWN pixels and placement", async () => {
+    const bmA = await solidBitmap(64, 64, COLOR.R);
+    const bmB = await solidBitmap(64, 64, COLOR.G);
+    const canvas = document.createElement("canvas");
+    const backend = new WebGPUBackend();
+    await backend.init(canvas, { pixelW: 100, pixelH: 100 });
+    backend.drawFrame(
+      twoLayerDescriptor({ w: 64, h: 64 }, { w: 64, h: 64 }),
+      new Map([
+        ["a", { kind: "image", bitmap: bmA }],
+        ["b", { kind: "image", bitmap: bmB }],
+      ]),
+    );
+    // Left half = layer a (red), right half = layer b (green) — the
+    // exact result WebGL2/Canvas2D produce for this descriptor.
+    const left = classify(await backend.readbackForTest(25, 50, 1, 1));
+    const right = classify(await backend.readbackForTest(75, 50, 1, 1));
+    backend.dispose();
+    bmA.close();
+    bmB.close();
+    expect({ left, right }).toEqual({ left: "R", right: "G" });
+  });
+
+  it("two DIFFERENT-size layers still produce a valid frame (no destroyed-texture submit)", async () => {
+    // Mismatched source dims force a texture (re)allocation between the
+    // two uploads — with a single shared texture the first draw's bind
+    // group referenced a destroyed texture and the whole submit failed
+    // validation (black frame).
+    const bmA = await solidBitmap(64, 64, COLOR.B);
+    const bmB = await solidBitmap(32, 32, COLOR.Y);
+    const canvas = document.createElement("canvas");
+    const backend = new WebGPUBackend();
+    await backend.init(canvas, { pixelW: 100, pixelH: 100 });
+    backend.drawFrame(
+      twoLayerDescriptor({ w: 64, h: 64 }, { w: 32, h: 32 }),
+      new Map([
+        ["a", { kind: "image", bitmap: bmA }],
+        ["b", { kind: "image", bitmap: bmB }],
+      ]),
+    );
+    const left = classify(await backend.readbackForTest(25, 50, 1, 1));
+    const right = classify(await backend.readbackForTest(75, 50, 1, 1));
+    backend.dispose();
+    bmA.close();
+    bmB.close();
+    expect({ left, right }).toEqual({ left: "B", right: "Y" });
+  });
+});
+
 d("WebGPUBackend — lifecycle + warmup", () => {
   it("warmup is a no-op (or compiles registered fx programs) without error", async () => {
     const canvas = document.createElement("canvas");

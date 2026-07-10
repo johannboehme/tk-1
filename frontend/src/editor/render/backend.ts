@@ -89,4 +89,13 @@ export interface CompositorBackend {
 
   /** Drop GPU resources. Idempotent. */
   dispose(): void;
+
+  /** Optional hook for backends whose device/context can die
+   *  asynchronously (WebGPU's `GPUDevice.lost`). The backend invokes it
+   *  once when the device is lost OUTSIDE of `dispose()` — after that,
+   *  `drawFrame` silently no-ops, so the owner must tear the backend
+   *  down and rebuild on a lower tier (the session capability has
+   *  already been downgraded by then). Assigned by the owner after
+   *  `init()`; backends without async loss never call it. */
+  onContextLost?: (info: { reason: string; message: string }) => void;
 }

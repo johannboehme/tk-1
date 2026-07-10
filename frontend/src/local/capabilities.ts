@@ -151,7 +151,14 @@ export async function probeWebGPUVideoFrameUpload(
       label: "webgpu-probe",
       size: { width: 2, height: 2, depthOrArrayLayers: 1 },
       format: "rgba8unorm",
-      usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
+      // The WebGPU spec requires copyExternalImageToTexture destinations
+      // to carry COPY_DST *and* RENDER_ATTACHMENT. Without the latter,
+      // every conformant implementation pops a validation error and the
+      // probe reports webgpu=false on fully capable hardware (issue #87).
+      usage:
+        GPUTextureUsage.COPY_DST |
+        GPUTextureUsage.TEXTURE_BINDING |
+        GPUTextureUsage.RENDER_ATTACHMENT,
     });
     device.pushErrorScope("validation");
     device.queue.copyExternalImageToTexture(
@@ -167,6 +174,23 @@ export async function probeWebGPUVideoFrameUpload(
     frame?.close();
     tex?.destroy();
     device?.destroy();
+  }
+}
+
+/**
+ * Downgrade the session's WebGPU capability after the probe turned out
+ * to be stale: a positive boot probe is no guarantee that a later
+ * `WebGPUBackend.init()` succeeds (GPU-process crash, driver reset,
+ * dGPU/iGPU switch) or that an initialised device survives (device
+ * loss). Called by the render factory when the WebGPU rung fails and
+ * by the backend's `device.lost` handler, so every subsequent
+ * `getCapabilities()` / `probeWebGPU()` / remount lands on WebGL2
+ * instead of re-failing until a full page reload.
+ */
+export function markWebGPUUnavailable(): void {
+  webgpuProbeCache = Promise.resolve(false);
+  if (_capabilitiesSingleton) {
+    _capabilitiesSingleton = { ..._capabilitiesSingleton, webgpu: false };
   }
 }
 
