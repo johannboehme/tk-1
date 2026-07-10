@@ -27,6 +27,7 @@ import type { Chunk } from "../../storage/jobs-db";
 import { Frame } from "./Frame";
 import { InsertionCursor } from "./InsertionCursor";
 import { reorderTargetIndex } from "./strip-reorder";
+import { TouchLongPressArmer } from "./touch-drag";
 
 const STRIP_HEIGHT = 132;
 const FRAME_HEIGHT = 96;
@@ -166,6 +167,47 @@ export function FilmStrip() {
   const suppressClickRef = useRef(false);
   const DRAG_THRESHOLD_PX = 5;
 
+  // Touch: a horizontal swipe over a frame must stay a NATIVE PAN of
+  // the strip (touch-action: manipulation on the frame wrappers) —
+  // reordering requires intent via long-press. The armer promotes a
+  // held-still touch to an active reorder drag.
+  const pendingTouchRef = useRef<{ itemId: string; pointerId: number } | null>(
+    null,
+  );
+  const longPressRef = useRef<TouchLongPressArmer | null>(null);
+  if (longPressRef.current === null) {
+    longPressRef.current = new TouchLongPressArmer({
+      onStart: (x) => {
+        const pending = pendingTouchRef.current;
+        if (!pending) return;
+        pendingTouchRef.current = null;
+        dragStateRef.current = {
+          itemId: pending.itemId,
+          pointerId: pending.pointerId,
+          startX: x,
+          active: true,
+        };
+        suppressClickRef.current = true;
+      },
+    });
+  }
+  useEffect(() => {
+    const armer = longPressRef.current;
+    return () => armer?.cancel();
+  }, []);
+
+  // Once a touch-reorder is active the browser must not start a native
+  // pan mid-drag (it would fire pointercancel and kill the reorder).
+  // React's touch listeners are passive, so preventDefault needs a
+  // native non-passive listener.
+  useEffect(() => {
+    function onTouchMove(ev: TouchEvent) {
+      if (dragStateRef.current?.active) ev.preventDefault();
+    }
+    window.addEventListener("touchmove", onTouchMove, { passive: false });
+    return () => window.removeEventListener("touchmove", onTouchMove);
+  }, []);
+
   function beginDrag(e: React.PointerEvent, itemId: string) {
     if (e.button !== 0 && e.pointerType !== "touch") return;
     // Pointerdowns on an InsertionCursor position the cursor — they
@@ -173,6 +215,12 @@ export function FilmStrip() {
     const target = e.target as HTMLElement;
     if (target.closest("[data-strip-cursor-index]")) return;
     suppressClickRef.current = false;
+    if (e.pointerType === "touch") {
+      // Long-press → reorder; swipe → native strip pan.
+      pendingTouchRef.current = { itemId, pointerId: e.pointerId };
+      longPressRef.current?.down(e.pointerId, e.clientX, e.clientY);
+      return;
+    }
     dragStateRef.current = {
       itemId,
       pointerId: e.pointerId,
@@ -183,6 +231,8 @@ export function FilmStrip() {
 
   useEffect(() => {
     function onMove(e: PointerEvent) {
+      // Touch: swipes disarm the pending long-press (native pan wins).
+      longPressRef.current?.move(e.pointerId, e.clientX, e.clientY);
       const drag = dragStateRef.current;
       if (!drag || drag.pointerId !== e.pointerId) return;
       if (!drag.active) {
@@ -206,6 +256,8 @@ export function FilmStrip() {
       reorderItem(drag.itemId, reorderTargetIndex(rects, drag.itemId, e.clientX));
     }
     function onUp(e: PointerEvent) {
+      longPressRef.current?.cancel();
+      pendingTouchRef.current = null;
       const drag = dragStateRef.current;
       if (drag && drag.pointerId !== e.pointerId) return;
       dragStateRef.current = null;
@@ -278,7 +330,11 @@ export function FilmStrip() {
               data-strip-frame-id={item.id}
               className="flex items-stretch"
               onPointerDown={(e) => beginDrag(e, item.id)}
-              style={{ touchAction: "pan-y" }}
+              // Swipes pan natively (horizontal = strip scroll,
+              // vertical = page); reorder requires a long-press.
+              // `manipulation` additionally kills double-tap zoom on
+              // rapid frame taps.
+              style={{ touchAction: "manipulation" }}
             >
               <Frame
                 jobId={jobId}
