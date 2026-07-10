@@ -112,10 +112,13 @@ export function FilmStrip() {
   // smoothly scroll the corresponding frame into the strip's center.
   // Suppressed while a reorder drag is in flight — each mid-drag
   // reorderItem re-runs this effect and the smooth scroll would slide
-  // the strip underneath the user's pointer.
+  // the strip underneath the user's pointer. Same for a MiniMap
+  // drag-scroll: its direct scrollLeft writes must not race a smooth
+  // scrollTo animation (e.g. when the playhead advances mid-scrub).
   useEffect(() => {
     if (!focusedItemId) return;
     if (dragStateRef.current) return;
+    if (useArrangeStore.getState().stripScrubbing) return;
     const scroller = scrollerRef.current;
     if (!scroller) return;
     const target = scroller.querySelector<HTMLElement>(

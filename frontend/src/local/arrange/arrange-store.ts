@@ -110,6 +110,10 @@ export interface ArrangeState {
 
   playback: ArrangePlayback;
   view: ArrangeView;
+  /** True while the user drag-scrolls the strip via the MiniMap. The
+   *  FilmStrip suppresses its auto-center smooth scroll for the
+   *  duration so the two don't fight over scrollLeft. */
+  stripScrubbing: boolean;
   /** In-flight drag of a chunk from the Contact Sheet onto the Strip.
    *  Null when not dragging. */
   drag: ArrangeDrag | null;
@@ -174,6 +178,7 @@ export interface ArrangeState {
   // View.
   setStripScrollPx(px: number): void;
   setStripMetrics(viewportWidthPx: number, contentWidthPx: number): void;
+  setStripScrubbing(scrubbing: boolean): void;
 
   // Audio glance data.
   setAnalysis(a: AudioAnalysis | null): void;
@@ -241,6 +246,7 @@ export const useArrangeStore = create<ArrangeState>((set, get) => ({
   previewChunkId: null,
   playback: INITIAL_PLAYBACK,
   view: INITIAL_VIEW,
+  stripScrubbing: false,
   drag: null,
   analysis: null,
   melByChunkId: {},
@@ -260,6 +266,7 @@ export const useArrangeStore = create<ArrangeState>((set, get) => ({
       previewChunkId: null,
       playback: INITIAL_PLAYBACK,
       view: INITIAL_VIEW,
+      stripScrubbing: false,
       drag: null,
       // initFromJob preserves analysis + mel data across re-keying so
       // hot reloads in dev don't re-trigger the full PCM decode.
@@ -281,6 +288,7 @@ export const useArrangeStore = create<ArrangeState>((set, get) => ({
       previewChunkId: null,
       playback: INITIAL_PLAYBACK,
       view: INITIAL_VIEW,
+      stripScrubbing: false,
       drag: null,
       analysis: null,
       melByChunkId: {},
@@ -525,6 +533,10 @@ export const useArrangeStore = create<ArrangeState>((set, get) => ({
         stripContentWidthPx: contentWidthPx,
       },
     }));
+  },
+
+  setStripScrubbing(scrubbing) {
+    set({ stripScrubbing: scrubbing });
   },
 
   beginChunkDrag(args) {
