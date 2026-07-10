@@ -20,7 +20,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, render } from "@testing-library/react";
 import { useEffect, useRef } from "react";
-import { useAudioMaster } from "./useAudioMaster";
+import { armParkMasterT, useAudioMaster } from "./useAudioMaster";
 import { useEditorStore } from "./store";
 
 function flushAll(): Promise<void> {
@@ -209,6 +209,24 @@ function Harness({
 
 afterEach(() => {
   useEditorStore.getState().reset();
+});
+
+describe("armParkMasterT — idle pre-roll compensation (#80/#104)", () => {
+  it("parks the lead window EARLY so the clock sits on the target at fire time", () => {
+    // Armed 30 ms before the wrap: the idle plays at gain 0 for those
+    // 30 ms, so park it 30 ms before the target.
+    expect(armParkMasterT(12, 0.03)).toBeCloseTo(11.97, 9);
+    expect(armParkMasterT(110, 0.048)).toBeCloseTo(109.952, 9);
+  });
+
+  it("negative dist (stall-overshoot arm, fires immediately) parks at the target", () => {
+    expect(armParkMasterT(905, -0.04)).toBe(905);
+    expect(armParkMasterT(905, 0)).toBe(905);
+  });
+
+  it("clamps to 0 near the start of the file", () => {
+    expect(armParkMasterT(0.02, 0.05)).toBe(0);
+  });
 });
 
 describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => {
@@ -944,6 +962,56 @@ describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => 
       });
       // Idle parked at seg 1 in = 5 (hop), NOT at wrap target (= 6).
       expect(mB.getCurrentTime()).toBeCloseTo(5, 1);
+    });
+
+    it("wrap arming parks the idle a lead-window EARLY, not at the target itself (#104)", async () => {
+      const segs = [
+        { in: 10, out: 20 }, // arr [0..10]
+      ];
+      const { mA, mB } = await setup(60);
+      useEditorStore.getState().setArrangementSegments(segs);
+      useEditorStore.getState().seek(10, { segmentIdxHint: 0 });
+      // arr loop {2, 5} → master wrap at 15, target 12.
+      await act(async () => {
+        useEditorStore.getState().setLoop({ start: 2, end: 5 });
+        await flushAll();
+      });
+      await act(async () => {
+        useEditorStore.getState().setPlaying(true);
+        await flushAll();
+      });
+      // Arm 30 ms before the wrap. The idle play()s NOW at gain 0 and
+      // advances through the lead window — parking it exactly at master
+      // 12 would make the audible loop landing overshoot loop.start.
+      await act(async () => {
+        mA.setCurrentTime(14.97);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      expect(mB.getCurrentTime()).toBeCloseTo(11.97, 3);
+      expect(mB.playSpy).toHaveBeenCalled();
+    });
+
+    it("hop arming parks the idle a lead-window EARLY, not at nextSeg.in (#80)", async () => {
+      const segs = [
+        { in: 10, out: 15 }, // arr [0..5]
+        { in: 30, out: 35 }, // arr [5..10]
+      ];
+      const { mA, mB } = await setup(60);
+      useEditorStore.getState().setArrangementSegments(segs);
+      useEditorStore.getState().seek(10, { segmentIdxHint: 0 });
+      await act(async () => {
+        useEditorStore.getState().setPlaying(true);
+        await flushAll();
+      });
+      // Arm 40 ms before the seam — idle must be parked at 30 − 0.04.
+      await act(async () => {
+        mA.setCurrentTime(14.96);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      expect(mB.getCurrentTime()).toBeCloseTo(29.96, 3);
+      expect(mB.playSpy).toHaveBeenCalled();
     });
 
     it("no loop set — walker behaves exactly as before (regression guard)", async () => {
