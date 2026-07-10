@@ -34,6 +34,7 @@ import {
   useState,
 } from "react";
 import { useEditorStore } from "../store";
+import { toggleFxPreviewLatch } from "../fx-latch";
 import { fxCatalog, defaultTapLengthS } from "../fx/catalog";
 import type { FxKind, FxParamDef } from "../fx/types";
 import { INSTANT_ENVELOPE, type ADSREnvelope } from "../fx/envelope";
@@ -478,30 +479,10 @@ function FxPad({ pad }: { pad: PadDef }) {
     // new kind. Clicking the same pad again drops the preview. This
     // frees the user's mouse to drag encoders / ADSR knots while the
     // effect sits on the live frame — without it, the effect would
-    // disappear the moment the pointer lifts off the pad.
+    // disappear the moment the pointer lifts off the pad. The gesture
+    // itself lives in fx-latch.ts, shared with the V/W/E/… hotkeys.
     if (!s.playback.isPlaying) {
-      // Find any existing preview-mode hold (only one preview at a
-      // time — keeps the LCD readout and live override unambiguous).
-      let existingSlot: string | null = null;
-      let existingKind: FxKind | null = null;
-      for (const [slot, h] of Object.entries(s.fxHolds)) {
-        if (h.mode === "preview") {
-          existingSlot = slot;
-          existingKind = h.kind;
-          break;
-        }
-      }
-      if (existingSlot != null && existingKind === pad.kind) {
-        // Same pad → toggle off.
-        endFxHold(existingSlot);
-        return;
-      }
-      if (existingSlot != null) {
-        // Different pad → drop the prior preview before latching new.
-        endFxHold(existingSlot);
-      }
-      const t = s.snapTimelineTime(s.playback.timelineT);
-      beginFxHold(pad.slotKey, pad.kind, t);
+      toggleFxPreviewLatch(s, pad.slotKey, pad.kind);
       return;
     }
 

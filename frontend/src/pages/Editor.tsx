@@ -18,6 +18,7 @@ import {
   XIcon,
 } from "../editor/components/icons";
 import { useEditorStore } from "../editor/store";
+import { toggleFxPreviewLatch } from "../editor/fx-latch";
 import type { FxKind } from "../editor/fx/types";
 import type { GradeParams } from "../editor/fx/looks";
 import { bindShortcut } from "../editor/shortcuts/keymap";
@@ -437,12 +438,24 @@ export default function Editor() {
           eraseKindFilter.add(kind);
           return;
         }
-        // Don't record FX capsules while paused. An accidental tap leaves
-        // a stub-marker on the timeline that's annoying to clean up later;
-        // the rule "punching only happens during playback" matches the
-        // tape-machine metaphor and is easy to remember.
-        if (!s.playback.isPlaying) return;
         const slotKey = `key:${e.key.toUpperCase()}`;
+
+        // Audition mode (paused) → the key LATCHES a live preview,
+        // exactly like a pad click (shared gesture in fx-latch.ts).
+        // Same kind toggles off; a different kind swaps. Lets the user
+        // dial encoders / ADSR with the mouse while the effect sits on
+        // the live frame. No capsule is written — an accidental tap
+        // leaves nothing on the timeline.
+        if (!s.playback.isPlaying) {
+          // Recording-Head: the press points the panel's encoders + LCD
+          // at the kind that was last triggered.
+          s.setSelectedFxKind(kind);
+          if (toggleFxPreviewLatch(s, slotKey, kind) !== "unlatched") {
+            ensureTick();
+          }
+          return;
+        }
+
         if (s.fxHolds[slotKey]) return;
         // Perf instrumentation: keypress → paint, plus an "fx first render"
         // marker the FX overlay's RAF tick will close on the first frame
@@ -458,31 +471,6 @@ export default function Editor() {
         // Recording-Head: jeder Press sets the selectedFxKind so the
         // panel's encoders + LCD point at the kind that was last triggered.
         s.setSelectedFxKind(kind);
-
-        // Audition mode (paused) → keybind LATCHES the preview, just like
-        // a mouse click on a pad. Same kind toggles off; different kind
-        // swaps. Lets the user dial encoders / ADSR with the mouse while
-        // the effect sits on the live frame.
-        if (!s.playback.isPlaying) {
-          let existingSlot: string | null = null;
-          let existingKind: FxKind | null = null;
-          for (const [slot, h] of Object.entries(s.fxHolds)) {
-            if (h.mode === "preview") {
-              existingSlot = slot;
-              existingKind = h.kind;
-              break;
-            }
-          }
-          if (existingSlot != null && existingKind === kind) {
-            s.endFxHold(existingSlot);
-            return;
-          }
-          if (existingSlot != null) s.endFxHold(existingSlot);
-          const t = s.snapTimelineTime(s.playback.timelineT);
-          s.beginFxHold(slotKey, kind, t);
-          ensureTick();
-          return;
-        }
 
         const t = s.snapTimelineTime(s.playback.timelineT);
         s.beginFxHold(slotKey, kind, t);
