@@ -2214,10 +2214,20 @@ export const useEditorStore = create<EditorState>()(
         (c) => c.atTimeS === fromAtTimeS && c.camId === camId,
       );
       if (idx < 0) return fromAtTimeS;
-      // Clamp to the duration window so a drag can't push a cut past
-      // the end of the master timeline.
-      const dur = get().jobMeta?.duration ?? Infinity;
-      const clamped = Math.max(0, Math.min(dur, toAtTimeS));
+      // Cut.atTimeS is timeline-time, so the drag clamps against the
+      // SONG axis [0, totalArrDuration] — NOT jobMeta.duration, which is
+      // the master-audio length (#135). Duplicated chunks make the song
+      // longer than the session (old clamp made the tail unreachable);
+      // a short song cut from a long jam makes it much shorter (old
+      // clamp let cuts sail into dead arr-space past the song's end).
+      // Pre-load empty segments fall back to the master duration, where
+      // both axes coincide.
+      const segs = get().arrangementSegments;
+      const hi =
+        segs.length > 0
+          ? totalArrDuration(segs)
+          : (get().jobMeta?.duration ?? Infinity);
+      const clamped = Math.max(0, Math.min(hi, toAtTimeS));
       // Replace, then re-sort. We don't dedupe during drag — collisions
       // (two cuts collapsing onto the same instant) are easier to
       // resolve visually after the user drops, and silently dropping

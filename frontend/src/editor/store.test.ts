@@ -322,6 +322,36 @@ describe("useEditorStore", () => {
       const committed = useEditorStore.getState().moveCut(99, "cam-X", 5);
       expect(committed).toBe(99);
     });
+
+    test("clamps against the SONG length, not master duration — duplicated chunks (#135)", () => {
+      // 60 s session arranged into a 120 s song (chunk duplicated).
+      // Cuts live in timeline-time [0, arrTotal]; the old master-duration
+      // clamp stuck every drag at 60 s and made the song's second half
+      // unreachable.
+      useEditorStore.getState().loadJob(baseJobMeta, {
+        arrangementSegments: [
+          { in: 0, out: 60 },
+          { in: 0, out: 60 },
+        ],
+      });
+      useEditorStore.setState({ cuts: [{ atTimeS: 3, camId: "cam-1" }] });
+      const committed = useEditorStore.getState().moveCut(3, "cam-1", 110);
+      expect(committed).toBe(110);
+      expect(useEditorStore.getState().cuts[0].atTimeS).toBe(110);
+    });
+
+    test("clamps against the SONG length — short song from a long session (#135)", () => {
+      // 30-min jam, 60 s song: dragging past the song end must stop at
+      // arrTotal, not sail up to the master duration into dead arr-space.
+      useEditorStore.getState().loadJob(
+        { ...baseJobMeta, duration: 1800 },
+        { arrangementSegments: [{ in: 100, out: 160 }] },
+      );
+      useEditorStore.setState({ cuts: [{ atTimeS: 3, camId: "cam-1" }] });
+      const committed = useEditorStore.getState().moveCut(3, "cam-1", 200);
+      expect(committed).toBe(60);
+      expect(useEditorStore.getState().cuts[0].atTimeS).toBe(60);
+    });
   });
 
   describe("addCut / hold-paint — timeline-time material guards (#75)", () => {
