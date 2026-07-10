@@ -29,7 +29,9 @@ import {
   segmentIndexAtArr,
   sliceByArrSegments,
   totalArrDuration,
+  trimHandlesArr,
 } from "../arrangement-time";
+import { trimWindowArr } from "../arrangement-loop";
 import { isPillDirty } from "../arrangement-pills";
 import { LaneHeader, type CamStatus } from "./timeline/LaneHeader";
 import { AddMediaButton } from "./AddMediaButton";
@@ -310,14 +312,18 @@ export function Timeline({
   // Trim window + audio-start marker projected into arr-time. Both are
   // master-time values that rarely change; projecting them per redraw
   // (60 Hz during playback) re-scans the whole segment list for nothing.
-  const trimProjection = useMemo(
-    () => ({
+  const trimProjection = useMemo(() => {
+    // Handle positions use the range-endpoint projector: trim.out equal
+    // to a segment's end (the loadJob default) still yields a handle,
+    // and endpoints in gaps clamp to the playable window's boundary —
+    // `mastersToArrAll`'s half-open point test would drop both (#101).
+    const handles = trimHandlesArr(trim.in, trim.out, arrangementSegments);
+    return {
       playableSlices: sliceByArrSegments(trim.in, trim.out, arrangementSegments),
-      trimInArrPositions: mastersToArrAll(trim.in, arrangementSegments),
-      trimOutArrPositions: mastersToArrAll(trim.out, arrangementSegments),
-    }),
-    [trim.in, trim.out, arrangementSegments],
-  );
+      trimInArrPositions: handles.inPositions,
+      trimOutArrPositions: handles.outPositions,
+    };
+  }, [trim.in, trim.out, arrangementSegments]);
   // Stable ProgramStrip callbacks — the strip is memo()ed, so handing it
   // fresh closures every render would defeat that and put its DOM
   // reconciliation back on the 60 Hz playback path.
@@ -608,6 +614,12 @@ export function Timeline({
   const stripDuration = arrTotal;
 
   // ---- Active-cam status per lane (drives LED color) ----
+  // activeCamId resolves through activeCamAtArr(cuts, t, pills, segments),
+  // so pills / segments / timelineT belong in the deps: while PAUSED
+  // (currentTime frozen) a pill drag/trim/reset under the playhead changes
+  // which cam is ON-AIR and the LED must follow immediately (#136).
+  // During playback timelineT ticks alongside currentTime, so this adds
+  // no recompute pressure over the existing 60 Hz path.
   const camStatusByCamId = useMemo(() => {
     const result: Record<string, CamStatus> = {};
     const activeId = useEditorStore.getState().activeCamId(timelineT);
@@ -623,7 +635,7 @@ export function Timeline({
       result[cam.id] = status;
     }
     return result;
-  }, [clips, cuts, currentTime]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [clips, cuts, pills, arrangementSegments, currentTime, timelineT]);
 
   // ---- Canvas drawing ----
   useEffect(() => {
@@ -928,27 +940,45 @@ export function Timeline({
     ctx.fill();
 
     // Q-hold quantize preview: ghost markers at the snapped target
-    // positions. Drawn last so they overlay every lane.
+    // positions — for cuts AND fx edges, the complete quantize scope
+    // (#70). Drawn last so they overlay every lane.
     if (quantizePreview) {
+      // Collect every pending target/origin position once so cuts and fx
+      // edges render through the same two passes.
+      const ghostTargets: number[] = [];
+      const ghostOrigins: number[] = [];
+      for (const change of quantizePreview.cuts) {
+        ghostTargets.push(change.to);
+        ghostOrigins.push(change.from);
+      }
+      for (const change of quantizePreview.fxs) {
+        if (change.in) {
+          ghostTargets.push(change.in.to);
+          ghostOrigins.push(change.in.from);
+        }
+        if (change.out) {
+          ghostTargets.push(change.out.to);
+          ghostOrigins.push(change.out.from);
+        }
+      }
       ctx.save();
-      ctx.fillStyle = "rgba(0, 102, 204, 0.85)"; // cobalt
-      ctx.strokeStyle = "rgba(0, 102, 204, 0.85)";
+      ctx.strokeStyle = "rgba(0, 102, 204, 0.85)"; // cobalt
       ctx.lineWidth = 2;
       ctx.setLineDash([4, 3]);
-      for (const change of quantizePreview.cuts) {
-        const xTo = tToX(change.to);
+      for (const t of ghostTargets) {
+        const xTo = tToX(t);
         if (xTo < -2 || xTo > canvasWidth + 2) continue;
         ctx.beginPath();
         ctx.moveTo(xTo, 0);
         ctx.lineTo(xTo, canvasH);
         ctx.stroke();
       }
-      // Faded "from" line for each off-grid cut (visual hint of the move).
+      // Faded "from" line for each off-grid marker (visual hint of the move).
       ctx.strokeStyle = "rgba(0, 0, 0, 0.25)";
       ctx.lineWidth = 1;
       ctx.setLineDash([2, 4]);
-      for (const change of quantizePreview.cuts) {
-        const xFrom = tToX(change.from);
+      for (const t of ghostOrigins) {
+        const xFrom = tToX(t);
         if (xFrom < -2 || xFrom > canvasWidth + 2) continue;
         ctx.beginPath();
         ctx.moveTo(xFrom, 0);
@@ -1098,13 +1128,13 @@ export function Timeline({
     // Trim handles render at every arr-time occurrence of trim.in /
     // trim.out — a chunk repeated in long-form yields N draggable
     // handles that all wire to the same master-time value. Hit-test
-    // every occurrence so any of them can start a drag.
-    const trimInArr = mastersToArrAll(trim.in, arrangementSegments);
-    for (const arrT of trimInArr) {
+    // every occurrence so any of them can start a drag. Reuses the
+    // memoized projection the draw pass renders from, so what's drawn
+    // and what's grabbable can never diverge.
+    for (const arrT of trimProjection.trimInArrPositions) {
       if (Math.abs(x - arrTToX(arrT)) <= HANDLE_HIT) return "trim-in";
     }
-    const trimOutArr = mastersToArrAll(trim.out, arrangementSegments);
-    for (const arrT of trimOutArr) {
+    for (const arrT of trimProjection.trimOutArrPositions) {
       if (Math.abs(x - arrTToX(arrT)) <= HANDLE_HIT) return "trim-out";
     }
     if (Math.abs(x - xp) <= HANDLE_HIT) return "playhead";
@@ -1441,22 +1471,16 @@ export function Timeline({
     } else if (drag.kind === "loop" && loop) {
       // Loop drag operates in arr-time (the composed tape). Clamp to the
       // master-trim window projected through `arrangementSegments` so
-      // the loop can't escape the export region — same trim-universal
-      // contract clampLoopToBounds enforces on the store side.
+      // the loop can't escape the export region — the SAME projection
+      // clampLoopToBounds uses on the store side (`trimWindowArr`), so
+      // drag bounds can never diverge from what setLoop/moveLoop accept.
       const len = loop.end - loop.start;
       const arrAtPointer = viewStart + (x / canvasWidth) * visibleDur;
-      const arrTotalLocal = totalArrDuration(arrangementSegments);
-      const trimInArr = Math.max(
-        0,
-        Math.min(arrTotalLocal, masterToArr(trim.in, arrangementSegments)),
-      );
-      const trimOutArr = Math.max(
-        trimInArr,
-        Math.min(arrTotalLocal, masterToArr(trim.out, arrangementSegments)),
-      );
+      const window = trimWindowArr(trim, arrangementSegments);
+      if (!window) return;
       const newStartRaw = Math.max(
-        trimInArr,
-        Math.min(trimOutArr - len, arrAtPointer - drag.offset),
+        window.startArr,
+        Math.min(window.endArr - len, arrAtPointer - drag.offset),
       );
       // Loop bounds live in arr-time; snap against the master-bar-grid
       // anchored into arr-time so a long-form arrangement still snaps

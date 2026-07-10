@@ -9,6 +9,7 @@ import {
   segmentIndexAtMaster,
   sliceByArrSegments,
   totalArrDuration,
+  trimHandlesArr,
 } from "./arrangement-time";
 
 const SEGS = [
@@ -159,5 +160,98 @@ describe("arrangement-time helpers", () => {
       { masterStartS: 50, masterEndS: 55, arrStartS: 10, arrEndS: 15 },
       { masterStartS: 30, masterEndS: 35, arrStartS: 25, arrEndS: 30 },
     ]);
+  });
+});
+
+describe("trimHandlesArr (#101)", () => {
+  it("empty segments → identity passthrough (direct-mode)", () => {
+    expect(trimHandlesArr(3, 9, [])).toEqual({
+      inPositions: [3],
+      outPositions: [9],
+    });
+  });
+
+  it("default single-take trim {0, dur} yields BOTH handles (out inclusive)", () => {
+    // The loadJob default: trim.out === seg.out exactly. The half-open
+    // mastersToArrAll test dropped the out-handle — it must sit at the
+    // arr end instead.
+    const segs = [{ in: 0, out: 60 }];
+    expect(trimHandlesArr(0, 60, segs)).toEqual({
+      inPositions: [0],
+      outPositions: [60],
+    });
+  });
+
+  it("long-form default: trim.in=0 before the first chunk clamps to arr 0", () => {
+    // No chunk starts at master 0 → trim.in has no occurrence; the handle
+    // must fall back to the start of the playable window (arr 0 here).
+    const segs = [
+      { in: 12.3, out: 42.3 }, // arr 0..30
+      { in: 100, out: 130 }, // arr 30..60
+    ];
+    expect(trimHandlesArr(0, 130, segs)).toEqual({
+      inPositions: [0],
+      outPositions: [60],
+    });
+  });
+
+  it("interior positions match mastersToArrAll", () => {
+    const segs = [
+      { in: 10, out: 20 }, // arr 0..10
+      { in: 50, out: 65 }, // arr 10..25
+    ];
+    expect(trimHandlesArr(15, 55, segs)).toEqual({
+      inPositions: [5],
+      outPositions: [15],
+    });
+  });
+
+  it("duplicated chunk → one handle per occurrence, out inclusive at both", () => {
+    const segs = [
+      { in: 10, out: 40 }, // arr 0..30
+      { in: 10, out: 40 }, // arr 30..60
+    ];
+    expect(trimHandlesArr(10, 40, segs)).toEqual({
+      inPositions: [0, 30],
+      outPositions: [30, 60],
+    });
+  });
+
+  it("trim.out on an interior seam belongs to the EARLIER segment only", () => {
+    const segs = [
+      { in: 10, out: 40 }, // arr 0..30
+      { in: 40, out: 70 }, // arr 30..60 (contiguous master)
+    ];
+    // out=40: (10, 40] contains it → arr 30; (40, 70] does not.
+    expect(trimHandlesArr(10, 40, segs).outPositions).toEqual([30]);
+    // in=40: [40, 70) contains it → arr 30; [10, 40) does not.
+    expect(trimHandlesArr(40, 70, segs).inPositions).toEqual([30]);
+  });
+
+  it("endpoints in interior gaps fall back to the playable window's hull", () => {
+    const segs = [
+      { in: 10, out: 40 }, // arr 0..30
+      { in: 100, out: 130 }, // arr 30..60
+    ];
+    // trim {50, 90} covers nothing... trim {50, 110}: in sits in the gap
+    // → falls to the first playable slice's start (arr 30).
+    expect(trimHandlesArr(50, 110, segs)).toEqual({
+      inPositions: [30],
+      outPositions: [40],
+    });
+    // trim {20, 60}: out sits in the gap → falls to the last playable
+    // slice's end (arr 30).
+    expect(trimHandlesArr(20, 60, segs)).toEqual({
+      inPositions: [10],
+      outPositions: [30],
+    });
+  });
+
+  it("trim window intersecting nothing → clamps to [0, totalArr]", () => {
+    const segs = [{ in: 10, out: 40 }];
+    expect(trimHandlesArr(50, 60, segs)).toEqual({
+      inPositions: [0],
+      outPositions: [30],
+    });
   });
 });

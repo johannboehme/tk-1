@@ -24,12 +24,15 @@ import {
 } from "./types";
 import {
   activeCamAtArr,
+  camHasPillAt,
   reconcilePills,
 } from "./arrangement-pills";
 import {
+  arrToMaster,
   masterToArr,
   segmentIndexAtArr,
   sliceByArrSegments,
+  totalArrDuration,
 } from "./arrangement-time";
 import type { ArrangementItem, Chunk } from "../storage/jobs-db";
 import { classifyAspectRatio } from "./exportPresets";
@@ -882,14 +885,43 @@ function makeFxId(): string {
   return `fx-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
 }
 
-/** True if `camId` has material at master-timeline time `t`. */
-function camHasMaterialAt(
+/** Resolve the cam on PROGRAM at timeline-time `t` for cut-guard
+ *  purposes. Cuts live in timeline-time (song axis) since the axis flip,
+ *  so the resolution MUST run against the pills' arr-time coverage —
+ *  master-time `clipRangeS` ranges are the wrong axis and reject valid
+ *  TAKEs in long-form (#75).
+ *
+ *  Pill-less stores (simplified test harnesses that `loadJob` without an
+ *  arrangement — production always synthesizes one) fall back to the
+ *  legacy master-range resolution; for those the default whole-master
+ *  segment makes both axes identical. */
+function activeCamIdAtTimelineT(
+  cuts: readonly Cut[],
+  t: number,
+  pills: readonly Pill[],
+  segments: readonly Segment[],
+  clips: readonly Clip[],
+): string | null {
+  if (pills.length === 0) {
+    return activeCamAt(cuts, t, computeCamRanges(clips));
+  }
+  return activeCamAtArr(cuts, t, pills, segments)?.camId ?? null;
+}
+
+/** True if `camId` has material at timeline-time `t` — pill coverage on
+ *  the song axis, with the same pill-less legacy fallback as
+ *  `activeCamIdAtTimelineT`. */
+function camHasMaterialAtTimelineT(
   camId: string,
   t: number,
-  ranges: readonly CamRange[],
+  pills: readonly Pill[],
+  clips: readonly Clip[],
 ): boolean {
-  const r = ranges.find((x) => x.id === camId);
-  return !!r && t >= r.startS && t < r.endS;
+  if (pills.length === 0) {
+    const r = computeCamRanges(clips).find((x) => x.id === camId);
+    return !!r && t >= r.startS && t < r.endS;
+  }
+  return camHasPillAt(camId, t, pills);
 }
 
 function buildClips(inits: ClipInit[] | undefined, fallbackOverrideMs: number): Clip[] {
@@ -1020,14 +1052,40 @@ function restorePillBaseline(p: Pill): Pill {
   };
 }
 
-/** Shift a pill's source-trim by `deltaS`, clamped against zero +
- *  minimum window. Shared by `nudgePillSourceMs` and
- *  `nudgeCamSourceMs` (which fans this out across the cam's pills). */
+/** Clamp a source-shift so `inS + deltaS` can't go negative, then return
+ *  the APPLIED delta. Both window edges must move by this same applied
+ *  amount — clamping the edges independently (the old pattern) moved
+ *  them by different deltas, silently shrinking the source window while
+ *  the pill's arr window stayed put: the 1:1 arr↔source mapping broke
+ *  and playback ran off-rate with drifting alignment (#103). */
+function clampSourceShift(inS: number, deltaS: number): number {
+  return Math.max(deltaS, -inS);
+}
+
+/** Shift a pill's source-trim by `deltaS`, clamped against zero while
+ *  ALWAYS preserving the window length. Shared by `nudgePillSourceMs`
+ *  and `nudgeCamSourceMs` (which fans this out across the cam's
+ *  pills). */
 function shiftPillSource(p: Pill, deltaS: number): Pill {
+  const applied = clampSourceShift(p.sourceInS, deltaS);
   return {
     ...p,
-    sourceInS: Math.max(0, p.sourceInS + deltaS),
-    sourceOutS: Math.max(p.sourceInS + 0.05, p.sourceOutS + deltaS),
+    sourceInS: p.sourceInS + applied,
+    sourceOutS: p.sourceOutS + applied,
+  };
+}
+
+/** Shift a pill's ORIGINAL source bounds (the RESET baseline) by
+ *  `deltaS` with the same length-preserving clamp as
+ *  `shiftPillSource`. Used by the cam-anchor mutations
+ *  (`setClipSyncOverride`, `setSelectedCandidateIdx`) so a per-pill
+ *  RESET restores a baseline that's consistent with the new anchor. */
+function shiftPillOriginalSource(p: Pill, deltaS: number): Pill {
+  const applied = clampSourceShift(p.originalSourceInS, deltaS);
+  return {
+    ...p,
+    originalSourceInS: p.originalSourceInS + applied,
+    originalSourceOutS: p.originalSourceOutS + applied,
   };
 }
 
@@ -1459,16 +1517,45 @@ export const useEditorStore = create<EditorState>()(
     },
     stepByActiveSnap(direction) {
       const s = get();
-      const t = s.playback.currentTime;
+      const segs = s.arrangementSegments;
       const fps = s.jobMeta?.fps && s.jobMeta.fps > 0 ? s.jobMeta.fps : 30;
-      const frameStep = () => s.seek(t + direction * (1 / fps));
       const mode = s.ui.snapMode;
+
+      // The step runs on the ARR axis (the composed song timeline, #102):
+      // every drawn grid surface — BeatRuler, snapTimelineTime, Timeline
+      // drags — anchors there, so a master-axis step lands off the
+      // visible bar lines in any segment ≥ 1. And a raw master seek near
+      // a chunk edge can escape into a segment GAP, where seek()'s
+      // fallback stores the master value in the arr-time playhead field.
+      const tArr = s.playback.timelineT;
+      const totalArr =
+        segs.length > 0
+          ? totalArrDuration(segs)
+          : (s.jobMeta?.duration ?? Infinity);
+      const seekArr = (targetArr: number) => {
+        const clamped = Math.max(0, Math.min(totalArr, targetArr));
+        if (segs.length === 0) {
+          s.seek(clamped);
+          return;
+        }
+        // arr == totalArr is past the half-open last segment — clamp the
+        // hint to the last index so the walker resumes on the right
+        // occurrence (arrToMaster already clamps the value to last.out).
+        let idx = segmentIndexAtArr(clamped, segs);
+        if (idx === -1) idx = segs.length - 1;
+        s.seek(arrToMaster(clamped, segs), { segmentIdxHint: idx });
+      };
+      const frameStep = () => seekArr(tArr + direction * (1 / fps));
 
       if (mode === "off") return frameStep();
 
       if (mode === "match") {
         const clip = s.clips.find((c) => c.id === s.selectedClipId);
         if (clip && isVideoClip(clip) && clip.candidates?.length) {
+          // Candidate alignments are master-time positions by definition;
+          // compare on the master clock, then project the winner onto the
+          // arr axis so the playhead field stays arr-time.
+          const t = s.playback.currentTime;
           const positions = buildClipMatchPositions(clip)
             .map((p) => p.startS)
             .sort((a, b) => a - b);
@@ -1478,7 +1565,7 @@ export const useEditorStore = create<EditorState>()(
               ? positions.find((p) => p > t + eps)
               : [...positions].reverse().find((p) => p < t - eps);
           if (target !== undefined) {
-            s.seek(target);
+            seekArr(masterToArr(target, segs));
             return;
           }
         }
@@ -1493,10 +1580,12 @@ export const useEditorStore = create<EditorState>()(
       // Probe slightly into the desired direction so snapTime rounds the
       // correct way (snapTime always picks the nearest tick — without the
       // probe, t already on a tick would round to itself).
-      const probe = t + direction * step * 0.5;
+      const probe = tArr + direction * step * 0.5;
       const candidate = snapTime(probe, mode, {
         bpm,
-        beatPhase: effectiveBeatPhaseS(s.jobMeta),
+        // Same anchor as snapTimelineTime / the BeatRuler — bar 0 in
+        // arr-time.
+        beatPhase: arrBeatPhaseS(s.jobMeta, segs),
         beatsPerBar,
         barOffsetBeats: effectiveBarOffsetBeats(s.jobMeta),
       });
@@ -1507,8 +1596,8 @@ export const useEditorStore = create<EditorState>()(
       // of a snap (e.g. via audio-mirror seek precision).
       const eps = step * 1e-9;
       let target = candidate;
-      if (Math.abs(target - t) < eps) target = candidate + direction * step;
-      s.seek(target);
+      if (Math.abs(target - tArr) < eps) target = candidate + direction * step;
+      seekArr(target);
     },
     shiftLoop(direction) {
       const s = get();
@@ -1791,14 +1880,9 @@ export const useEditorStore = create<EditorState>()(
       if (Math.abs(deltaMs) > 1e-6) {
         const deltaS = deltaMs / 1000;
         set({
-          pills: mutatePillsForCam(get().pills, camId, (p) => ({
-            ...shiftPillSource(p, deltaS),
-            originalSourceInS: Math.max(0, p.originalSourceInS + deltaS),
-            originalSourceOutS: Math.max(
-              p.originalSourceInS + 0.05,
-              p.originalSourceOutS + deltaS,
-            ),
-          })),
+          pills: mutatePillsForCam(get().pills, camId, (p) =>
+            shiftPillOriginalSource(shiftPillSource(p, deltaS), deltaS),
+          ),
         });
       }
     },
@@ -1936,15 +2020,18 @@ export const useEditorStore = create<EditorState>()(
     setPillSourceOffsetMs(id, offsetMs) {
       const offsetS = offsetMs / 1000;
       set({
-        pills: mutatePill(get().pills, id, (p) => ({
-          ...p,
-          sourceInS: Math.max(0, p.originalSourceInS + offsetS),
-          sourceOutS: Math.max(
-            p.originalSourceInS + offsetS + 0.05,
-            p.originalSourceOutS + offsetS,
-          ),
-          userEdited: true,
-        })),
+        pills: mutatePill(get().pills, id, (p) => {
+          // Clamp the OFFSET (not the edges independently) so the window
+          // length always survives — same invariant as shiftPillSource
+          // (#103).
+          const applied = clampSourceShift(p.originalSourceInS, offsetS);
+          return {
+            ...p,
+            sourceInS: p.originalSourceInS + applied,
+            sourceOutS: p.originalSourceOutS + applied,
+            userEdited: true,
+          };
+        }),
       });
     },
     nudgePillArrMs(id, deltaMs) {
@@ -1986,14 +2073,9 @@ export const useEditorStore = create<EditorState>()(
       if (Math.abs(deltaMs) > 1e-6) {
         const deltaS = deltaMs / 1000;
         set({
-          pills: mutatePillsForCam(get().pills, camId, (p) => ({
-            ...shiftPillSource(p, deltaS),
-            originalSourceInS: Math.max(0, p.originalSourceInS + deltaS),
-            originalSourceOutS: Math.max(
-              p.originalSourceInS + 0.05,
-              p.originalSourceOutS + deltaS,
-            ),
-          })),
+          pills: mutatePillsForCam(get().pills, camId, (p) =>
+            shiftPillOriginalSource(shiftPillSource(p, deltaS), deltaS),
+          ),
         });
       }
       // Mirror cam-1 changes into legacy offset slice (SyncTuner).
@@ -2085,28 +2167,33 @@ export const useEditorStore = create<EditorState>()(
       set({ audioVolume: clamped });
     },
     addCut(cut) {
-      // Compute ranges once (memoized on the clips array reference, so
-      // back-to-back addCut calls share the same range list) and reuse
-      // for both no-op guards instead of recomputing twice.
+      // Cut.atTimeS is timeline-time — both guards resolve on the SAME
+      // axis via pill coverage (see activeCamIdAtTimelineT, #75). The
+      // legacy master-range guards rejected valid TAKEs whenever a cam's
+      // master range didn't happen to contain the small arr-times that
+      // long-form cuts carry.
       const s = get();
-      const ranges = computeCamRanges(s.clips);
 
       // No-op guard #1: if the cam is already active at this time (via a
       // prior cut or default-fallback), inserting another marker to the
       // same cam is redundant.
-      const currentActive = activeCamAt(s.cuts, cut.atTimeS, ranges);
+      const currentActive = activeCamIdAtTimelineT(
+        s.cuts,
+        cut.atTimeS,
+        s.pills,
+        s.arrangementSegments,
+        s.clips,
+      );
       if (currentActive === cut.camId) return false;
 
-      // No-op guard #2: if the target cam has NO material at this time,
-      // adding the cut wouldn't change anything — activeCamAt would still
-      // fall back to whatever cam has material here. This is the "single-
-      // video area" case: in a region only cam-2 covers, hitting TAKE on
-      // cam-1 used to deposit a marker that did nothing.
-      const target = ranges.find((r) => r.id === cut.camId);
+      // No-op guard #2: if the target cam has NO material (pill) at this
+      // song-position, adding the cut wouldn't change anything — the
+      // resolver would still fall back to whatever cam covers the spot.
+      // This is the "single-video area" case: in a region only cam-2
+      // covers, hitting TAKE on cam-1 used to deposit a marker that did
+      // nothing.
       if (
-        !target ||
-        cut.atTimeS < target.startS ||
-        cut.atTimeS >= target.endS
+        !camHasMaterialAtTimelineT(cut.camId, cut.atTimeS, s.pills, s.clips)
       ) {
         return false;
       }
@@ -2127,10 +2214,20 @@ export const useEditorStore = create<EditorState>()(
         (c) => c.atTimeS === fromAtTimeS && c.camId === camId,
       );
       if (idx < 0) return fromAtTimeS;
-      // Clamp to the duration window so a drag can't push a cut past
-      // the end of the master timeline.
-      const dur = get().jobMeta?.duration ?? Infinity;
-      const clamped = Math.max(0, Math.min(dur, toAtTimeS));
+      // Cut.atTimeS is timeline-time, so the drag clamps against the
+      // SONG axis [0, totalArrDuration] — NOT jobMeta.duration, which is
+      // the master-audio length (#135). Duplicated chunks make the song
+      // longer than the session (old clamp made the tail unreachable);
+      // a short song cut from a long jam makes it much shorter (old
+      // clamp let cuts sail into dead arr-space past the song's end).
+      // Pre-load empty segments fall back to the master duration, where
+      // both axes coincide.
+      const segs = get().arrangementSegments;
+      const hi =
+        segs.length > 0
+          ? totalArrDuration(segs)
+          : (get().jobMeta?.duration ?? Infinity);
+      const clamped = Math.max(0, Math.min(hi, toAtTimeS));
       // Replace, then re-sort. We don't dedupe during drag — collisions
       // (two cuts collapsing onto the same instant) are easier to
       // resolve visually after the user drops, and silently dropping
@@ -2145,18 +2242,25 @@ export const useEditorStore = create<EditorState>()(
     overwriteCutsRange(camId, fromS, toS) {
       const lo = Math.min(fromS, toS);
       const hi = Math.max(fromS, toS);
-      const cuts = get().cuts;
+      const s = get();
       // Drop every cut inside [lo, hi] — the held cam painted over them.
-      let next = cuts.filter((c) => c.atTimeS < lo || c.atTimeS > hi);
-      const ranges = get().clips.map((c) => {
-        const r = clipRangeS(c);
-        return { id: c.id, startS: r.startS, endS: r.endS };
-      });
-      const activeAtLo = activeCamAt(next, lo, ranges);
+      let next = s.cuts.filter((c) => c.atTimeS < lo || c.atTimeS > hi);
+      // Hold-paint endpoints are timeline-time — resolve on the pill
+      // axis, exactly like addCut (#75).
+      const activeAtLo = activeCamIdAtTimelineT(
+        next,
+        lo,
+        s.pills,
+        s.arrangementSegments,
+        s.clips,
+      );
       // Same guard as addCut: only emit the in-marker when the held cam
       // actually has material at lo. Otherwise the marker is visually
-      // inert (activeCamAt falls back to whoever else covers the spot).
-      if (activeAtLo !== camId && camHasMaterialAt(camId, lo, ranges)) {
+      // inert (the resolver falls back to whoever else covers the spot).
+      if (
+        activeAtLo !== camId &&
+        camHasMaterialAtTimelineT(camId, lo, s.pills, s.clips)
+      ) {
         next = [...next, { atTimeS: lo, camId }].sort(
           (a, b) => a.atTimeS - b.atTimeS,
         );
@@ -2166,26 +2270,43 @@ export const useEditorStore = create<EditorState>()(
     applyHoldRelease(camId: string, fromS: number, toS: number, priorCuts: Cut[]) {
       const lo = Math.min(fromS, toS);
       const hi = Math.max(fromS, toS);
-      const ranges = get().clips.map((c) => {
-        const r = clipRangeS(c);
-        return { id: c.id, startS: r.startS, endS: r.endS };
-      });
+      const s = get();
       // What WOULD have been on PROGRAM at the release moment if we hadn't
       // painted? That's the cam we want to resume to (unless it's the cam
       // we were holding, in which case the hold was redundant and no
-      // trailing cut is needed).
-      const prevActiveAtRelease = activeCamAt(priorCuts, hi, ranges);
+      // trailing cut is needed). All endpoints are timeline-time, so the
+      // resolution runs on the pill axis (#75) — the legacy master-range
+      // lookup could resume to a cam with no pill at this song-position
+      // (inert cut) or to the wrong cam.
+      const prevActiveAtRelease = activeCamIdAtTimelineT(
+        priorCuts,
+        hi,
+        s.pills,
+        s.arrangementSegments,
+        s.clips,
+      );
 
       // Paint: drop cuts in [lo, hi], insert lead cut if camId wasn't
       // already active at lo AND it actually has material there.
-      let next: Cut[] = priorCuts.filter((c) => c.atTimeS < lo || c.atTimeS > hi);
-      const activeAtLo = activeCamAt(next, lo, ranges);
-      if (activeAtLo !== camId && camHasMaterialAt(camId, lo, ranges)) {
+      const next: Cut[] = priorCuts.filter(
+        (c) => c.atTimeS < lo || c.atTimeS > hi,
+      );
+      const activeAtLo = activeCamIdAtTimelineT(
+        next,
+        lo,
+        s.pills,
+        s.arrangementSegments,
+        s.clips,
+      );
+      if (
+        activeAtLo !== camId &&
+        camHasMaterialAtTimelineT(camId, lo, s.pills, s.clips)
+      ) {
         next.push({ atTimeS: lo, camId });
       }
 
       // Trailing resume cut at hi — only if the original would have shown
-      // a different cam there. activeCamAt only returns a cam that has
+      // a different cam there. The resolver only returns a cam that has
       // material, so the trailing cut already targets a valid spot.
       if (prevActiveAtRelease !== null && prevActiveAtRelease !== camId) {
         next.push({ atTimeS: hi, camId: prevActiveAtRelease });
@@ -2227,15 +2348,21 @@ export const useEditorStore = create<EditorState>()(
     },
     buildAndStartQuantizePreview() {
       const s = get();
-      // Quantize is sync-aligned (snaps cut times to beat grid). Image
-      // clips don't participate — feed only video clips to the helper.
-      const videoClips = s.clips.filter(isVideoClip);
+      // Scope: cuts + fx ONLY (#70). Cam start offsets are auto-synced
+      // (snapping them would break A/V alignment) and the master trim is
+      // the user's export window — quantize must not touch either.
+      //
+      // Cuts + fx live in timeline-time, so the beat anchor must be the
+      // ARR-time one — the exact grid the BeatRuler draws and
+      // snapTimelineTime recorded the cuts on (#94). The master anchor
+      // differs by segments[0].in in long-form and would move on-grid
+      // markers OFF the visible bar lines.
       const preview = buildQuantizePreview(
-        { cuts: s.cuts, clips: videoClips, trim: s.trim, fx: s.fx },
+        { cuts: s.cuts, fx: s.fx },
         s.ui.snapMode,
         {
           bpm: s.jobMeta?.bpm?.value ?? null,
-          beatPhase: effectiveBeatPhaseS(s.jobMeta),
+          beatPhase: arrBeatPhaseS(s.jobMeta, s.arrangementSegments),
           beatsPerBar: effectiveBeatsPerBar(s.jobMeta),
           barOffsetBeats: effectiveBarOffsetBeats(s.jobMeta),
         },
@@ -2279,16 +2406,8 @@ export const useEditorStore = create<EditorState>()(
       }
       nextCuts = dedupedReverse.reverse();
 
-      // Apply clip start-offsets.
-      const nextClips = get().clips.map((c) => {
-        const change = preview.clipStartOffsets.find((p) => p.camId === c.id);
-        return change ? { ...c, startOffsetS: change.to } : c;
-      });
-
-      // Apply trim.
-      const nextTrim = preview.trim ? preview.trim.to : get().trim;
-
-      // Apply fx in/out snaps.
+      // Apply fx in/out snaps. (Cuts + fx are the ENTIRE quantize scope —
+      // cam start offsets and trim are deliberately untouched, #70.)
       let nextFx = get().fx;
       if (preview.fxs.length > 0) {
         nextFx = nextFx.map((f) => {
@@ -2306,8 +2425,6 @@ export const useEditorStore = create<EditorState>()(
 
       set({
         cuts: nextCuts,
-        clips: nextClips,
-        trim: nextTrim,
         fx: nextFx,
         quantizePreview: null,
       });

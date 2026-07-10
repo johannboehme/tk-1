@@ -14,10 +14,9 @@ import type { LoopRegion, TrimRegion } from "./OffsetScheduler";
 import { clampLoopRegion } from "./OffsetScheduler";
 import {
   arrToMaster,
-  masterToArr,
   segmentArrStarts,
   segmentIndexAtArr,
-  totalArrDuration,
+  sliceByArrSegments,
 } from "./arrangement-time";
 
 /** Float tolerance for "loop.end sits exactly on a segment seam". Arr-times
@@ -118,11 +117,44 @@ export function loopAroundPlayhead(
   return { start, end };
 }
 
+/** Project the master-trim WINDOW into arr-time: the hull of the trim's
+ *  playable slices (`sliceByArrSegments`), i.e. [first slice's arrStartS,
+ *  last slice's arrEndS].
+ *
+ *  This must be a RANGE projection, never a point projection of the two
+ *  endpoints through `masterToArr`: the default trim {0, duration} (and
+ *  the first-load derivation {min seg.in, max seg.out}) has both endpoints
+ *  outside every segment, and masterToArr's nearest-edge fallback picks
+ *  the edge closest in MASTER distance — which is only the arrangement's
+ *  start/end when chunks play in source order. Out-of-order or duplicated
+ *  arrangements would collapse the window (loop dead everywhere).
+ *
+ *  Empty `segments` → identity passthrough ({trim.in, trim.out}), matching
+ *  the other arr-time helpers. Returns null when the trim window
+ *  intersects no segment (nothing playable). */
+export function trimWindowArr(
+  trim: TrimRegion,
+  segments: readonly Segment[],
+): { startArr: number; endArr: number } | null {
+  if (segments.length === 0) {
+    return { startArr: trim.in, endArr: trim.out };
+  }
+  const slices = sliceByArrSegments(trim.in, trim.out, segments);
+  if (slices.length === 0) return null;
+  // Slices come back in playback order and the arr cursor is monotonic,
+  // so the hull is simply first-start .. last-end.
+  return {
+    startArr: slices[0].arrStartS,
+    endArr: slices[slices.length - 1].arrEndS,
+  };
+}
+
 /** Clamp the loop to the playable arr-time window: the intersection of
  *  the segments' totalArrDuration and the master-trim's projection into
- *  arr-time. Master-trim universally narrows the loop in both single-take
- *  (where arr-time == master-time) and long-form (where trim cuts across
- *  chunks). Returns null when the loop collapses to zero length.
+ *  arr-time (`trimWindowArr`). Master-trim universally narrows the loop
+ *  in both single-take (where arr-time == master-time) and long-form
+ *  (where trim cuts across chunks). Returns null when the loop collapses
+ *  to zero length.
  *
  *  Defensive: with empty segments falls back to legacy trim-clamp so a
  *  pre-load store snapshot doesn't crash. */
@@ -133,11 +165,10 @@ export function clampLoopToBounds(
 ): LoopRegion | null {
   if (!loop) return null;
   if (segments.length === 0) return clampLoopRegion(loop, trim);
-  const total = totalArrDuration(segments);
-  const trimInArr = Math.max(0, Math.min(total, masterToArr(trim.in, segments)));
-  const trimOutArr = Math.max(trimInArr, Math.min(total, masterToArr(trim.out, segments)));
-  const start = Math.max(trimInArr, loop.start);
-  const end = Math.min(trimOutArr, loop.end);
+  const window = trimWindowArr(trim, segments);
+  if (!window) return null;
+  const start = Math.max(window.startArr, loop.start);
+  const end = Math.min(window.endArr, loop.end);
   if (end <= start) return null;
   return { start, end };
 }

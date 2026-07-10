@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { activeCamAtArr, generatePills, reconcilePills } from "./arrangement-pills";
+import {
+  activeCamAtArr,
+  camHasPillAt,
+  generatePills,
+  reconcilePills,
+} from "./arrangement-pills";
 import type { Clip, Pill, Segment } from "./types";
 import type { Cut } from "../storage/jobs-db";
 
@@ -393,5 +398,34 @@ describe("activeCamAtArr — timeline-time cut isolation across duplicate pills"
     // Pill 4 (timeline 17, cam-B): the cut is in scope, cam-B has a
     // covering pill — we get cam-B.
     expect(activeCamAtArr(cuts, 17, pills, segments)?.camId).toBe("cam-B");
+  });
+});
+
+describe("camHasPillAt", () => {
+  const pill = (camId: string, arrStartS: number, arrEndS: number): Pill => ({
+    id: `${camId}::${arrStartS}`,
+    camId,
+    arrStartS,
+    arrEndS,
+    sourceInS: 0,
+    sourceOutS: arrEndS - arrStartS,
+    originalArrStartS: arrStartS,
+    originalArrEndS: arrEndS,
+    originalSourceInS: 0,
+    originalSourceOutS: arrEndS - arrStartS,
+  });
+
+  it("true inside a covering pill, half-open at the end", () => {
+    const pills = [pill("cam-A", 0, 10), pill("cam-B", 5, 15)];
+    expect(camHasPillAt("cam-A", 0, pills)).toBe(true);
+    expect(camHasPillAt("cam-A", 9.99, pills)).toBe(true);
+    expect(camHasPillAt("cam-A", 10, pills)).toBe(false); // end exclusive
+    expect(camHasPillAt("cam-B", 4, pills)).toBe(false);
+    expect(camHasPillAt("cam-B", 5, pills)).toBe(true);
+  });
+
+  it("false for unknown cams and empty pill lists", () => {
+    expect(camHasPillAt("cam-X", 3, [pill("cam-A", 0, 10)])).toBe(false);
+    expect(camHasPillAt("cam-A", 3, [])).toBe(false);
   });
 });
