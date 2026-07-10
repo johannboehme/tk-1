@@ -8,11 +8,11 @@
  * list stays in sync without anyone maintaining a hand-written cheat
  * sheet — behavior and documentation come from the same declaration.
  */
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { createPortal } from "react-dom";
 import { useShortcutRegistry, type ShortcutMeta } from "../shortcuts/registry";
-import { useGlobalShortcut } from "../shortcuts/keymap";
+import { acquireModalScope, useGlobalShortcut } from "../shortcuts/keymap";
 import { HelpIcon, XIcon } from "./icons";
 
 const GROUP_ORDER = ["Transport", "Cameras", "FX", "Edit"];
@@ -92,6 +92,16 @@ export function HelpOverlay() {
   // and would cancel themselves out for `v => !v` toggles).
   const openRef = useRef(open);
   openRef.current = open;
+
+  // While the sheet is open it is a modal for the keyboard too: holding
+  // the keymap's modal scope suppresses every binding not marked
+  // `inModal` (Space, cam digits, I/O/L, FX pads, …). Trying a key while
+  // reading the cheat sheet must never edit the project behind the
+  // dialog — there is no undo. Only ?/Esc below stay live.
+  useEffect(() => {
+    if (!open) return;
+    return acquireModalScope("help-overlay");
+  }, [open]);
 
   // "?" lives on different physical keys per layout (Shift+/ on US,
   // Shift+ß on DE, etc). Most browsers normalise `e.key` to "?", but

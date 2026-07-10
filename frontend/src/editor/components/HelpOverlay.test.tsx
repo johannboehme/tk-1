@@ -1,7 +1,8 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { render, screen, fireEvent, cleanup } from "@testing-library/react";
 import { HelpOverlay } from "./HelpOverlay";
 import { useShortcutRegistry, registerShortcut } from "../shortcuts/registry";
+import { bindShortcut, modalScopeActive } from "../shortcuts/keymap";
 
 function pressKey(key: string, opts: KeyboardEventInit = {}) {
   fireEvent.keyDown(window, { key, ...opts });
@@ -110,5 +111,56 @@ describe("HelpOverlay", () => {
     pressKey("?");
     const dialog = await screen.findByTestId("help-overlay");
     expect(dialog.textContent).toContain("No shortcuts registered yet.");
+  });
+
+  // #95 — reading the cheat sheet must not edit the project: while the
+  // overlay is open it holds the keymap's modal scope, which suppresses
+  // every binding not marked inModal (Space, digits, I/O/L, FX pads, …).
+  it("suppresses edit shortcuts while open and releases them on close", async () => {
+    const onSpace = vi.fn();
+    const off = bindShortcut({ id: "test.space", keys: [" "], onDown: onSpace });
+    try {
+      render(<HelpOverlay />);
+      expect(modalScopeActive()).toBe(false);
+
+      pressKey("?");
+      expect(await screen.findByTestId("help-overlay")).toBeInTheDocument();
+      expect(modalScopeActive()).toBe(true);
+
+      // Trying a key from the sheet must NOT reach the editor binding.
+      pressKey(" ");
+      expect(onSpace).not.toHaveBeenCalled();
+
+      // Esc still closes (inModal binding) …
+      pressKey("Escape");
+      await new Promise((r) => setTimeout(r, 50));
+      expect(screen.queryByTestId("help-overlay")).toBeNull();
+      expect(modalScopeActive()).toBe(false);
+
+      // … and afterwards the suppressed binding works again.
+      pressKey(" ");
+      expect(onSpace).toHaveBeenCalledTimes(1);
+    } finally {
+      off();
+    }
+  });
+
+  it("releases the modal scope when unmounted while open", async () => {
+    const { unmount } = render(<HelpOverlay />);
+    pressKey("?");
+    expect(await screen.findByTestId("help-overlay")).toBeInTheDocument();
+    expect(modalScopeActive()).toBe(true);
+    unmount();
+    expect(modalScopeActive()).toBe(false);
+  });
+
+  it("keeps `?` working as a toggle while the overlay is open", async () => {
+    render(<HelpOverlay />);
+    pressKey("?");
+    expect(await screen.findByTestId("help-overlay")).toBeInTheDocument();
+    pressKey("?");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.queryByTestId("help-overlay")).toBeNull();
+    expect(modalScopeActive()).toBe(false);
   });
 });
