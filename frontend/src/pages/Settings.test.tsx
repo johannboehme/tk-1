@@ -1,7 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { Settings } from "./Settings";
 import type { Capabilities } from "../local/capabilities";
+import {
+  exportProjectArchive,
+  importProjectArchive,
+} from "../local/project-archive";
+import { jobsDb, type LocalJob } from "../storage/jobs-db";
+import { opfs } from "../storage/opfs";
 
 const ALL_PRESENT: Capabilities = {
   webAssembly: true,
@@ -67,5 +73,110 @@ describe("Settings page", () => {
     expect(screen.getByTestId("min-status")).toHaveTextContent(
       /Origin Private File System/i,
     );
+  });
+});
+
+// -----------------------------------------------------------------------------
+// #86 — Projects backup / restore section
+// -----------------------------------------------------------------------------
+
+vi.mock("../local/project-archive", () => ({
+  exportProjectArchive: vi.fn(),
+  importProjectArchive: vi.fn(),
+}));
+
+describe("Settings — projects backup (#86)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.spyOn(jobsDb, "listJobs").mockResolvedValue([
+      makeBackupJob("job-a", "Song A"),
+      makeBackupJob("job-b", null),
+    ]);
+    vi.spyOn(opfs, "dirStats").mockResolvedValue({
+      bytes: 2 * 1024 * 1024,
+      newestModifiedMs: null,
+    });
+    if (typeof URL.createObjectURL !== "function") {
+      URL.createObjectURL = () => "blob:fake";
+    }
+    if (typeof URL.revokeObjectURL !== "function") {
+      URL.revokeObjectURL = () => undefined;
+    }
+  });
+
+  function makeBackupJob(id: string, title: string | null): LocalJob {
+    return {
+      id,
+      title,
+      videoFilename: "v.mp4",
+      audioFilename: "a.wav",
+      createdAt: 1720000000000,
+    };
+  }
+
+  it("lists every project with a size and an Export button", async () => {
+    render(<Settings caps={ALL_PRESENT} />);
+    expect(await screen.findByText("Song A")).toBeInTheDocument();
+    expect(screen.getByText("job-b")).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /^export$/i })).toHaveLength(2);
+    expect(screen.getAllByText(/2 MB/)).toHaveLength(2);
+  });
+
+  it("exports the clicked project as a downloaded archive", async () => {
+    vi.mocked(exportProjectArchive).mockResolvedValue({
+      blob: new Blob(["zip"]),
+      filename: "Song A.tk1.zip",
+    });
+    render(<Settings caps={ALL_PRESENT} />);
+    await screen.findByText("Song A");
+
+    fireEvent.click(screen.getAllByRole("button", { name: /^export$/i })[0]);
+    await waitFor(() => {
+      expect(exportProjectArchive).toHaveBeenCalledWith("job-a");
+    });
+    expect(await screen.findByTestId("backup-msg")).toHaveTextContent(
+      /Exported "Song A"/,
+    );
+  });
+
+  it("imports a picked archive file and reports the restored project", async () => {
+    vi.mocked(importProjectArchive).mockResolvedValue({
+      jobId: "job-new",
+      title: "Restored Song",
+    });
+    render(<Settings caps={ALL_PRESENT} />);
+    await screen.findByText("Song A");
+
+    const input = screen.getByLabelText(/project archive file/i);
+    const file = new File(["zipbytes"], "Song.tk1.zip", {
+      type: "application/zip",
+    });
+    fireEvent.change(input, { target: { files: [file] } });
+
+    await waitFor(() => {
+      expect(importProjectArchive).toHaveBeenCalledWith(file);
+    });
+    expect(await screen.findByTestId("backup-msg")).toHaveTextContent(
+      /Imported "Restored Song"/,
+    );
+  });
+
+  it("surfaces an import failure without crashing the page", async () => {
+    vi.mocked(importProjectArchive).mockRejectedValue(
+      new Error("Not a TK-1 project archive"),
+    );
+    render(<Settings caps={ALL_PRESENT} />);
+    await screen.findByText("Song A");
+
+    const input = screen.getByLabelText(/project archive file/i);
+    fireEvent.change(input, {
+      target: { files: [new File(["x"], "foreign.zip")] },
+    });
+
+    expect(await screen.findByTestId("backup-err")).toHaveTextContent(
+      /not a tk-1 project archive/i,
+    );
+    // Page chrome intact.
+    expect(screen.getByTestId("min-status")).toBeInTheDocument();
   });
 });
