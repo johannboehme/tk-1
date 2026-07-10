@@ -792,7 +792,6 @@ export function useAudioMaster(
         const wrapBlocksHop = pendingWrapAt == null && wrapHere;
         if (
           state.armed === null &&
-          distToEnd > 0 &&
           distToEnd <= LEAD_TIME_S &&
           nextSeg &&
           !wrapBlocksHop
@@ -802,7 +801,14 @@ export function useAudioMaster(
           // pre-played at nextSeg.in so its decoder is hot by the time
           // the ramp fires; armed.nextSegmentIdx tells the swap block
           // which index to advance into (handles duplicate chunks).
-          const fireAtCtxTime = graph.ctx.currentTime + distToEnd;
+          //
+          // No lower bound on distToEnd: like the loop-wrap path, this
+          // tolerates a tick landing AT or PAST the boundary (RAF stall,
+          // GC pause, hidden tab). The crossfade then fires immediately —
+          // without this the hop would never arm, the authoritative index
+          // would never advance, and the active element would free-run
+          // into master material that is not in the arrangement.
+          const fireAtCtxTime = graph.ctx.currentTime + Math.max(0, distToEnd);
           try {
             if (Math.abs(idle.currentTime - nextSeg.in) > 0.01) {
               idle.currentTime = clampSeek(nextSeg.in, idle.duration);
@@ -829,10 +835,13 @@ export function useAudioMaster(
           };
         } else if (
           !nextSeg &&
-          distToEnd > 0 &&
           distToEnd <= LEAD_TIME_S &&
           state.endPauseSegmentIdx !== curIdx
         ) {
+          // No lower bound on distToEnd here either: a stall can carry t
+          // past the last segment's out without a tick in the lead
+          // window — the timer then fires with zero delay instead of the
+          // playhead sailing to the end of the master file.
           // Last segment — schedule a pause when the active element
           // reaches its `out`. We do NOT engage the crossfade machinery
           // here: a fake-arm would trip the swap block on the next tick

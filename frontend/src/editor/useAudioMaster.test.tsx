@@ -647,6 +647,64 @@ describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => 
       void mB;
     });
 
+    it("RAF stall past a chunk boundary still arms the hop — no tick landed in the lead window (#76)", async () => {
+      // Unique chunks with a fat master-time gap between them. A GC pause /
+      // hidden tab / decoder churn can swallow every tick in the 50 ms
+      // window before seg 0's out; the first tick after the stall sees
+      // t PAST the boundary (distToEnd <= 0). Without overshoot tolerance
+      // the hop never arms and the active element free-runs into master
+      // material that is NOT in the arrangement (dropped jam territory).
+      const segs = [
+        { in: 620, out: 650 }, // arr [0..30]
+        { in: 905, out: 935 }, // arr [30..60]
+      ];
+      const { mA, mB } = await setup(1000);
+      useEditorStore.getState().setArrangementSegments(segs);
+      useEditorStore.getState().seek(649, { segmentIdxHint: 0 });
+      await act(async () => {
+        await flushAll();
+      });
+      await act(async () => {
+        useEditorStore.getState().setPlaying(true);
+        await flushAll();
+      });
+      // Simulate the stall: master-time jumps from inside seg 0 straight
+      // past its out — no tick ever landed inside (out - 0.05, out].
+      await act(async () => {
+        mA.setCurrentTime(650.04);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      // Recovery: the hop arms anyway (immediate crossfade), idle parked
+      // at the next chunk's head instead of free-running into master 650+.
+      expect(mB.playSpy).toHaveBeenCalled();
+      expect(mB.getCurrentTime()).toBeCloseTo(905, 0);
+    });
+
+    it("RAF stall past the LAST segment's out still schedules the end-pause (#76)", async () => {
+      const segs = [{ in: 620, out: 650 }];
+      const { mA } = await setup(1000);
+      useEditorStore.getState().setArrangementSegments(segs);
+      useEditorStore.getState().seek(649, { segmentIdxHint: 0 });
+      await act(async () => {
+        await flushAll();
+      });
+      await act(async () => {
+        useEditorStore.getState().setPlaying(true);
+        await flushAll();
+      });
+      await act(async () => {
+        mA.setCurrentTime(650.04);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      // The pause timer fires with zero delay (we're already past out).
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 20));
+      });
+      expect(useEditorStore.getState().playback.isPlaying).toBe(false);
+    });
+
     it(
       "end of last segment does NOT swap roles (the loop-back bug). " +
         "The active element keeps playing past `out` until the timeout " +
