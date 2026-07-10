@@ -3,14 +3,16 @@
  * registered in the global registry. Toggles on `?`, closes on `Esc`,
  * `?` again, the close button, or a backdrop click.
  *
- * Components that own a key handler are expected to call
- * `useRegisterShortcut(...)` so this list stays in sync without anyone
- * maintaining a hand-written cheat sheet.
+ * Components declare their shortcuts through the keymap
+ * (`useGlobalShortcut` / `bindShortcut` with a `help` entry), so this
+ * list stays in sync without anyone maintaining a hand-written cheat
+ * sheet — behavior and documentation come from the same declaration.
  */
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { createPortal } from "react-dom";
 import { useShortcutRegistry, type ShortcutMeta } from "../shortcuts/registry";
+import { useGlobalShortcut } from "../shortcuts/keymap";
 import { HelpIcon, XIcon } from "./icons";
 
 const GROUP_ORDER = ["Transport", "Cameras", "FX", "Edit"];
@@ -91,46 +93,41 @@ export function HelpOverlay() {
   const openRef = useRef(open);
   openRef.current = open;
 
-  useEffect(() => {
-    function isTypingTarget(t: EventTarget | null): boolean {
-      const el = t as HTMLElement | null;
-      if (!el) return false;
-      const tag = el.tagName;
-      return tag === "INPUT" || tag === "TEXTAREA" || el.isContentEditable;
-    }
-    // "?" lives on different physical keys per layout (Shift+/ on US,
-    // Shift+ß on DE, etc). Most browsers normalise `e.key` to "?", but
-    // we also fall back to `e.code` so this works regardless of layout
-    // or input source — including synthetic events fired in tests.
-    function isQuestionMark(e: KeyboardEvent): boolean {
-      if (e.key === "?") return true;
-      if (!e.shiftKey) return false;
-      if (e.key === "/" || e.key === "ß") return true;
-      // Physical keys that produce "?" on common layouts.
-      return (
-        e.code === "Slash" ||
-        e.code === "Minus" ||
-        e.code === "IntlRo"
-      );
-    }
-    function onKey(e: KeyboardEvent) {
-      if (isQuestionMark(e)) {
-        if (isTypingTarget(e.target)) return;
-        if (e.metaKey || e.ctrlKey || e.altKey) return;
-        e.preventDefault();
-        setOpen(!openRef.current);
-        return;
-      }
-      if (e.key === "Escape" && openRef.current) {
-        e.preventDefault();
-        setOpen(false);
-      }
-    }
-    // Capture phase so we receive the event even if some other handler
-    // calls stopPropagation on it during bubbling.
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, []);
+  // "?" lives on different physical keys per layout (Shift+/ on US,
+  // Shift+ß on DE, etc). Most browsers normalise `e.key` to "?", but
+  // we also fall back to `e.code` so this works regardless of layout
+  // or input source — including synthetic events fired in tests.
+  function isQuestionMark(e: KeyboardEvent): boolean {
+    if (e.key === "?") return true;
+    if (!e.shiftKey) return false;
+    if (e.key === "/" || e.key === "ß") return true;
+    // Physical keys that produce "?" on common layouts.
+    return e.code === "Slash" || e.code === "Minus" || e.code === "IntlRo";
+  }
+  // Both bindings run in-modal (they ARE the modal's controls) and on the
+  // capture phase so no bubbling handler can stopPropagation them away.
+  // The keymap dispatcher applies the typing-target guard and blocks
+  // Ctrl/Cmd/Alt chords; Shift is free (it's how "?" is typed).
+  useGlobalShortcut({
+    id: "help.toggle",
+    match: isQuestionMark,
+    shiftInsensitive: true,
+    inModal: true,
+    capture: true,
+    onDown: () => setOpen(!openRef.current),
+  });
+  useGlobalShortcut({
+    id: "help.close",
+    keys: ["Escape"],
+    inModal: true,
+    capture: true,
+    preventDefault: false,
+    onDown: (e) => {
+      if (!openRef.current) return;
+      e.preventDefault();
+      setOpen(false);
+    },
+  });
 
   const groups = groupShortcuts(shortcuts);
 

@@ -1,5 +1,4 @@
 // Transport row with chunky play/pause + frame steppers + time readouts. Keyboard-aware.
-import { useEffect } from "react";
 import { useEditorStore } from "../store";
 import { effectiveAudioStartS } from "../selectors/timing";
 import {
@@ -13,7 +12,7 @@ import {
   masterToArr,
   totalArrDuration,
 } from "../arrangement-time";
-import { useRegisterShortcut } from "../shortcuts/useRegisterShortcut";
+import { useGlobalShortcut } from "../shortcuts/keymap";
 import { useIsNarrowViewport } from "../use-is-narrow";
 import { ChunkyButton } from "./ChunkyButton";
 import { TransportClock } from "./TransportClock";
@@ -78,8 +77,7 @@ export function TransportBar() {
   const setVideoClipTrim = useEditorStore((s) => s.setVideoClipTrim);
   const setImageClipDuration = useEditorStore((s) => s.setImageClipDuration);
   const setClipStartOffset = useEditorStore((s) => s.setClipStartOffset);
-  // Read-only subscriptions to drive aria-labels + shortcut hints.
-  const selectedClipId = useEditorStore((s) => s.selectedClipId);
+  // Read-only subscription to drive aria-labels + shortcut hints.
   const ioContextKind = useEditorStore((s) => {
     if (s.playback.loop) return "loop" as const;
     if (s.selectedClipId === null) return "master" as const;
@@ -100,7 +98,6 @@ export function TransportBar() {
   const trimSize = isNarrow ? "xs" : "sm";
 
   const fps = meta?.fps && meta.fps > 0 ? meta.fps : 30;
-  const duration = meta?.duration ?? 0;
   // Visibility gates on the raw value: if the file is non-silent throughout
   // we have nothing meaningful to jump to. The seek target itself uses the
   // user-corrected (effective) start.
@@ -223,117 +220,107 @@ export function TransportBar() {
     setLoop({ start, end });
   }
 
-  // Keyboard shortcuts (skip when an input/textarea is focused)
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      const tag = (e.target as HTMLElement)?.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA" || (e.target as HTMLElement)?.isContentEditable) {
-        return;
-      }
-      // ignore if a knob is focused (it has its own handler)
-      const ae = document.activeElement as HTMLElement | null;
-      if (ae?.dataset?.knob) return;
-      // Browser chords (Cmd/Ctrl+L address bar, Cmd/Ctrl+I/O, Cmd+Arrow
-      // history) must never fall through into transport edits. Alt stays
-      // allowed — the arrow cases branch on it for the loop-shift.
-      if (e.metaKey || e.ctrlKey) return;
-
-      switch (e.key) {
-        case " ":
-          e.preventDefault();
-          setPlaying(!isPlaying);
-          break;
-        case "ArrowLeft":
-          e.preventDefault();
-          if (e.altKey) shiftLoop(-1);
-          else stepByActiveSnap(-1);
-          break;
-        case "ArrowRight":
-          e.preventDefault();
-          if (e.altKey) shiftLoop(1);
-          else stepByActiveSnap(1);
-          break;
-        case "i":
-        case "I":
-          e.preventDefault();
-          setInPointAtPlayhead();
-          break;
-        case "o":
-        case "O":
-          e.preventDefault();
-          setOutPointAtPlayhead();
-          break;
-        case "l":
-        case "L":
-          e.preventDefault();
-          toggleLoop();
-          break;
-      }
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [
-    fps,
-    duration,
-    isPlaying,
-    loop,
-    setPlaying,
-    setLoop,
-    setTrim,
-    setVideoClipTrim,
-    setImageClipDuration,
-    setClipStartOffset,
-    selectedClipId,
-    trim.in,
-    trim.out,
-    stepByActiveSnap,
-    shiftLoop,
-    arrSegments,
-  ]);
-
-  useRegisterShortcut({
+  // Keyboard shortcuts. The keymap dispatcher owns the standard guards
+  // (typing target, exact-modifier policy — browser chords like Cmd/Ctrl+L
+  // or Cmd+Arrow never reach these handlers — repeat, modal scope) and
+  // registers each binding's cheat-sheet entry from the same declaration.
+  // `unlessKnobFocused` keeps the transport quiet while a Knob has focus
+  // (it owns its own arrow/step handling).
+  useGlobalShortcut({
     id: "transport.playpause",
-    keys: ["Space"],
-    description: "Play / pause",
-    group: "Transport",
-    icon: <PlayIcon />,
+    keys: [" "],
+    unlessKnobFocused: true,
+    onDown: () => setPlaying(!isPlaying),
+    help: {
+      keys: ["Space"],
+      description: "Play / pause",
+      group: "Transport",
+      icon: <PlayIcon />,
+    },
   });
-  useRegisterShortcut({
+  useGlobalShortcut({
     id: "transport.framestep",
-    keys: ["←", "→"],
-    description: "Step by snap target (frame, beat, bar, or match-point)",
-    group: "Transport",
-    icon: <ArrowKeysIcon />,
+    keys: ["ArrowLeft"],
+    allowRepeat: true,
+    unlessKnobFocused: true,
+    onDown: () => stepByActiveSnap(-1),
+    help: {
+      keys: ["←", "→"],
+      description: "Step by snap target (frame, beat, bar, or match-point)",
+      group: "Transport",
+      icon: <ArrowKeysIcon />,
+    },
   });
-  useRegisterShortcut({
+  useGlobalShortcut({
+    id: "transport.framestep.fwd",
+    keys: ["ArrowRight"],
+    allowRepeat: true,
+    unlessKnobFocused: true,
+    onDown: () => stepByActiveSnap(1),
+  });
+  useGlobalShortcut({
     id: "transport.loopshift",
-    keys: ["⌥←", "⌥→"],
-    description: "Shift loop region by its length (OP-1 style; playback continues)",
-    group: "Transport",
-    icon: <LoopIcon />,
+    keys: ["ArrowLeft"],
+    modifiers: ["alt"],
+    allowRepeat: true,
+    unlessKnobFocused: true,
+    onDown: () => shiftLoop(-1),
+    help: {
+      keys: ["⌥←", "⌥→"],
+      description:
+        "Shift loop region by its length (OP-1 style; playback continues)",
+      group: "Transport",
+      icon: <LoopIcon />,
+    },
   });
-  useRegisterShortcut({
+  useGlobalShortcut({
+    id: "transport.loopshift.fwd",
+    keys: ["ArrowRight"],
+    modifiers: ["alt"],
+    allowRepeat: true,
+    unlessKnobFocused: true,
+    onDown: () => shiftLoop(1),
+  });
+  useGlobalShortcut({
     id: "transport.in",
-    keys: ["I"],
-    description: ioInDescription(ioContextKind),
-    group: "Transport",
-    icon: <InIcon />,
+    keys: ["i", "I"],
+    shiftInsensitive: true,
+    unlessKnobFocused: true,
+    onDown: () => setInPointAtPlayhead(),
+    help: {
+      keys: ["I"],
+      description: ioInDescription(ioContextKind),
+      group: "Transport",
+      icon: <InIcon />,
+    },
   });
-  useRegisterShortcut({
+  useGlobalShortcut({
     id: "transport.out",
-    keys: ["O"],
-    description: ioOutDescription(ioContextKind),
-    group: "Transport",
-    icon: <OutIcon />,
+    keys: ["o", "O"],
+    shiftInsensitive: true,
+    unlessKnobFocused: true,
+    onDown: () => setOutPointAtPlayhead(),
+    help: {
+      keys: ["O"],
+      description: ioOutDescription(ioContextKind),
+      group: "Transport",
+      icon: <OutIcon />,
+    },
   });
-  useRegisterShortcut({
+  useGlobalShortcut({
     id: "transport.loop",
-    keys: ["L"],
-    description: loop
-      ? "Disable loop"
-      : "Loop a 2-second region from the playhead",
-    group: "Transport",
-    icon: <LoopIcon />,
+    keys: ["l", "L"],
+    shiftInsensitive: true,
+    unlessKnobFocused: true,
+    onDown: () => toggleLoop(),
+    help: {
+      keys: ["L"],
+      description: loop
+        ? "Disable loop"
+        : "Loop a 2-second region from the playhead",
+      group: "Transport",
+      icon: <LoopIcon />,
+    },
   });
 
   return (
