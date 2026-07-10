@@ -58,8 +58,21 @@ import type { Visualizer } from "./visualizer/types";
 import { camSourceTimeUs } from "../timing/cam-time";
 
 export interface Segment {
-  in: number; // seconds
-  out: number; // seconds
+  in: number; // seconds (master-time)
+  out: number; // seconds (master-time)
+  /**
+   * Arrangement-time (seconds) of this segment's start on the EDITOR'S
+   * FULL arrangement axis — the axis pills, cuts and FX are anchored
+   * against. Set by `buildEditSpec` (which slices the arrangement by the
+   * master-trim window via `sliceByArrSegments`). Without it the render
+   * loop re-accumulates arr-time from 0 at the trim point, so a leading
+   * trim of Δ seconds resolved pills/cuts/FX Δ seconds early — the
+   * exported picture showed the song's beginning while the audio played
+   * from the trim point. Optional for callers without arrangement
+   * context; the renderer then falls back to accumulation (correct
+   * whenever nothing was trimmed away).
+   */
+  arrStartS?: number;
 }
 
 export interface EditRenderProgress {
@@ -887,18 +900,22 @@ export async function editRenderMulti(
   let outputQueue: Promise<void> = Promise.resolve();
   let chainInFlight = 0;
   try {
-    // Per-segment arr-time cursor — accumulated so each frame's `tArr`
-    // matches the editor's masterToArr projection, which is what pills
-    // are anchored against.
+    // Per-segment arr-time cursor — fallback for segments without an
+    // explicit `arrStartS`. Segments produced by `buildEditSpec` carry
+    // their start position on the editor's FULL arrangement axis, which
+    // is what pills/cuts/FX are anchored against; a master-trim removes
+    // leading arr-time, so re-accumulating from 0 would shift every
+    // lookup by the trimmed duration (issue #79).
     let arrCursorPerSeg = 0;
     for (const seg of intervals) {
       const segStartFrame = framesEmitted;
       framesSinceKeyframe = 0;
+      const segArrStartS = seg.arrStartS ?? arrCursorPerSeg;
       const segFrames = Math.max(0, Math.round((seg.out - seg.in) * fps));
       for (let i = 0; i < segFrames; i++) {
         if (pendingError) throw pendingError;
         const tMaster = seg.in + i / fps;
-        const tArr = arrCursorPerSeg + i / fps;
+        const tArr = segArrStartS + i / fps;
         // Active cam: pill-aware in arrangement-mode, legacy clip-range
         // in direct-mode. Pills also yield the active pill so we can
         // pull source-time directly from its sourceIn/Out window.

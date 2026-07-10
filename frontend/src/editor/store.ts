@@ -2351,7 +2351,14 @@ export const useEditorStore = create<EditorState>()(
         s.arrangementSegments,
       );
       const segments = slices.map((sl) => {
-        const out: Segment = { in: sl.masterStartS, out: sl.masterEndS };
+        // arrStartS = the slice's position on the FULL arrangement axis.
+        // The renderer needs it to resolve pills/cuts/FX at the editor's
+        // arr-coordinates after a master-trim removed leading material.
+        const out: Segment = {
+          in: sl.masterStartS,
+          out: sl.masterEndS,
+          arrStartS: sl.arrStartS,
+        };
         // Pass through audioStartMs / chunkId for any chunk-anchored
         // metadata the renderer might inspect downstream — we don't
         // re-derive it from the slice (the original segment's anchor

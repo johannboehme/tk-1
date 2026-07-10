@@ -169,4 +169,61 @@ describe("Export verification — multi-cam × multi-pill × multi-segment", () 
     },
     180_000,
   );
+
+  it(
+    "master-trimmed export resolves pills on the editor's arrangement axis (#79)",
+    async () => {
+      const [redBlob, blueBlob] = await Promise.all([
+        (await fetch(RED_URL)).blob(),
+        (await fetch(BLUE_URL)).blob(),
+      ]);
+      const audio = makeSineWav(880, 6.0, 48000);
+
+      // Editor state this mirrors: arrangement [0..2)+[3..5) master →
+      // arr axis 0..4; pills RED over arr [0..2), BLUE over arr [2..4);
+      // the user then master-trims to [3..5], i.e. keeps only the last
+      // chunk. buildEditSpec slices the arrangement to one segment
+      // {in:3, out:5} whose arr-position on the FULL editor axis is 2
+      // (carried as arrStartS). The exported 2 s must therefore show
+      // BLUE (arr 2..4) — the pre-fix renderer re-accumulated arr-time
+      // from 0 at the trim point and showed RED (arr 0..2) while the
+      // audio played the trimmed-to master range: a constant 2 s A/V
+      // content desync.
+      const result = await editRenderMulti({
+        cams: [
+          { id: "red",  file: redBlob,  masterStartS: 0, sourceDurationS: 6, kind: "video" },
+          { id: "blue", file: blueBlob, masterStartS: 0, sourceDurationS: 6, kind: "video" },
+        ],
+        cuts: [],
+        pills: [
+          { id: "p1", camId: "red",  arrStartS: 0, arrEndS: 2, sourceInS: 0, sourceOutS: 2, originalArrStartS: 0, originalArrEndS: 2, originalSourceInS: 0, originalSourceOutS: 2 },
+          { id: "p2", camId: "blue", arrStartS: 2, arrEndS: 4, sourceInS: 0, sourceOutS: 2, originalArrStartS: 2, originalArrEndS: 4, originalSourceInS: 0, originalSourceOutS: 2 },
+        ],
+        masterDurationS: 6,
+        audioFile: audio,
+        segments: [{ in: 3, out: 5, arrStartS: 2 }],
+        overlays: [],
+        offsetMs: 0,
+        driftRatio: 1.0,
+        outputFps: 30,
+      });
+
+      expect(result.output).not.toBeNull();
+      const outBytes = result.output!;
+
+      const reparsed = await demuxVideoTrack(new Blob([outBytes as BlobPart]));
+      expect(reparsed).not.toBeNull();
+      expect(reparsed!.info.durationS).toBeGreaterThan(1.7);
+      expect(reparsed!.info.durationS).toBeLessThan(2.3);
+
+      const colors = await decodeFrameColorsAt(outBytes, [0.5, 1.5]);
+      console.log("[verify-trim] sampled output frames (centre pixel):");
+      for (const c of colors) {
+        console.log(`  t=${c.tS.toFixed(2)}s  rgb=${c.r},${c.g},${c.b}  → ${c.dominant}`);
+      }
+      expect(colors[0].dominant).toBe("blue"); // arr 2.5 → BLUE pill
+      expect(colors[1].dominant).toBe("blue"); // arr 3.5 → BLUE pill
+    },
+    180_000,
+  );
 });
