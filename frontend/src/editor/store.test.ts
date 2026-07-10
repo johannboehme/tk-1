@@ -324,6 +324,118 @@ describe("useEditorStore", () => {
     });
   });
 
+  describe("addCut / hold-paint — timeline-time material guards (#75)", () => {
+    // Long-form: chunk at master [300, 330) arranged FIRST (arr [0, 30)).
+    // cam-2 joins the session late — master range [280, 400) — so its
+    // pill covers arr [0, 30) but its MASTER range contains none of the
+    // small arr-times that cuts carry. cam-3 leaves early — master range
+    // [0, 310) — so its pill covers only arr [0, 10).
+    const loadLongform = () => {
+      useEditorStore.getState().loadJob(
+        { ...baseJobMeta, duration: 400 },
+        {
+          clips: [
+            {
+              id: "cam-1",
+              filename: "a.mp4",
+              color: "#fff",
+              sourceDurationS: 400,
+              syncOffsetMs: 0,
+            },
+            {
+              id: "cam-2",
+              filename: "b.mp4",
+              color: "#0ff",
+              sourceDurationS: 120,
+              syncOffsetMs: -280000, // master range [280, 400)
+            },
+            {
+              id: "cam-3",
+              filename: "c.mp4",
+              color: "#ff0",
+              sourceDurationS: 310,
+              syncOffsetMs: 0, // master range [0, 310) → pill arr [0, 10)
+            },
+          ],
+          arrangement: [{ id: "i1", chunkId: "c1" }],
+          chunks: [
+            {
+              id: "c1",
+              startMs: 300_000,
+              endMs: 330_000,
+              bpmOctaveShift: 0 as const,
+              effectiveBpm: 120,
+              beatsPerBar: 4,
+              accepted: true,
+              trimMode: "auto" as const,
+            },
+          ],
+          arrangementSegments: [{ in: 300, out: 330 }],
+        },
+      );
+    };
+
+    test("TAKE succeeds when the cam's PILL covers the arr-time (master range doesn't)", () => {
+      loadLongform();
+      // Sanity: cam-2's pill covers the whole chunk slot.
+      const pill = useEditorStore
+        .getState()
+        .pills.find((p) => p.camId === "cam-2");
+      expect(pill?.arrStartS).toBe(0);
+      expect(pill?.arrEndS).toBe(30);
+      // arr-time 10 is nowhere near cam-2's master range [280, 400) —
+      // the old master-axis guard silently dropped this cut.
+      const ok = useEditorStore
+        .getState()
+        .addCut({ atTimeS: 10, camId: "cam-2" });
+      expect(ok).toBe(true);
+      expect(useEditorStore.getState().cuts).toEqual([
+        { atTimeS: 10, camId: "cam-2" },
+      ]);
+    });
+
+    test("TAKE is rejected when the cam has NO pill at the arr-time (even if its master range covers it)", () => {
+      loadLongform();
+      // cam-3's pill ends at arr 10; master range [0, 310) contains 20,
+      // which used to let an inert cut through.
+      const ok = useEditorStore
+        .getState()
+        .addCut({ atTimeS: 20, camId: "cam-3" });
+      expect(ok).toBe(false);
+      expect(useEditorStore.getState().cuts).toEqual([]);
+      // Inside its pill window the TAKE lands.
+      expect(
+        useEditorStore.getState().addCut({ atTimeS: 5, camId: "cam-3" }),
+      ).toBe(true);
+    });
+
+    test("applyHoldRelease resumes to the arr-time active cam, not a master-axis guess", () => {
+      loadLongform();
+      const priorCuts = [{ atTimeS: 2, camId: "cam-2" }];
+      useEditorStore.setState({ cuts: priorCuts });
+      // Hold-paint cam-1 over arr [5, 12]: the resume cut at 12 must
+      // target cam-2 (on PROGRAM there via the cut at arr 2). The old
+      // master-axis resolution thought cam-2 had no material at master 12
+      // and fell back to cam-1 — dropping both lead and resume cuts.
+      useEditorStore.getState().applyHoldRelease("cam-1", 5, 12, priorCuts);
+      expect(useEditorStore.getState().cuts).toEqual([
+        { atTimeS: 2, camId: "cam-2" },
+        { atTimeS: 5, camId: "cam-1" },
+        { atTimeS: 12, camId: "cam-2" },
+      ]);
+    });
+
+    test("overwriteCutsRange emits the in-marker on pill coverage", () => {
+      loadLongform();
+      useEditorStore.setState({ cuts: [{ atTimeS: 2, camId: "cam-2" }] });
+      useEditorStore.getState().overwriteCutsRange("cam-1", 5, 12);
+      expect(useEditorStore.getState().cuts).toEqual([
+        { atTimeS: 2, camId: "cam-2" },
+        { atTimeS: 5, camId: "cam-1" },
+      ]);
+    });
+  });
+
   describe("hold-gesture cancellation", () => {
     test("beginHoldGesture snapshots cuts, cancelHold reverts them", () => {
       useEditorStore.getState().loadJob(baseJobMeta, {

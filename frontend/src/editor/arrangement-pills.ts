@@ -204,6 +204,21 @@ export function reconcilePills(
  * Returns the active pill so callers (compositor + Timeline) can pull
  * its source-time mapping without re-scanning.
  */
+/** True when `camId` has a pill covering song-time `arrT` (half-open,
+ *  like every pill window). Pills ARE the cam's material on the song
+ *  timeline — use this for "can this cam be cut to here" guards instead
+ *  of master-time `clipRangeS` ranges, which live on the wrong axis for
+ *  timeline-time cuts. */
+export function camHasPillAt(
+  camId: string,
+  arrT: number,
+  pills: readonly Pill[],
+): boolean {
+  return pills.some(
+    (p) => p.camId === camId && arrT >= p.arrStartS && arrT < p.arrEndS,
+  );
+}
+
 export function activeCamAtArr(
   cuts: readonly Cut[],
   arrT: number,

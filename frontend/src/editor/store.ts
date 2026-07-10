@@ -24,6 +24,7 @@ import {
 } from "./types";
 import {
   activeCamAtArr,
+  camHasPillAt,
   reconcilePills,
 } from "./arrangement-pills";
 import {
@@ -882,14 +883,43 @@ function makeFxId(): string {
   return `fx-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
 }
 
-/** True if `camId` has material at master-timeline time `t`. */
-function camHasMaterialAt(
+/** Resolve the cam on PROGRAM at timeline-time `t` for cut-guard
+ *  purposes. Cuts live in timeline-time (song axis) since the axis flip,
+ *  so the resolution MUST run against the pills' arr-time coverage —
+ *  master-time `clipRangeS` ranges are the wrong axis and reject valid
+ *  TAKEs in long-form (#75).
+ *
+ *  Pill-less stores (simplified test harnesses that `loadJob` without an
+ *  arrangement — production always synthesizes one) fall back to the
+ *  legacy master-range resolution; for those the default whole-master
+ *  segment makes both axes identical. */
+function activeCamIdAtTimelineT(
+  cuts: readonly Cut[],
+  t: number,
+  pills: readonly Pill[],
+  segments: readonly Segment[],
+  clips: readonly Clip[],
+): string | null {
+  if (pills.length === 0) {
+    return activeCamAt(cuts, t, computeCamRanges(clips));
+  }
+  return activeCamAtArr(cuts, t, pills, segments)?.camId ?? null;
+}
+
+/** True if `camId` has material at timeline-time `t` — pill coverage on
+ *  the song axis, with the same pill-less legacy fallback as
+ *  `activeCamIdAtTimelineT`. */
+function camHasMaterialAtTimelineT(
   camId: string,
   t: number,
-  ranges: readonly CamRange[],
+  pills: readonly Pill[],
+  clips: readonly Clip[],
 ): boolean {
-  const r = ranges.find((x) => x.id === camId);
-  return !!r && t >= r.startS && t < r.endS;
+  if (pills.length === 0) {
+    const r = computeCamRanges(clips).find((x) => x.id === camId);
+    return !!r && t >= r.startS && t < r.endS;
+  }
+  return camHasPillAt(camId, t, pills);
 }
 
 function buildClips(inits: ClipInit[] | undefined, fallbackOverrideMs: number): Clip[] {
@@ -2085,28 +2115,33 @@ export const useEditorStore = create<EditorState>()(
       set({ audioVolume: clamped });
     },
     addCut(cut) {
-      // Compute ranges once (memoized on the clips array reference, so
-      // back-to-back addCut calls share the same range list) and reuse
-      // for both no-op guards instead of recomputing twice.
+      // Cut.atTimeS is timeline-time — both guards resolve on the SAME
+      // axis via pill coverage (see activeCamIdAtTimelineT, #75). The
+      // legacy master-range guards rejected valid TAKEs whenever a cam's
+      // master range didn't happen to contain the small arr-times that
+      // long-form cuts carry.
       const s = get();
-      const ranges = computeCamRanges(s.clips);
 
       // No-op guard #1: if the cam is already active at this time (via a
       // prior cut or default-fallback), inserting another marker to the
       // same cam is redundant.
-      const currentActive = activeCamAt(s.cuts, cut.atTimeS, ranges);
+      const currentActive = activeCamIdAtTimelineT(
+        s.cuts,
+        cut.atTimeS,
+        s.pills,
+        s.arrangementSegments,
+        s.clips,
+      );
       if (currentActive === cut.camId) return false;
 
-      // No-op guard #2: if the target cam has NO material at this time,
-      // adding the cut wouldn't change anything — activeCamAt would still
-      // fall back to whatever cam has material here. This is the "single-
-      // video area" case: in a region only cam-2 covers, hitting TAKE on
-      // cam-1 used to deposit a marker that did nothing.
-      const target = ranges.find((r) => r.id === cut.camId);
+      // No-op guard #2: if the target cam has NO material (pill) at this
+      // song-position, adding the cut wouldn't change anything — the
+      // resolver would still fall back to whatever cam covers the spot.
+      // This is the "single-video area" case: in a region only cam-2
+      // covers, hitting TAKE on cam-1 used to deposit a marker that did
+      // nothing.
       if (
-        !target ||
-        cut.atTimeS < target.startS ||
-        cut.atTimeS >= target.endS
+        !camHasMaterialAtTimelineT(cut.camId, cut.atTimeS, s.pills, s.clips)
       ) {
         return false;
       }
@@ -2145,18 +2180,25 @@ export const useEditorStore = create<EditorState>()(
     overwriteCutsRange(camId, fromS, toS) {
       const lo = Math.min(fromS, toS);
       const hi = Math.max(fromS, toS);
-      const cuts = get().cuts;
+      const s = get();
       // Drop every cut inside [lo, hi] — the held cam painted over them.
-      let next = cuts.filter((c) => c.atTimeS < lo || c.atTimeS > hi);
-      const ranges = get().clips.map((c) => {
-        const r = clipRangeS(c);
-        return { id: c.id, startS: r.startS, endS: r.endS };
-      });
-      const activeAtLo = activeCamAt(next, lo, ranges);
+      let next = s.cuts.filter((c) => c.atTimeS < lo || c.atTimeS > hi);
+      // Hold-paint endpoints are timeline-time — resolve on the pill
+      // axis, exactly like addCut (#75).
+      const activeAtLo = activeCamIdAtTimelineT(
+        next,
+        lo,
+        s.pills,
+        s.arrangementSegments,
+        s.clips,
+      );
       // Same guard as addCut: only emit the in-marker when the held cam
       // actually has material at lo. Otherwise the marker is visually
-      // inert (activeCamAt falls back to whoever else covers the spot).
-      if (activeAtLo !== camId && camHasMaterialAt(camId, lo, ranges)) {
+      // inert (the resolver falls back to whoever else covers the spot).
+      if (
+        activeAtLo !== camId &&
+        camHasMaterialAtTimelineT(camId, lo, s.pills, s.clips)
+      ) {
         next = [...next, { atTimeS: lo, camId }].sort(
           (a, b) => a.atTimeS - b.atTimeS,
         );
@@ -2166,26 +2208,43 @@ export const useEditorStore = create<EditorState>()(
     applyHoldRelease(camId: string, fromS: number, toS: number, priorCuts: Cut[]) {
       const lo = Math.min(fromS, toS);
       const hi = Math.max(fromS, toS);
-      const ranges = get().clips.map((c) => {
-        const r = clipRangeS(c);
-        return { id: c.id, startS: r.startS, endS: r.endS };
-      });
+      const s = get();
       // What WOULD have been on PROGRAM at the release moment if we hadn't
       // painted? That's the cam we want to resume to (unless it's the cam
       // we were holding, in which case the hold was redundant and no
-      // trailing cut is needed).
-      const prevActiveAtRelease = activeCamAt(priorCuts, hi, ranges);
+      // trailing cut is needed). All endpoints are timeline-time, so the
+      // resolution runs on the pill axis (#75) — the legacy master-range
+      // lookup could resume to a cam with no pill at this song-position
+      // (inert cut) or to the wrong cam.
+      const prevActiveAtRelease = activeCamIdAtTimelineT(
+        priorCuts,
+        hi,
+        s.pills,
+        s.arrangementSegments,
+        s.clips,
+      );
 
       // Paint: drop cuts in [lo, hi], insert lead cut if camId wasn't
       // already active at lo AND it actually has material there.
-      let next: Cut[] = priorCuts.filter((c) => c.atTimeS < lo || c.atTimeS > hi);
-      const activeAtLo = activeCamAt(next, lo, ranges);
-      if (activeAtLo !== camId && camHasMaterialAt(camId, lo, ranges)) {
+      const next: Cut[] = priorCuts.filter(
+        (c) => c.atTimeS < lo || c.atTimeS > hi,
+      );
+      const activeAtLo = activeCamIdAtTimelineT(
+        next,
+        lo,
+        s.pills,
+        s.arrangementSegments,
+        s.clips,
+      );
+      if (
+        activeAtLo !== camId &&
+        camHasMaterialAtTimelineT(camId, lo, s.pills, s.clips)
+      ) {
         next.push({ atTimeS: lo, camId });
       }
 
       // Trailing resume cut at hi — only if the original would have shown
-      // a different cam there. activeCamAt only returns a cam that has
+      // a different cam there. The resolver only returns a cam that has
       // material, so the trailing cut already targets a valid spot.
       if (prevActiveAtRelease !== null && prevActiveAtRelease !== camId) {
         next.push({ atTimeS: hi, camId: prevActiveAtRelease });
