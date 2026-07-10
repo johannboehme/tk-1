@@ -30,6 +30,7 @@ import {
 type MuxTarget = ArrayBufferTarget | FileSystemWritableFileStreamTarget;
 import {
   encodeAudioFromPcm,
+  resolveAudioCodecWithFallback,
   streamEncodeAudioWithSegments,
   type AudioEncodeCodec,
 } from "../codec/webcodecs/audio-encode";
@@ -46,9 +47,10 @@ import {
 import { Compositor } from "./compositor";
 import type { BackendCapabilities } from "../../editor/render/factory";
 import { CamFrameStream } from "./cam-frame-stream";
-import { makeTestPatternCanvas } from "./test-pattern";
+import { makeTestPatternBitmap } from "./test-pattern";
 import { activeCamAt } from "../../editor/cuts";
 import { activeCamAtArr as activeCamAtArrLocal } from "../../editor/arrangement-pills";
+import { planSegmentFrames, outputTimestampUs } from "./frame-timing";
 import type { Cut } from "../../storage/jobs-db";
 import type { PunchFx } from "../../editor/fx/types";
 import type { GradeParams } from "../../editor/fx/looks";
@@ -58,8 +60,21 @@ import type { Visualizer } from "./visualizer/types";
 import { camSourceTimeUs } from "../timing/cam-time";
 
 export interface Segment {
-  in: number; // seconds
-  out: number; // seconds
+  in: number; // seconds (master-time)
+  out: number; // seconds (master-time)
+  /**
+   * Arrangement-time (seconds) of this segment's start on the EDITOR'S
+   * FULL arrangement axis — the axis pills, cuts and FX are anchored
+   * against. Set by `buildEditSpec` (which slices the arrangement by the
+   * master-trim window via `sliceByArrSegments`). Without it the render
+   * loop re-accumulates arr-time from 0 at the trim point, so a leading
+   * trim of Δ seconds resolved pills/cuts/FX Δ seconds early — the
+   * exported picture showed the song's beginning while the audio played
+   * from the trim point. Optional for callers without arrangement
+   * context; the renderer then falls back to accumulation (correct
+   * whenever nothing was trimmed away).
+   */
+  arrStartS?: number;
 }
 
 export interface EditRenderProgress {
@@ -356,11 +371,10 @@ export async function editRender(input: EditRenderInput): Promise<EditRenderResu
             frame.codedHeight,
             outTs,
             frame.duration ?? 0,
+            // Single-cam pipeline: no arrangement, so timeline-time ==
+            // master-time == the source frame's timestamp.
+            { tTimelineS: tS, tMasterS: tS },
             srcRot,
-            undefined,
-            // FX live on the master timeline; tS is the source-frame's
-            // master time (single-cam pipeline = master time).
-            tS,
           );
           const keyFrame =
             firstFrameInGop || framesSinceKeyframe >= KEYFRAME_INTERVAL_FRAMES;
@@ -707,9 +721,21 @@ export async function editRenderMulti(
   } else {
     throw new Error("editRenderMulti: either audioFile or audioPcm is required");
   }
-  const audioCodec: AudioEncodeCodec = input.audioCodec ?? "aac";
   const audioSampleRate = audio.sampleRate;
   const audioChannels = audio.channels;
+  // Pre-probe the audio codec with aac↔opus fallback (mirrors the h265
+  // pre-probe above). The muxer's audio track codec is fixed at
+  // construction and streamEncodeAudioWithSegments deliberately has no
+  // mid-encode fallback, so this is the only point where an unsupported
+  // codec can still be swapped. iOS Safari ships AudioEncoder without
+  // AAC (and some Android AAC encoders are broken) — without the probe
+  // every default export there hard-failed even though Opus works.
+  const audioCodec: AudioEncodeCodec = await resolveAudioCodecWithFallback(
+    input.audioCodec ?? "aac",
+    audioSampleRate,
+    audioChannels,
+    input.audioBitrateBps ?? 192_000,
+  );
 
   // Cam ranges on the master timeline + a test-pattern source for gaps.
   // Per-clip trim (video cams only) narrows the available window; image
@@ -738,7 +764,9 @@ export async function editRenderMulti(
   const masterDurationS =
     input.masterDurationS ??
     Math.max(...camRanges.map((r) => r.endS), 0);
-  const testPattern = makeTestPatternCanvas(outputWidth, outputHeight);
+  // ImageBitmap, not the raw canvas: WebGL2 canvas uploads ignore
+  // UNPACK_FLIP_Y_WEBGL and rendered the pattern upside-down (#141).
+  const testPattern = makeTestPatternBitmap(outputWidth, outputHeight);
 
   // Compositor (overlays + visualizers + fx shared across cams).
   const compositor = await Compositor.create(
@@ -862,8 +890,15 @@ export async function editRenderMulti(
     input.segments.length > 0
       ? input.segments
       : [{ in: 0, out: masterDurationS }];
-  const totalKept = intervals.reduce((acc, s) => acc + (s.out - s.in), 0);
-  const totalFrames = Math.max(1, Math.round(totalKept * fps));
+  // Frame counts come from CUMULATIVE kept-duration targets so the
+  // per-segment rounding errors cancel instead of accumulating against
+  // the sample-exact audio concatenation (issue #107) — see
+  // frame-timing.ts for the failure math.
+  const segFramesPlan = planSegmentFrames(intervals, fps);
+  const totalFrames = Math.max(
+    1,
+    segFramesPlan.reduce((acc, n) => acc + n, 0),
+  );
   const frameDurationUs = Math.round(1_000_000 / fps);
   // Force a keyframe every ~2s so players can scrub without decoding
   // thousands of P-frames from the segment start.
@@ -888,18 +923,23 @@ export async function editRenderMulti(
   let outputQueue: Promise<void> = Promise.resolve();
   let chainInFlight = 0;
   try {
-    // Per-segment arr-time cursor — accumulated so each frame's `tArr`
-    // matches the editor's masterToArr projection, which is what pills
-    // are anchored against.
+    // Per-segment arr-time cursor — fallback for segments without an
+    // explicit `arrStartS`. Segments produced by `buildEditSpec` carry
+    // their start position on the editor's FULL arrangement axis, which
+    // is what pills/cuts/FX are anchored against; a master-trim removes
+    // leading arr-time, so re-accumulating from 0 would shift every
+    // lookup by the trimmed duration (issue #79).
     let arrCursorPerSeg = 0;
-    for (const seg of intervals) {
+    for (let segIdx = 0; segIdx < intervals.length; segIdx++) {
+      const seg = intervals[segIdx];
       const segStartFrame = framesEmitted;
       framesSinceKeyframe = 0;
-      const segFrames = Math.max(0, Math.round((seg.out - seg.in) * fps));
+      const segArrStartS = seg.arrStartS ?? arrCursorPerSeg;
+      const segFrames = segFramesPlan[segIdx];
       for (let i = 0; i < segFrames; i++) {
         if (pendingError) throw pendingError;
         const tMaster = seg.in + i / fps;
-        const tArr = arrCursorPerSeg + i / fps;
+        const tArr = segArrStartS + i / fps;
         // Active cam: pill-aware in arrangement-mode, legacy clip-range
         // in direct-mode. Pills also yield the active pill so we can
         // pull source-time directly from its sourceIn/Out window.
@@ -1058,7 +1098,10 @@ export async function editRenderMulti(
             transform: {},
           };
         }
-        const outTimestampUs = framesEmitted * frameDurationUs;
+        // Exact per-frame stamp — NOT framesEmitted * frameDurationUs:
+        // the pre-rounded 33333 µs cadence drifts ~18 ms per 30 min at
+        // 30 fps against the audio's exact sample clock (issue #107).
+        const outTimestampUs = outputTimestampUs(framesEmitted, fps);
         const isFirstInSeg = framesEmitted === segStartFrame;
         const isKeyframe =
           isFirstInSeg || framesSinceKeyframe >= KEYFRAME_INTERVAL_FRAMES;
@@ -1068,7 +1111,18 @@ export async function editRenderMulti(
           src,
           outTs: outTimestampUs,
           isKeyframe,
-          tArr,
+          // Semantic frame times for the compositor (see FrameTimes).
+          // Timeline axis: in pill mode the arrangement axis the editor
+          // anchors FX/cuts/pills against; in direct mode there is no
+          // arrangement, so timeline == master (a trimmed direct export
+          // re-accumulating from 0 would fire every FX late by the
+          // leading-trim duration). Master axis: the audio position the
+          // encoder made audible at this output frame — beat grid +
+          // sidechain + visualizers are anchored there.
+          times: {
+            tTimelineS: pillMode ? tArr : tMaster,
+            tMasterS: tMaster,
+          },
         };
         framesEmitted++;
         chainInFlight++;
@@ -1083,12 +1137,9 @@ export async function editRenderMulti(
               captured.src.h,
               captured.outTs,
               frameDurationUs,
+              captured.times,
               captured.src.rot,
               captured.src.transform,
-              // FX live in timeline-time (= arrangement-time). Pass tArr
-              // so the FX-active query lines up with the editor: a recording
-              // at the duplicate-pill slot fires there and only there.
-              captured.tArr,
             );
             encoder.pushFrame(composed, { keyFrame: captured.isKeyframe });
             composed.close();
@@ -1177,6 +1228,7 @@ export async function editRenderMulti(
     };
   } finally {
     compositor.destroy();
+    testPattern.close();
     for (const d of demuxResults) {
       if (d.kind === "video") d.stream.close();
       else d.bitmap.close();

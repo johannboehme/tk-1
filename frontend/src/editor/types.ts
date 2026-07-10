@@ -28,6 +28,13 @@ export interface Segment {
    *  item. Useful for diagnostics and for picking the right per-chunk
    *  metadata downstream. */
   chunkId?: string;
+  /** Arrangement-time (seconds) of this segment's start on the FULL
+   *  editor arrangement axis. Set by `buildEditSpec` when slicing the
+   *  arrangement by the master-trim window, so the renderer resolves
+   *  pills/cuts/FX at the same arr-positions the editor shows instead
+   *  of re-accumulating arr-time from 0 at the trim point (issue #79).
+   *  Optional — arrangement segments themselves don't carry it. */
+  arrStartS?: number;
 }
 
 /**

@@ -74,6 +74,35 @@ async function decodeFrameColorsAt(
   return out;
 }
 
+/** Corner-pixel brightness (max channel) per probe time. A punch-in
+ *  vignette at full intensity crushes the corners to near-black, so
+ *  this cleanly separates "FX active" from "FX inactive" frames. */
+async function decodeCornerBrightnessAt(
+  mp4Bytes: Uint8Array,
+  targetTimesS: number[],
+): Promise<{ tS: number; brightness: number }[]> {
+  const stream = await CamFrameStream.create(new Blob([mp4Bytes as BlobPart]));
+  const canvas = new OffscreenCanvas(stream.width, stream.height);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("no canvas 2d");
+  const out: { tS: number; brightness: number }[] = [];
+  try {
+    for (const tS of targetTimesS) {
+      const frame = await stream.frameAtOrBefore(Math.round(tS * 1_000_000));
+      if (!frame) {
+        out.push({ tS, brightness: -1 });
+        continue;
+      }
+      ctx.drawImage(frame as unknown as CanvasImageSource, 0, 0);
+      const px = ctx.getImageData(4, 4, 1, 1).data;
+      out.push({ tS, brightness: Math.max(px[0], px[1], px[2]) });
+    }
+  } finally {
+    stream.close();
+  }
+  return out;
+}
+
 describe("Export verification — multi-cam × multi-pill × multi-segment", () => {
   it(
     "produces a valid MP4 with the correct cam at every output time",
@@ -166,6 +195,275 @@ describe("Export verification — multi-cam × multi-pill × multi-segment", () 
       expect(colors[1].dominant).toBe("blue");  // Pill 2 @ arr 1.5
       expect(colors[2].dominant).toBe("red");   // Pill 3 @ arr 2.5
       expect(colors[3].dominant).toBe("blue");  // Pill 4 @ arr 3.5
+    },
+    180_000,
+  );
+
+  it(
+    "master-trimmed export resolves pills on the editor's arrangement axis (#79)",
+    async () => {
+      const [redBlob, blueBlob] = await Promise.all([
+        (await fetch(RED_URL)).blob(),
+        (await fetch(BLUE_URL)).blob(),
+      ]);
+      const audio = makeSineWav(880, 6.0, 48000);
+
+      // Editor state this mirrors: arrangement [0..2)+[3..5) master →
+      // arr axis 0..4; pills RED over arr [0..2), BLUE over arr [2..4);
+      // the user then master-trims to [3..5], i.e. keeps only the last
+      // chunk. buildEditSpec slices the arrangement to one segment
+      // {in:3, out:5} whose arr-position on the FULL editor axis is 2
+      // (carried as arrStartS). The exported 2 s must therefore show
+      // BLUE (arr 2..4) — the pre-fix renderer re-accumulated arr-time
+      // from 0 at the trim point and showed RED (arr 0..2) while the
+      // audio played the trimmed-to master range: a constant 2 s A/V
+      // content desync.
+      const result = await editRenderMulti({
+        cams: [
+          { id: "red",  file: redBlob,  masterStartS: 0, sourceDurationS: 6, kind: "video" },
+          { id: "blue", file: blueBlob, masterStartS: 0, sourceDurationS: 6, kind: "video" },
+        ],
+        cuts: [],
+        pills: [
+          { id: "p1", camId: "red",  arrStartS: 0, arrEndS: 2, sourceInS: 0, sourceOutS: 2, originalArrStartS: 0, originalArrEndS: 2, originalSourceInS: 0, originalSourceOutS: 2 },
+          { id: "p2", camId: "blue", arrStartS: 2, arrEndS: 4, sourceInS: 0, sourceOutS: 2, originalArrStartS: 2, originalArrEndS: 4, originalSourceInS: 0, originalSourceOutS: 2 },
+        ],
+        masterDurationS: 6,
+        audioFile: audio,
+        segments: [{ in: 3, out: 5, arrStartS: 2 }],
+        overlays: [],
+        offsetMs: 0,
+        driftRatio: 1.0,
+        outputFps: 30,
+      });
+
+      expect(result.output).not.toBeNull();
+      const outBytes = result.output!;
+
+      const reparsed = await demuxVideoTrack(new Blob([outBytes as BlobPart]));
+      expect(reparsed).not.toBeNull();
+      expect(reparsed!.info.durationS).toBeGreaterThan(1.7);
+      expect(reparsed!.info.durationS).toBeLessThan(2.3);
+
+      const colors = await decodeFrameColorsAt(outBytes, [0.5, 1.5]);
+      console.log("[verify-trim] sampled output frames (centre pixel):");
+      for (const c of colors) {
+        console.log(`  t=${c.tS.toFixed(2)}s  rgb=${c.r},${c.g},${c.b}  → ${c.dominant}`);
+      }
+      expect(colors[0].dominant).toBe("blue"); // arr 2.5 → BLUE pill
+      expect(colors[1].dominant).toBe("blue"); // arr 3.5 → BLUE pill
+    },
+    180_000,
+  );
+
+  it(
+    "punch-in FX fires exactly at its timeline window in a trimmed multi-segment export (#85)",
+    async () => {
+      const [redBlob, blueBlob] = await Promise.all([
+        (await fetch(RED_URL)).blob(),
+        (await fetch(BLUE_URL)).blob(),
+      ]);
+      const audio = makeSineWav(880, 6.0, 48000);
+
+      // Same trimmed arrangement as the #79 test: full arr axis 0..4
+      // (master [0..2) ∪ [3..5)), master-trimmed to [3..5] → the export
+      // covers arr 2..4 as output 0..2. A full-strength vignette is
+      // authored over arr [2.5, 3.5) — i.e. output [0.5, 1.5). All three
+      // time axes disagree here:
+      //   - output-relative lookup: window 2.5..3.5 doesn't exist in a
+      //     2 s output → FX never fires (the `?? t` fallback bug that
+      //     shipped once),
+      //   - master-time lookup: master 3+t → fires at output [0, 0.5),
+      //   - timeline lookup (correct): fires at output [0.5, 1.5).
+      const result = await editRenderMulti({
+        cams: [
+          { id: "red",  file: redBlob,  masterStartS: 0, sourceDurationS: 6, kind: "video" },
+          { id: "blue", file: blueBlob, masterStartS: 0, sourceDurationS: 6, kind: "video" },
+        ],
+        cuts: [],
+        pills: [
+          { id: "p1", camId: "red",  arrStartS: 0, arrEndS: 2, sourceInS: 0, sourceOutS: 2, originalArrStartS: 0, originalArrEndS: 2, originalSourceInS: 0, originalSourceOutS: 2 },
+          { id: "p2", camId: "blue", arrStartS: 2, arrEndS: 4, sourceInS: 0, sourceOutS: 2, originalArrStartS: 2, originalArrEndS: 4, originalSourceInS: 0, originalSourceOutS: 2 },
+        ],
+        masterDurationS: 6,
+        audioFile: audio,
+        segments: [{ in: 3, out: 5, arrStartS: 2 }],
+        fx: [
+          {
+            id: "fx-vign",
+            kind: "vignette",
+            inS: 2.5,
+            outS: 3.5,
+            params: { intensity: 1, falloff: 0.9 },
+          },
+        ],
+        overlays: [],
+        offsetMs: 0,
+        driftRatio: 1.0,
+        outputFps: 30,
+      });
+      expect(result.output).not.toBeNull();
+      const outBytes = result.output!;
+
+      // Sanity: still the right cam everywhere (BLUE pill covers arr 2..4).
+      const colors = await decodeFrameColorsAt(outBytes, [0.2, 0.8, 1.8]);
+      for (const c of colors) expect(c.dominant).toBe("blue");
+
+      const probes = await decodeCornerBrightnessAt(
+        outBytes,
+        [0.2, 0.8, 1.2, 1.8],
+      );
+      console.log("[verify-fx] corner brightness:");
+      for (const p of probes) {
+        console.log(`  t=${p.tS.toFixed(2)}s  brightness=${p.brightness}`);
+      }
+      // Outside the FX window: clean bright cam pixels.
+      expect(probes[0].brightness).toBeGreaterThan(180); // t=0.2 (before)
+      expect(probes[3].brightness).toBeGreaterThan(180); // t=1.8 (after)
+      // Inside the FX window: vignette-crushed corners.
+      expect(probes[1].brightness).toBeLessThan(100); // t=0.8
+      expect(probes[2].brightness).toBeLessThan(100); // t=1.2
+    },
+    180_000,
+  );
+
+  it(
+    "A/V stays frame-aligned across dozens of off-grid segment boundaries (#84/#107)",
+    async () => {
+      // 24 KEEP chunks of 0.35 s each (= 10.5 frames at 30 fps — the
+      // adversarial half-frame duration: naive per-segment rounding
+      // always rounds UP, so pre-fix the video gained 16.7 ms per chunk
+      // over the sample-exact audio, ~0.38 s by the last boundary).
+      // Each chunk starts with an 880 Hz beep in the master audio and
+      // the active cam alternates red/blue at every chunk start, so the
+      // output carries a measurable audio marker AND a visual marker at
+      // every boundary.
+      const FPS = 30;
+      const N = 24;
+      const SEG_DUR = 0.35;
+      const SR = 48000;
+
+      const makeImageBlob = async (color: string): Promise<Blob> => {
+        const c = new OffscreenCanvas(160, 120);
+        const ctx = c.getContext("2d")!;
+        ctx.fillStyle = color;
+        ctx.fillRect(0, 0, 160, 120);
+        return c.convertToBlob({ type: "image/png" });
+      };
+      const [redImg, blueImg] = await Promise.all([
+        makeImageBlob("#ff0000"),
+        makeImageBlob("#0000ff"),
+      ]);
+
+      // Master audio: 24 s of silence with a 60 ms beep at every chunk
+      // start (master k·1.0 s). Segments keep [k·1.0, k·1.0+0.35].
+      const masterSamples = new Float32Array(24 * SR);
+      for (let k = 0; k < N; k++) {
+        const start = Math.round(k * 1.0 * SR);
+        for (let i = 0; i < Math.round(0.06 * SR); i++) {
+          masterSamples[start + i] =
+            0.6 * Math.sin((2 * Math.PI * 880 * i) / SR);
+        }
+      }
+      const audio = makeWav(masterSamples, 1, SR);
+
+      const segments = Array.from({ length: N }, (_, k) => ({
+        in: k * 1.0,
+        out: k * 1.0 + SEG_DUR,
+      }));
+      const cuts = Array.from({ length: N }, (_, k) => ({
+        atTimeS: k * 1.0,
+        camId: k % 2 === 0 ? "red" : "blue",
+      }));
+
+      const result = await editRenderMulti({
+        cams: [
+          { id: "red",  file: redImg,  masterStartS: 0, sourceDurationS: 24, kind: "image" },
+          { id: "blue", file: blueImg, masterStartS: 0, sourceDurationS: 24, kind: "image" },
+        ],
+        cuts,
+        masterDurationS: 24,
+        audioFile: audio,
+        segments,
+        overlays: [],
+        offsetMs: 0,
+        driftRatio: 1.0,
+        outputFps: FPS,
+      });
+      expect(result.output).not.toBeNull();
+      const outBytes = result.output!;
+
+      // ── Video: locate every red↔blue switch, frame-exact. ──
+      const totalFrames = Math.round(N * SEG_DUR * FPS); // 252
+      const probeTimes = Array.from(
+        { length: totalFrames },
+        (_, i) => (i + 0.5) / FPS,
+      );
+      const colors = await decodeFrameColorsAt(outBytes, probeTimes);
+      const switchFrames: number[] = [];
+      for (let i = 1; i < colors.length; i++) {
+        if (
+          colors[i].dominant !== colors[i - 1].dominant &&
+          colors[i].dominant !== "missing" &&
+          colors[i - 1].dominant !== "missing"
+        ) {
+          switchFrames.push(i);
+        }
+      }
+      console.log(`[verify-drift] video switches at frames: ${switchFrames.join(",")}`);
+      expect(switchFrames.length).toBe(N - 1);
+
+      // Every boundary must sit at the CUMULATIVE frame target
+      // round(k · 10.5), not at k·11 (the pre-fix one-directional
+      // rounding).
+      for (let k = 1; k < N; k++) {
+        const expected = Math.round(k * SEG_DUR * FPS);
+        expect(Math.abs(switchFrames[k - 1] - expected)).toBeLessThanOrEqual(1);
+      }
+
+      // ── Audio: locate every beep onset in the decoded output. ──
+      const audioOut = await decodeAudioToMonoPcm(
+        new Blob([outBytes as BlobPart]),
+        22050,
+      );
+      const pcm = audioOut.pcm;
+      const onsets: number[] = [];
+      let quietRun = Math.round(0.1 * 22050); // treat file start as quiet
+      for (let i = 0; i < pcm.length; i++) {
+        if (Math.abs(pcm[i]) > 0.15) {
+          if (quietRun > 0.1 * 22050) onsets.push(i / 22050);
+          quietRun = 0;
+        } else {
+          quietRun++;
+        }
+      }
+      console.log(
+        `[verify-drift] beep onsets: ${onsets.map((t) => t.toFixed(3)).join(",")}`,
+      );
+      expect(onsets.length).toBe(N);
+
+      // ── A/V alignment per boundary, codec-delay-invariant: compare
+      // each beep's position RELATIVE to the first beep against the
+      // video boundary's position. Pre-fix the mismatch grows ~16.7 ms
+      // per boundary (~0.38 s at k=23); post-fix it stays within one
+      // frame everywhere. ──
+      const frameS = 1 / FPS;
+      for (let k = 1; k < N; k++) {
+        const audioRel = onsets[k] - onsets[0];
+        const videoRel = switchFrames[k - 1] / FPS;
+        expect(
+          Math.abs(audioRel - videoRel),
+          `boundary ${k}: audioRel=${audioRel.toFixed(3)} videoRel=${videoRel.toFixed(3)}`,
+        ).toBeLessThanOrEqual(frameS + 0.005);
+      }
+
+      // Total duration parity within one frame (the old test only
+      // asserted < 0.1 s, which a cumulative drift passes right through).
+      const reparsed = await demuxVideoTrack(new Blob([outBytes as BlobPart]));
+      expect(reparsed).not.toBeNull();
+      expect(
+        Math.abs(reparsed!.info.durationS - N * SEG_DUR),
+      ).toBeLessThanOrEqual(frameS + 0.005);
     },
     180_000,
   );

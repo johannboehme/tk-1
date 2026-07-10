@@ -17,6 +17,9 @@
  *    `.close()` on them. Older frames are auto-freed on the next call.
  *  - End-of-source returns the very last frame for any targetUs >= last
  *    frame's timestamp.
+ *  - Targets BEFORE the first frame's timestamp (sources with an initial
+ *    composition offset, i.e. first cts > 0) clamp to the first frame —
+ *    "at or before, else first".
  *
  * Streaming-friendly: encoded chunks are pulled on demand via
  * `loadSample(idx)` which does a `Blob.slice` per sample. Bounded memory
@@ -187,6 +190,23 @@ export class CamFrameStream {
         else break;
       }
       const haveLater = this.pending.length > bestIdx + 1;
+      // Target precedes the earliest decodable frame: real for sources
+      // whose first sample cts > 0 (B-frame recordings with an initial
+      // composition offset — demux.ts hands mp4box's raw cts through
+      // without applying the elst) when the caller asks for source-time
+      // ~0 (pill with sourceInS=0, cam start in direct mode).
+      // VideoDecoder emits frames in PRESENTATION order, so once any
+      // frame with timestamp > targetUs is pending, no frame ≤ targetUs
+      // can ever arrive — clamp "at or before" to "else first". Without
+      // this, the feed loop below decoded the ENTIRE source while every
+      // output frame piled up unclosed in `pending` (multi-GB for a
+      // few minutes of 1080p30; in practice Chromium's decoder stalls
+      // when its output pool is exhausted), then returned null and the
+      // frame rendered as the SMPTE test pattern although valid footage
+      // exists one composition-offset away.
+      if (bestIdx < 0 && this.pending.length > 0) {
+        return this.pending[0];
+      }
       // Confident in `bestIdx` if either we have a later frame queued
       // (so no earlier frame can still arrive ≤ targetUs from the decoder)
       // or the decoder is fully drained.

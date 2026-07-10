@@ -113,9 +113,29 @@ describe("useEditorStore", () => {
     useEditorStore.getState().setExport({ preset: "web" });
     const spec = useEditorStore.getState().buildEditSpec();
     expect(spec.version).toBe(1);
-    expect(spec.segments).toEqual([{ in: 1, out: 5 }]);
+    // Direct mode: arr axis == master axis, so the slice's arrStartS is
+    // just the trim-in.
+    expect(spec.segments).toEqual([{ in: 1, out: 5, arrStartS: 1 }]);
     expect(spec.sync_override_ms).toBe(-30);
     expect(spec.export?.preset).toBe("web");
+  });
+
+  test("buildEditSpec carries each slice's FULL-arrangement arrStartS through a master trim (#79)", () => {
+    useEditorStore.getState().loadJob(baseJobMeta);
+    // Arrangement: master [0..2) is arr [0..2), master [3..5) is arr
+    // [2..4). Master-trim keeps [3..5] → one slice whose arr-position
+    // on the editor's full axis is 2, NOT 0. The renderer needs that
+    // value to resolve pills/cuts/FX at the editor's coordinates.
+    useEditorStore.getState().setArrangementSegments([
+      { in: 0, out: 2 },
+      { in: 3, out: 5 },
+    ]);
+    useEditorStore.getState().setTrim({ in: 3, out: 5 });
+    const spec = useEditorStore.getState().buildEditSpec();
+    expect(spec.segments).toHaveLength(1);
+    expect(spec.segments[0].in).toBe(3);
+    expect(spec.segments[0].out).toBe(5);
+    expect(spec.segments[0].arrStartS).toBe(2);
   });
 
   describe("updateClip", () => {

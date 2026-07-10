@@ -48,3 +48,19 @@ export function makeTestPatternCanvas(
   ctx.fillText(plateText, width / 2, plateY + plateH / 2);
   return canvas;
 }
+
+/**
+ * Same pattern as an ImageBitmap. The render pipeline uses this instead
+ * of the raw canvas: WebGL2's texture upload honours
+ * UNPACK_FLIP_Y_WEBGL for ImageBitmap but ignores it on Chrome's GPU
+ * fast path for canvases, which made the exported NO-SIGNAL frame
+ * vertically flipped on the WebGL2 backend (issue #141). One-time,
+ * synchronous conversion (`transferToImageBitmap` moves the backing
+ * store); caller owns the bitmap and should `.close()` it on teardown.
+ */
+export function makeTestPatternBitmap(
+  width: number,
+  height: number,
+): ImageBitmap {
+  return makeTestPatternCanvas(width, height).transferToImageBitmap();
+}
