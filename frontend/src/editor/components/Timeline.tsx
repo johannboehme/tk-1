@@ -614,6 +614,12 @@ export function Timeline({
   const stripDuration = arrTotal;
 
   // ---- Active-cam status per lane (drives LED color) ----
+  // activeCamId resolves through activeCamAtArr(cuts, t, pills, segments),
+  // so pills / segments / timelineT belong in the deps: while PAUSED
+  // (currentTime frozen) a pill drag/trim/reset under the playhead changes
+  // which cam is ON-AIR and the LED must follow immediately (#136).
+  // During playback timelineT ticks alongside currentTime, so this adds
+  // no recompute pressure over the existing 60 Hz path.
   const camStatusByCamId = useMemo(() => {
     const result: Record<string, CamStatus> = {};
     const activeId = useEditorStore.getState().activeCamId(timelineT);
@@ -629,7 +635,7 @@ export function Timeline({
       result[cam.id] = status;
     }
     return result;
-  }, [clips, cuts, currentTime]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [clips, cuts, pills, arrangementSegments, currentTime, timelineT]);
 
   // ---- Canvas drawing ----
   useEffect(() => {
