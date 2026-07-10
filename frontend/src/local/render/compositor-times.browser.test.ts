@@ -23,6 +23,8 @@ import { Compositor, type FrameTimes } from "./compositor";
 import type { PunchFx } from "../../editor/fx/types";
 import type { AudioEnvelope, Modulation } from "../../editor/fx/modulation";
 import { INSTANT_ENVELOPE } from "../../editor/fx/envelope";
+import type { Visualizer } from "./visualizer/types";
+import type { TextOverlay } from "./ass-builder";
 
 const W = 64;
 const H = 64;
@@ -186,3 +188,101 @@ describe("Compositor time axes (export must match preview semantics)", () => {
     compositor.destroy();
   });
 });
+
+describe("Compositor visualizer + overlay time axis (#106)", () => {
+  it("visualizers draw at MASTER time, not the output-relative timestamp", async () => {
+    // The visualizer's PCM/energy data is decoded from the FULL master
+    // audio (jobs.ts), so it must be indexed by master time. Pre-fix the
+    // compositor handed it the output-relative timestamp — every export
+    // with dropped/trimmed material displayed the wrong section of the
+    // song (e.g. the dropped intro's waveform under an audible chorus).
+    const seen: number[] = [];
+    const fake: Visualizer = {
+      draw(_ctx, t) {
+        seen.push(t);
+      },
+    };
+    const compositor = await Compositor.create(
+      { ...baseOpts, fx: [], visualizers: [fake] },
+      caps,
+    );
+    const frame = await compositor.compositeImage(
+      solidBitmap("#ff0000"),
+      W,
+      H,
+      500_000, // output-relative: 0.5 s
+      33_333,
+      { tTimelineS: 2.5, tMasterS: 12.25 },
+    );
+    frame.close();
+    compositor.destroy();
+    expect(seen).toEqual([12.25]);
+  });
+
+  it("text overlays window on MASTER time (their start/end are authored at master positions)", async () => {
+    const overlay: TextOverlay = {
+      text: "MASTER-AXIS",
+      start: 10,
+      end: 11,
+      preset: "plain",
+      x: 0.5,
+      y: 0.5,
+      animation: "none" as TextOverlay["animation"],
+      reactiveBand: null,
+      reactiveParam: "scale" as TextOverlay["reactiveParam"],
+      reactiveAmount: 0,
+    };
+    const compositor = await Compositor.create(
+      { ...baseOpts, width: 128, height: 128, overlays: [overlay], fx: [] },
+      caps,
+    );
+    await compositor.ensureSubtitleEngine();
+
+    const countNonRed = async (timestampUs: number, times: FrameTimes) => {
+      const frame = await compositor.compositeImage(
+        solidBitmap128("#ff0000"),
+        128,
+        128,
+        timestampUs,
+        33_333,
+        times,
+      );
+      const c = new OffscreenCanvas(128, 128);
+      const ctx = c.getContext("2d")!;
+      ctx.drawImage(frame as unknown as CanvasImageSource, 0, 0);
+      frame.close();
+      const px = ctx.getImageData(0, 0, 128, 128).data;
+      let n = 0;
+      for (let i = 0; i < px.length; i += 4) {
+        if (px[i] < 200 || px[i + 1] > 60 || px[i + 2] > 60) n++;
+      }
+      return n;
+    };
+
+    // Master time inside the overlay window, output time far outside →
+    // text must be burned in.
+    const inside = await countNonRed(500_000, {
+      tTimelineS: 2.5,
+      tMasterS: 10.5,
+    });
+    expect(inside).toBeGreaterThan(20);
+
+    // Master time outside the window (output time numerically inside it)
+    // → clean frame.
+    const outside = await countNonRed(10_500_000, {
+      tTimelineS: 2.5,
+      tMasterS: 2.5,
+    });
+    expect(outside).toBe(0);
+
+    compositor.destroy();
+  });
+});
+
+function solidBitmap128(color: string): ImageBitmap {
+  const c = new OffscreenCanvas(128, 128);
+  const ctx = c.getContext("2d")!;
+  ctx.fillStyle = color;
+  ctx.fillRect(0, 0, 128, 128);
+  return c.transferToImageBitmap();
+}

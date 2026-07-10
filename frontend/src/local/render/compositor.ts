@@ -358,11 +358,16 @@ export class Compositor {
       bitmap.close();
     }
 
-    // 3. Visualizer + Overlays auf den finalen 2D-Context.
-    const t = timestampUs / 1_000_000;
+    // 3. Visualizer + Overlays auf den finalen 2D-Context — beide auf
+    // der MASTER-Achse. Visualizer besitzen PCM/Energy aus dem VOLLEN
+    // Master-Audio (jobs.ts decodiert untrimmed), Overlays werden im
+    // Editor an `playback.currentTime` (= Master-Zeit) geankert. Mit dem
+    // output-relativen Timestamp zeigte jeder Long-form-Export den
+    // falschen Song-Abschnitt (z.B. die Waveform des gedroppten Intros
+    // unter dem hörbaren Chorus) — issue #106.
     if (this.opts.visualizers && this.opts.visualizers.length > 0) {
       for (const v of this.opts.visualizers) {
-        v.draw(this.ctx, t, this.opts.width, this.opts.height);
+        v.draw(this.ctx, tMaster, this.opts.width, this.opts.height);
       }
     }
     if (this.opts.overlays.length > 0) {
@@ -371,7 +376,7 @@ export class Compositor {
         this.opts.overlays,
         this.opts.width,
         this.opts.height,
-        t,
+        tMaster,
         this.opts.energy ?? null,
       );
     }
