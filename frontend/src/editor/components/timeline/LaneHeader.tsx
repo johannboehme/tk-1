@@ -9,7 +9,7 @@
  *
  * Sized to fit a 44 × 44 button + name/filename column without clipping.
  */
-import { CSSProperties, PointerEvent as ReactPointerEvent } from "react";
+import { CSSProperties, memo, PointerEvent as ReactPointerEvent } from "react";
 
 export type CamStatus = "off" | "available" | "on-air";
 
@@ -63,7 +63,11 @@ const HEADER_W = 156;
  *  retains the lion's share of a 280–390 px wide phone screen. */
 export const HEADER_W_COMPACT = 64;
 
-export function LaneHeader({
+// memo()ed below: the Timeline re-renders every playback frame, and this
+// ~360-line control strip × N cams must not reconcile at 60 Hz. Works
+// because Timeline hands it primitives + identity-stable callbacks (see
+// timeline/lane-callbacks.ts).
+function LaneHeaderImpl({
   name,
   filename,
   color,
@@ -320,8 +324,10 @@ export function LaneHeader({
   );
 }
 
-LaneHeader.WIDTH = HEADER_W;
-LaneHeader.WIDTH_COMPACT = HEADER_W_COMPACT;
+export const LaneHeader = Object.assign(memo(LaneHeaderImpl), {
+  WIDTH: HEADER_W,
+  WIDTH_COMPACT: HEADER_W_COMPACT,
+});
 
 /**
  * Recessed paper-toned button face.

@@ -5,6 +5,8 @@ import {
   buildFollowerCurve,
   computeIntensity,
   DEFAULT_MODULATION,
+  FOLLOWER_MEMO_MAX,
+  followerFor,
   isSyncedRate,
   lfoPhaseAt,
   lfoShapeAt,
@@ -12,6 +14,7 @@ import {
   type AudioEnvelope,
   type ModContext,
   type Modulation,
+  type SidechainConfig,
 } from "./modulation";
 
 /** A rate on the synced half that resolves to a given division label. */
@@ -237,5 +240,73 @@ describe("sidechain follower curve", () => {
     expect(sampleFollower(curve, -5)).toBeCloseTo(0, 6);
     expect(sampleFollower(curve, 99)).toBeCloseTo(1, 6);
     expect(sampleFollower(curve, 0.5)).toBeCloseTo(0.5, 6);
+  });
+});
+
+describe("followerFor memo — bounded LRU per audio env", () => {
+  const makeAudio = (): AudioEnvelope => ({
+    data: new Float32Array(256).fill(0.5),
+    fps: 120,
+  });
+  const sideAt = (threshold: number): SidechainConfig => ({
+    threshold,
+    attackS: 0.01,
+    releaseS: 0.18,
+    invert: false,
+  });
+
+  test("same config returns the cached curve (identity)", () => {
+    const audio = makeAudio();
+    const a = followerFor(audio, sideAt(0.3));
+    const b = followerFor(audio, sideAt(0.3));
+    expect(b).toBe(a);
+  });
+
+  test("null audio returns null", () => {
+    expect(followerFor(null, sideAt(0.3))).toBeNull();
+    expect(followerFor(undefined, sideAt(0.3))).toBeNull();
+  });
+
+  test("retains at most FOLLOWER_MEMO_MAX curves — a knob-drag's worth of stale configs is evicted", () => {
+    const audio = makeAudio();
+    const first = followerFor(audio, sideAt(0));
+    // Simulate a knob drag: a stream of distinct intermediate configs,
+    // more than the cap. The earliest entry must be evicted (rebuilt on
+    // re-request → different identity), the freshest must survive.
+    for (let i = 1; i <= FOLLOWER_MEMO_MAX; i++) {
+      followerFor(audio, sideAt(i / 100));
+    }
+    const freshest = followerFor(audio, sideAt(FOLLOWER_MEMO_MAX / 100));
+    expect(followerFor(audio, sideAt(0))).not.toBe(first); // evicted
+    expect(followerFor(audio, sideAt(FOLLOWER_MEMO_MAX / 100))).toBe(freshest); // retained
+  });
+
+  test("a cache hit refreshes recency (true LRU, not FIFO)", () => {
+    const audio = makeAudio();
+    const a = followerFor(audio, sideAt(0)); // oldest insert
+    const b = followerFor(audio, sideAt(0.01)); // second-oldest insert
+    // Fill the cache to exactly the cap.
+    for (let i = 2; i < FOLLOWER_MEMO_MAX; i++) {
+      followerFor(audio, sideAt(i / 100));
+    }
+    // Touch `a` — under LRU this makes `b` the eviction candidate;
+    // under FIFO `a` would still be first out.
+    expect(followerFor(audio, sideAt(0))).toBe(a);
+    followerFor(audio, sideAt(0.99)); // one insert → exactly one eviction
+    expect(followerFor(audio, sideAt(0))).toBe(a); // refreshed → survives
+    expect(followerFor(audio, sideAt(0.01))).not.toBe(b); // LRU → evicted
+  });
+
+  test("caches are independent per audio env", () => {
+    const audioA = makeAudio();
+    const audioB = makeAudio();
+    const a = followerFor(audioA, sideAt(0.3));
+    const b = followerFor(audioB, sideAt(0.3));
+    expect(a).not.toBe(b);
+    // Overflowing B's cache never evicts A's entries.
+    for (let i = 1; i <= FOLLOWER_MEMO_MAX + 1; i++) {
+      followerFor(audioB, sideAt(i / 200));
+    }
+    expect(followerFor(audioA, sideAt(0.3))).toBe(a);
   });
 });

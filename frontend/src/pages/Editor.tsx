@@ -53,7 +53,7 @@ import {
   getOrComputePyramid,
 } from "../local/waveform/pyramid-cache";
 import { loadMasterAudio } from "../editor/load-master-audio";
-import { buildLoudnessEnvelope } from "../editor/fx/audio-envelope";
+import { buildLoudnessEnvelopeAsync } from "../editor/fx/audio-envelope";
 import { exportSpecToRenderOpts } from "../editor/exportPresets";
 import { loadAssetFile } from "../local/asset-source";
 import type { ClipInit } from "../editor/store";
@@ -824,12 +824,16 @@ export default function Editor() {
       // this .then runs after the synchronous effect body, so loadJob has
       // already executed (eager setting before loadJob is what showed the
       // sidechain "NO AUDIO"). On a synced job the envelope arrives a beat
-      // after the editor is already interactive.
-      void getPcm().then((dec) => {
+      // after the editor is already interactive — which is exactly why the
+      // build is the chunked, yielding variant: the editor may already be
+      // PLAYING when the decode resolves, and a synchronous full-track PCM
+      // scan (~100-300 ms for an hour-long master) would stall the preview
+      // rAF and the audio walker past its crossfade lead window.
+      void getPcm().then(async (dec) => {
         if (cancelled || !dec) return;
-        useEditorStore
-          .getState()
-          .setAudioEnv(buildLoudnessEnvelope(dec.pcm, dec.sampleRate));
+        const env = await buildLoudnessEnvelopeAsync(dec.pcm, dec.sampleRate);
+        if (cancelled) return;
+        useEditorStore.getState().setAudioEnv(env);
         lap("bg decode + loudness done");
       });
 
