@@ -6,6 +6,7 @@ import { TrashIcon } from "../editor/components/icons";
 import { formatDuration } from "../components/ProgressBar";
 import { jobsDb, deleteJob, jobEvents, type LocalJob } from "../local/jobs";
 import { useOpsStore } from "../local/ops-store";
+import { confirmDestructive } from "../lib/confirm";
 import { activePct, jobBadge, type BadgeKind } from "./history-model";
 
 export default function History() {
@@ -33,10 +34,20 @@ export default function History() {
     };
   }, []);
 
-  async function remove(id: string) {
-    if (!window.confirm("Delete this job and its files?")) return;
-    await deleteJob(id);
-    setJobs((curr) => (curr ? curr.filter((j) => j.id !== id) : curr));
+  async function remove(job: LocalJob) {
+    const ok = await confirmDestructive({
+      title: "Delete job?",
+      body: (
+        <>
+          Deletes <strong>{job.title || job.id.slice(0, 12)}</strong> and its
+          files from this device. This cannot be undone.
+        </>
+      ),
+      destructiveLabel: "Delete",
+    });
+    if (!ok) return;
+    await deleteJob(job.id);
+    setJobs((curr) => (curr ? curr.filter((j) => j.id !== job.id) : curr));
   }
 
   if (err)
@@ -80,7 +91,7 @@ export default function History() {
       ) : (
         <ul className="grid sm:grid-cols-2 xl:grid-cols-3 gap-3">
           {jobs.map((j) => (
-            <JobCard key={j.id} job={j} onDelete={() => remove(j.id)} />
+            <JobCard key={j.id} job={j} onDelete={() => remove(j)} />
           ))}
         </ul>
       )}
@@ -146,7 +157,7 @@ function JobCard({ job, onDelete }: { job: LocalJob; onDelete: () => void }) {
           e.preventDefault();
           onDelete();
         }}
-        className="absolute top-2 right-2 h-7 w-7 inline-flex items-center justify-center rounded-md bg-paper-hi/90 backdrop-blur text-ink-2 hover:text-danger opacity-0 group-hover:opacity-100 transition-opacity"
+        className="absolute top-2 right-2 h-7 w-7 inline-flex items-center justify-center rounded-md bg-paper-hi border border-rule text-ink-2 hover:text-danger hover:border-danger focus-visible:outline focus-visible:outline-2 focus-visible:outline-danger transition-colors"
         aria-label="Delete job"
       >
         <TrashIcon width={14} height={14} />
