@@ -233,6 +233,10 @@ export function TransportBar() {
       // ignore if a knob is focused (it has its own handler)
       const ae = document.activeElement as HTMLElement | null;
       if (ae?.dataset?.knob) return;
+      // Browser chords (Cmd/Ctrl+L address bar, Cmd/Ctrl+I/O, Cmd+Arrow
+      // history) must never fall through into transport edits. Alt stays
+      // allowed — the arrow cases branch on it for the loop-shift.
+      if (e.metaKey || e.ctrlKey) return;
 
       switch (e.key) {
         case " ":
