@@ -1,7 +1,13 @@
-import { beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { act, renderHook } from "@testing-library/react";
 import { useEditorStore } from "./store";
-import { buildPersistPatch, persistRelevantChanged } from "./useAutoPersist";
-import type { LocalJob, VideoAsset } from "../storage/jobs-db";
+import {
+  buildPersistPatch,
+  flushEditorStateNow,
+  persistRelevantChanged,
+  useAutoPersist,
+} from "./useAutoPersist";
+import { jobsDb, type LocalJob, type VideoAsset } from "../storage/jobs-db";
 
 const baseJob: LocalJob = {
   id: "j1",
@@ -153,5 +159,130 @@ describe("persistRelevantChanged", () => {
     expect(persistRelevantChanged(withFx, prev)).toBe(true);
     const withVolume = { ...prev, audioVolume: prev.audioVolume + 0.1 };
     expect(persistRelevantChanged(withVolume, prev)).toBe(true);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// #120 — the debounced write must flush, not vanish, when the editor leaves
+// -----------------------------------------------------------------------------
+
+describe("useAutoPersist — flush semantics (#120)", () => {
+  beforeEach(() => {
+    useEditorStore.getState().reset();
+    vi.restoreAllMocks();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Drain the microtask queue so promise-chained (non-timer) work in
+   *  the hook's flush path completes under fake timers. */
+  async function drainMicrotasks(rounds = 10): Promise<void> {
+    for (let i = 0; i < rounds; i++) await Promise.resolve();
+  }
+
+  function mockDb() {
+    const getJob = vi
+      .spyOn(jobsDb, "getJob")
+      .mockResolvedValue({ ...baseJob });
+    const updateJob = vi
+      .spyOn(jobsDb, "updateJob")
+      .mockImplementation(async (_id, patch) => ({ ...baseJob, ...patch }));
+    return { getJob, updateJob };
+  }
+
+  test("persists after the debounce window on an ordinary edit", async () => {
+    const { updateJob } = mockDb();
+    const { unmount } = renderHook(() => useAutoPersist("j1"));
+    act(() => {
+      useEditorStore.getState().loadJob(meta); // hydration — skipped
+    });
+    act(() => {
+      useEditorStore.getState().setTrim({ in: 2, out: 30 });
+    });
+    expect(updateJob).not.toHaveBeenCalled();
+    await act(async () => {
+      vi.advanceTimersByTime(300);
+      await drainMicrotasks();
+    });
+    expect(updateJob).toHaveBeenCalledTimes(1);
+    expect(updateJob.mock.calls[0][1]).toMatchObject({
+      trim: { in: 2, out: 30 },
+    });
+    unmount();
+  });
+
+  test("unmount before the debounce fires still persists the pending edit", async () => {
+    const { updateJob } = mockDb();
+    const { unmount } = renderHook(() => useAutoPersist("j1"));
+    act(() => {
+      useEditorStore.getState().loadJob(meta);
+    });
+    act(() => {
+      useEditorStore.getState().setTrim({ in: 5, out: 42 });
+    });
+    // Leave the editor 100 ms after the edit — well inside the 300 ms
+    // debounce. The old cleanup discarded the timer and the edit.
+    vi.advanceTimersByTime(100);
+    unmount();
+    await drainMicrotasks();
+    expect(updateJob).toHaveBeenCalledTimes(1);
+    expect(updateJob.mock.calls[0][1]).toMatchObject({
+      trim: { in: 5, out: 42 },
+    });
+  });
+
+  test("unmount without a pending edit writes nothing", async () => {
+    const { updateJob } = mockDb();
+    const { unmount } = renderHook(() => useAutoPersist("j1"));
+    act(() => {
+      useEditorStore.getState().loadJob(meta);
+    });
+    unmount();
+    await drainMicrotasks();
+    expect(updateJob).not.toHaveBeenCalled();
+  });
+
+  test("flushEditorStateNow persists the full patch immediately and cancels the pending timer", async () => {
+    const { updateJob } = mockDb();
+    const { unmount } = renderHook(() => useAutoPersist("j1"));
+    act(() => {
+      useEditorStore.getState().loadJob(meta);
+    });
+    act(() => {
+      useEditorStore.getState().setTrim({ in: 1, out: 9 });
+    });
+    await flushEditorStateNow("j1");
+    expect(updateJob).toHaveBeenCalledTimes(1);
+    expect(updateJob.mock.calls[0][1]).toMatchObject({
+      trim: { in: 1, out: 9 },
+    });
+    // The debounced timer must not double-write afterwards.
+    await act(async () => {
+      vi.advanceTimersByTime(600);
+      await drainMicrotasks();
+    });
+    expect(updateJob).toHaveBeenCalledTimes(1);
+    unmount();
+  });
+
+  test("pagehide flushes a pending edit (tab close mid-debounce)", async () => {
+    const { updateJob } = mockDb();
+    const { unmount } = renderHook(() => useAutoPersist("j1"));
+    act(() => {
+      useEditorStore.getState().loadJob(meta);
+    });
+    act(() => {
+      useEditorStore.getState().setTrim({ in: 3, out: 33 });
+    });
+    window.dispatchEvent(new Event("pagehide"));
+    await drainMicrotasks();
+    expect(updateJob).toHaveBeenCalledTimes(1);
+    expect(updateJob.mock.calls[0][1]).toMatchObject({
+      trim: { in: 3, out: 33 },
+    });
+    unmount();
   });
 });

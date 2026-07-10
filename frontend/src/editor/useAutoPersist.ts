@@ -14,6 +14,10 @@
  * Skipped during the initial load — we only fire when the user actually
  * changes something. Wiring point: mount once in the editor shell after
  * `loadJob()` resolved.
+ *
+ * Leaving the editor never discards a pending write (#120): unmount and
+ * `pagehide` flush it, and `flushEditorStateNow()` lets submit paths
+ * persist the full state before navigating.
  */
 import { useEffect } from "react";
 import { useEditorStore } from "./store";
@@ -102,32 +106,85 @@ export function buildPersistPatch(
 
 type EditorStoreState = ReturnType<typeof useEditorStore.getState>;
 
+/**
+ * The single source of truth for "which store slices feed the persisted
+ * patch". `persistRelevantChanged` is derived from this list so it can
+ * not drift from what `buildPersistPatch` writes — when you add a field
+ * to the patch, add its selector here (and the round-trip test will
+ * remind you).
+ */
+const PERSIST_SELECTORS: ReadonlyArray<(s: EditorStoreState) => unknown> = [
+  (s) => s.clips,
+  (s) => s.cuts,
+  (s) => s.pills,
+  (s) => s.trim,
+  (s) => s.ui.snapMode,
+  (s) => s.ui.lanesLocked,
+  (s) => s.jobMeta?.bpm,
+  (s) => s.jobMeta?.audioStartNudgeS,
+  (s) => s.jobMeta?.beatsPerBar,
+  (s) => s.jobMeta?.barOffsetBeats,
+  (s) => s.fx,
+  (s) => s.colorGrade,
+  (s) => s.filterSlots,
+  (s) => s.audioVolume,
+  (s) => s.exportSpec,
+];
+
 /** Pure dirty-check for the auto-persist subscription: did this store
- *  transition touch anything `buildPersistPatch` writes? Exported for
- *  tests — every field the patch persists must be watched here, or edits
- *  to it silently survive only until the next unrelated change. */
+ *  transition touch anything `buildPersistPatch` writes? Derived from
+ *  `PERSIST_SELECTORS` — see there. Exported for tests. */
 export function persistRelevantChanged(
   state: EditorStoreState,
   prev: EditorStoreState,
 ): boolean {
-  return (
-    state.clips !== prev.clips ||
-    state.cuts !== prev.cuts ||
-    state.pills !== prev.pills ||
-    state.trim !== prev.trim ||
-    state.ui.snapMode !== prev.ui.snapMode ||
-    state.ui.lanesLocked !== prev.ui.lanesLocked ||
-    state.jobMeta?.bpm !== prev.jobMeta?.bpm ||
-    state.jobMeta?.audioStartNudgeS !== prev.jobMeta?.audioStartNudgeS ||
-    state.jobMeta?.beatsPerBar !== prev.jobMeta?.beatsPerBar ||
-    state.jobMeta?.barOffsetBeats !== prev.jobMeta?.barOffsetBeats ||
-    state.fx !== prev.fx ||
-    state.colorGrade !== prev.colorGrade ||
-    state.filterSlots !== prev.filterSlots ||
-    state.audioVolume !== prev.audioVolume ||
-    state.exportSpec !== prev.exportSpec
-  );
+  return PERSIST_SELECTORS.some((sel) => sel(state) !== sel(prev));
 }
+
+/**
+ * Persist one editor-state snapshot into the job row. Shared by the
+ * debounced auto-persist, the flush-on-unmount/pagehide paths, and
+ * `flushEditorStateNow`. The snapshot is captured by the caller so a
+ * flush that races unmount still writes what the user last saw.
+ *
+ * `isStale` is re-checked after the async job read: the debounced path
+ * uses it to bail when the hook was cleaned up mid-flight (the cleanup
+ * itself runs a snapshot-based final flush instead).
+ */
+async function persistSnapshot(
+  jobId: string,
+  s: EditorStoreState,
+  isStale: () => boolean = () => false,
+): Promise<void> {
+  if (!s.jobMeta || s.jobMeta.id !== jobId) return;
+  try {
+    const job = await jobsDb.getJob(jobId);
+    if (!job || isStale()) return;
+    await jobsDb.updateJob(jobId, buildPersistPatch(s, job));
+  } catch (err) {
+    // Non-fatal: a failed write means we'll retry on the next change.
+    console.warn("auto-persist failed:", err);
+  }
+}
+
+/**
+ * Immediately persist the current editor state for `jobId` (#120).
+ *
+ * Callers that leave the editor programmatically (EXPORT navigates to
+ * /render right away) await this instead of racing the 300 ms debounce
+ * — it writes the full `buildPersistPatch`, not a hand-picked subset.
+ * Any pending debounced timer becomes a harmless double-write, and the
+ * mounted hook drops its timer on the next scheduled change anyway.
+ */
+export async function flushEditorStateNow(jobId: string): Promise<void> {
+  cancelPendingFlush?.();
+  await persistSnapshot(jobId, useEditorStore.getState());
+}
+
+/** Set by the mounted hook so `flushEditorStateNow` can cancel a pending
+ *  debounce timer (avoiding a duplicate write right after the explicit
+ *  flush). Null when no editor is mounted. */
+let cancelPendingFlush: (() => void) | null = null;
 
 export function useAutoPersist(jobId: string | null): void {
   useEffect(() => {
@@ -137,26 +194,35 @@ export function useAutoPersist(jobId: string | null): void {
     let cancelled = false;
     let firstFire = true;
 
-    const flush = async () => {
+    const clearTimer = () => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+    cancelPendingFlush = clearTimer;
+
+    const flush = () => {
       timer = null;
       if (cancelled) return;
-      const s = useEditorStore.getState();
-      if (!s.jobMeta || s.jobMeta.id !== jobId) return;
-
-      try {
-        const job = await jobsDb.getJob(jobId);
-        if (!job || cancelled) return;
-        await jobsDb.updateJob(jobId, buildPersistPatch(s, job));
-      } catch (err) {
-        // Non-fatal: a failed write means we'll retry on the next change.
-        console.warn("auto-persist failed:", err);
-      }
+      void persistSnapshot(jobId, useEditorStore.getState(), () => cancelled);
     };
 
     const schedule = () => {
       if (timer !== null) clearTimeout(timer);
       timer = setTimeout(flush, DEBOUNCE_MS);
     };
+
+    // Flush, don't discard, when the pending write would otherwise be
+    // lost (#120): tab close / navigation fires pagehide, and unmount
+    // covers in-app navigation (EXPORT, back). The snapshot is taken
+    // synchronously so a store reset right after unmount can't blank it.
+    const flushPendingNow = () => {
+      if (timer === null) return;
+      clearTimer();
+      void persistSnapshot(jobId, useEditorStore.getState());
+    };
+    window.addEventListener("pagehide", flushPendingNow);
 
     const unsub = useEditorStore.subscribe((state, prev) => {
       // Skip while the store hasn't been loaded yet for this jobId.
@@ -175,9 +241,11 @@ export function useAutoPersist(jobId: string | null): void {
     });
 
     return () => {
-      cancelled = true;
-      if (timer !== null) clearTimeout(timer);
+      window.removeEventListener("pagehide", flushPendingNow);
       unsub();
+      flushPendingNow();
+      cancelled = true;
+      if (cancelPendingFlush === clearTimer) cancelPendingFlush = null;
     };
   }, [jobId]);
 }

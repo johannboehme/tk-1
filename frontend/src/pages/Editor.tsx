@@ -57,7 +57,7 @@ import { exportSpecToRenderOpts } from "../editor/exportPresets";
 import { loadAssetFile } from "../local/asset-source";
 import type { ClipInit } from "../editor/store";
 import type { ExportSpec } from "../editor/types";
-import { useAutoPersist } from "../editor/useAutoPersist";
+import { flushEditorStateNow, useAutoPersist } from "../editor/useAutoPersist";
 import {
   getCachedAnalysis,
   getOrComputeAnalysis,
@@ -1041,8 +1041,9 @@ export default function Editor() {
     const exportOpts = spec.export
       ? exportSpecToRenderOpts(spec.export, sourceDims)
       : undefined;
-    // Persist the multi-cam state (clips + cuts) into the job record so
-    // a refresh / history-page revisit shows the same edit.
+    // Persist the FULL editor state into the job record before we leave —
+    // the auto-persist debounce (300 ms) would otherwise race the
+    // navigation and drop the user's last edit (#120).
     const liveState = useEditorStore.getState();
     const clipOverrides = liveState.clips.map((c) => ({
       id: c.id,
@@ -1055,7 +1056,7 @@ export default function Editor() {
       viewportTransform: c.viewportTransform,
     }));
     const cuts = liveState.cuts;
-    await jobsDb.updateJob(id, { cuts });
+    await flushEditorStateNow(id);
     const local: EditSpecLocal = {
       segments: spec.segments,
       overlays: (spec.overlays ?? []).map((o) => ({
