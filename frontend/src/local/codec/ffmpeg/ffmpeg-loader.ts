@@ -19,7 +19,16 @@ import { toBlobURL } from "@ffmpeg/util";
 // dropped @ffmpeg/ffmpeg's worker.js into /public/ as-is.
 import ffmpegWorkerUrl from "@ffmpeg/ffmpeg/worker?worker&url";
 
+/** Injected by Vite's `define` from @ffmpeg/core's package.json. */
+declare const __FFMPEG_CORE_VERSION__: string;
+
 const BASE_URL = "/ffmpeg-core";
+/** The core files sit at unversioned URLs but are runtime-cached
+ *  CacheFirst (1 year) by the service worker. Keying the URL on the
+ *  installed @ffmpeg/core version busts that cache exactly when the
+ *  core actually changes — otherwise an updated wrapper (hashed chunk,
+ *  updates every deploy) could run against a year-old cached core. */
+const VERSION_QUERY = `?v=${__FFMPEG_CORE_VERSION__}`;
 
 let loadPromise: Promise<FFmpeg> | null = null;
 
@@ -35,8 +44,14 @@ export function getFfmpeg(): Promise<FFmpeg> {
         let wasmURL: string;
         try {
           [coreURL, wasmURL] = await Promise.all([
-            toBlobURL(`${BASE_URL}/ffmpeg-core-esm.js`, "text/javascript"),
-            toBlobURL(`${BASE_URL}/ffmpeg-core-esm.wasm`, "application/wasm"),
+            toBlobURL(
+              `${BASE_URL}/ffmpeg-core-esm.js${VERSION_QUERY}`,
+              "text/javascript",
+            ),
+            toBlobURL(
+              `${BASE_URL}/ffmpeg-core-esm.wasm${VERSION_QUERY}`,
+              "application/wasm",
+            ),
           ]);
         } catch (e) {
           // The core is ~25 MB and fetched on demand — a flaky connection

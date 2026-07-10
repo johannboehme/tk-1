@@ -70,6 +70,25 @@ describe("getFfmpeg", () => {
     );
   });
 
+  it("requests the core files with the @ffmpeg/core version in the URL (#116 cache-busting)", async () => {
+    // The SW caches /ffmpeg-core/* CacheFirst for a year. Without a
+    // version key in the URL, a deployed core upgrade would never reach
+    // existing users: the hashed wrapper JS updates instantly, the cached
+    // core never revalidates — a permanent wrapper/core mismatch.
+    mockToBlobURL.mockResolvedValue("blob:mock");
+    mockLoad.mockResolvedValue(true);
+
+    await getFfmpeg();
+
+    const urls = mockToBlobURL.mock.calls.map((c) => c[0] as string);
+    expect(urls).toHaveLength(2);
+    for (const url of urls) {
+      expect(url).toMatch(
+        /^\/ffmpeg-core\/ffmpeg-core-esm\.(js|wasm)\?v=\d+\.\d+\.\d+/,
+      );
+    }
+  });
+
   it("retries when ffmpeg.load() itself rejects (e.g. worker spawn failure)", async () => {
     mockToBlobURL.mockResolvedValue("blob:mock");
     mockLoad.mockRejectedValueOnce(new Error("worker exploded"));
