@@ -286,3 +286,106 @@ describe("useAutoPersist — flush semantics (#120)", () => {
     unmount();
   });
 });
+
+// -----------------------------------------------------------------------------
+// #124 — a failed IDB write must retry (and eventually surface), not vanish
+// -----------------------------------------------------------------------------
+
+describe("useAutoPersist — write-failure retry (#124)", () => {
+  beforeEach(() => {
+    useEditorStore.getState().reset();
+    vi.restoreAllMocks();
+    vi.useFakeTimers();
+    // The retry path logs each failed attempt — keep test output clean.
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function drainMicrotasks(rounds = 10): Promise<void> {
+    for (let i = 0; i < rounds; i++) await Promise.resolve();
+  }
+
+  async function advance(ms: number): Promise<void> {
+    await act(async () => {
+      vi.advanceTimersByTime(ms);
+      await drainMicrotasks();
+    });
+  }
+
+  function mountWithEdit() {
+    const hook = renderHook(() => useAutoPersist("j1"));
+    act(() => {
+      useEditorStore.getState().loadJob(meta); // hydration — skipped
+    });
+    act(() => {
+      useEditorStore.getState().setTrim({ in: 2, out: 30 });
+    });
+    return hook;
+  }
+
+  test("a transient failure retries WITHOUT a further user change and lands the edit", async () => {
+    vi.spyOn(jobsDb, "getJob").mockResolvedValue({ ...baseJob });
+    const updateJob = vi
+      .spyOn(jobsDb, "updateJob")
+      .mockRejectedValueOnce(new DOMException("boom", "QuotaExceededError"))
+      .mockImplementation(async (_id, patch) => ({ ...baseJob, ...patch }));
+
+    const { unmount } = mountWithEdit();
+    await advance(300); // debounce fires → attempt 1 fails
+    expect(updateJob).toHaveBeenCalledTimes(1);
+
+    // The user tweaks one knob and exports — the common case. No further
+    // store change happens; the retry must be self-scheduled.
+    await advance(5000);
+    expect(updateJob.mock.calls.length).toBeGreaterThanOrEqual(2);
+    const lastPatch = updateJob.mock.calls[updateJob.mock.calls.length - 1][1];
+    expect(lastPatch).toMatchObject({ trim: { in: 2, out: 30 } });
+    unmount();
+  });
+
+  test("retries are bounded and a persistent failure surfaces as an editor notice", async () => {
+    vi.spyOn(jobsDb, "getJob").mockResolvedValue({ ...baseJob });
+    const updateJob = vi
+      .spyOn(jobsDb, "updateJob")
+      .mockRejectedValue(new Error("connection closed"));
+
+    const { unmount } = mountWithEdit();
+    await advance(300);
+    // Walk through every retry delay generously.
+    for (let i = 0; i < 8; i++) await advance(10_000);
+
+    const attempts = updateJob.mock.calls.length;
+    expect(attempts).toBeGreaterThanOrEqual(2); // it did retry
+    expect(attempts).toBeLessThanOrEqual(5); // …but not forever
+
+    // The user gets a visible signal instead of a silent loss.
+    const notice = useEditorStore.getState().notice;
+    expect(notice).not.toBeNull();
+    expect(notice!.message.toLowerCase()).toContain("sav");
+    unmount();
+  });
+
+  test("a retry picks up fresher state when the user edited meanwhile", async () => {
+    vi.spyOn(jobsDb, "getJob").mockResolvedValue({ ...baseJob });
+    const updateJob = vi
+      .spyOn(jobsDb, "updateJob")
+      .mockRejectedValueOnce(new Error("transient"))
+      .mockImplementation(async (_id, patch) => ({ ...baseJob, ...patch }));
+
+    const { unmount } = mountWithEdit();
+    await advance(300); // attempt 1 fails with trim {2,30}
+
+    act(() => {
+      useEditorStore.getState().setTrim({ in: 7, out: 55 });
+    });
+    await advance(10_000); // retry (and/or the new debounce) lands
+
+    const lastPatch = updateJob.mock.calls[updateJob.mock.calls.length - 1][1];
+    expect(lastPatch).toMatchObject({ trim: { in: 7, out: 55 } });
+    unmount();
+  });
+});

@@ -141,29 +141,65 @@ export function persistRelevantChanged(
   return PERSIST_SELECTORS.some((sel) => sel(state) !== sel(prev));
 }
 
+/** Backoff schedule for failed writes (#124). A transient IndexedDB
+ *  failure (QuotaExceededError, connection closed by another tab) used
+ *  to lose the edit permanently when the user made no further change —
+ *  the common tweak-one-knob-then-export case. Bounded so a dead DB
+ *  doesn't get hammered forever; after the last attempt the failure
+ *  surfaces as an editor notice instead of a console-only warn. */
+const RETRY_DELAYS_MS = [1000, 2000, 4000];
+
 /**
- * Persist one editor-state snapshot into the job row. Shared by the
- * debounced auto-persist, the flush-on-unmount/pagehide paths, and
+ * Persist one editor-state snapshot into the job row, retrying failed
+ * writes on a bounded backoff (#124). Shared by the debounced
+ * auto-persist, the flush-on-unmount/pagehide paths, and
  * `flushEditorStateNow`. The snapshot is captured by the caller so a
- * flush that races unmount still writes what the user last saw.
+ * flush that races unmount still writes what the user last saw; a retry
+ * upgrades to the store's current state when it still holds this job,
+ * so it never overwrites newer edits with a stale snapshot.
  *
- * `isStale` is re-checked after the async job read: the debounced path
- * uses it to bail when the hook was cleaned up mid-flight (the cleanup
- * itself runs a snapshot-based final flush instead).
+ * `isStale` is re-checked after every await: the debounced path uses it
+ * to bail when the hook was cleaned up mid-flight (the cleanup itself
+ * runs a snapshot-based final flush instead).
  */
 async function persistSnapshot(
   jobId: string,
   s: EditorStoreState,
   isStale: () => boolean = () => false,
 ): Promise<void> {
-  if (!s.jobMeta || s.jobMeta.id !== jobId) return;
-  try {
-    const job = await jobsDb.getJob(jobId);
-    if (!job || isStale()) return;
-    await jobsDb.updateJob(jobId, buildPersistPatch(s, job));
-  } catch (err) {
-    // Non-fatal: a failed write means we'll retry on the next change.
-    console.warn("auto-persist failed:", err);
+  for (let attempt = 0; ; attempt++) {
+    // Prefer the freshest state for this job — matters on retries, where
+    // the user may have edited again since the failed attempt.
+    const live = useEditorStore.getState();
+    const snap = live.jobMeta?.id === jobId ? live : s;
+    if (!snap.jobMeta || snap.jobMeta.id !== jobId) return;
+    try {
+      const job = await jobsDb.getJob(jobId);
+      if (!job || isStale()) return;
+      await jobsDb.updateJob(jobId, buildPersistPatch(snap, job));
+      return;
+    } catch (err) {
+      if (attempt >= RETRY_DELAYS_MS.length) {
+        console.error("auto-persist failed permanently:", err);
+        // Loud, user-visible signal — silent data loss is the one thing
+        // this hook exists to prevent.
+        try {
+          const cur = useEditorStore.getState();
+          if (cur.jobMeta?.id === jobId) {
+            cur.pushNotice("Saving failed — recent edits may be lost on reload");
+          }
+        } catch {
+          // notice is best-effort
+        }
+        return;
+      }
+      console.warn(
+        `auto-persist failed (attempt ${attempt + 1}/${RETRY_DELAYS_MS.length + 1}), retrying:`,
+        err,
+      );
+      await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt]));
+      if (isStale()) return;
+    }
   }
 }
 
