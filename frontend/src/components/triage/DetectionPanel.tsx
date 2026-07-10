@@ -14,7 +14,9 @@
  */
 import { useCallback, useRef } from "react";
 import { detectChunksFromEnvelope } from "../../local/triage/chunk-detect";
+import { mergeRedetectedChunks } from "../../local/triage/redetect-merge";
 import { jobsDb } from "../../local/jobs";
+import { confirmDestructive } from "../../lib/confirm";
 import {
   isChunkEffectivelyAccepted,
   useTriageStore,
@@ -53,6 +55,14 @@ export function DetectionPanel() {
 
   const liveDebounceRef = useRef<number | null>(null);
   const persistDebounceRef = useRef<number | null>(null);
+  /** One-shot session gate: the first slider tweak with downstream work
+   *  (persisted arrangement, manual chunk edits) goes through the same
+   *  confirmDestructive() dialog as reject/split/join. Once approved,
+   *  subsequent tweaks in this Triage session run freely. */
+  const redetectApprovedRef = useRef(false);
+  /** Deduplicates concurrent approval checks during a slider drag —
+   *  every onPointerMove would otherwise open its own dialog. */
+  const approvalPromiseRef = useRef<Promise<boolean> | null>(null);
 
   const reDetect = useCallback(
     (config: SilenceConfig) => {
@@ -64,33 +74,51 @@ export function DetectionPanel() {
         state.envelope,
         config,
       ).then((result) => {
-        // Preserve the user's per-chunk accept/reject decisions AND
-        // the chunk id across re-detection. The id match keeps any
-        // arrangement / pill references pointing at the right chunk
-        // so a slider tweak that re-detects the same chunk geometry
-        // doesn't quietly empty the user's arrangement.
-        const merged = result.chunks.map((c) => {
-          const prev = state.chunks.find(
-            (p) => p.startMs === c.startMs && p.endMs === c.endMs,
-          );
-          if (prev) {
-            return {
-              ...c,
-              id: prev.id,
-              accepted: prev.accepted,
-              bpmOctaveShift: prev.bpmOctaveShift,
-              detectedBpm: c.detectedBpm ?? prev.detectedBpm,
-              effectiveBpm: c.detectedBpm ? c.effectiveBpm : prev.effectiveBpm,
-              audioStartMs: c.audioStartMs ?? prev.audioStartMs,
-            };
-          }
-          return c;
-        });
-        setChunks(merged);
+        // Reconcile against the CURRENT chunk list (not the kickoff
+        // snapshot) via the overlap merge: keep/drop decisions, ids and
+        // manual edits survive the boundary shifts every parameter
+        // change produces — so arrangement / pill references stay
+        // valid and a slider tweak doesn't quietly empty the user's
+        // arrangement.
+        const prev = useTriageStore.getState().chunks;
+        setChunks(mergeRedetectedChunks(prev, result.chunks));
       });
     },
     [setChunks],
   );
+
+  const ensureRedetectApproved = useCallback((): Promise<boolean> => {
+    if (redetectApprovedRef.current) return Promise.resolve(true);
+    if (approvalPromiseRef.current) return approvalPromiseRef.current;
+    const pending = (async () => {
+      const state = useTriageStore.getState();
+      const hasManualEdits = state.chunks.some(
+        (c) => c.trimMode !== "auto" || !c.accepted,
+      );
+      let hasArrangement = false;
+      if (state.jobId) {
+        const job = await jobsDb.getJob(state.jobId).catch(() => undefined);
+        hasArrangement = (job?.arrangement ?? []).length > 0;
+      }
+      if (!hasManualEdits && !hasArrangement) {
+        // Nothing downstream to protect — don't nag.
+        redetectApprovedRef.current = true;
+        return true;
+      }
+      const ok = await confirmDestructive({
+        title: "Re-run detection?",
+        body:
+          "Changing detection settings re-segments the audio. Kept/dropped flags and manual edits carry over where chunks still overlap, but chunks the new segmentation drops disappear from the arrangement too.",
+        destructiveLabel: "Re-detect",
+      });
+      if (ok) redetectApprovedRef.current = true;
+      return ok;
+    })().finally(() => {
+      approvalPromiseRef.current = null;
+    });
+    approvalPromiseRef.current = pending;
+    return pending;
+  }, []);
 
   const persist = useCallback((config: SilenceConfig) => {
     const state = useTriageStore.getState();
@@ -108,16 +136,22 @@ export function DetectionPanel() {
   }, []);
 
   function onChange(patch: Partial<SilenceConfig>) {
-    const next = { ...silenceConfig, ...patch };
-    setSilenceConfig(next);
-    if (liveDebounceRef.current !== null) {
-      window.clearTimeout(liveDebounceRef.current);
-    }
-    liveDebounceRef.current = window.setTimeout(() => {
-      reDetect(next);
-      persist(next);
-      liveDebounceRef.current = null;
-    }, 50);
+    void ensureRedetectApproved().then((approved) => {
+      if (!approved) return;
+      // Read the config fresh — during a drag several onChange calls
+      // can await the same approval, and each must stack on the latest
+      // applied value, not on its own stale render snapshot.
+      const next = { ...useTriageStore.getState().silenceConfig, ...patch };
+      setSilenceConfig(next);
+      if (liveDebounceRef.current !== null) {
+        window.clearTimeout(liveDebounceRef.current);
+      }
+      liveDebounceRef.current = window.setTimeout(() => {
+        reDetect(next);
+        persist(next);
+        liveDebounceRef.current = null;
+      }, 50);
+    });
   }
 
   return (
