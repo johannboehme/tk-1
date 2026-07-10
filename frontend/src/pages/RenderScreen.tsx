@@ -9,7 +9,7 @@ import {
   jobsDb,
   type LocalJob,
 } from "../local/jobs";
-import { useRenderOp } from "../local/ops-store";
+import { useOpsStore, useRenderOp } from "../local/ops-store";
 import { renderStageLabel } from "./render-stages";
 
 function formatDuration(s: number): string {
@@ -73,10 +73,16 @@ export default function RenderScreen() {
   }, [op?.pct, op?.stage, op]);
 
   // Auto-navigate when the render finishes. We give the success path a
-  // brief moment so the user sees "Done" before the page swaps.
+  // brief moment so the user sees "Done" before the page swaps. The op
+  // is cleared on the way out — its result now lives on the job
+  // (`lastRender`), so keeping a done-op around would leave History
+  // showing a perpetual RENDER badge (#92).
   useEffect(() => {
     if (!op?.done) return;
-    const t = window.setTimeout(() => navigate(`/job/${id}`), 600);
+    const t = window.setTimeout(() => {
+      navigate(`/job/${id}`);
+      useOpsStore.getState().clearRenderOp(id);
+    }, 600);
     return () => window.clearTimeout(t);
   }, [op?.done, id, navigate]);
 
@@ -85,6 +91,10 @@ export default function RenderScreen() {
     setCancelling(true);
     try {
       await cancelEditRender(id);
+      // cancelEditRender flags the op with error:"cancelled" for any
+      // screen that's still watching; we're leaving, so drop it — a
+      // deliberate cancel must not linger as a FAIL badge (#92).
+      useOpsStore.getState().clearRenderOp(id);
     } finally {
       navigate(`/job/${id}/edit`);
     }

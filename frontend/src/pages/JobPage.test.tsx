@@ -116,6 +116,22 @@ describe("JobPage — quick render feedback + double-start guard (#91)", () => {
   });
 });
 
+describe("JobPage — render op cleanup (#92)", () => {
+  it("clears the finished render op after a successful quick render", async () => {
+    runQuickRenderMock.mockImplementation(async (jobId: string) => {
+      // Mimic runQuickRender's store lifecycle: start, then finish.
+      useOpsStore.getState().startRenderOp(jobId, { pct: 5, stage: "render-prep" });
+      useOpsStore.getState().finishRenderOp(jobId);
+    });
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: /quick render/i }));
+    await waitFor(() => {
+      expect(useOpsStore.getState().ops["job-1"]?.render).toBeUndefined();
+    });
+  });
+});
+
 describe("JobPage — quick-render error handling (#90)", () => {
   it("keeps the full page layout when quick render fails", async () => {
     runQuickRenderMock.mockRejectedValue(new Error("Render exploded"));

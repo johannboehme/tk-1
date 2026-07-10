@@ -5,8 +5,8 @@ import { RuleStrip } from "../editor/components/RuleStrip";
 import { TrashIcon } from "../editor/components/icons";
 import { formatDuration } from "../components/ProgressBar";
 import { jobsDb, deleteJob, jobEvents, type LocalJob } from "../local/jobs";
-import { useOpsStore, type JobOps } from "../local/ops-store";
-import { isVideoAsset } from "../storage/jobs-db";
+import { useOpsStore } from "../local/ops-store";
+import { activePct, jobBadge, type BadgeKind } from "./history-model";
 
 export default function History() {
   const [jobs, setJobs] = useState<LocalJob[] | null>(null);
@@ -86,26 +86,6 @@ export default function History() {
       )}
     </main>
   );
-}
-
-type BadgeKind = "queued" | "syncing" | "rendering" | "rendered" | "synced" | "failed" | "needs-sync";
-
-function jobBadge(job: LocalJob, ops: JobOps | undefined): BadgeKind {
-  if (ops?.render && !ops.render.error) return "rendering";
-  if (ops?.sync && !ops.sync.error) return "syncing";
-  if (ops?.render?.error || ops?.sync?.error) return "failed";
-  const cams = job.videos ?? [];
-  const hasSyncData =
-    cams.length > 0 && cams.every((c) => !isVideoAsset(c) || Boolean(c.sync));
-  if (job.lastRender) return "rendered";
-  if (hasSyncData) return "synced";
-  return "needs-sync";
-}
-
-function activePct(ops: JobOps | undefined): number | null {
-  if (ops?.render) return ops.render.pct;
-  if (ops?.sync) return ops.sync.pct;
-  return null;
 }
 
 function JobCard({ job, onDelete }: { job: LocalJob; onDelete: () => void }) {

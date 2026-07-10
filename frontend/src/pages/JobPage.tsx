@@ -15,7 +15,7 @@ import {
   type LocalJob,
 } from "../local/jobs";
 import { jobRoutePath, nextRouteForJob } from "../local/jobs-routing";
-import { useRenderOp, useSyncOp } from "../local/ops-store";
+import { useOpsStore, useRenderOp, useSyncOp } from "../local/ops-store";
 import { isVideoAsset } from "../storage/jobs-db";
 import { SyncPatchPanel } from "../components/sync/SyncPatchPanel";
 import { renderStageLabel } from "./render-stages";
@@ -98,6 +98,10 @@ export default function JobPage() {
     setErr(null);
     try {
       await runQuickRender(job.id);
+      // The result is persisted on the job (`lastRender`) — drop the
+      // finished op so it can't linger as a stuck RENDER badge (#92).
+      // Failed ops stay in the store until the next attempt clears them.
+      useOpsStore.getState().clearRenderOp(job.id);
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Render failed");
     } finally {
