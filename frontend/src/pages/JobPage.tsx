@@ -101,7 +101,6 @@ export default function JobPage() {
     navigate("/jobs");
   }
 
-  if (err) return <Banner kind="error" text={err} />;
   if (!job) {
     return (
       <main className="flex-1 flex items-center justify-center">
@@ -171,7 +170,9 @@ export default function JobPage() {
       {syncFailed && syncOp?.error && (
         <Banner kind="error" text={syncOp.error} details={syncOp.errorReport} />
       )}
-      {err && <Banner kind="error" text={err} />}
+      {err && (
+        <Banner kind="error" text={err} onDismiss={() => setErr(null)} />
+      )}
 
       {(isDone || canRetry) && (
         <div className="flex flex-wrap gap-3 border-t border-rule pt-5">
@@ -329,6 +330,7 @@ function Banner({
   kind,
   text,
   details,
+  onDismiss,
 }: {
   kind: "error";
   text: string;
@@ -336,6 +338,9 @@ function Banner({
    *  shows a "Show details" toggle + "Copy details" affordance so the
    *  user can ship the report to us without poking around devtools. */
   details?: string;
+  /** When set, the banner shows a "Dismiss" affordance that lets the
+   *  user clear a transient error without leaving the page. */
+  onDismiss?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -360,22 +365,35 @@ function Banner({
       ].join(" ")}
     >
       <div>{text}</div>
-      {details && (
+      {(details || onDismiss) && (
         <div className="mt-1 flex items-center gap-3 text-xs">
-          <button
-            type="button"
-            onClick={() => setOpen((v) => !v)}
-            className="underline underline-offset-2 hover:opacity-80"
-          >
-            {open ? "Hide details" : "Show details"}
-          </button>
-          <button
-            type="button"
-            onClick={copy}
-            className="underline underline-offset-2 hover:opacity-80"
-          >
-            {copied ? "Copied" : "Copy details"}
-          </button>
+          {details && (
+            <>
+              <button
+                type="button"
+                onClick={() => setOpen((v) => !v)}
+                className="underline underline-offset-2 hover:opacity-80"
+              >
+                {open ? "Hide details" : "Show details"}
+              </button>
+              <button
+                type="button"
+                onClick={copy}
+                className="underline underline-offset-2 hover:opacity-80"
+              >
+                {copied ? "Copied" : "Copy details"}
+              </button>
+            </>
+          )}
+          {onDismiss && (
+            <button
+              type="button"
+              onClick={onDismiss}
+              className="underline underline-offset-2 hover:opacity-80"
+            >
+              Dismiss
+            </button>
+          )}
         </div>
       )}
       {details && open && (

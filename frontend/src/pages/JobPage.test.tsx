@@ -1,0 +1,114 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
+import JobPage from "./JobPage";
+import { useOpsStore } from "../local/ops-store";
+import {
+  deleteJob,
+  jobsDb,
+  resolveJobAssetUrl,
+  runQuickRender,
+  type LocalJob,
+} from "../local/jobs";
+
+vi.mock("../local/jobs", () => ({
+  jobEvents: new EventTarget(),
+  jobsDb: { getJob: vi.fn(), updateJob: vi.fn() },
+  deleteJob: vi.fn(),
+  resolveJobAssetUrl: vi.fn(),
+  runQuickRender: vi.fn(),
+}));
+
+const getJobMock = vi.mocked(jobsDb.getJob);
+const resolveUrlMock = vi.mocked(resolveJobAssetUrl);
+const runQuickRenderMock = vi.mocked(runQuickRender);
+
+function makeJob(overrides: Partial<LocalJob> = {}): LocalJob {
+  const sync = { offsetMs: 12, driftRatio: 1, confidence: 0.9 };
+  return {
+    id: "job-1",
+    title: "My Song",
+    videoFilename: "take-1.mp4",
+    audioFilename: "song.wav",
+    createdAt: Date.now(),
+    schemaVersion: 3,
+    mode: "direct",
+    sync,
+    cuts: [],
+    videos: [
+      {
+        kind: "video",
+        id: "cam-1",
+        filename: "take-1.mp4",
+        opfsPath: "jobs/job-1/cam-1.mp4",
+        color: "#dd4a1f",
+        sync,
+      },
+    ],
+    ...overrides,
+  };
+}
+
+function renderPage() {
+  return render(
+    <MemoryRouter initialEntries={["/job/job-1"]}>
+      <Routes>
+        <Route path="/job/:id" element={<JobPage />} />
+        <Route path="/jobs" element={<div>jobs list</div>} />
+        <Route path="/job/:id/edit" element={<div>editor</div>} />
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  useOpsStore.setState({ ops: {} });
+  getJobMock.mockResolvedValue(makeJob());
+  resolveUrlMock.mockResolvedValue(null);
+  vi.mocked(deleteJob).mockResolvedValue(undefined);
+});
+
+describe("JobPage — quick-render error handling (#90)", () => {
+  it("keeps the full page layout when quick render fails", async () => {
+    runQuickRenderMock.mockRejectedValue(new Error("Render exploded"));
+    renderPage();
+
+    const btn = await screen.findByRole("button", { name: /quick render/i });
+    fireEvent.click(btn);
+
+    // Error banner appears…
+    expect(await screen.findByText("Render exploded")).toBeTruthy();
+    // …but the page chrome is still there: title, quick render, delete.
+    expect(screen.getByText("My Song")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /quick render/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /delete/i })).toBeTruthy();
+  });
+
+  it("lets the user dismiss the quick-render error", async () => {
+    runQuickRenderMock.mockRejectedValue(new Error("Render exploded"));
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: /quick render/i }));
+    expect(await screen.findByText("Render exploded")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /dismiss/i }));
+    await waitFor(() => {
+      expect(screen.queryByText("Render exploded")).toBeNull();
+    });
+  });
+
+  it("clears a previous error when quick render is retried", async () => {
+    runQuickRenderMock.mockRejectedValueOnce(new Error("Render exploded"));
+    runQuickRenderMock.mockResolvedValueOnce(undefined);
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: /quick render/i }));
+    expect(await screen.findByText("Render exploded")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /quick render/i }));
+    await waitFor(() => {
+      expect(screen.queryByText("Render exploded")).toBeNull();
+    });
+  });
+});
