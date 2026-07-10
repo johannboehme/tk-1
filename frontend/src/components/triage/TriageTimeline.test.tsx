@@ -115,3 +115,27 @@ describe("TriageTimeline — playhead tick isolation", () => {
     expect(screen.queryByTestId("triage-playhead")).not.toBeInTheDocument();
   });
 });
+
+describe("TriageTimeline — bar ruler (unified grid)", () => {
+  it("renders stride-labeled bar numbers for the focused chunk", () => {
+    useTriageStore.setState({
+      jobBpm: { value: 120, manualOverride: false },
+      focusedChunkId: "c1",
+    });
+    render(<TriageTimeline />);
+    // 800 px over 600 s → pxPerBar ≈ 2.67 at 120 BPM (bar = 2 s) →
+    // auto stride 32: bar 1 anchors at c1's start (10 s), the next
+    // labeled downbeats are bars 33 and 65 — projected across the view.
+    expect(screen.getByText("33")).toBeInTheDocument();
+    expect(screen.getByText("65")).toBeInTheDocument();
+  });
+
+  it("renders no bar ticks without a focused chunk", () => {
+    useTriageStore.setState({
+      jobBpm: { value: 120, manualOverride: false },
+      focusedChunkId: null,
+    });
+    render(<TriageTimeline />);
+    expect(screen.queryByText("33")).not.toBeInTheDocument();
+  });
+});

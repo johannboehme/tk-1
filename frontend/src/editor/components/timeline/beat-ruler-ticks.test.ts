@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildRulerTicks } from "./beat-ruler-ticks";
+import { buildRulerTicks, pickBarStride } from "./beat-ruler-ticks";
 
 const BPM = 120;        // 0.5 s per beat, 2 s per bar (4/4)
 const PHASE = 0;
@@ -256,5 +256,188 @@ describe("buildRulerTicks — bar offset (anacrusis / pickup)", () => {
       barOffsetBeats: 4,
     });
     expect(b).toEqual(a);
+  });
+});
+
+describe("buildRulerTicks — extendBeforePhase (grid projected left of anchor)", () => {
+  it("emits bars before the phase with bar numbers ≤ 0", () => {
+    // Anchor at 10 s, window 0..12 s. Bars every 2 s: t=0..12.
+    const ticks = buildRulerTicks({
+      bpm: BPM,
+      beatPhase: 10,
+      startS: 0,
+      endS: 12,
+      pxPerSec: 30,
+      extendBeforePhase: true,
+    });
+    const bars = ticks.filter((t) => t.kind === "bar");
+    expect(bars.map((t) => t.t)).toEqual([0, 2, 4, 6, 8, 10, 12]);
+    expect(bars.map((t) => t.barNumber)).toEqual([-4, -3, -2, -1, 0, 1, 2]);
+  });
+
+  it("still renders in-between beats left of the anchor", () => {
+    const ticks = buildRulerTicks({
+      bpm: BPM,
+      beatPhase: 10,
+      startS: 8,
+      endS: 10,
+      pxPerSec: 30,
+      extendBeforePhase: true,
+    });
+    const beats = ticks.filter((t) => t.kind === "beat");
+    expect(beats.map((t) => t.t)).toEqual([8.5, 9, 9.5]);
+  });
+
+  it("combines with a pickup: bar 1 sits offset beats after the phase, bar 0 one bar earlier", () => {
+    // Phase 5 s, 2-beat pickup at 120 BPM → bar 1 at 6 s, bar 0 at 4 s.
+    const ticks = buildRulerTicks({
+      bpm: BPM,
+      beatPhase: 5,
+      startS: 0,
+      endS: 10,
+      pxPerSec: 30,
+      beatsPerBar: 4,
+      barOffsetBeats: 2,
+      extendBeforePhase: true,
+    });
+    const bars = ticks.filter((t) => t.kind === "bar");
+    expect(bars.map((t) => t.t)).toEqual([0, 2, 4, 6, 8, 10]);
+    expect(bars.map((t) => t.barNumber)).toEqual([-2, -1, 0, 1, 2, 3]);
+  });
+
+  it("defaults to the editor behavior (no pre-phase ticks) when omitted", () => {
+    const ticks = buildRulerTicks({
+      bpm: BPM,
+      beatPhase: 10,
+      startS: 0,
+      endS: 12,
+      pxPerSec: 30,
+    });
+    for (const t of ticks) expect(t.t).toBeGreaterThanOrEqual(10 - 1e-9);
+  });
+});
+
+describe("buildRulerTicks — labelStride", () => {
+  it("labels every bar at stride 1 (default)", () => {
+    const ticks = buildRulerTicks({
+      bpm: BPM,
+      beatPhase: PHASE,
+      startS: 0,
+      endS: 8,
+      pxPerSec: 30,
+    });
+    const bars = ticks.filter((t) => t.kind === "bar");
+    expect(bars.length).toBeGreaterThan(0);
+    for (const b of bars) expect(b.labeled).toBe(true);
+  });
+
+  it("labels only every Nth bar with 'auto' stride at low zoom, keeping bar 1 labeled", () => {
+    // pxPerSec 7 → pxPerBar 14 → stride 4 (labels ≥ 56 px apart).
+    const ticks = buildRulerTicks({
+      bpm: BPM,
+      beatPhase: PHASE,
+      startS: 0,
+      endS: 40,
+      pxPerSec: 7,
+      labelStride: "auto",
+    });
+    const bars = ticks.filter((t) => t.kind === "bar");
+    expect(bars.length).toBe(21); // bars 1..21 at 0,2,…,40 s
+    for (const b of bars) {
+      expect(b.labeled).toBe((b.barNumber! - 1) % 4 === 0);
+    }
+  });
+
+  it("suppresses beats and subdivisions when the stride is > 1", () => {
+    const ticks = buildRulerTicks({
+      bpm: BPM,
+      beatPhase: PHASE,
+      startS: 0,
+      endS: 40,
+      pxPerSec: 7,
+      labelStride: "auto",
+    });
+    const kinds = new Set(ticks.map((t) => t.kind));
+    expect(kinds).toEqual(new Set(["bar"]));
+  });
+
+  it("drops unlabeled bars entirely when they'd sit closer than 6 px", () => {
+    // pxPerSec 2 → pxPerBar 4 (< 6): only stride-labeled bars survive.
+    const ticks = buildRulerTicks({
+      bpm: BPM,
+      beatPhase: PHASE,
+      startS: 0,
+      endS: 120,
+      pxPerSec: 2,
+      labelStride: "auto",
+    });
+    const bars = ticks.filter((t) => t.kind === "bar");
+    expect(bars.length).toBeGreaterThan(0);
+    for (const b of bars) expect(b.labeled).toBe(true);
+  });
+
+  it("returns nothing when bars would sit closer than a quarter pixel", () => {
+    // pxPerSec 0.1 → pxPerBar 0.2 < 0.25 → tick soup guard kicks in.
+    const ticks = buildRulerTicks({
+      bpm: BPM,
+      beatPhase: PHASE,
+      startS: 0,
+      endS: 600,
+      pxPerSec: 0.1,
+    });
+    expect(ticks).toEqual([]);
+  });
+});
+
+describe("pickBarStride", () => {
+  it("is 1 when a bar already spans the label target", () => {
+    expect(pickBarStride(56)).toBe(1);
+    expect(pickBarStride(200)).toBe(1);
+  });
+  it("doubles until labeled bars sit ≥ 56 px apart", () => {
+    expect(pickBarStride(28)).toBe(2);
+    expect(pickBarStride(14)).toBe(4);
+    expect(pickBarStride(13)).toBe(8);
+  });
+});
+
+describe("buildRulerTicks — extensionSpan", () => {
+  const opts = {
+    bpm: BPM,
+    beatPhase: 2,
+    startS: 0,
+    endS: 8,
+    pxPerSec: 30,
+    extendBeforePhase: true,
+    extensionSpan: { startS: 2, endS: 6 },
+  };
+
+  it("flags ticks outside the half-open span [startS, endS) as extension", () => {
+    const ticks = buildRulerTicks(opts);
+    const bars = ticks.filter((t) => t.kind === "bar");
+    expect(bars.map((t) => t.t)).toEqual([0, 2, 4, 6, 8]);
+    // The downbeat exactly at span end opens the NEXT bar → extension
+    // (half-open chunk span — the boundary bar is not primary).
+    expect(bars.map((t) => t.extension)).toEqual([true, false, false, true, true]);
+  });
+
+  it("flags beat ticks by the same half-open rule", () => {
+    const ticks = buildRulerTicks(opts);
+    const at = (t: number) => ticks.find((x) => Math.abs(x.t - t) < 1e-6)!;
+    expect(at(2.5).extension).toBe(false);
+    expect(at(5.5).extension).toBe(false);
+    expect(at(6.5).extension).toBe(true);
+    expect(at(1.5).extension).toBe(true);
+  });
+
+  it("emits no extension field when no span is given", () => {
+    const ticks = buildRulerTicks({
+      bpm: BPM,
+      beatPhase: PHASE,
+      startS: 0,
+      endS: 4,
+      pxPerSec: 30,
+    });
+    for (const t of ticks) expect(t.extension).toBeUndefined();
   });
 });
