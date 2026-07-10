@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import JobPage from "./JobPage";
 import { useOpsStore } from "../local/ops-store";
@@ -67,6 +67,53 @@ beforeEach(() => {
   getJobMock.mockResolvedValue(makeJob());
   resolveUrlMock.mockResolvedValue(null);
   vi.mocked(deleteJob).mockResolvedValue(undefined);
+});
+
+describe("JobPage — quick render feedback + double-start guard (#91)", () => {
+  it("disables the button and shows progress while a render op is active", async () => {
+    renderPage();
+    await screen.findByRole("button", { name: /quick render/i });
+
+    act(() => {
+      useOpsStore
+        .getState()
+        .startRenderOp("job-1", { pct: 42, stage: "encoding" });
+    });
+
+    const btn = screen.getByRole("button", {
+      name: /rendering/i,
+    }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+    // Progress console: stage label + pct readout.
+    expect(screen.getByText("Encoding video")).toBeTruthy();
+    expect(screen.getByText("42%")).toBeTruthy();
+    // Status badge flips to "rendering".
+    expect(screen.getByText("rendering")).toBeTruthy();
+  });
+
+  it("starts only one render on a double click", async () => {
+    let release!: () => void;
+    runQuickRenderMock.mockImplementation(
+      () =>
+        new Promise<void>((res) => {
+          release = res;
+        }),
+    );
+    renderPage();
+
+    const btn = await screen.findByRole("button", { name: /quick render/i });
+    fireEvent.click(btn);
+    fireEvent.click(btn);
+    expect(runQuickRenderMock).toHaveBeenCalledTimes(1);
+
+    release();
+    await waitFor(() => {
+      expect(
+        (screen.getByRole("button", { name: /quick render/i }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(false);
+    });
+  });
 });
 
 describe("JobPage — quick-render error handling (#90)", () => {

@@ -10,25 +10,7 @@ import {
   type LocalJob,
 } from "../local/jobs";
 import { useRenderOp } from "../local/ops-store";
-
-const STAGE_LABELS: Record<string, string> = {
-  "render-prep": "Preparing",
-  "audio-decode": "Decoding audio",
-  "audio-encode": "Encoding audio",
-  "energy-curves": "Analyzing audio energy",
-  "extracting-frames": "Extracting preview frames",
-  encoding: "Encoding video",
-  "encoder-flush": "Flushing last frames",
-  muxing: "Muxing audio + video",
-  finalizing: "Finalizing file",
-  writing: "Writing MP4",
-  rendered: "Done",
-  cancelled: "Cancelled",
-};
-
-function stageLabel(stage: string): string {
-  return STAGE_LABELS[stage] ?? stage;
-}
+import { renderStageLabel } from "./render-stages";
 
 function formatDuration(s: number): string {
   if (!isFinite(s) || s < 0) return "—";
@@ -144,7 +126,7 @@ export default function RenderScreen() {
         {!isFailed && (
           <section className="bg-paper-hi border border-rule rounded-md p-5 flex flex-col gap-3">
             <div className="flex items-center justify-between font-mono text-[11px] tracking-label uppercase text-ink-2">
-              <span>{stageLabel(stage)}</span>
+              <span>{renderStageLabel(stage)}</span>
               <span className="tabular text-ink">{Math.round(pct)}%</span>
             </div>
             <div className="h-3 rounded-full bg-paper border border-rule overflow-hidden">

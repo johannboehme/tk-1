@@ -15,9 +15,10 @@ import {
   type LocalJob,
 } from "../local/jobs";
 import { jobRoutePath, nextRouteForJob } from "../local/jobs-routing";
-import { useSyncOp } from "../local/ops-store";
+import { useRenderOp, useSyncOp } from "../local/ops-store";
 import { isVideoAsset } from "../storage/jobs-db";
 import { SyncPatchPanel } from "../components/sync/SyncPatchPanel";
+import { renderStageLabel } from "./render-stages";
 
 export default function JobPage() {
   const { id = "" } = useParams<{ id: string }>();
@@ -26,6 +27,11 @@ export default function JobPage() {
   const [err, setErr] = useState<string | null>(null);
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const syncOp = useSyncOp(id);
+  const renderOp = useRenderOp(id);
+  // Local synchronous guard for the window between the click and the
+  // render op appearing in the store (runQuickRender awaits the job
+  // lookup before it starts the op).
+  const [renderPending, setRenderPending] = useState(false);
 
   // Derived state — phase comes from data + ops, never a status enum.
   const hasSyncData = useMemo(() => {
@@ -36,6 +42,8 @@ export default function JobPage() {
   const isSyncing = Boolean(syncOp) && !syncOp?.error;
   const syncFailed = Boolean(syncOp?.error);
   const hasOutput = Boolean(job?.lastRender);
+  const isRendering = Boolean(renderOp) && !renderOp?.error && !renderOp?.done;
+  const renderBusy = renderPending || isRendering;
 
   // Download filename: prefer the custom name the user set in the export panel
   // (persisted on the last render's editSpec), falling back to the project title.
@@ -85,12 +93,15 @@ export default function JobPage() {
   }, [job?.lastRender, job?.id]);
 
   async function onQuickRender() {
-    if (!job) return;
+    if (!job || renderBusy) return;
+    setRenderPending(true);
     setErr(null);
     try {
       await runQuickRender(job.id);
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Render failed");
+    } finally {
+      setRenderPending(false);
     }
   }
 
@@ -133,7 +144,13 @@ export default function JobPage() {
           </span>
           <RuleStrip count={32} className="text-rule flex-1 max-w-[200px]" />
           <StatusBadge
-            label={statusLabel({ isSyncing, syncFailed, hasSyncData, hasOutput })}
+            label={statusLabel({
+              isSyncing,
+              isRendering,
+              syncFailed,
+              hasSyncData,
+              hasOutput,
+            })}
           />
         </div>
         <h1 className="font-display font-semibold text-3xl sm:text-4xl text-ink truncate">
@@ -167,6 +184,23 @@ export default function JobPage() {
         </AnimatePresence>
       </section>
 
+      {isRendering && renderOp && (
+        <section className="mb-6 bg-paper-hi border border-rule rounded-md p-4 flex flex-col gap-2">
+          <div className="flex items-center justify-between font-mono text-[11px] tracking-label uppercase text-ink-2">
+            <span>{renderStageLabel(renderOp.stage)}</span>
+            <span className="tabular text-ink">{Math.round(renderOp.pct)}%</span>
+          </div>
+          <div className="h-2 rounded-full bg-paper border border-rule overflow-hidden">
+            <div
+              className="h-full bg-hot transition-[width] duration-200 ease-out"
+              style={{
+                width: `${Math.min(100, Math.max(0, renderOp.pct))}%`,
+              }}
+            />
+          </div>
+        </section>
+      )}
+
       {syncFailed && syncOp?.error && (
         <Banner kind="error" text={syncOp.error} details={syncOp.errorReport} />
       )}
@@ -177,8 +211,17 @@ export default function JobPage() {
       {(isDone || canRetry) && (
         <div className="flex flex-wrap gap-3 border-t border-rule pt-5">
           {showQuickRender && (
-            <ChunkyButton variant="primary" size="lg" onClick={onQuickRender}>
-              {canRetry ? "Retry quick render" : "Quick render"}
+            <ChunkyButton
+              variant="primary"
+              size="lg"
+              onClick={onQuickRender}
+              disabled={renderBusy}
+            >
+              {renderBusy
+                ? `Rendering… ${Math.round(renderOp?.pct ?? 0)}%`
+                : canRetry
+                  ? "Retry quick render"
+                  : "Quick render"}
             </ChunkyButton>
           )}
           {job.mode === "longform" ? (
@@ -301,11 +344,13 @@ function StatusBadge({ label }: { label: string }) {
 
 function statusLabel(args: {
   isSyncing: boolean;
+  isRendering: boolean;
   syncFailed: boolean;
   hasSyncData: boolean;
   hasOutput: boolean;
 }): string {
   if (args.isSyncing) return "syncing";
+  if (args.isRendering) return "rendering";
   if (args.syncFailed) return "failed";
   if (args.hasOutput) return "rendered";
   if (args.hasSyncData) return "synced";
