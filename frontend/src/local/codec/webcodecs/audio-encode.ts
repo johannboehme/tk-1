@@ -43,6 +43,41 @@ export async function isAudioCodecSupported(
   }
 }
 
+/**
+ * Resolve which codec a STREAMING export should encode with, before the
+ * muxer exists. The streaming path (`streamEncodeAudioWithSegments`)
+ * deliberately has no mid-encode fallback — the mp4 muxer's audio track
+ * codec is fixed at construction, so an aac↔opus swap after encoding
+ * started is structurally impossible. Callers therefore probe UP FRONT
+ * (mirroring the h265 video pre-probe) and build the muxer with the
+ * resolved codec:
+ *   - requested codec supported → requested.
+ *   - otherwise, if the other codec is supported → the other one
+ *     (iOS Safari ships AudioEncoder without AAC but with Opus — the
+ *     case that used to hard-fail every default export).
+ *   - neither supported → the requested codec, so the encoder's own
+ *     descriptive isConfigSupported error surfaces downstream.
+ */
+export async function resolveAudioCodecWithFallback(
+  requested: AudioEncodeCodec,
+  sampleRate: number,
+  numberOfChannels: number,
+  bitrateBps: number = 192_000,
+): Promise<AudioEncodeCodec> {
+  if (
+    await isAudioCodecSupported(requested, sampleRate, numberOfChannels, bitrateBps)
+  ) {
+    return requested;
+  }
+  const fallback: AudioEncodeCodec = requested === "aac" ? "opus" : "aac";
+  if (
+    await isAudioCodecSupported(fallback, sampleRate, numberOfChannels, bitrateBps)
+  ) {
+    return fallback;
+  }
+  return requested;
+}
+
 export interface EncodedAudioChunkRecord {
   type: "key" | "delta";
   timestampUs: number;

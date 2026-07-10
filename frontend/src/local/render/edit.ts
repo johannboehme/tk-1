@@ -30,6 +30,7 @@ import {
 type MuxTarget = ArrayBufferTarget | FileSystemWritableFileStreamTarget;
 import {
   encodeAudioFromPcm,
+  resolveAudioCodecWithFallback,
   streamEncodeAudioWithSegments,
   type AudioEncodeCodec,
 } from "../codec/webcodecs/audio-encode";
@@ -720,9 +721,21 @@ export async function editRenderMulti(
   } else {
     throw new Error("editRenderMulti: either audioFile or audioPcm is required");
   }
-  const audioCodec: AudioEncodeCodec = input.audioCodec ?? "aac";
   const audioSampleRate = audio.sampleRate;
   const audioChannels = audio.channels;
+  // Pre-probe the audio codec with aac↔opus fallback (mirrors the h265
+  // pre-probe above). The muxer's audio track codec is fixed at
+  // construction and streamEncodeAudioWithSegments deliberately has no
+  // mid-encode fallback, so this is the only point where an unsupported
+  // codec can still be swapped. iOS Safari ships AudioEncoder without
+  // AAC (and some Android AAC encoders are broken) — without the probe
+  // every default export there hard-failed even though Opus works.
+  const audioCodec: AudioEncodeCodec = await resolveAudioCodecWithFallback(
+    input.audioCodec ?? "aac",
+    audioSampleRate,
+    audioChannels,
+    input.audioBitrateBps ?? 192_000,
+  );
 
   // Cam ranges on the master timeline + a test-pattern source for gaps.
   // Per-clip trim (video cams only) narrows the available window; image
