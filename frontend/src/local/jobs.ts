@@ -30,6 +30,7 @@ import {
   type VideoAsset,
 } from "../storage/jobs-db";
 import { useOpsStore } from "./ops-store";
+import { defaultJobTitle } from "../lib/filenames";
 import type { GradeParams } from "../editor/fx/looks";
 import { camColorAt } from "../storage/migrations";
 import { opfs } from "../storage/opfs";
@@ -209,7 +210,8 @@ async function persistImageCam(
 }
 
 interface CreateJobOptions {
-  /** Optional title; falls back to the video file name. */
+  /** Optional title; defaults to the master audio's name (the song is
+   *  the project's identity), then the first video's name. */
   title?: string | null;
   /** Workflow-Pfad. Default `"direct"` für die Legacy-Sync-Flow.
    *  `"longform"` schaltet den Triage → Arrange → Editor-Pfad frei. */
@@ -259,7 +261,7 @@ export async function createJob(
 
   const job: LocalJob = {
     id: jobId,
-    title: options.title ?? firstVideo.name,
+    title: options.title ?? defaultJobTitle(audioPick.file.name, firstVideo.name),
     // Legacy V1 mirrors of cam-1 (kept for backward compat — older callers
     // may still read videoFilename / sync / dimensions at the top level).
     videoFilename: firstVideo.name,

@@ -33,6 +33,10 @@ export default function JobPage() {
   // render op appearing in the store (runQuickRender awaits the job
   // lookup before it starts the op).
   const [renderPending, setRenderPending] = useState(false);
+  // Inline rename (#143) — the title defaults to the song's name, but
+  // stays editable right where it's displayed.
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState("");
 
   // Derived state — phase comes from data + ops, never a status enum.
   const hasSyncData = useMemo(() => {
@@ -111,6 +115,21 @@ export default function JobPage() {
     }
   }
 
+  function startRename() {
+    if (!job) return;
+    setTitleDraft(job.title || "");
+    setEditingTitle(true);
+  }
+
+  async function commitRename() {
+    if (!job) return;
+    setEditingTitle(false);
+    const trimmed = titleDraft.trim();
+    if (trimmed === (job.title ?? "")) return;
+    const saved = await jobsDb.updateJob(job.id, { title: trimmed || null });
+    setJob({ ...saved });
+  }
+
   async function onDelete() {
     if (!job) return;
     if (!window.confirm("Delete this job and its files?")) return;
@@ -159,9 +178,38 @@ export default function JobPage() {
             })}
           />
         </div>
-        <h1 className="font-display font-semibold text-3xl sm:text-4xl text-ink truncate">
-          {job.title || job.id}
-        </h1>
+        {editingTitle ? (
+          <input
+            autoFocus
+            value={titleDraft}
+            onChange={(e) => setTitleDraft(e.target.value)}
+            onBlur={() => void commitRename()}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void commitRename();
+              } else if (e.key === "Escape") {
+                setEditingTitle(false);
+              }
+            }}
+            aria-label="Job title"
+            className="font-display font-semibold text-3xl sm:text-4xl text-ink bg-paper-hi border border-rule rounded-md px-2 py-1 w-full max-w-2xl outline-none focus:border-ink-2"
+          />
+        ) : (
+          <div className="flex items-center gap-3 min-w-0">
+            <h1 className="font-display font-semibold text-3xl sm:text-4xl text-ink truncate">
+              {job.title || job.id}
+            </h1>
+            <button
+              type="button"
+              onClick={startRename}
+              aria-label="Rename job"
+              className="shrink-0 font-mono text-[10px] tracking-label uppercase text-ink-2 bg-paper-hi border border-rule rounded-full px-2 py-0.5 hover:text-ink hover:border-ink-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-ink-2"
+            >
+              Rename
+            </button>
+          </div>
+        )}
         <JobSubtitle job={job} />
       </header>
 

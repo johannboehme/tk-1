@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { downloadFilename, stripFileExtension } from "./filenames";
+import {
+  defaultJobTitle,
+  downloadFilename,
+  stripFileExtension,
+} from "./filenames";
 
 describe("stripFileExtension", () => {
   it("strips a common media extension", () => {
@@ -23,6 +27,22 @@ describe("stripFileExtension", () => {
 
   it("keeps dot-leading names intact", () => {
     expect(stripFileExtension(".mp4")).toBe(".mp4");
+  });
+});
+
+describe("defaultJobTitle (#143)", () => {
+  it("uses the master audio's name — the song is the project's identity", () => {
+    expect(defaultJobTitle("neon-nights.wav", "take-1.mp4")).toBe(
+      "neon-nights",
+    );
+  });
+
+  it("falls back to the first video's name when the audio name is empty", () => {
+    expect(defaultJobTitle("   ", "take-1.mp4")).toBe("take-1");
+  });
+
+  it("falls back to a generic title when both names are empty", () => {
+    expect(defaultJobTitle("", "")).toBe("Untitled session");
   });
 });
 

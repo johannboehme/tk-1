@@ -27,3 +27,19 @@ export function downloadFilename(base: string, ext = "mp4"): string {
   const cleaned = stripFileExtension(base.trim()).trim();
   return `${cleaned || "export"}.${ext}`;
 }
+
+/**
+ * Default title for a new job (#143). The song is the project's
+ * identity — every session shot on the same phone yields the same
+ * `take-1.mp4`, but the master audio is what the user is cutting to.
+ * Falls back to the first video's name, then to a generic label.
+ */
+export function defaultJobTitle(
+  audioFilename: string,
+  videoFilename: string,
+): string {
+  const song = stripFileExtension(audioFilename.trim()).trim();
+  if (song) return song;
+  const video = stripFileExtension(videoFilename.trim()).trim();
+  return video || "Untitled session";
+}

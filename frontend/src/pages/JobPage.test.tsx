@@ -121,6 +121,40 @@ describe("JobPage — quick render feedback + double-start guard (#91)", () => {
   });
 });
 
+describe("JobPage — inline rename (#143)", () => {
+  it("renames the job via the title edit affordance", async () => {
+    const renamed = makeJob({ title: "Neon Nights" });
+    vi.mocked(jobsDb.updateJob).mockResolvedValue(renamed);
+    renderPage();
+    await screen.findByText("My Song");
+
+    fireEvent.click(screen.getByRole("button", { name: /rename job/i }));
+    const input = screen.getByRole("textbox", { name: /job title/i });
+    fireEvent.change(input, { target: { value: "Neon Nights" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => {
+      expect(jobsDb.updateJob).toHaveBeenCalledWith("job-1", {
+        title: "Neon Nights",
+      });
+    });
+    expect(await screen.findByText("Neon Nights")).toBeTruthy();
+  });
+
+  it("cancels the rename on Escape without saving", async () => {
+    renderPage();
+    await screen.findByText("My Song");
+
+    fireEvent.click(screen.getByRole("button", { name: /rename job/i }));
+    const input = screen.getByRole("textbox", { name: /job title/i });
+    fireEvent.change(input, { target: { value: "typo" } });
+    fireEvent.keyDown(input, { key: "Escape" });
+
+    expect(jobsDb.updateJob).not.toHaveBeenCalled();
+    expect(screen.getByText("My Song")).toBeTruthy();
+  });
+});
+
 describe("JobPage — download filename (#142)", () => {
   it("does not double the extension when the title is a filename", async () => {
     getJobMock.mockResolvedValue(
