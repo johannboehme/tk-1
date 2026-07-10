@@ -2289,12 +2289,18 @@ export const useEditorStore = create<EditorState>()(
       // Scope: cuts + fx ONLY (#70). Cam start offsets are auto-synced
       // (snapping them would break A/V alignment) and the master trim is
       // the user's export window — quantize must not touch either.
+      //
+      // Cuts + fx live in timeline-time, so the beat anchor must be the
+      // ARR-time one — the exact grid the BeatRuler draws and
+      // snapTimelineTime recorded the cuts on (#94). The master anchor
+      // differs by segments[0].in in long-form and would move on-grid
+      // markers OFF the visible bar lines.
       const preview = buildQuantizePreview(
         { cuts: s.cuts, fx: s.fx },
         s.ui.snapMode,
         {
           bpm: s.jobMeta?.bpm?.value ?? null,
-          beatPhase: effectiveBeatPhaseS(s.jobMeta),
+          beatPhase: arrBeatPhaseS(s.jobMeta, s.arrangementSegments),
           beatsPerBar: effectiveBeatsPerBar(s.jobMeta),
           barOffsetBeats: effectiveBarOffsetBeats(s.jobMeta),
         },

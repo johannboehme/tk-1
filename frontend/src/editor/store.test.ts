@@ -568,6 +568,35 @@ describe("useEditorStore", () => {
       expect(useEditorStore.getState().quantizePreview).toBeNull();
       expect(useEditorStore.getState().cuts[0].atTimeS).toBeCloseTo(0.61, 6);
     });
+
+    test("quantize snaps against the ARR-time beat anchor, same as the BeatRuler and live cuts (#94)", () => {
+      // Long-form: the first played chunk starts at master 0.2, so the
+      // arr-time grid is shifted by -0.2 vs the master grid. At 120 BPM
+      // (step 0.5) the BeatRuler's ticks sit at arr 0.3, 0.8, 1.3, … —
+      // exactly where snapTimelineTime puts live-recorded cuts. Quantize
+      // must target the SAME ticks; the master anchor would 'snap' an
+      // on-ruler cut to 1.0, actively de-quantizing the performance.
+      useEditorStore.getState().loadJob(
+        {
+          ...baseJobMeta,
+          bpm: { value: 120, confidence: 1, phase: 0, manualOverride: false },
+        },
+        { arrangementSegments: [{ in: 0.2, out: 30.2 }] },
+      );
+      useEditorStore.getState().setSnapMode("1/4");
+      // Sanity: the live-cut snap lands on the arr grid.
+      expect(
+        useEditorStore.getState().snapTimelineTime(0.85),
+      ).toBeCloseTo(0.8, 6);
+      useEditorStore.setState({ cuts: [{ atTimeS: 0.85, camId: "cam-1" }] });
+      useEditorStore.getState().addFx("vignette", 0.85, 2.35);
+      useEditorStore.getState().buildAndStartQuantizePreview();
+      const p = useEditorStore.getState().quantizePreview;
+      expect(p?.cuts).toHaveLength(1);
+      expect(p?.cuts[0].to).toBeCloseTo(0.8, 6);
+      expect(p?.fxs[0]?.in?.to).toBeCloseTo(0.8, 6);
+      expect(p?.fxs[0]?.out?.to).toBeCloseTo(2.3, 6);
+    });
   });
 
   describe("snapMasterTime — selector", () => {
