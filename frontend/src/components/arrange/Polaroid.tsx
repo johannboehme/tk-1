@@ -211,6 +211,18 @@ export function Polaroid({
             transition: "opacity 600ms ease-out",
           }}
         />
+        {/* Preview-loop badge — solid cobalt tag while this chunk's
+         *  transient audition loop owns playback. Pairs with the
+         *  cobalt ring on the card so the state reads from across the
+         *  room, like a tape-deck "MONITOR" lamp. */}
+        {active && (
+          <span
+            className="absolute left-1 top-1 rounded-sm bg-cobalt px-1 py-[1px] font-display text-[8px] font-semibold tracking-label uppercase text-paper-hi pointer-events-none shadow-emboss"
+            title="Preview loop — click a strip frame to exit"
+          >
+            ◁ loop
+          </span>
+        )}
         {/* Spectral fingerprint stripe — 3px on the right edge of the
          *  image well, fading at top + bottom so it doesn't slam into
          *  the corners. Reads as part of the photograph rather than a

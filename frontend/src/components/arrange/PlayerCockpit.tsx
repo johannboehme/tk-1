@@ -70,6 +70,7 @@ export function PlayerCockpit() {
   const arrangement = useArrangeStore((s) => s.arrangement);
   const chunks = useArrangeStore((s) => s.chunks);
   const focusedItemId = useArrangeStore((s) => s.focusedItemId);
+  const previewChunkId = useArrangeStore((s) => s.previewChunkId);
   const currentItemId = useArrangeStore((s) => s.playback.currentItemId);
   const currentTime = useArrangeStore((s) => s.playback.currentTime);
   const isPlaying = useArrangeStore((s) => s.playback.isPlaying);
@@ -94,14 +95,19 @@ export function PlayerCockpit() {
     ? arrangement.findIndex((a) => a.id === showItemId) + 1
     : 0;
 
-  // Resolve the chunk to glance — same priority as itemIdx so the
-  // numeric counter and the phosphor mel always agree.
+  // Resolve the chunk to glance — a pool-preview loop wins (the LCD
+  // follows whatever the audio master is actually playing), otherwise
+  // same priority as itemIdx so the numeric counter and the phosphor
+  // mel always agree.
   const showChunk = useMemo(() => {
+    if (previewChunkId) {
+      return chunks.find((c) => c.id === previewChunkId) ?? null;
+    }
     if (!showItemId) return null;
     const item = arrangement.find((a) => a.id === showItemId);
     if (!item) return null;
     return chunks.find((c) => c.id === item.chunkId) ?? null;
-  }, [showItemId, arrangement, chunks]);
+  }, [previewChunkId, showItemId, arrangement, chunks]);
 
   const mel = showChunk ? melByChunkId[showChunk.id] ?? null : null;
   const autoTags = useMemo<CockpitAutoTags>(
@@ -122,9 +128,14 @@ export function PlayerCockpit() {
   // Real playhead fraction within the *currently playing* chunk, in
   // [0, 1]. Null when nothing is playing, or when the displayed chunk
   // isn't the one the audio master is currently inside (e.g. user
-  // focused a different chunk while playback runs elsewhere).
+  // focused a different chunk while playback runs elsewhere). In
+  // preview mode the audio master loops the displayed pool chunk, so
+  // the playhead always belongs to it.
+  const audioInsideShowChunk =
+    previewChunkId !== null ||
+    (currentItemId !== null && currentItemId === showItemId);
   let playheadFraction: number | null = null;
-  if (isPlaying && currentItemId && showChunk && currentItemId === showItemId) {
+  if (isPlaying && showChunk && audioInsideShowChunk) {
     const tMs = currentTime * 1000;
     const span = showChunk.endMs - showChunk.startMs;
     if (span > 0) {
@@ -139,13 +150,14 @@ export function PlayerCockpit() {
   // here even if the click landed in a chunk other than the focused
   // one. No-op when there's no chunk to seek inside.
   const onSeekToFraction =
-    showChunk && showItemId
+    showChunk && (previewChunkId || showItemId)
       ? (fraction: number) => {
           const span = showChunk.endMs - showChunk.startMs;
           if (span <= 0) return;
           const clamped = Math.max(0, Math.min(1, fraction));
           const targetMs = showChunk.startMs + clamped * span;
-          if (currentItemId !== showItemId) {
+          // Preview mode: seek within the loop, walker stays detached.
+          if (!previewChunkId && showItemId && currentItemId !== showItemId) {
             setCurrentItemId(showItemId);
           }
           seek(targetMs / 1000);

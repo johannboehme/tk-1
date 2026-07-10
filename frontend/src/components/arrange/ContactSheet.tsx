@@ -22,8 +22,8 @@ export function ContactSheet() {
   const selectedCamId = useArrangeStore((s) => s.selectedCamId);
   const arrangement = useArrangeStore((s) => s.arrangement);
   const insertChunkAtCursor = useArrangeStore((s) => s.insertChunkAtCursor);
-  const seek = useArrangeStore((s) => s.seek);
-  const focusItem = useArrangeStore((s) => s.focusItem);
+  const previewChunkId = useArrangeStore((s) => s.previewChunkId);
+  const previewChunk = useArrangeStore((s) => s.previewChunk);
   const seekToItem = useArrangeStore((s) => s.seekToItem);
   const jobBpm = useArrangeStore((s) => s.jobBpm);
   const jobBeatsPerBar = useArrangeStore((s) => s.jobBeatsPerBar);
@@ -93,6 +93,7 @@ export function ContactSheet() {
                 onAdd={() => {
                   insertChunkAtCursor(chunk.id);
                 }}
+                active={previewChunkId === chunk.id}
                 onPreview={() => {
                   // Click never changes the play state — if playback
                   // is paused, stay paused; if it's running, the seek
@@ -104,8 +105,10 @@ export function ContactSheet() {
                   if (inArrangement) {
                     seekToItem(inArrangement.id);
                   } else {
-                    focusItem(null);
-                    seek(chunk.startMs / 1000);
+                    // Unarranged chunk → transient preview loop
+                    // (chunk.startMs..endMs), so pool chunks can be
+                    // auditioned before committing them to the strip.
+                    previewChunk(chunk.id);
                   }
                 }}
               />

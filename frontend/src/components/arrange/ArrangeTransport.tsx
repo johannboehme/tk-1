@@ -37,6 +37,7 @@ export function ArrangeTransport() {
   const isPlaying = useArrangeStore((s) => s.playback.isPlaying);
   const setPlaying = useArrangeStore((s) => s.setPlaying);
   const arrangement = useArrangeStore((s) => s.arrangement);
+  const previewChunkId = useArrangeStore((s) => s.previewChunkId);
   const focusedItemId = useArrangeStore((s) => s.focusedItemId);
   const focusRelative = useArrangeStore((s) => s.focusRelative);
   const shiftItem = useArrangeStore((s) => s.shiftItem);
@@ -204,7 +205,9 @@ export function ArrangeTransport() {
         variant="primary"
         size="md"
         onClick={() => setPlaying(!isPlaying)}
-        disabled={arrangement.length === 0}
+        // A pool-preview loop is playable even when the strip is empty
+        // — auditioning chunks BEFORE arranging is the whole point.
+        disabled={arrangement.length === 0 && !previewChunkId}
         title={isPlaying ? "Pause · Space" : "Play · Space"}
         iconLeft={
           isPlaying ? (

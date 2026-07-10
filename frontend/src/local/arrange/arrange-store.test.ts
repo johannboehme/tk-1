@@ -219,6 +219,114 @@ describe("arrange-store · remove + reorder", () => {
   });
 });
 
+describe("arrange-store · pool preview (unarranged chunk audition)", () => {
+  beforeEach(() => {
+    useArrangeStore.getState().reset();
+    useArrangeStore.getState().initFromJob({
+      jobId: "j",
+      audioDuration: 100,
+      chunks: [chunk("c1", 0, 1000), chunk("c2", 2000, 3000), chunk("cPool", 8000, 9000)],
+      arrangement: [arr("a1", "c1"), arr("a2", "c2")],
+      cams: [],
+      jobBpm: 120,
+      jobBeatsPerBar: 4,
+    });
+  });
+
+  it("previewChunk enters preview: clears focus + walker, seeks to chunk start", () => {
+    const s = useArrangeStore.getState();
+    s.seekToItem("a2"); // simulate prior arrangement navigation
+    s.previewChunk("cPool");
+    const after = useArrangeStore.getState();
+    expect(after.previewChunkId).toBe("cPool");
+    expect(after.focusedItemId).toBeNull();
+    expect(after.playback.currentItemId).toBeNull();
+    expect(after.playback.currentTime).toBeCloseTo(8);
+  });
+
+  it("previewChunk does not change the play state", () => {
+    const s = useArrangeStore.getState();
+    expect(s.playback.isPlaying).toBe(false);
+    s.previewChunk("cPool");
+    expect(useArrangeStore.getState().playback.isPlaying).toBe(false);
+  });
+
+  it("previewChunk with an unknown chunk id is a no-op", () => {
+    useArrangeStore.getState().previewChunk("nope");
+    expect(useArrangeStore.getState().previewChunkId).toBeNull();
+  });
+
+  it("previewChunk(null) exits preview", () => {
+    useArrangeStore.getState().previewChunk("cPool");
+    useArrangeStore.getState().previewChunk(null);
+    expect(useArrangeStore.getState().previewChunkId).toBeNull();
+  });
+
+  it("seekToItem exits preview (navigation back to the arrangement)", () => {
+    useArrangeStore.getState().previewChunk("cPool");
+    useArrangeStore.getState().seekToItem("a1");
+    const after = useArrangeStore.getState();
+    expect(after.previewChunkId).toBeNull();
+    expect(after.playback.currentItemId).toBe("a1");
+  });
+
+  it("Play during preview resumes the preview loop, not the arrangement", () => {
+    const s = useArrangeStore.getState();
+    s.previewChunk("cPool");
+    s.setPlaying(true);
+    const after = useArrangeStore.getState();
+    expect(after.playback.isPlaying).toBe(true);
+    // Walker stays off the arrangement; the preview loop owns playback.
+    expect(after.playback.currentItemId).toBeNull();
+    // currentTime stays inside the previewed chunk (not snapped to
+    // arrangement[0]'s chunk start).
+    expect(after.playback.currentTime).toBeCloseTo(8);
+  });
+
+  it("Play during preview snaps back into the chunk range when currentTime drifted out", () => {
+    const s = useArrangeStore.getState();
+    s.previewChunk("cPool");
+    s.seek(50); // way outside cPool's 8s..9s range
+    useArrangeStore.getState().setPlaying(true);
+    const after = useArrangeStore.getState();
+    expect(after.playback.isPlaying).toBe(true);
+    expect(after.playback.currentTime).toBeCloseTo(8);
+  });
+
+  it("Play during preview works with an empty arrangement", () => {
+    useArrangeStore.getState().reset();
+    useArrangeStore.getState().initFromJob({
+      jobId: "j",
+      audioDuration: 100,
+      chunks: [chunk("cPool", 8000, 9000)],
+      arrangement: [],
+      cams: [],
+      jobBpm: 120,
+      jobBeatsPerBar: 4,
+    });
+    useArrangeStore.getState().previewChunk("cPool");
+    useArrangeStore.getState().setPlaying(true);
+    const after = useArrangeStore.getState();
+    expect(after.playback.isPlaying).toBe(true);
+    expect(after.playback.currentTime).toBeCloseTo(8);
+  });
+
+  it("Play without preview keeps the arrangement fallback (currentItem → focus → first)", () => {
+    const s = useArrangeStore.getState();
+    s.focusItem("a2");
+    s.setPlaying(true);
+    const after = useArrangeStore.getState();
+    expect(after.playback.currentItemId).toBe("a2");
+    expect(after.playback.currentTime).toBeCloseTo(2);
+  });
+
+  it("initFromJob and reset clear any active preview", () => {
+    useArrangeStore.getState().previewChunk("cPool");
+    useArrangeStore.getState().reset();
+    expect(useArrangeStore.getState().previewChunkId).toBeNull();
+  });
+});
+
 describe("arrange-store · totals", () => {
   it("totalDurationMs sums chunk lengths in arrangement order", () => {
     useArrangeStore.getState().reset();
