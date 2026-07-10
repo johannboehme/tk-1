@@ -1155,6 +1155,59 @@ describe("PreviewRuntime — frame-budget watchdog", () => {
   });
 });
 
+describe("PreviewRuntime — backend context loss (issue #115)", () => {
+  it("wires onContextLost, disposes the dead backend, and notifies onBackendLost", async () => {
+    const backend = makeBackend();
+    const pool = makePool();
+    const onBackendLost = vi.fn();
+    const cancelRaf = vi.fn();
+    const rt = new PreviewRuntime({
+      canvas: document.createElement("canvas"),
+      cams: {},
+      capabilities: { webgl2: false, webgpu: false },
+      cssW: 100,
+      cssH: 50,
+      dpr: 1,
+      createBackendFn: vi.fn(async () => backend),
+      createPool: () => pool,
+      raf: vi.fn(() => 7),
+      cancelRaf,
+      readSnapshot: () => snapshot(),
+      readPlayback: () => ({ currentTime: 0, timelineT: 0, isPlaying: false }),
+      onBackendLost,
+    });
+    await rt.init();
+    // The runtime must subscribe to the backend's loss hook.
+    expect(backend.onContextLost).toBeTypeOf("function");
+
+    rt.start();
+    backend.onContextLost!({ reason: "unknown", message: "GPU crashed" });
+
+    expect(backend.dispose).toHaveBeenCalled();
+    expect(onBackendLost).toHaveBeenCalledWith({
+      reason: "unknown",
+      message: "GPU crashed",
+    });
+    // The RAF loop is stopped and further ticks no-op instead of
+    // drawing on a dead device.
+    expect(cancelRaf).toHaveBeenCalled();
+    expect(() => rt.tick()).not.toThrow();
+    expect(backend.drawFrame).not.toHaveBeenCalled();
+    rt.dispose();
+  });
+
+  it("context loss without an onBackendLost handler still tears down safely", async () => {
+    const backend = makeBackend();
+    const { rt } = makeRuntime({ snap: snapshot(), backend });
+    await rt.init();
+    expect(() =>
+      backend.onContextLost!({ reason: "unknown", message: "reset" }),
+    ).not.toThrow();
+    expect(backend.dispose).toHaveBeenCalled();
+    rt.dispose();
+  });
+});
+
 // silence the "unused variable" lint for the imported VideoCam helper.
 void ((): VideoCam | null => null);
 void ((_: VideoElementPoolOptions) => null);

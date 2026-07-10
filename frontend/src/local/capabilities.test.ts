@@ -1,10 +1,15 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   detectCapabilities,
+  getCapabilities,
+  initCapabilities,
+  markWebGPUUnavailable,
   meetsMinRequirements,
+  probeWebGPU,
   probeWebGPUVideoFrameUpload,
   supportsLargeMediaFiles,
   LEGACY_BROWSER_MAX_FILE_BYTES,
+  _resetWebGPUProbeForTest,
   type Capabilities,
 } from "./capabilities";
 
@@ -384,5 +389,37 @@ describe("probeWebGPUVideoFrameUpload — spec-conformant validation", () => {
   it("passes against a device that enforces COPY_DST|RENDER_ATTACHMENT on the destination", async () => {
     const adapter = makeSpecConformantAdapter();
     expect(await probeWebGPUVideoFrameUpload(adapter)).toBe(true);
+  });
+
+  describe("markWebGPUUnavailable — session capability downgrade (issue #115)", () => {
+    beforeEach(() => {
+      _resetWebGPUProbeForTest();
+      vi.stubGlobal("navigator", {
+        ...globalThis.navigator,
+        gpu: { requestAdapter: async () => makeSpecConformantAdapter() },
+      });
+    });
+
+    afterEach(() => {
+      _resetWebGPUProbeForTest();
+    });
+
+    it("flips the initialised singleton to webgpu=false and poisons the probe cache", async () => {
+      const before = await initCapabilities();
+      expect(before.webgpu).toBe(true);
+
+      markWebGPUUnavailable();
+
+      expect(getCapabilities().webgpu).toBe(false);
+      // Re-probing must not resurrect the tier for this session.
+      expect(await probeWebGPU()).toBe(false);
+      expect((await initCapabilities()).webgpu).toBe(false);
+    });
+
+    it("is safe to call before initCapabilities (probe stays false)", async () => {
+      markWebGPUUnavailable();
+      expect(await probeWebGPU()).toBe(false);
+      expect((await initCapabilities()).webgpu).toBe(false);
+    });
   });
 });

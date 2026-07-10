@@ -19,6 +19,7 @@
  * HTMLVideoElement, VideoFrame). `importExternalTexture` als
  * Zero-Copy-Optimierung für Video ist ein Phase-2/3-Follow-up.
  */
+import { markWebGPUUnavailable } from "../../local/capabilities";
 import { fxCatalog } from "../fx/catalog";
 import { FX_WEBGPU_SPECS } from "../fx/webgpu/registry";
 import type { PunchFx } from "../fx/types";
@@ -50,6 +51,10 @@ const CANVAS_FORMAT: GPUTextureFormat = "bgra8unorm";
 
 export class WebGPUBackend implements CompositorBackend {
   readonly id = "webgpu" as const;
+
+  /** See CompositorBackend.onContextLost — invoked on async device
+   *  loss (NOT on dispose()). Assigned by the owner after init(). */
+  onContextLost?: (info: { reason: string; message: string }) => void;
 
   private canvas: AnyCanvas | null = null;
   private device: GPUDevice | null = null;
@@ -121,6 +126,36 @@ export class WebGPUBackend implements CompositorBackend {
       );
     }
     this.device = device;
+
+    // Observe async device loss (GPU-process crash, driver reset,
+    // dGPU/iGPU switch mid-session). Without this, drawFrame silently
+    // no-ops on the dead device and the preview freezes on the last
+    // frame with no message and no fallback (issue #115).
+    // `reason === "destroyed"` is the intentional dispose() path.
+    void device.lost.then((info) => {
+      if (info.reason === "destroyed") return;
+      console.warn(
+        `[compositor] WebGPU device lost (${info.reason}): ${info.message}`,
+      );
+      // Downgrade the session capability BEFORE notifying, so the
+      // owner's rebuild path already sees webgpu=false.
+      markWebGPUUnavailable();
+      this.onContextLost?.({
+        reason: String(info.reason),
+        message: info.message,
+      });
+    });
+    // Surface validation/OOM errors that escape every error scope —
+    // otherwise they only appear on the browser's dev console.
+    if (typeof device.addEventListener === "function") {
+      device.addEventListener("uncapturederror", (ev) => {
+        const err = (ev as GPUUncapturedErrorEvent).error;
+        console.error(
+          "[compositor] WebGPU uncaptured error:",
+          err?.message ?? ev,
+        );
+      });
+    }
 
     const context = canvas.getContext("webgpu") as GPUCanvasContext | null;
     if (!context) {

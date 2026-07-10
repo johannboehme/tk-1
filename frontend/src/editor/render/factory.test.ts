@@ -1,6 +1,12 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createBackend, type BackendCapabilities } from "./factory";
 import { WebGPUBackend } from "./webgpu-backend";
+import { BackendError } from "./backend";
+import {
+  getCapabilities,
+  initCapabilities,
+  _resetWebGPUProbeForTest,
+} from "../../local/capabilities";
 
 /** Mock canvas with a getContext that returns a hand-rolled 2D ctx
  *  (jsdom doesn't ship one). Matches the pattern used in
@@ -73,6 +79,94 @@ describe("createBackend factory — fallback ladder", () => {
     );
     expect(b.id).toBe("canvas2d");
     b.dispose();
+  });
+});
+
+describe("createBackend factory — WebGPU init failure (issue #115)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    _resetWebGPUProbeForTest();
+  });
+
+  it("falls through the ladder when WebGPUBackend.init rejects (probe was stale)", async () => {
+    // A positive probe is NOT a hard guarantee: the GPU process can
+    // crash, the driver can reset, or a dGPU/iGPU switch can happen
+    // between boot probe and backend init. The factory must fall
+    // through to the next rung instead of propagating.
+    const initSpy = vi
+      .spyOn(WebGPUBackend.prototype, "init")
+      .mockRejectedValue(
+        new BackendError("init", "requestAdapter returned null"),
+      );
+    const disposeSpy = vi
+      .spyOn(WebGPUBackend.prototype, "dispose")
+      .mockImplementation(() => undefined);
+    const b = await createBackend(
+      mockCanvas(),
+      { pixelW: 1, pixelH: 1 },
+      CAPS_BOTH,
+    );
+    expect(initSpy).toHaveBeenCalledOnce();
+    // jsdom has no WebGL2 either, so the ladder bottoms out at Canvas2D.
+    expect(b.id).toBe("canvas2d");
+    // The half-initialised WebGPU backend must be cleaned up.
+    expect(disposeSpy).toHaveBeenCalled();
+  });
+
+  it("poisons the session WebGPU capability so remounts skip the dead tier", async () => {
+    // Boot-probe said webgpu=true (mock a working adapter), then the
+    // backend init fails. Afterwards getCapabilities() must report
+    // webgpu=false — otherwise every remount re-fails on the WebGPU
+    // branch until a full page reload.
+    _resetWebGPUProbeForTest();
+    const FakeOffscreenCanvas = class {
+      constructor(
+        public width: number,
+        public height: number,
+      ) {}
+      getContext() {
+        return { fillStyle: "", fillRect: () => undefined };
+      }
+    };
+    const FakeVideoFrame = class {
+      close() {}
+    };
+    const fakeDevice = {
+      queue: { copyExternalImageToTexture: () => undefined },
+      pushErrorScope: () => undefined,
+      popErrorScope: async () => null,
+      createTexture: () => ({ destroy: () => undefined }),
+      destroy: () => undefined,
+    };
+    vi.stubGlobal("OffscreenCanvas", FakeOffscreenCanvas);
+    vi.stubGlobal("VideoFrame", FakeVideoFrame);
+    vi.stubGlobal("GPUTextureUsage", {
+      COPY_DST: 2,
+      TEXTURE_BINDING: 4,
+      RENDER_ATTACHMENT: 16,
+    });
+    vi.stubGlobal("navigator", {
+      ...globalThis.navigator,
+      gpu: {
+        requestAdapter: async () => ({ requestDevice: async () => fakeDevice }),
+      },
+    });
+    expect((await initCapabilities()).webgpu).toBe(true);
+
+    vi.spyOn(WebGPUBackend.prototype, "init").mockRejectedValue(
+      new BackendError("init", "requestDevice threw: device lost"),
+    );
+    vi.spyOn(WebGPUBackend.prototype, "dispose").mockImplementation(
+      () => undefined,
+    );
+    const b = await createBackend(
+      mockCanvas(),
+      { pixelW: 1, pixelH: 1 },
+      CAPS_BOTH,
+    );
+    expect(b.id).toBe("canvas2d");
+    expect(getCapabilities().webgpu).toBe(false);
   });
 });
 

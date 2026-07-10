@@ -177,6 +177,23 @@ export async function probeWebGPUVideoFrameUpload(
   }
 }
 
+/**
+ * Downgrade the session's WebGPU capability after the probe turned out
+ * to be stale: a positive boot probe is no guarantee that a later
+ * `WebGPUBackend.init()` succeeds (GPU-process crash, driver reset,
+ * dGPU/iGPU switch) or that an initialised device survives (device
+ * loss). Called by the render factory when the WebGPU rung fails and
+ * by the backend's `device.lost` handler, so every subsequent
+ * `getCapabilities()` / `probeWebGPU()` / remount lands on WebGL2
+ * instead of re-failing until a full page reload.
+ */
+export function markWebGPUUnavailable(): void {
+  webgpuProbeCache = Promise.resolve(false);
+  if (_capabilitiesSingleton) {
+    _capabilitiesSingleton = { ..._capabilitiesSingleton, webgpu: false };
+  }
+}
+
 /** Test-only: clear the WebGPU probe cache. Used so a test that
  *  monkey-patches `navigator.gpu` can re-probe without bleeding cache
  *  state into the next test. */
