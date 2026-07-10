@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { decideCamPreviewAction } from "./cam-preview-sync";
+import {
+  INITIAL_SEGMENT_HOP_ARM,
+  decideCamPreviewAction,
+  trackSegmentHop,
+} from "./cam-preview-sync";
 
 /** Convenience: builds an input with the cold-start defaults (no
  *  previous master tick, no observed video currentTime). The decider
@@ -176,6 +180,33 @@ describe("decideCamPreviewAction — stutter avoidance during playback", () => {
     ).toMatchObject({ kind: "hold" });
   });
 
+  it("sub-500 ms segment hop with forceJump → seek precisely (no accumulating lag)", () => {
+    // Sequence walker hopped over a 400 ms inter-chunk gap. masterDelta
+    // (≈ 0.416) is below JUMP_FORWARD_S and the resulting drift (≈ 0.4)
+    // is below the natural-drift threshold — without the explicit hop
+    // flag this tick classified as natural advance and HELD, leaving
+    // the video permanently ~0.4 s behind the audio.
+    expect(
+      decideCamPreviewAction({
+        ...coldInput(10.416, 0),
+        videoCurrentTimeS: 10.014,
+        prevMasterT: 10.0,
+        forceJump: true,
+      }),
+    ).toEqual({ kind: "seek", sourceT: 10.416 });
+  });
+
+  it("forceJump tick with the element already on target → hold", () => {
+    expect(
+      decideCamPreviewAction({
+        ...coldInput(10.416, 0),
+        videoCurrentTimeS: 10.4,
+        prevMasterT: 10.0,
+        forceJump: true,
+      }),
+    ).toMatchObject({ kind: "hold" });
+  });
+
   it("tiny backward jitter (under 20 ms) is NOT classified as a jump", () => {
     // `<audio>.currentTime` can jiggle by a few ms between RAFs. We must
     // not treat that as a wrap.
@@ -186,5 +217,79 @@ describe("decideCamPreviewAction — stutter avoidance during playback", () => {
         prevMasterT: 10.01,
       }),
     ).toMatchObject({ kind: "hold" });
+  });
+});
+
+describe("trackSegmentHop — arming forced jumps on segment changes", () => {
+  it("arms on a segment change and consumes on the hop tick one tick later", () => {
+    // The sequence walker flips focusedChunkId one store update BEFORE
+    // the time hop lands (the swap tick still broadcasts the old
+    // element's time), so the arm must survive the in-between tick.
+    let arm = INITIAL_SEGMENT_HOP_ARM;
+    let r = trackSegmentHop(arm, "chunk-a", 10.0, null);
+    arm = r.arm; // initial contact arms; nothing to force yet
+    expect(r.forceJump).toBe(false);
+
+    // Natural ticks — no force.
+    r = trackSegmentHop(arm, "chunk-a", 10.016, 0.016);
+    arm = r.arm;
+    expect(r.forceJump).toBe(false);
+
+    // Walker advances: key flips, but this tick's time is still the old
+    // element's (~16 ms natural delta).
+    r = trackSegmentHop(arm, "chunk-b", 10.032, 0.016);
+    arm = r.arm;
+    expect(r.forceJump).toBe(false);
+
+    // Next tick carries the actual hop (+0.4 s gap) → force the jump.
+    r = trackSegmentHop(arm, "chunk-b", 10.44, 0.408);
+    arm = r.arm;
+    expect(r.forceJump).toBe(true);
+
+    // Consumed — the next stall tick must NOT force again.
+    r = trackSegmentHop(arm, "chunk-b", 10.55, 0.11);
+    expect(r.forceJump).toBe(false);
+  });
+
+  it("consumes immediately when the key change and the hop land in the same tick", () => {
+    // Chunk-list click: focusChunk writes focusedChunkId AND currentTime
+    // in one store update.
+    let arm = INITIAL_SEGMENT_HOP_ARM;
+    arm = trackSegmentHop(arm, "chunk-a", 10.0, null).arm;
+    arm = trackSegmentHop(arm, "chunk-a", 10.016, 0.016).arm;
+    const r = trackSegmentHop(arm, "chunk-b", 10.3, 0.284);
+    expect(r.forceJump).toBe(true);
+  });
+
+  it("expires the arm when no hop-like tick arrives within the window", () => {
+    let arm = INITIAL_SEGMENT_HOP_ARM;
+    arm = trackSegmentHop(arm, "chunk-a", 10.0, null).arm;
+    arm = trackSegmentHop(arm, "chunk-b", 10.016, 0.016).arm; // arms
+    // Contiguous chunks: the hop is seamless, only natural ticks follow.
+    let t = 10.032;
+    let forced = false;
+    for (let i = 0; i < 90; i++) {
+      const r = trackSegmentHop(arm, "chunk-b", t, 0.016);
+      arm = r.arm;
+      forced = forced || r.forceJump;
+      t += 0.016;
+    }
+    expect(forced).toBe(false);
+    // Window has expired (> 1 s of master time) — a later stall tick is
+    // ordinary playback jitter, not a hop.
+    const r = trackSegmentHop(arm, "chunk-b", t + 0.2, 0.2);
+    expect(r.forceJump).toBe(false);
+  });
+
+  it("disarms on a backward jump (the normal classifier already seeks)", () => {
+    let arm = INITIAL_SEGMENT_HOP_ARM;
+    arm = trackSegmentHop(arm, "chunk-a", 14.0, null).arm;
+    arm = trackSegmentHop(arm, "chunk-b", 14.016, 0.016).arm; // arms
+    let r = trackSegmentHop(arm, "chunk-b", 10.0, -4.016); // loop wrap
+    arm = r.arm;
+    expect(r.forceJump).toBe(false);
+    // …and a stall tick after the wrap must not force a stale jump.
+    r = trackSegmentHop(arm, "chunk-b", 10.1, 0.1);
+    expect(r.forceJump).toBe(false);
   });
 });

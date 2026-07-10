@@ -14,7 +14,7 @@
  *
  * Plus a playhead overlay and zoom/pan affordances.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import {
   chunkBeatPhaseS,
@@ -84,7 +84,12 @@ export function TriageTimeline() {
   const focusChunk = useTriageStore((s) => s.focusChunk);
   const seek = useTriageStore((s) => s.seek);
   const updateChunk = useTriageStore((s) => s.updateChunk);
-  const currentTime = useTriageStore((s) => s.playback.currentTime);
+  // NOTE: deliberately NOT subscribed to playback.currentTime — during
+  // playback that field updates at ~60 Hz, and re-rendering the whole
+  // timeline subtree (per-chunk framer-motion blocks, ruler tick maps)
+  // per tick made triage playback sluggish on long-form jams. The
+  // playhead lives in its own tiny child (TimelinePlayhead below) that
+  // alone subscribes to the ticking value.
   const playbackMode = useTriageStore((s) => s.playback.mode);
   const sliceReveal = useTriageStore((s) => s.sliceReveal);
   const clearSliceReveal = useTriageStore((s) => s.clearSliceReveal);
@@ -191,10 +196,9 @@ export function TriageTimeline() {
   }, [focusedChunkId]);
 
   // Stable identities — both sit in effect dependency arrays (waveform
-  // redraw, window drag listeners). As plain functions they'd get a fresh
-  // identity on every render, and this component re-renders on every
-  // playhead tick (`playback.currentTime` above) — the waveform would
-  // redraw its full hi-res body 60×/s during playback for nothing.
+  // redraw, window drag listeners) and in the memoized ChunkBlock's
+  // props. As plain functions they'd get a fresh identity on every
+  // render and defeat both.
   const timeToX = useCallback(
     (tS: number): number => (tS - viewStartS) * pxPerSec,
     [viewStartS, pxPerSec],
@@ -392,22 +396,23 @@ export function TriageTimeline() {
     seek(snapTimeS(tRaw, e));
   }
 
-  function startTrimDrag(
-    e: React.MouseEvent,
-    chunk: Chunk,
-    edge: "left" | "right",
-  ) {
-    if (e.button !== 0) return;
-    e.preventDefault();
-    e.stopPropagation();
-    movedRef.current = false;
-    dragRef.current = {
-      kind: "trim",
-      chunkId: chunk.id,
-      edge,
-      anchorS: chunkBeatPhaseS(chunk),
-    };
-  }
+  // Stable identity (refs only) so the memoized ChunkBlock's props
+  // don't churn — the block passes its own chunk back in.
+  const startTrimDrag = useCallback(
+    (chunk: Chunk, edge: "left" | "right", e: React.MouseEvent) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      movedRef.current = false;
+      dragRef.current = {
+        kind: "trim",
+        chunkId: chunk.id,
+        edge,
+        anchorS: chunkBeatPhaseS(chunk),
+      };
+    },
+    [],
+  );
 
   useEffect(() => {
     function onMove(ev: MouseEvent) {
@@ -878,7 +883,7 @@ export function TriageTimeline() {
               chunk.accepted &&
               chunkPassesFilter(chunk, minChunkBars, jobBpm?.value ?? null, beatsPerBar)
             }
-            onTrimStart={(edge, e) => startTrimDrag(e, chunk, edge)}
+            onTrimStart={startTrimDrag}
           />
           );
         })}
@@ -916,19 +921,44 @@ export function TriageTimeline() {
           })}
       </AnimatePresence>
 
-      {currentTime >= viewStartS && currentTime <= viewEndS && (
-        <div
-          className="absolute top-0 pointer-events-none"
-          style={{
-            left: timeToX(currentTime),
-            height: totalHeight,
-            width: 2,
-            background: PLAYHEAD_COLOR,
-            boxShadow: "0 0 4px rgba(255,87,34,0.6)",
-          }}
-        />
-      )}
+      <TimelinePlayhead
+        viewStartS={viewStartS}
+        viewEndS={viewEndS}
+        timeToX={timeToX}
+        heightPx={totalHeight}
+      />
     </div>
+  );
+}
+
+/** The one element that tracks the 60 Hz playback clock. Isolated in
+ *  its own component so the per-tick store update re-renders exactly
+ *  this line — never the chunk lane or the rulers above. */
+function TimelinePlayhead({
+  viewStartS,
+  viewEndS,
+  timeToX,
+  heightPx,
+}: {
+  viewStartS: number;
+  viewEndS: number;
+  timeToX: (t: number) => number;
+  heightPx: number;
+}) {
+  const currentTime = useTriageStore((s) => s.playback.currentTime);
+  if (currentTime < viewStartS || currentTime > viewEndS) return null;
+  return (
+    <div
+      data-testid="triage-playhead"
+      className="absolute top-0 pointer-events-none"
+      style={{
+        left: timeToX(currentTime),
+        height: heightPx,
+        width: 2,
+        background: PLAYHEAD_COLOR,
+        boxShadow: "0 0 4px rgba(255,87,34,0.6)",
+      }}
+    />
   );
 }
 
@@ -947,10 +977,14 @@ interface ChunkBlockProps {
    *  staggered "deal" animation. */
   revealIndex: number | null;
   reducedMotion: boolean;
-  onTrimStart: (edge: "left" | "right", e: React.MouseEvent) => void;
+  onTrimStart: (chunk: Chunk, edge: "left" | "right", e: React.MouseEvent) => void;
 }
 
-function ChunkBlock({
+/** Memoized: on focus / filter / single-chunk edits only the affected
+ *  blocks re-render — with 100+ chunks per long-form jam the untouched
+ *  framer-motion blocks are the expensive part of the lane. All props
+ *  are identity-stable (store chunk objects, useCallback handlers). */
+const ChunkBlock = memo(function ChunkBlock({
   chunk,
   timeToX,
   visibleStart,
@@ -1096,7 +1130,7 @@ function ChunkBlock({
             data-trim-handle="left"
             className="absolute left-0 top-0 bottom-0 cursor-ew-resize"
             style={{ width: handleHitPx }}
-            onMouseDown={(e) => onTrimStart("left", e)}
+            onMouseDown={(e) => onTrimStart(chunk, "left", e)}
             title="Drag to trim start (Shift = bypass snap)"
           >
             <div
@@ -1115,7 +1149,7 @@ function ChunkBlock({
             data-trim-handle="right"
             className="absolute right-0 top-0 bottom-0 cursor-ew-resize"
             style={{ width: handleHitPx }}
-            onMouseDown={(e) => onTrimStart("right", e)}
+            onMouseDown={(e) => onTrimStart(chunk, "right", e)}
             title="Drag to trim end (Shift = bypass snap)"
           >
             <div
@@ -1134,7 +1168,7 @@ function ChunkBlock({
       )}
     </motion.div>
   );
-}
+});
 
 interface RulerTick {
   t: number;

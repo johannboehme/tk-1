@@ -379,6 +379,10 @@ export interface LocalJob {
   ui?: {
     snapMode?: "off" | "match" | "1" | "1/2" | "1/4" | "1/8" | "1/16";
     lanesLocked?: boolean;
+    /** Triage's MIN LCD filter (bars at the song-global tempo; 0 = off).
+     *  Feeds the effectively-accepted predicate that decides which
+     *  chunks ship into Arrange — must survive a reload. */
+    minChunkBars?: number;
   };
   /** Trim region (seconds). Mirrors editSpec.segments[0] but persisted on
    *  every drag, not only at render time. */
