@@ -835,6 +835,7 @@ describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => 
         { in: 30, out: 35 }, // arr [5..10]
       ];
       const { mA, mB } = await setup(60);
+      const { ctx } = ctxHandle;
       useEditorStore.getState().setArrangementSegments(segs);
       // Park inside the last segment.
       useEditorStore.getState().seek(30, { segmentIdxHint: 1 });
@@ -857,6 +858,21 @@ describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => 
       expect(mB.getCurrentTime()).toBeCloseTo(10, 1);
       // Wrap was armed (idle play()ed); pause-at-end did NOT take over.
       expect(mB.playSpy).toHaveBeenCalled();
+      expect(useEditorStore.getState().playback.isPlaying).toBe(true);
+
+      // #77: while the wrap was ARMED, further ticks ran with
+      // distToEnd inside the lead window — the end-pause branch must not
+      // schedule a setPlaying(false) timer behind the armed crossfade.
+      // Fire the crossfade, then advance real time past where that stale
+      // timer would land: playback must keep running.
+      await act(async () => {
+        ctx.currentTime = 100; // past fireAt + CROSSFADE_S
+        mB.setCurrentTime(10);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 80));
+      });
       expect(useEditorStore.getState().playback.isPlaying).toBe(true);
     });
 

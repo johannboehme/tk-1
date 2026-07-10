@@ -494,6 +494,11 @@ export function useAudioMaster(
         const formerActive = active;
         state.active = state.active === "A" ? "B" : "A";
         state.armed = null;
+        // A fired wrap/hop invalidates any scheduled end-of-arrangement
+        // pause — we've just crossfaded away from the segment it was
+        // scheduled for. Without this a stale timer stops playback
+        // milliseconds after a loop wrap at the arrangement's end.
+        cancelEndPause(state);
         // Authoritative segment-walker advance: the listener is now
         // hearing the segment whose `in` we crossfaded into. Stamp it
         // into state so the next tick's segment lookup doesn't snap
@@ -834,10 +839,16 @@ export function useAudioMaster(
             nextSegmentIdx: curIdx + 1,
           };
         } else if (
+          state.armed === null &&
           !nextSeg &&
           distToEnd <= LEAD_TIME_S &&
           state.endPauseSegmentIdx !== curIdx
         ) {
+          // `state.armed === null`: while a loop-wrap crossfade is armed
+          // in this segment (loop.end at/near the last segment's out),
+          // ticks inside the lead window would otherwise schedule a
+          // setPlaying(false) timer that fires right after the wrap and
+          // kills the loop's next pass.
           // No lower bound on distToEnd here either: a stall can carry t
           // past the last segment's out without a tick in the lead
           // window — the timer then fires with zero delay instead of the
