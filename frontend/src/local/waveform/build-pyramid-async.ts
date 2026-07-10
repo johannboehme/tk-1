@@ -24,8 +24,9 @@ export interface BuildPyramidAsyncOpts extends BuildPyramidOpts {
   onProgress?: (frac: number) => void;
 }
 
-/** Yield to the event loop without the setTimeout 4ms clamp where possible. */
-function yieldToEventLoop(): Promise<void> {
+/** Yield to the event loop without the setTimeout 4ms clamp where possible.
+ *  Shared with other chunked main-thread builders (loudness envelope). */
+export function yieldToEventLoop(): Promise<void> {
   if (typeof MessageChannel !== "undefined") {
     return new Promise((resolve) => {
       const ch = new MessageChannel();

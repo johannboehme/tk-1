@@ -1,5 +1,8 @@
 import { describe, expect, test } from "vitest";
-import { buildLoudnessEnvelope } from "./audio-envelope";
+import {
+  buildLoudnessEnvelope,
+  buildLoudnessEnvelopeAsync,
+} from "./audio-envelope";
 
 describe("buildLoudnessEnvelope", () => {
   test("empty input → empty curve", () => {
@@ -65,5 +68,66 @@ describe("buildLoudnessEnvelope", () => {
       const hop = Math.round(sr / 120); // 184
       expect(env.fps).toBeCloseTo(sr / hop, 6); // 119.84, NOT 120
     });
+  });
+});
+
+describe("buildLoudnessEnvelopeAsync — chunked, yielding builder", () => {
+  /** Music-ish PCM: tone bed + a transient burst so the peak windows have
+   *  structure (an all-constant signal would hide bucket-boundary bugs). */
+  function makePcm(n: number): Float32Array {
+    const pcm = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      pcm[i] = 0.3 * Math.sin(i * 0.01);
+      if (i % 5000 < 50) pcm[i] += 0.6 * (1 - (i % 5000) / 50);
+    }
+    return pcm;
+  }
+
+  test("produces an envelope identical to the sync builder", async () => {
+    const sr = 22050;
+    const pcm = makePcm(3 * sr);
+    const sync = buildLoudnessEnvelope(pcm, sr);
+    const asy = await buildLoudnessEnvelopeAsync(pcm, sr, {
+      chunkSamples: 8_192, // force many chunks
+    });
+    expect(asy.fps).toBeCloseTo(sync.fps, 9);
+    expect(asy.data.length).toBe(sync.data.length);
+    expect(Array.from(asy.data)).toEqual(Array.from(sync.data));
+  });
+
+  test("identical across chunk boundaries (window overlaps a chunk seam)", async () => {
+    const sr = 600;
+    const pcm = makePcm(sr * 4);
+    const sync = buildLoudnessEnvelope(pcm, sr, 60);
+    // chunk of ~7 buckets → many seams; centred windows span seams.
+    const asy = await buildLoudnessEnvelopeAsync(pcm, sr, {
+      fps: 60,
+      chunkSamples: 70,
+    });
+    expect(Array.from(asy.data)).toEqual(Array.from(sync.data));
+  });
+
+  test("reports progress ending at 1 and yields between chunks", async () => {
+    const sr = 22050;
+    const pcm = makePcm(2 * sr);
+    const ticks: number[] = [];
+    const env = await buildLoudnessEnvelopeAsync(pcm, sr, {
+      chunkSamples: 8_192,
+      onProgress: (f) => ticks.push(f),
+    });
+    expect(env.data.length).toBeGreaterThan(0);
+    expect(ticks.length).toBeGreaterThan(1); // actually chunked
+    expect(ticks[ticks.length - 1]).toBeCloseTo(1, 6);
+    for (let i = 1; i < ticks.length; i++) {
+      expect(ticks[i]).toBeGreaterThanOrEqual(ticks[i - 1]);
+    }
+  });
+
+  test("empty input → empty curve", async () => {
+    const env = await buildLoudnessEnvelopeAsync(new Float32Array(0), 22050, {
+      fps: 60,
+    });
+    expect(env.data.length).toBe(0);
+    expect(env.fps).toBe(60);
   });
 });
