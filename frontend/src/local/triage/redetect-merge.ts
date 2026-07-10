@@ -30,6 +30,7 @@
  * Pure function — no store access, no IO.
  */
 import type { Chunk } from "../../storage/jobs-db";
+import { snapChunkEndToBar } from "./chunk-bar-grid";
 
 /** Overlap (ms) between two chunks; 0 when disjoint. */
 function overlapMs(
@@ -133,22 +134,45 @@ export function mergeRedetectedChunks(
 
 /** Fresh geometry wins (the detector's new parameters legitimately
  *  reshape untouched chunks), but identity + the user's decisions and —
- *  when the fresh detection ran without PCM — the prev analysis carry
- *  over. */
+ *  when the fresh detection ran without PCM (background decode still
+ *  in flight) — the prev analysis carry over. In that case the fresh
+ *  end is also re-snapped to the carried bar grid: the persisted end
+ *  was bar-snapped at birth, and without this every chunk would flip
+ *  back to a raw silence boundary and lose its bar ruler / snap /
+ *  min-bars behaviour. */
 function carryOver(prev: Chunk, fresh: Chunk): Chunk {
+  if (fresh.detectedBpm) {
+    // Fresh detection had PCM — its analysis and bar-snapped end are
+    // authoritative; only identity + user decisions carry over.
+    return {
+      ...fresh,
+      id: prev.id,
+      accepted: prev.accepted,
+      bpmOctaveShift: prev.bpmOctaveShift,
+    };
+  }
+  const anchorMs = prev.audioStartMs ?? fresh.audioStartMs ?? fresh.startMs;
+  const snappedEndMs = snapChunkEndToBar(
+    fresh.startMs,
+    fresh.endMs,
+    anchorMs,
+    prev.detectedBpm,
+    fresh.beatsPerBar > 0 ? fresh.beatsPerBar : prev.beatsPerBar,
+  );
   return {
     ...fresh,
     id: prev.id,
     accepted: prev.accepted,
     bpmOctaveShift: prev.bpmOctaveShift,
-    detectedBpm: fresh.detectedBpm ?? prev.detectedBpm,
-    detectedBpmConfidence: fresh.detectedBpm
-      ? fresh.detectedBpmConfidence
-      : prev.detectedBpmConfidence,
-    detectedBpmStability: fresh.detectedBpm
-      ? fresh.detectedBpmStability
-      : prev.detectedBpmStability,
-    effectiveBpm: fresh.detectedBpm ? fresh.effectiveBpm : prev.effectiveBpm,
-    audioStartMs: fresh.detectedBpm ? fresh.audioStartMs : prev.audioStartMs ?? fresh.audioStartMs,
+    detectedBpm: prev.detectedBpm,
+    detectedBpmConfidence: prev.detectedBpmConfidence,
+    detectedBpmStability: prev.detectedBpmStability,
+    effectiveBpm: prev.effectiveBpm,
+    audioStartMs: anchorMs,
+    endMs: snappedEndMs,
+    // Reset should restore the bar-aligned detection geometry, exactly
+    // like a full-PCM detection would have seeded it.
+    originalEndMs: snappedEndMs,
+    originalAudioStartMs: anchorMs,
   };
 }

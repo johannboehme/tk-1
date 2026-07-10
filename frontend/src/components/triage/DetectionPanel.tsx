@@ -41,6 +41,11 @@ export function DetectionPanel() {
   const setMinChunkBars = useTriageStore((s) => s.setMinChunkBars);
   const jobBpmValue = useTriageStore((s) => s.jobBpm?.value ?? null);
   const beatsPerBar = useTriageStore((s) => s.beatsPerBar);
+  // Cached opens seed the store with an empty PCM and decode the real
+  // one in the background. A re-detect in that window would run without
+  // per-chunk analysis (no BPM, no onset anchor, no bar-snapped ends) —
+  // hold the sliders until the decode lands.
+  const pcmDecoding = useTriageStore((s) => s.pcmDecoding);
   // "Kept" counts only chunks that survive both the user's manual
   // accept AND the active min-bars filter. Toggling the filter back
   // off restores the count without touching anyone's accept flag.
@@ -156,7 +161,7 @@ export function DetectionPanel() {
 
   return (
     <div className="flex-1 grid grid-cols-1 sm:grid-cols-[1fr_auto_auto] gap-3 sm:gap-4 items-center">
-      <div className="flex flex-col gap-1.5 min-w-0">
+      <div className="relative flex flex-col gap-1.5 min-w-0">
         <SliderRow
           label="Threshold"
           value={silenceConfig.thresholdDb}
@@ -165,6 +170,7 @@ export function DetectionPanel() {
           step={1}
           unit="dBFS"
           format={(v) => `${v} dB`}
+          disabled={pcmDecoding}
           onChange={(v) => onChange({ thresholdDb: v })}
         />
         <SliderRow
@@ -177,8 +183,17 @@ export function DetectionPanel() {
           format={(v) =>
             v >= 1000 ? `${(v / 1000).toFixed(v % 1000 === 0 ? 0 : 1)} s` : `${v} ms`
           }
+          disabled={pcmDecoding}
           onChange={(v) => onChange({ minPauseMs: v })}
         />
+        {pcmDecoding && (
+          <span
+            className="font-mono text-[9px] tracking-label uppercase"
+            style={{ color: "#B8865A" }}
+          >
+            decoding audio… sliders unlock when it's done
+          </span>
+        )}
       </div>
       <BarCountLcd
         label="MIN"
@@ -205,6 +220,9 @@ interface SliderRowProps {
   unit: string;
   /** Optional formatter — e.g. "ms" → "1.5 s" once the value crosses 1000. */
   format?: (value: number) => string;
+  /** Freeze the fader (pointer + keyboard) — used while the background
+   *  PCM decode is still running and a re-detect would be lossy. */
+  disabled?: boolean;
   onChange: (v: number) => void;
 }
 
@@ -214,7 +232,7 @@ interface SliderRowProps {
  *  keyboard semantics; the visual surface intercepts pointer events
  *  for the polished feel. Tick marks along the track give the scale a
  *  hardware-instrument vibe without crowding the panel. */
-function SliderRow({ label, value, min, max, step, unit, format, onChange }: SliderRowProps) {
+function SliderRow({ label, value, min, max, step, unit, format, disabled, onChange }: SliderRowProps) {
   const fraction = (value - min) / Math.max(1e-9, max - min);
   const trackRef = useRef<HTMLDivElement | null>(null);
   const draggingRef = useRef(false);
@@ -231,6 +249,7 @@ function SliderRow({ label, value, min, max, step, unit, format, onChange }: Sli
   }
 
   function onPointerDown(e: React.PointerEvent) {
+    if (disabled) return;
     if (e.button !== 0) return;
     e.preventDefault();
     draggingRef.current = true;
@@ -238,7 +257,7 @@ function SliderRow({ label, value, min, max, step, unit, format, onChange }: Sli
     onChange(pickFromClientX(e.clientX));
   }
   function onPointerMove(e: React.PointerEvent) {
-    if (!draggingRef.current) return;
+    if (disabled || !draggingRef.current) return;
     onChange(pickFromClientX(e.clientX));
   }
   function onPointerUp(e: React.PointerEvent) {
@@ -272,18 +291,24 @@ function SliderRow({ label, value, min, max, step, unit, format, onChange }: Sli
       >
         <div
           ref={trackRef}
-          className="relative w-full h-full cursor-ew-resize"
+          className={
+            disabled
+              ? "relative w-full h-full cursor-default"
+              : "relative w-full h-full cursor-ew-resize"
+          }
           role="slider"
           aria-label={label}
           aria-valuemin={min}
           aria-valuemax={max}
           aria-valuenow={value}
-          tabIndex={0}
+          aria-disabled={disabled ? "true" : undefined}
+          tabIndex={disabled ? -1 : 0}
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
           onPointerCancel={onPointerUp}
           onKeyDown={(e) => {
+            if (disabled) return;
             const big = e.shiftKey ? 10 : 1;
             if (e.key === "ArrowLeft" || e.key === "ArrowDown") {
               e.preventDefault();
@@ -311,14 +336,16 @@ function SliderRow({ label, value, min, max, step, unit, format, onChange }: Sli
             overflow: "hidden",
           }}
         >
-          {/* Phosphor fill from left edge to current fraction. */}
+          {/* Phosphor fill from left edge to current fraction. Goes cold
+           *  (solid slate, no glow) while the control is frozen. */}
           <div
             className="absolute top-0 bottom-0 left-0 pointer-events-none"
             style={{
               width: `${fraction * 100}%`,
-              background:
-                "linear-gradient(180deg, rgba(255,179,71,0.35) 0%, rgba(255,87,34,0.55) 100%)",
-              boxShadow: "0 0 8px rgba(255,138,79,0.55)",
+              background: disabled
+                ? "linear-gradient(180deg, #4A443B 0%, #5D5546 100%)"
+                : "linear-gradient(180deg, rgba(255,179,71,0.35) 0%, rgba(255,87,34,0.55) 100%)",
+              boxShadow: disabled ? undefined : "0 0 8px rgba(255,138,79,0.55)",
             }}
           />
           {/* Tick marks across the full track. */}

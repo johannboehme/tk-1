@@ -220,6 +220,70 @@ describe("mergeRedetectedChunks — user-shaped chunks are preserved verbatim", 
     );
   });
 
+  it("re-snaps the fresh end to the carried bar grid when detection ran without PCM", () => {
+    // Cached open: the fresh detection ran on an empty PCM, so the
+    // detector skipped analysis — raw silence boundary, no BPM, no
+    // onset anchor. The matched prev chunk has all of it. Carrying the
+    // analysis must also re-snap the end, otherwise every persisted
+    // bar-snapped chunk flips to a raw boundary on the first slider
+    // touch during background decode.
+    const prev = [
+      makeChunk({
+        id: "chunk-10000-18000",
+        startMs: 10000,
+        endMs: 18000, // bar-snapped at birth: 4 bars of 2000 ms from the anchor
+        detectedBpm: 120,
+        effectiveBpm: 120,
+        audioStartMs: 10000,
+      }),
+    ];
+    // Raw re-detection of the same region: start shifted one envelope
+    // sample, end at the raw silence boundary.
+    const fresh = [freshChunk(9900, 18400)];
+    const out = mergeRedetectedChunks(prev, fresh);
+    expect(out).toHaveLength(1);
+    expect(out[0].id).toBe("chunk-10000-18000");
+    expect(out[0].detectedBpm).toBe(120);
+    expect(out[0].audioStartMs).toBe(10000);
+    // (18400 − 10000) / 2000 = 4.2 bars → floors to 4 → 10000 + 8000.
+    expect(out[0].endMs).toBe(18000);
+    expect(out[0].originalEndMs).toBe(18000);
+  });
+
+  it("keeps the raw fresh end when neither side has a BPM", () => {
+    const prev = [
+      makeChunk({ id: "chunk-10000-18000", startMs: 10000, endMs: 18000 }),
+    ];
+    const fresh = [freshChunk(9900, 18400)];
+    const out = mergeRedetectedChunks(prev, fresh);
+    expect(out[0].endMs).toBe(18400);
+  });
+
+  it("does not re-snap when the fresh chunk has its own analysis", () => {
+    const prev = [
+      makeChunk({
+        id: "chunk-10000-18000",
+        startMs: 10000,
+        endMs: 18000,
+        detectedBpm: 120,
+        effectiveBpm: 120,
+        audioStartMs: 10000,
+      }),
+    ];
+    // Fresh analysis present — the detector already snapped this end
+    // to its own grid; leave it alone.
+    const fresh = [
+      freshChunk(9900, 17900, {
+        detectedBpm: 96,
+        effectiveBpm: 96,
+        audioStartMs: 9950,
+      }),
+    ];
+    const out = mergeRedetectedChunks(prev, fresh);
+    expect(out[0].endMs).toBe(17900);
+    expect(out[0].detectedBpm).toBe(96);
+  });
+
   it("output is sorted by startMs and has no duplicate ids", () => {
     const trimmed = makeChunk({
       id: "chunk-30000-40000",

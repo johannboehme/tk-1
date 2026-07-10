@@ -157,6 +157,38 @@ describe("DetectionPanel — destructive re-detect gate", () => {
     expect(useTriageStore.getState().silenceConfig.thresholdDb).toBe(-48);
   });
 
+  it("disables the sliders with a hint while the background PCM decode runs", async () => {
+    // Cached open seeds the store with a length-0 PCM and decodes in the
+    // background — a re-detect in that window would strip analysis from
+    // every chunk. The sliders must not fire until PCM lands.
+    seedStore([makeChunk({ id: "chunk-10000-20000", startMs: 10000, endMs: 20000 })]);
+    act(() => {
+      useTriageStore.setState({ pcmDecoding: true });
+    });
+    getJobMock.mockResolvedValue({ arrangement: [] } as never);
+
+    render(<DetectionPanel />);
+    const slider = screen.getByRole("slider", { name: "Threshold" });
+    expect(slider).toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByText(/decoding audio/i)).toBeInTheDocument();
+
+    fireEvent.keyDown(slider, { key: "ArrowRight" });
+    await flush();
+    expect(useTriageStore.getState().silenceConfig.thresholdDb).toBe(-50);
+    expect(detectMock).not.toHaveBeenCalled();
+
+    // PCM landed → sliders come back to life.
+    act(() => {
+      useTriageStore.setState({ pcmDecoding: false });
+    });
+    expect(screen.queryByText(/decoding audio/i)).not.toBeInTheDocument();
+    fireEvent.keyDown(screen.getByRole("slider", { name: "Threshold" }), {
+      key: "ArrowRight",
+    });
+    await flush();
+    expect(useTriageStore.getState().silenceConfig.thresholdDb).toBe(-49);
+  });
+
   it("does not ask on a clean session (no arrangement, no manual edits)", async () => {
     seedStore([makeChunk({ id: "chunk-10000-20000", startMs: 10000, endMs: 20000 })]);
     getJobMock.mockResolvedValue({ arrangement: [] } as never);
