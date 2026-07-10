@@ -764,6 +764,78 @@ describe("useEditorStore", () => {
       useEditorStore.getState().stepByActiveSnap(1);
       expect(useEditorStore.getState().playback.currentTime).toBeCloseTo(2.0 + 1 / 30, 6);
     });
+
+    describe("long-form arr-time stepping (#102)", () => {
+      const loadLongform = () => {
+        useEditorStore.getState().loadJob(
+          {
+            ...baseJobMeta,
+            duration: 400,
+            bpm: {
+              value: 120,
+              confidence: 1,
+              phase: 0.4,
+              manualOverride: false,
+            },
+            beatsPerBar: 4,
+          },
+          {
+            arrangementSegments: [
+              { in: 12.3, out: 42.3 }, // arr 0..30
+              { in: 100, out: 130 }, // arr 30..60
+            ],
+          },
+        );
+      };
+
+      test("bar-steps land on the BeatRuler's arr-time bars in segment ≥ 1", () => {
+        loadLongform();
+        useEditorStore.getState().setSnapMode("1");
+        // Playhead at arr 30.4 (master 100.4, inside segment 1).
+        useEditorStore.getState().seek(100.4, { segmentIdxHint: 1 });
+        useEditorStore.getState().clearSeekRequest();
+        useEditorStore.getState().stepByActiveSnap(1);
+        // arrBeatPhase = 0.4 − 12.3 = −11.9; bar ticks at arr …30.1, 32.1.
+        // The old master-anchored snap landed at arr 32.4 — visibly off
+        // the bar lines the ruler draws.
+        expect(useEditorStore.getState().playback.timelineT).toBeCloseTo(
+          32.1,
+          6,
+        );
+        expect(useEditorStore.getState().playback.currentTime).toBeCloseTo(
+          102.1,
+          6,
+        );
+      });
+
+      test("frame-step across a chunk seam hops into the next segment (no gap escape)", () => {
+        loadLongform();
+        useEditorStore.getState().setSnapMode("off");
+        // 0.01 s of arr-time before the seam at arr 30 (master 42.29).
+        useEditorStore.getState().seek(42.29, { segmentIdxHint: 0 });
+        useEditorStore.getState().clearSeekRequest();
+        useEditorStore.getState().stepByActiveSnap(1);
+        // One 1/30 frame forward crosses the seam: arr 30.0233… lives in
+        // segment 1 at master 100.0233…. The old master-axis step landed
+        // at master 42.3233 (a gap): seek's fallback then stored the raw
+        // MASTER value in timelineT and the playhead drew deep inside the
+        // second chunk's territory.
+        const pb = useEditorStore.getState().playback;
+        expect(pb.timelineT).toBeCloseTo(29.99 + 1 / 30, 5);
+        expect(pb.currentTime).toBeCloseTo(100 + (29.99 + 1 / 30 - 30), 5);
+      });
+
+      test("step clamps to the end of the song (arr axis)", () => {
+        loadLongform();
+        useEditorStore.getState().setSnapMode("1");
+        useEditorStore.getState().seek(129.5, { segmentIdxHint: 1 }); // arr 59.5
+        useEditorStore.getState().clearSeekRequest();
+        useEditorStore.getState().stepByActiveSnap(1);
+        const pb = useEditorStore.getState().playback;
+        expect(pb.timelineT).toBeCloseTo(60, 6);
+        expect(pb.currentTime).toBeCloseTo(130, 6);
+      });
+    });
   });
 
   describe("shiftLoop — OP-1 style loop-shift", () => {

@@ -28,9 +28,11 @@ import {
   reconcilePills,
 } from "./arrangement-pills";
 import {
+  arrToMaster,
   masterToArr,
   segmentIndexAtArr,
   sliceByArrSegments,
+  totalArrDuration,
 } from "./arrangement-time";
 import type { ArrangementItem, Chunk } from "../storage/jobs-db";
 import { classifyAspectRatio } from "./exportPresets";
@@ -1489,16 +1491,45 @@ export const useEditorStore = create<EditorState>()(
     },
     stepByActiveSnap(direction) {
       const s = get();
-      const t = s.playback.currentTime;
+      const segs = s.arrangementSegments;
       const fps = s.jobMeta?.fps && s.jobMeta.fps > 0 ? s.jobMeta.fps : 30;
-      const frameStep = () => s.seek(t + direction * (1 / fps));
       const mode = s.ui.snapMode;
+
+      // The step runs on the ARR axis (the composed song timeline, #102):
+      // every drawn grid surface — BeatRuler, snapTimelineTime, Timeline
+      // drags — anchors there, so a master-axis step lands off the
+      // visible bar lines in any segment ≥ 1. And a raw master seek near
+      // a chunk edge can escape into a segment GAP, where seek()'s
+      // fallback stores the master value in the arr-time playhead field.
+      const tArr = s.playback.timelineT;
+      const totalArr =
+        segs.length > 0
+          ? totalArrDuration(segs)
+          : (s.jobMeta?.duration ?? Infinity);
+      const seekArr = (targetArr: number) => {
+        const clamped = Math.max(0, Math.min(totalArr, targetArr));
+        if (segs.length === 0) {
+          s.seek(clamped);
+          return;
+        }
+        // arr == totalArr is past the half-open last segment — clamp the
+        // hint to the last index so the walker resumes on the right
+        // occurrence (arrToMaster already clamps the value to last.out).
+        let idx = segmentIndexAtArr(clamped, segs);
+        if (idx === -1) idx = segs.length - 1;
+        s.seek(arrToMaster(clamped, segs), { segmentIdxHint: idx });
+      };
+      const frameStep = () => seekArr(tArr + direction * (1 / fps));
 
       if (mode === "off") return frameStep();
 
       if (mode === "match") {
         const clip = s.clips.find((c) => c.id === s.selectedClipId);
         if (clip && isVideoClip(clip) && clip.candidates?.length) {
+          // Candidate alignments are master-time positions by definition;
+          // compare on the master clock, then project the winner onto the
+          // arr axis so the playhead field stays arr-time.
+          const t = s.playback.currentTime;
           const positions = buildClipMatchPositions(clip)
             .map((p) => p.startS)
             .sort((a, b) => a - b);
@@ -1508,7 +1539,7 @@ export const useEditorStore = create<EditorState>()(
               ? positions.find((p) => p > t + eps)
               : [...positions].reverse().find((p) => p < t - eps);
           if (target !== undefined) {
-            s.seek(target);
+            seekArr(masterToArr(target, segs));
             return;
           }
         }
@@ -1523,10 +1554,12 @@ export const useEditorStore = create<EditorState>()(
       // Probe slightly into the desired direction so snapTime rounds the
       // correct way (snapTime always picks the nearest tick — without the
       // probe, t already on a tick would round to itself).
-      const probe = t + direction * step * 0.5;
+      const probe = tArr + direction * step * 0.5;
       const candidate = snapTime(probe, mode, {
         bpm,
-        beatPhase: effectiveBeatPhaseS(s.jobMeta),
+        // Same anchor as snapTimelineTime / the BeatRuler — bar 0 in
+        // arr-time.
+        beatPhase: arrBeatPhaseS(s.jobMeta, segs),
         beatsPerBar,
         barOffsetBeats: effectiveBarOffsetBeats(s.jobMeta),
       });
@@ -1537,8 +1570,8 @@ export const useEditorStore = create<EditorState>()(
       // of a snap (e.g. via audio-mirror seek precision).
       const eps = step * 1e-9;
       let target = candidate;
-      if (Math.abs(target - t) < eps) target = candidate + direction * step;
-      s.seek(target);
+      if (Math.abs(target - tArr) < eps) target = candidate + direction * step;
+      seekArr(target);
     },
     shiftLoop(direction) {
       const s = get();
