@@ -49,74 +49,78 @@ export function useTriagePersist() {
   const chunksDirtyRef = useRef(false);
 
   useEffect(() => {
+    async function writeNow() {
+      const s = useTriageStore.getState();
+      if (!s.jobId) return;
+      const fingerprint = JSON.stringify({
+        chunks: s.chunks,
+        silenceConfig: s.silenceConfig,
+        jobBpm: s.jobBpm,
+        beatsPerBar: s.beatsPerBar,
+        snapMode: s.snapMode,
+        camSync: s.cams.map((c) => [c.id, c.syncOverrideMs ?? 0]),
+      });
+      if (fingerprint === lastWrittenRef.current) return;
+      const isFirstWrite = lastWrittenRef.current === null;
+      lastWrittenRef.current = fingerprint;
+
+      const job = await jobsDb.getJob(s.jobId);
+      if (!job) return;
+      const updatedVideos = (job.videos ?? []).map((v) => {
+        if (!isVideoAsset(v)) return v;
+        const overlay = s.cams.find((c) => c.id === v.id);
+        if (!overlay) return v;
+        return { ...v, syncOverrideMs: overlay.syncOverrideMs ?? 0 };
+      });
+      // Build the BPM payload in the same shape `LocalJob.bpm` uses —
+      // includes `phase` so the editor's bar grid stays anchored
+      // correctly on the same job.
+      const bpmPayload = s.jobBpm
+        ? {
+            value: s.jobBpm.value,
+            confidence: s.jobBpm.confidence ?? job.bpm?.confidence ?? 0,
+            phase: job.bpm?.phase ?? s.beatPhaseS,
+            manualOverride: s.jobBpm.manualOverride,
+          }
+        : job.bpm;
+      // Downstream propagation. On a real chunk mutation (post-load),
+      // diff against the previously-persisted chunks set and prune
+      // arrangement items whose chunk got dropped. The Editor's
+      // reconcile pass picks up new pill geometry on its own —
+      // wiping pills here would needlessly drop user edits.
+      const propagate = chunksDirtyRef.current && !isFirstWrite;
+      chunksDirtyRef.current = false;
+      const prevChunks = lastPersistedChunksRef.current ?? [];
+      const nextArrangement = propagate
+        ? propagateTriageChangesToArrangement(
+            prevChunks,
+            s.chunks,
+            job.arrangement ?? [],
+          )
+        : null;
+      const arrangementChanged =
+        nextArrangement !== null && nextArrangement !== (job.arrangement ?? []);
+      await jobsDb.updateJob(s.jobId, {
+        chunks: s.chunks,
+        silenceConfig: s.silenceConfig,
+        bpm: bpmPayload,
+        beatsPerBar: s.beatsPerBar,
+        ui: { ...(job.ui ?? {}), snapMode: s.snapMode },
+        videos: updatedVideos,
+        ...(arrangementChanged && nextArrangement !== null
+          ? { arrangement: nextArrangement }
+          : {}),
+      });
+      lastPersistedChunksRef.current = s.chunks;
+    }
+
     function scheduleWrite() {
       if (timeoutRef.current !== null) {
         window.clearTimeout(timeoutRef.current);
       }
-      timeoutRef.current = window.setTimeout(async () => {
-        const s = useTriageStore.getState();
-        if (!s.jobId) return;
-        const fingerprint = JSON.stringify({
-          chunks: s.chunks,
-          silenceConfig: s.silenceConfig,
-          jobBpm: s.jobBpm,
-          beatsPerBar: s.beatsPerBar,
-          snapMode: s.snapMode,
-          camSync: s.cams.map((c) => [c.id, c.syncOverrideMs ?? 0]),
-        });
-        if (fingerprint === lastWrittenRef.current) return;
-        const isFirstWrite = lastWrittenRef.current === null;
-        lastWrittenRef.current = fingerprint;
-
-        const job = await jobsDb.getJob(s.jobId);
-        if (!job) return;
-        const updatedVideos = (job.videos ?? []).map((v) => {
-          if (!isVideoAsset(v)) return v;
-          const overlay = s.cams.find((c) => c.id === v.id);
-          if (!overlay) return v;
-          return { ...v, syncOverrideMs: overlay.syncOverrideMs ?? 0 };
-        });
-        // Build the BPM payload in the same shape `LocalJob.bpm` uses —
-        // includes `phase` so the editor's bar grid stays anchored
-        // correctly on the same job.
-        const bpmPayload = s.jobBpm
-          ? {
-              value: s.jobBpm.value,
-              confidence: s.jobBpm.confidence ?? job.bpm?.confidence ?? 0,
-              phase: job.bpm?.phase ?? s.beatPhaseS,
-              manualOverride: s.jobBpm.manualOverride,
-            }
-          : job.bpm;
-        // Downstream propagation. On a real chunk mutation (post-load),
-        // diff against the previously-persisted chunks set and prune
-        // arrangement items whose chunk got dropped. The Editor's
-        // reconcile pass picks up new pill geometry on its own —
-        // wiping pills here would needlessly drop user edits.
-        const propagate = chunksDirtyRef.current && !isFirstWrite;
-        chunksDirtyRef.current = false;
-        const prevChunks = lastPersistedChunksRef.current ?? [];
-        const nextArrangement = propagate
-          ? propagateTriageChangesToArrangement(
-              prevChunks,
-              s.chunks,
-              job.arrangement ?? [],
-            )
-          : null;
-        const arrangementChanged =
-          nextArrangement !== null && nextArrangement !== (job.arrangement ?? []);
-        await jobsDb.updateJob(s.jobId, {
-          chunks: s.chunks,
-          silenceConfig: s.silenceConfig,
-          bpm: bpmPayload,
-          beatsPerBar: s.beatsPerBar,
-          ui: { ...(job.ui ?? {}), snapMode: s.snapMode },
-          videos: updatedVideos,
-          ...(arrangementChanged && nextArrangement !== null
-            ? { arrangement: nextArrangement }
-            : {}),
-        });
-        lastPersistedChunksRef.current = s.chunks;
+      timeoutRef.current = window.setTimeout(() => {
         timeoutRef.current = null;
+        void writeNow();
       }, DEBOUNCE_MS);
     }
 
@@ -159,8 +163,16 @@ export function useTriagePersist() {
     });
     return () => {
       unsub();
+      // FLUSH a pending write, don't drop it. This cleanup runs before
+      // Triage's store-reset cleanup (effect declaration order), so the
+      // synchronous getState() inside writeNow still sees the final
+      // session state. Cancelling here (the old behaviour) let "tweak a
+      // slider → immediately hit Back/Continue" leave IDB with a stale
+      // half of the watched slice.
       if (timeoutRef.current !== null) {
         window.clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+        void writeNow();
       }
     };
   }, []);

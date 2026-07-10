@@ -28,6 +28,7 @@ vi.mock("../../local/triage/chunk-detect", () => ({
 }));
 
 const getJobMock = vi.mocked(jobsDb.getJob);
+const updateJobMock = vi.mocked(jobsDb.updateJob);
 const confirmMock = vi.mocked(confirmDestructive);
 const detectMock = vi.mocked(detectChunksFromEnvelope);
 
@@ -202,5 +203,66 @@ describe("DetectionPanel — destructive re-detect gate", () => {
     expect(confirmMock).not.toHaveBeenCalled();
     expect(useTriageStore.getState().silenceConfig.thresholdDb).toBe(-49);
     expect(detectMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("DetectionPanel — persistence and detection races", () => {
+  it("discards a stale detection that resolves after a newer one", async () => {
+    // Two in-flight detections from a slow slider drag can resolve out
+    // of order — without a generation counter the FIRST config's chunks
+    // would clobber the second's ("last writer wins with stale
+    // geometry").
+    seedStore([makeChunk({ id: "chunk-0-5000", startMs: 0, endMs: 5000 })]);
+    getJobMock.mockResolvedValue({ arrangement: [] } as never);
+    const pending: Array<(r: ReturnType<typeof detectionResult>) => void> = [];
+    detectMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          pending.push(resolve);
+        }),
+    );
+
+    render(<DetectionPanel />);
+    const slider = screen.getByRole("slider", { name: "Threshold" });
+    fireEvent.keyDown(slider, { key: "ArrowRight" });
+    await flush(60); // debounce fires → detection #1 in flight
+    fireEvent.keyDown(slider, { key: "ArrowRight" });
+    await flush(60); // detection #2 in flight
+    expect(pending).toHaveLength(2);
+
+    // Newer detection resolves first…
+    pending[1](
+      detectionResult([makeChunk({ id: "chunk-new", startMs: 0, endMs: 4800 })]),
+    );
+    await flush(0);
+    // …then the stale one limps in. It must be dropped.
+    pending[0](
+      detectionResult([makeChunk({ id: "chunk-stale", startMs: 50000, endMs: 60000 })]),
+    );
+    await flush(0);
+
+    expect(useTriageStore.getState().chunks.map((c) => c.id)).toEqual([
+      "chunk-0-5000", // identity carried through the overlap merge
+    ]);
+    expect(useTriageStore.getState().chunks[0].endMs).toBe(4800);
+  });
+
+  it("never writes to IDB itself — persistence is the auto-persist hook's single job", async () => {
+    // The old inline persist() snapshotted the store at slider time and
+    // wrote OLD chunks with the NEW config 250 ms later. DetectionPanel
+    // must not have its own write path at all.
+    seedStore([makeChunk({ id: "chunk-10000-20000", startMs: 10000, endMs: 20000 })]);
+    getJobMock.mockResolvedValue({ arrangement: [] } as never);
+    detectMock.mockResolvedValue(
+      detectionResult([makeChunk({ id: "chunk-9900-20100", startMs: 9900, endMs: 20100 })]),
+    );
+
+    render(<DetectionPanel />);
+    fireEvent.keyDown(screen.getByRole("slider", { name: "Threshold" }), {
+      key: "ArrowRight",
+    });
+    await flush(500);
+
+    expect(updateJobMock).not.toHaveBeenCalled();
   });
 });

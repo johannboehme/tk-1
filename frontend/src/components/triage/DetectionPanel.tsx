@@ -5,9 +5,13 @@
  * counter doubles as a passive readout: as the user drags the
  * threshold the kept count + summed duration update live.
  *
- * Slider changes re-run silence detection on the cached envelope
- * (cheap, sub-ms) and write the new chunks back to the Triage store +
- * IDB.
+ * Slider changes re-run silence detection on the cached envelope. The
+ * silence pass itself is cheap, but with PCM loaded each chunk gets a
+ * main-thread tempo/onset analysis — seconds of work on a long-form
+ * jam, so runs are debounced and stale resolutions are discarded via a
+ * generation counter. Persistence is NOT done here: the store writes
+ * flow through useTriagePersist (single writer), which snapshots
+ * chunks + silenceConfig together after the detection has landed.
  *
  * BPM lives on the brass plate inside ChunkInspector — this panel
  * is purely about "where do chunks begin and end".
@@ -59,7 +63,10 @@ export function DetectionPanel() {
   );
 
   const liveDebounceRef = useRef<number | null>(null);
-  const persistDebounceRef = useRef<number | null>(null);
+  /** Monotonic id per detection kick-off. Two in-flight detections from
+   *  a slow slider drag can resolve out of order; only the newest one
+   *  may write its chunks. */
+  const redetectGenRef = useRef(0);
   /** One-shot session gate: the first slider tweak with downstream work
    *  (persisted arrangement, manual chunk edits) goes through the same
    *  confirmDestructive() dialog as reject/split/join. Once approved,
@@ -73,12 +80,16 @@ export function DetectionPanel() {
     (config: SilenceConfig) => {
       const state = useTriageStore.getState();
       if (!state.envelope || !state.jobId) return;
+      const gen = ++redetectGenRef.current;
       void detectChunksFromEnvelope(
         state.pcm ?? new Float32Array(0),
         state.pcmSampleRate,
         state.envelope,
         config,
       ).then((result) => {
+        // A newer detection was kicked off while this one ran — its
+        // geometry belongs to a superseded config. Drop it.
+        if (gen !== redetectGenRef.current) return;
         // Reconcile against the CURRENT chunk list (not the kickoff
         // snapshot) via the overlap merge: keep/drop decisions, ids and
         // manual edits survive the boundary shifts every parameter
@@ -125,21 +136,6 @@ export function DetectionPanel() {
     return pending;
   }, []);
 
-  const persist = useCallback((config: SilenceConfig) => {
-    const state = useTriageStore.getState();
-    if (!state.jobId) return;
-    if (persistDebounceRef.current !== null) {
-      window.clearTimeout(persistDebounceRef.current);
-    }
-    persistDebounceRef.current = window.setTimeout(() => {
-      void jobsDb.updateJob(state.jobId!, {
-        silenceConfig: config,
-        chunks: state.chunks,
-      });
-      persistDebounceRef.current = null;
-    }, 250);
-  }, []);
-
   function onChange(patch: Partial<SilenceConfig>) {
     void ensureRedetectApproved().then((approved) => {
       if (!approved) return;
@@ -153,7 +149,6 @@ export function DetectionPanel() {
       }
       liveDebounceRef.current = window.setTimeout(() => {
         reDetect(next);
-        persist(next);
         liveDebounceRef.current = null;
       }, 50);
     });
