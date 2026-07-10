@@ -18,9 +18,10 @@ import {
   XIcon,
 } from "../editor/components/icons";
 import { useEditorStore } from "../editor/store";
+import { toggleFxPreviewLatch } from "../editor/fx-latch";
 import type { FxKind } from "../editor/fx/types";
 import type { GradeParams } from "../editor/fx/looks";
-import { useRegisterShortcut } from "../editor/shortcuts/useRegisterShortcut";
+import { bindShortcut } from "../editor/shortcuts/keymap";
 import {
   jobEvents,
   jobsDb,
@@ -182,13 +183,6 @@ export default function Editor() {
     let promoteTimer: ReturnType<typeof setTimeout> | null = null;
     const PAINT_PROMOTION_MS = 500;
 
-    function isTypingTarget(t: EventTarget | null): boolean {
-      const el = t as HTMLElement | null;
-      if (!el) return false;
-      const tag = el.tagName;
-      return tag === "INPUT" || tag === "TEXTAREA" || el.isContentEditable;
-    }
-
     function clearPromoteTimer() {
       if (promoteTimer !== null) {
         clearTimeout(promoteTimer);
@@ -196,71 +190,81 @@ export default function Editor() {
       }
     }
 
-    function onKeyDown(e: KeyboardEvent) {
-      if (e.metaKey || e.ctrlKey || e.altKey) return;
-      if (isTypingTarget(e.target)) return;
-      if (e.repeat) {
+    // Standard guards (typing target, exact modifiers, repeat, modal
+    // scope) live in the keymap dispatcher. preventDefault stays manual:
+    // a digit without a matching clip must not eat the key.
+    const offDigits = bindShortcut({
+      id: "editor.cam-switch",
+      keys: ["1", "2", "3", "4", "5", "6", "7", "8", "9"],
+      preventDefault: false,
+      onDown: (e) => {
+        const s = useEditorStore.getState();
+        // Single-active-hold: a new TAKE while another is held is ignored.
+        if (s.holdGesture) {
+          e.preventDefault();
+          return;
+        }
+        const n = parseInt(e.key, 10);
+        const clip = s.clips[n - 1];
+        if (!clip) return;
         e.preventDefault();
-        return;
-      }
-      const s = useEditorStore.getState();
+        // Perf instrumentation: capture press → next paint for the digit
+        // hotkey + the cam-switch this triggers. No-op when perf disabled.
+        trackKeypressToPaint(e.key);
+        trackCamSwitchToPaint(clip.id);
+        const startS = s.snapTimelineTime(s.playback.timelineT);
+        // beginHoldGesture must happen BEFORE addCut, so the snapshot
+        // captures cuts as they were *before* the immediate tap-cut lands.
+        s.beginHoldGesture(clip.id, startS);
+        s.addCut({ atTimeS: startS, camId: clip.id });
+        activeKey = e.key;
+        promoteTimer = setTimeout(() => {
+          useEditorStore.getState().promoteHoldToPaint();
+        }, PAINT_PROMOTION_MS);
+      },
+      onUp: (e) => {
+        if (e.key !== activeKey) return;
+        activeKey = null;
+        clearPromoteTimer();
+        const s = useEditorStore.getState();
+        const hold = s.holdGesture;
+        if (!hold) return;
+        const endS = s.snapTimelineTime(s.playback.timelineT);
+        if (hold.painting) {
+          // Paint-mode commit: drop everything in (start, end], add the
+          // trailing resume-cut (handled by applyHoldRelease).
+          s.applyHoldRelease(hold.camId, hold.startS, endS, hold.priorCuts);
+        }
+        // Else: tap. The immediate cut from keydown stays in place.
+        s.endHoldGesture();
+      },
+      help: {
+        keys: ["1", "…", "9"],
+        description:
+          "Switch active camera (tap = cut, hold = paint over the lane)",
+        group: "Cameras",
+        icon: <CameraIcon />,
+      },
+    });
 
-      // Esc cancels an active hold (revert to pre-press state).
-      if (e.key === "Escape" && s.holdGesture) {
+    // Esc cancels an active hold (revert to pre-press state).
+    const offEsc = bindShortcut({
+      id: "editor.cam-switch.cancel",
+      keys: ["Escape"],
+      preventDefault: false,
+      onDown: (e) => {
+        const s = useEditorStore.getState();
+        if (!s.holdGesture) return;
         e.preventDefault();
         clearPromoteTimer();
         activeKey = null;
         s.cancelHold();
-        return;
-      }
+      },
+    });
 
-      const n = parseInt(e.key, 10);
-      if (!Number.isInteger(n) || n < 1 || n > 9) return;
-      // Single-active-hold: a new TAKE while another is held is ignored.
-      if (s.holdGesture) {
-        e.preventDefault();
-        return;
-      }
-      const clip = s.clips[n - 1];
-      if (!clip) return;
-      e.preventDefault();
-      // Perf instrumentation: capture press → next paint for the digit
-      // hotkey + the cam-switch this triggers. No-op when perf disabled.
-      trackKeypressToPaint(e.key);
-      trackCamSwitchToPaint(clip.id);
-      const startS = s.snapTimelineTime(s.playback.timelineT);
-      // beginHoldGesture must happen BEFORE addCut, so the snapshot
-      // captures cuts as they were *before* the immediate tap-cut lands.
-      s.beginHoldGesture(clip.id, startS);
-      s.addCut({ atTimeS: startS, camId: clip.id });
-      activeKey = e.key;
-      promoteTimer = setTimeout(() => {
-        useEditorStore.getState().promoteHoldToPaint();
-      }, PAINT_PROMOTION_MS);
-    }
-
-    function onKeyUp(e: KeyboardEvent) {
-      if (e.key !== activeKey) return;
-      activeKey = null;
-      clearPromoteTimer();
-      const s = useEditorStore.getState();
-      const hold = s.holdGesture;
-      if (!hold) return;
-      const endS = s.snapTimelineTime(s.playback.timelineT);
-      if (hold.painting) {
-        // Paint-mode commit: drop everything in (start, end], add the
-        // trailing resume-cut (handled by applyHoldRelease).
-        s.applyHoldRelease(hold.camId, hold.startS, endS, hold.priorCuts);
-      }
-      // Else: tap. The immediate cut from keydown stays in place.
-      s.endHoldGesture();
-    }
-
-    window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("keyup", onKeyUp);
     return () => {
-      window.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("keyup", onKeyUp);
+      offDigits();
+      offEsc();
       clearPromoteTimer();
     };
   }, []);
@@ -283,13 +287,6 @@ export default function Editor() {
   // RAF tick lives in the same effect: while holds OR erase are active,
   // we extend each held fx's outS and apply the erase head each frame.
   useEffect(() => {
-    function isTypingTarget(t: EventTarget | null): boolean {
-      const el = t as HTMLElement | null;
-      if (!el) return false;
-      const tag = el.tagName;
-      return tag === "INPUT" || tag === "TEXTAREA" || el.isContentEditable;
-    }
-
     // Pad-Bank: top letter row, mnemonic-aligned with the FxHardwarePanel.
     // V (Vignette) sits on its own — bottom row — because vignette already
     // shipped as F before the redesign and `V` matches the label.
@@ -387,12 +384,128 @@ export default function Editor() {
       if (raf === null) raf = requestAnimationFrame(tick);
     }
 
-    function onKeyDown(e: KeyboardEvent) {
-      if (e.metaKey || e.ctrlKey || e.altKey) return;
-      if (isTypingTarget(e.target)) return;
-      const s = useEditorStore.getState();
+    // Standard guards (typing target, exact modifiers, repeat, modal
+    // scope) live in the keymap dispatcher. Keyup is dispatched unguarded
+    // so holds always release.
 
-      if (e.key === "Escape") {
+    // X-hotkey:
+    //   - Playback running → erase-head modifier (existing behavior:
+    //     X+kind narrows scope; X alone wipes all kinds under the
+    //     150 ms window at the playhead while held).
+    //   - Paused → long-press-to-clear, mirroring the pointer-driven
+    //     hold gesture on the program strip. Mode-aware: clears cuts
+    //     in "cuts" mode, fx in "fx" mode, both in "both" mode.
+    const offErase = bindShortcut({
+      id: "editor.erase-fx",
+      keys: ["x", "X"],
+      shiftInsensitive: true,
+      onDown: () => {
+        const s = useEditorStore.getState();
+        if (s.playback.isPlaying) {
+          eraseHeld = true;
+          ensureTick();
+        } else if (!xClearActive) {
+          xClearActive = true;
+          xClearStartT = performance.now();
+          useEditorStore.getState().setXClearProgress(0);
+          xClearRaf = requestAnimationFrame(tickXClear);
+        }
+      },
+      onUp: () => {
+        eraseHeld = false;
+        eraseKindFilter.clear();
+        cancelXClear();
+      },
+      help: {
+        keys: ["X"],
+        description:
+          "While playing: hold to erase FX under the playhead — combine with an FX pad (e.g. X+V) to restrict the wipe to that kind. While paused: hold 3 s to clear the program strip — clears cuts in cuts mode, fx in fx mode, both in both mode. Release or Esc cancels.",
+        group: "FX",
+        icon: <XIcon />,
+      },
+    });
+
+    const offPads = bindShortcut({
+      id: "editor.fx-pad",
+      keys: Object.keys(FX_HOTKEYS),
+      shiftInsensitive: true,
+      onDown: (e) => {
+        const s = useEditorStore.getState();
+        const kind = FX_HOTKEYS[e.key];
+        // While X is held, FX-hotkeys narrow the erase scope rather than
+        // starting a recording.
+        if (eraseHeld) {
+          eraseKindFilter.add(kind);
+          return;
+        }
+        const slotKey = `key:${e.key.toUpperCase()}`;
+
+        // Audition mode (paused) → the key LATCHES a live preview,
+        // exactly like a pad click (shared gesture in fx-latch.ts).
+        // Same kind toggles off; a different kind swaps. Lets the user
+        // dial encoders / ADSR with the mouse while the effect sits on
+        // the live frame. No capsule is written — an accidental tap
+        // leaves nothing on the timeline.
+        if (!s.playback.isPlaying) {
+          // Recording-Head: the press points the panel's encoders + LCD
+          // at the kind that was last triggered.
+          s.setSelectedFxKind(kind);
+          if (toggleFxPreviewLatch(s, slotKey, kind) !== "unlatched") {
+            ensureTick();
+          }
+          return;
+        }
+
+        if (s.fxHolds[slotKey]) return;
+        // Perf instrumentation: keypress → paint, plus an "fx first render"
+        // marker the FX overlay's RAF tick will close on the first frame
+        // it actually drew this hold. Sandboxes are no-ops when perf=off.
+        trackKeypressToPaint(e.key);
+        const pending = beginFxFirstRender();
+        if (pending && PERF_ENABLED) {
+          // Stash on window so the FX overlay tick can pick it up without
+          // adding a coupling import. One slot is enough — the F hotkey
+          // is the only fx-hold trigger in V1.
+          (window as unknown as { __fxFirstRenderPending?: { end: () => void } }).__fxFirstRenderPending = pending;
+        }
+        // Recording-Head: jeder Press sets the selectedFxKind so the
+        // panel's encoders + LCD point at the kind that was last triggered.
+        s.setSelectedFxKind(kind);
+
+        const t = s.snapTimelineTime(s.playback.timelineT);
+        s.beginFxHold(slotKey, kind, t);
+        ensureTick();
+      },
+      onUp: (e) => {
+        const kind = FX_HOTKEYS[e.key];
+        // If we were using this kind as an erase filter, drop it from the
+        // filter — but never treat the up-stroke as a fx-hold release for a
+        // hold that was never started.
+        if (eraseKindFilter.has(kind)) {
+          eraseKindFilter.delete(kind);
+          return;
+        }
+        // While paused, the hold latches — only the next click/key un-latches.
+        const s = useEditorStore.getState();
+        if (!s.playback.isPlaying) return;
+        const slotKey = `key:${e.key.toUpperCase()}`;
+        s.endFxHold(slotKey);
+      },
+      help: {
+        keys: ["V", "W", "E", "R", "T", "Z", "U"],
+        description:
+          "While playing: hold a pad to record its FX under the playhead. While paused: tap to latch a live preview — turn the encoders to dial in DEPTH/EDGE; tap again or hit another pad to switch. V vignette · W wear · E echo · R rgb · T tape · Z zoom · U uv",
+        group: "FX",
+        icon: <VignetteIcon />,
+      },
+    });
+
+    const offEsc = bindShortcut({
+      id: "editor.fx.cancel",
+      keys: ["Escape"],
+      preventDefault: false,
+      onDown: (e) => {
+        const s = useEditorStore.getState();
         if (Object.keys(s.fxHolds).length > 0) {
           e.preventDefault();
           s.cancelAllFxHolds();
@@ -406,124 +519,8 @@ export default function Editor() {
           e.preventDefault();
           cancelXClear();
         }
-        return;
-      }
-
-      // X-hotkey:
-      //   - Playback running → erase-head modifier (existing behavior:
-      //     X+kind narrows scope; X alone wipes all kinds under the
-      //     150 ms window at the playhead while held).
-      //   - Paused → long-press-to-clear, mirroring the pointer-driven
-      //     hold gesture on the program strip. Mode-aware: clears cuts
-      //     in "cuts" mode, fx in "fx" mode, both in "both" mode.
-      if (e.key === "x" || e.key === "X") {
-        if (e.repeat) {
-          e.preventDefault();
-          return;
-        }
-        e.preventDefault();
-        if (s.playback.isPlaying) {
-          eraseHeld = true;
-          ensureTick();
-        } else if (!xClearActive) {
-          xClearActive = true;
-          xClearStartT = performance.now();
-          useEditorStore.getState().setXClearProgress(0);
-          xClearRaf = requestAnimationFrame(tickXClear);
-        }
-        return;
-      }
-
-      const kind = FX_HOTKEYS[e.key];
-      if (!kind) return;
-      if (e.repeat) {
-        e.preventDefault();
-        return;
-      }
-      e.preventDefault();
-      // While X is held, FX-hotkeys narrow the erase scope rather than
-      // starting a recording.
-      if (eraseHeld) {
-        eraseKindFilter.add(kind);
-        return;
-      }
-      // Don't record FX capsules while paused. An accidental tap leaves
-      // a stub-marker on the timeline that's annoying to clean up later;
-      // the rule "punching only happens during playback" matches the
-      // tape-machine metaphor and is easy to remember.
-      if (!s.playback.isPlaying) return;
-      const slotKey = `key:${e.key.toUpperCase()}`;
-      if (s.fxHolds[slotKey]) return;
-      // Perf instrumentation: keypress → paint, plus an "fx first render"
-      // marker the FX overlay's RAF tick will close on the first frame
-      // it actually drew this hold. Sandboxes are no-ops when perf=off.
-      trackKeypressToPaint(e.key);
-      const pending = beginFxFirstRender();
-      if (pending && PERF_ENABLED) {
-        // Stash on window so the FX overlay tick can pick it up without
-        // adding a coupling import. One slot is enough — the F hotkey
-        // is the only fx-hold trigger in V1.
-        (window as unknown as { __fxFirstRenderPending?: { end: () => void } }).__fxFirstRenderPending = pending;
-      }
-      // Recording-Head: jeder Press sets the selectedFxKind so the
-      // panel's encoders + LCD point at the kind that was last triggered.
-      s.setSelectedFxKind(kind);
-
-      // Audition mode (paused) → keybind LATCHES the preview, just like
-      // a mouse click on a pad. Same kind toggles off; different kind
-      // swaps. Lets the user dial encoders / ADSR with the mouse while
-      // the effect sits on the live frame.
-      if (!s.playback.isPlaying) {
-        let existingSlot: string | null = null;
-        let existingKind: FxKind | null = null;
-        for (const [slot, h] of Object.entries(s.fxHolds)) {
-          if (h.mode === "preview") {
-            existingSlot = slot;
-            existingKind = h.kind;
-            break;
-          }
-        }
-        if (existingSlot != null && existingKind === kind) {
-          s.endFxHold(existingSlot);
-          return;
-        }
-        if (existingSlot != null) s.endFxHold(existingSlot);
-        const t = s.snapTimelineTime(s.playback.timelineT);
-        s.beginFxHold(slotKey, kind, t);
-        ensureTick();
-        return;
-      }
-
-      const t = s.snapTimelineTime(s.playback.timelineT);
-      s.beginFxHold(slotKey, kind, t);
-      ensureTick();
-    }
-
-    function onKeyUp(e: KeyboardEvent) {
-      if (e.key === "x" || e.key === "X") {
-        eraseHeld = false;
-        eraseKindFilter.clear();
-        cancelXClear();
-        return;
-      }
-      const kind = FX_HOTKEYS[e.key];
-      if (!kind) return;
-      // If we were using this kind as an erase filter, drop it from the
-      // filter — but never treat the up-stroke as a fx-hold release for a
-      // hold that was never started.
-      if (eraseKindFilter.has(kind)) {
-        eraseKindFilter.delete(kind);
-        return;
-      }
-      // While paused, the hold latches — only the next click/key un-latches.
-      const s = useEditorStore.getState();
-      if (!s.playback.isPlaying) return;
-      const slotKey = `key:${e.key.toUpperCase()}`;
-      s.endFxHold(slotKey);
-    }
-
-    window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("keyup", onKeyUp);
+      },
+    });
 
     // The pad-row triggers `beginFxHold` directly (without a keydown event),
     // so the RAF tick must also start when the holds-state transitions
@@ -536,8 +533,9 @@ export default function Editor() {
     );
 
     return () => {
-      window.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("keyup", onKeyUp);
+      offErase();
+      offPads();
+      offEsc();
       unsub();
       if (raf !== null) cancelAnimationFrame(raf);
       cancelXClear();
@@ -549,34 +547,39 @@ export default function Editor() {
   // The preview lives in the store as `quantizePreview` and the timeline
   // canvas reads it to render ghost ticks.
   useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      const ae = document.activeElement as HTMLElement | null;
-      const tag = (e.target as HTMLElement | null)?.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA" || ae?.isContentEditable) {
-        return;
-      }
-      if (e.metaKey || e.ctrlKey || e.altKey) return;
-      const s = useEditorStore.getState();
-      if (e.key === "q" || e.key === "Q") {
-        if (e.repeat) return;
-        e.preventDefault();
-        s.buildAndStartQuantizePreview();
-      } else if (e.key === "Escape" && s.quantizePreview !== null) {
-        e.preventDefault();
-        s.cancelQuantizePreview();
-      }
-    };
-    const onKeyUp = (e: KeyboardEvent) => {
-      if (e.key === "q" || e.key === "Q") {
+    const offQ = bindShortcut({
+      id: "editor.quantize",
+      keys: ["q", "Q"],
+      shiftInsensitive: true,
+      onDown: () => {
+        useEditorStore.getState().buildAndStartQuantizePreview();
+      },
+      onUp: () => {
         const s = useEditorStore.getState();
         if (s.quantizePreview !== null) s.commitQuantizePreview();
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("keyup", onKeyUp);
+      },
+      help: {
+        keys: ["Q"],
+        description:
+          "Hold to preview-snap every cut to the active grid; release commits, Esc cancels",
+        group: "Edit",
+        icon: <MagnetIcon />,
+      },
+    });
+    const offEsc = bindShortcut({
+      id: "editor.quantize.cancel",
+      keys: ["Escape"],
+      preventDefault: false,
+      onDown: (e) => {
+        const s = useEditorStore.getState();
+        if (s.quantizePreview === null) return;
+        e.preventDefault();
+        s.cancelQuantizePreview();
+      },
+    });
     return () => {
-      window.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("keyup", onKeyUp);
+      offQ();
+      offEsc();
     };
   }, []);
 
@@ -1091,39 +1094,6 @@ export default function Editor() {
     void runEditRender(id, local);
     navigate(`/job/${id}/render`);
   }
-
-  useRegisterShortcut({
-    id: "editor.cam-switch",
-    keys: ["1", "…", "9"],
-    description:
-      "Switch active camera (tap = cut, hold = paint over the lane)",
-    group: "Cameras",
-    icon: <CameraIcon />,
-  });
-  useRegisterShortcut({
-    id: "editor.fx-pad",
-    keys: ["V", "W", "E", "R", "T", "Z", "U"],
-    description:
-      "While playing: hold a pad to record its FX under the playhead. While paused: tap to latch a live preview — turn the encoders to dial in DEPTH/EDGE; tap again or hit another pad to switch. V vignette · W wear · E echo · R rgb · T tape · Z zoom · U uv",
-    group: "FX",
-    icon: <VignetteIcon />,
-  });
-  useRegisterShortcut({
-    id: "editor.erase-fx",
-    keys: ["X"],
-    description:
-      "While playing: hold to erase FX under the playhead — combine with an FX pad (e.g. X+V) to restrict the wipe to that kind. While paused: hold 3 s to clear the program strip — clears cuts in cuts mode, fx in fx mode, both in both mode. Release or Esc cancels.",
-    group: "FX",
-    icon: <XIcon />,
-  });
-  useRegisterShortcut({
-    id: "editor.quantize",
-    keys: ["Q"],
-    description:
-      "Hold to preview-snap every cut to the active grid; release commits, Esc cancels",
-    group: "Edit",
-    icon: <MagnetIcon />,
-  });
 
   if (err) {
     return (

@@ -1,10 +1,11 @@
 /**
- * Global keyboard-shortcut registry.
+ * Global keyboard-shortcut registry (cheat-sheet metadata).
  *
- * The components that wire up `keydown`/`keyup` listeners ALSO register
- * their shortcut metadata here, so the HelpOverlay can render an
- * always-current list of what each key does — without us having to
- * maintain a parallel hand-written cheat sheet.
+ * Entries are registered by the keymap (`bindShortcut` /
+ * `useGlobalShortcut` with a `help` field) together with the binding
+ * that implements the behavior, so the HelpOverlay renders an
+ * always-current list of what each key does — behavior and
+ * documentation cannot drift apart.
  *
  * Storage is a flat ordered list keyed by stable `id`. Re-registering
  * the same id replaces the entry in place (StrictMode mounts a hook

@@ -11,9 +11,9 @@
  * (Impressum · Datenschutz, fixed bottom-right) doesn't sit on top of
  * any actionable buttons.
  */
-import { useEffect, useMemo } from "react";
+import { useMemo } from "react";
 import { ChunkyButton } from "../../editor/components/ChunkyButton";
-import { useRegisterShortcut } from "../../editor/shortcuts/useRegisterShortcut";
+import { useGlobalShortcut } from "../../editor/shortcuts/keymap";
 import {
   CopyIcon,
   PauseIcon,
@@ -62,115 +62,102 @@ export function ArrangeTransport() {
     [focusedChunk, jobBpm, jobBeatsPerBar],
   );
 
-  // Shortcut registration so HelpOverlay surfaces them.
-  useRegisterShortcut({
+  // ─── Keyboard shortcuts ────────────────────────────────────────────────
+  // Declared through the central keymap: guards (typing target, exact
+  // modifiers — Cmd+D bookmark, Cmd+Backspace etc. never reach these —
+  // repeat, modal scope) live in the dispatcher, and each binding
+  // registers its cheat-sheet entry from the same declaration.
+  function focusAndSeek(delta: -1 | 1) {
+    focusRelative(delta);
+    const next = useArrangeStore.getState().focusedItemId;
+    if (next) useArrangeStore.getState().seekToItem(next);
+  }
+
+  useGlobalShortcut({
     id: "arrange.playpause",
-    keys: ["Space"],
-    description: "Play / pause",
-    group: "Transport",
+    codes: ["Space"],
+    onDown: () => setPlaying(!useArrangeStore.getState().playback.isPlaying),
+    help: { keys: ["Space"], description: "Play / pause", group: "Transport" },
   });
-  useRegisterShortcut({
+  useGlobalShortcut({
     id: "arrange.prev-item",
-    keys: ["←"],
-    description: "Focus previous frame",
-    group: "Arrange",
+    codes: ["ArrowLeft"],
+    allowRepeat: true,
+    onDown: () => focusAndSeek(-1),
+    help: { keys: ["←"], description: "Focus previous frame", group: "Arrange" },
   });
-  useRegisterShortcut({
+  useGlobalShortcut({
     id: "arrange.next-item",
-    keys: ["→"],
-    description: "Focus next frame",
-    group: "Arrange",
+    codes: ["ArrowRight"],
+    allowRepeat: true,
+    onDown: () => focusAndSeek(+1),
+    help: { keys: ["→"], description: "Focus next frame", group: "Arrange" },
   });
-  useRegisterShortcut({
+  useGlobalShortcut({
     id: "arrange.shift-left",
-    keys: ["⇧←"],
-    description: "Move focused frame left",
-    group: "Arrange",
+    codes: ["ArrowLeft"],
+    modifiers: ["shift"],
+    onDown: () => {
+      const id = useArrangeStore.getState().focusedItemId;
+      if (id) shiftItem(id, -1);
+    },
+    help: {
+      keys: ["⇧←"],
+      description: "Move focused frame left",
+      group: "Arrange",
+    },
   });
-  useRegisterShortcut({
+  useGlobalShortcut({
     id: "arrange.shift-right",
-    keys: ["⇧→"],
-    description: "Move focused frame right",
-    group: "Arrange",
+    codes: ["ArrowRight"],
+    modifiers: ["shift"],
+    onDown: () => {
+      const id = useArrangeStore.getState().focusedItemId;
+      if (id) shiftItem(id, +1);
+    },
+    help: {
+      keys: ["⇧→"],
+      description: "Move focused frame right",
+      group: "Arrange",
+    },
   });
-  useRegisterShortcut({
+  useGlobalShortcut({
     id: "arrange.remove",
-    keys: ["Backspace"],
-    description: "Drop focused frame",
-    group: "Arrange",
-  });
-  useRegisterShortcut({
-    id: "arrange.duplicate",
-    keys: ["D"],
-    description: "Duplicate focused frame",
-    group: "Arrange",
-  });
-
-  // Keyboard handler.
-  useEffect(() => {
-    function isTextInput(t: EventTarget | null): boolean {
-      if (!(t instanceof HTMLElement)) return false;
-      const tag = t.tagName;
-      return (
-        tag === "INPUT" ||
-        tag === "TEXTAREA" ||
-        tag === "SELECT" ||
-        t.isContentEditable
-      );
-    }
-    function focusAndSeek(delta: -1 | 1) {
-      focusRelative(delta);
-      const next = useArrangeStore.getState().focusedItemId;
-      if (next) useArrangeStore.getState().seekToItem(next);
-    }
-
-    function handler(e: KeyboardEvent) {
-      if (isTextInput(e.target)) return;
-      if (e.code === "Space") {
+    codes: ["Backspace"],
+    preventDefault: false, // only consume the key when a frame is focused
+    onDown: (e) => {
+      const id = useArrangeStore.getState().focusedItemId;
+      if (id) {
         e.preventDefault();
-        setPlaying(!useArrangeStore.getState().playback.isPlaying);
-      } else if (e.shiftKey && e.code === "ArrowLeft") {
-        // Move focused frame one position to the left.
-        e.preventDefault();
-        const id = useArrangeStore.getState().focusedItemId;
-        if (id) shiftItem(id, -1);
-      } else if (e.shiftKey && e.code === "ArrowRight") {
-        e.preventDefault();
-        const id = useArrangeStore.getState().focusedItemId;
-        if (id) shiftItem(id, +1);
-      } else if (e.code === "ArrowLeft") {
-        // Bare left = walk focus to the previous frame and seek.
-        e.preventDefault();
-        focusAndSeek(-1);
-      } else if (e.code === "ArrowRight") {
-        e.preventDefault();
-        focusAndSeek(+1);
-      } else if (e.code === "Backspace") {
-        const id = useArrangeStore.getState().focusedItemId;
-        if (id) {
-          e.preventDefault();
-          void removeItemGuarded(id);
-        }
-      } else if (
-        !e.metaKey &&
-        !e.ctrlKey &&
-        !e.altKey &&
-        (e.code === "KeyD" || e.key === "d" || e.key === "D")
-      ) {
-        // Plain "D" — no modifiers. Stays out of the way of browser
-        // shortcuts (Cmd+D = bookmark) and doesn't fight the user when
-        // they're just typing a letter (focus would be in a text input
-        // and isTextInput() filters above already).
-        const id = useArrangeStore.getState().focusedItemId;
-        if (id) {
-          e.preventDefault();
-          void duplicateItemWithEdits(id);
-        }
+        void removeItemGuarded(id);
       }
-    }
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [setPlaying, focusRelative, shiftItem]);
+    },
+    help: {
+      keys: ["Backspace"],
+      description: "Drop focused frame",
+      group: "Arrange",
+    },
+  });
+  useGlobalShortcut({
+    id: "arrange.duplicate",
+    // Physical D on any layout, plus produced-character fallback for
+    // exotic layouts; CapsLock "D" arrives without Shift and matches.
+    codes: ["KeyD"],
+    keys: ["d", "D"],
+    preventDefault: false,
+    onDown: (e) => {
+      const id = useArrangeStore.getState().focusedItemId;
+      if (id) {
+        e.preventDefault();
+        void duplicateItemWithEdits(id);
+      }
+    },
+    help: {
+      keys: ["D"],
+      description: "Duplicate focused frame",
+      group: "Arrange",
+    },
+  });
 
   const seekToItem = useArrangeStore((s) => s.seekToItem);
   const onPrevItem = () => {
