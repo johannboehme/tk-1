@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { detectCapabilities, meetsMinRequirements } from "./capabilities";
+import {
+  detectCapabilities,
+  meetsMinRequirements,
+  probeWebGPUVideoFrameUpload,
+} from "./capabilities";
 
 /**
  * Smoke-Test im echten Chromium (vitest-browser, Playwright Provider).
@@ -36,5 +40,17 @@ describe("capabilities (real Chromium)", () => {
   it("Chromium supports the File System Access API (nice-to-have)", () => {
     const caps = detectCapabilities();
     expect(caps.fileSystemAccess).toBe(true);
+  });
+
+  it("VideoFrame-upload probe passes on a real adapter (WebGPU tier reachable)", async () => {
+    // Regression guard for issue #87: the probe texture used to miss
+    // RENDER_ATTACHMENT usage, so real Chrome popped a validation error
+    // and the WebGPU tier was silently disabled app-wide. On any host
+    // where requestAdapter() yields an adapter, the probe MUST pass.
+    const gpu = (navigator as Navigator & { gpu?: GPU }).gpu;
+    if (!gpu) return; // Chromium built without WebGPU — nothing to probe.
+    const adapter = await gpu.requestAdapter();
+    if (!adapter) return; // No compatible adapter on this host (e.g. bare CI).
+    expect(await probeWebGPUVideoFrameUpload(adapter)).toBe(true);
   });
 });

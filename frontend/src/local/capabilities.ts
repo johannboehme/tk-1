@@ -151,7 +151,14 @@ export async function probeWebGPUVideoFrameUpload(
       label: "webgpu-probe",
       size: { width: 2, height: 2, depthOrArrayLayers: 1 },
       format: "rgba8unorm",
-      usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
+      // The WebGPU spec requires copyExternalImageToTexture destinations
+      // to carry COPY_DST *and* RENDER_ATTACHMENT. Without the latter,
+      // every conformant implementation pops a validation error and the
+      // probe reports webgpu=false on fully capable hardware (issue #87).
+      usage:
+        GPUTextureUsage.COPY_DST |
+        GPUTextureUsage.TEXTURE_BINDING |
+        GPUTextureUsage.RENDER_ATTACHMENT,
     });
     device.pushErrorScope("validation");
     device.queue.copyExternalImageToTexture(
