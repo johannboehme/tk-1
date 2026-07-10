@@ -226,4 +226,145 @@ describe("Export verification — multi-cam × multi-pill × multi-segment", () 
     },
     180_000,
   );
+
+  it(
+    "A/V stays frame-aligned across dozens of off-grid segment boundaries (#84/#107)",
+    async () => {
+      // 24 KEEP chunks of 0.35 s each (= 10.5 frames at 30 fps — the
+      // adversarial half-frame duration: naive per-segment rounding
+      // always rounds UP, so pre-fix the video gained 16.7 ms per chunk
+      // over the sample-exact audio, ~0.38 s by the last boundary).
+      // Each chunk starts with an 880 Hz beep in the master audio and
+      // the active cam alternates red/blue at every chunk start, so the
+      // output carries a measurable audio marker AND a visual marker at
+      // every boundary.
+      const FPS = 30;
+      const N = 24;
+      const SEG_DUR = 0.35;
+      const SR = 48000;
+
+      const makeImageBlob = async (color: string): Promise<Blob> => {
+        const c = new OffscreenCanvas(160, 120);
+        const ctx = c.getContext("2d")!;
+        ctx.fillStyle = color;
+        ctx.fillRect(0, 0, 160, 120);
+        return c.convertToBlob({ type: "image/png" });
+      };
+      const [redImg, blueImg] = await Promise.all([
+        makeImageBlob("#ff0000"),
+        makeImageBlob("#0000ff"),
+      ]);
+
+      // Master audio: 24 s of silence with a 60 ms beep at every chunk
+      // start (master k·1.0 s). Segments keep [k·1.0, k·1.0+0.35].
+      const masterSamples = new Float32Array(24 * SR);
+      for (let k = 0; k < N; k++) {
+        const start = Math.round(k * 1.0 * SR);
+        for (let i = 0; i < Math.round(0.06 * SR); i++) {
+          masterSamples[start + i] =
+            0.6 * Math.sin((2 * Math.PI * 880 * i) / SR);
+        }
+      }
+      const audio = makeWav(masterSamples, 1, SR);
+
+      const segments = Array.from({ length: N }, (_, k) => ({
+        in: k * 1.0,
+        out: k * 1.0 + SEG_DUR,
+      }));
+      const cuts = Array.from({ length: N }, (_, k) => ({
+        atTimeS: k * 1.0,
+        camId: k % 2 === 0 ? "red" : "blue",
+      }));
+
+      const result = await editRenderMulti({
+        cams: [
+          { id: "red",  file: redImg,  masterStartS: 0, sourceDurationS: 24, kind: "image" },
+          { id: "blue", file: blueImg, masterStartS: 0, sourceDurationS: 24, kind: "image" },
+        ],
+        cuts,
+        masterDurationS: 24,
+        audioFile: audio,
+        segments,
+        overlays: [],
+        offsetMs: 0,
+        driftRatio: 1.0,
+        outputFps: FPS,
+      });
+      expect(result.output).not.toBeNull();
+      const outBytes = result.output!;
+
+      // ── Video: locate every red↔blue switch, frame-exact. ──
+      const totalFrames = Math.round(N * SEG_DUR * FPS); // 252
+      const probeTimes = Array.from(
+        { length: totalFrames },
+        (_, i) => (i + 0.5) / FPS,
+      );
+      const colors = await decodeFrameColorsAt(outBytes, probeTimes);
+      const switchFrames: number[] = [];
+      for (let i = 1; i < colors.length; i++) {
+        if (
+          colors[i].dominant !== colors[i - 1].dominant &&
+          colors[i].dominant !== "missing" &&
+          colors[i - 1].dominant !== "missing"
+        ) {
+          switchFrames.push(i);
+        }
+      }
+      console.log(`[verify-drift] video switches at frames: ${switchFrames.join(",")}`);
+      expect(switchFrames.length).toBe(N - 1);
+
+      // Every boundary must sit at the CUMULATIVE frame target
+      // round(k · 10.5), not at k·11 (the pre-fix one-directional
+      // rounding).
+      for (let k = 1; k < N; k++) {
+        const expected = Math.round(k * SEG_DUR * FPS);
+        expect(Math.abs(switchFrames[k - 1] - expected)).toBeLessThanOrEqual(1);
+      }
+
+      // ── Audio: locate every beep onset in the decoded output. ──
+      const audioOut = await decodeAudioToMonoPcm(
+        new Blob([outBytes as BlobPart]),
+        22050,
+      );
+      const pcm = audioOut.pcm;
+      const onsets: number[] = [];
+      let quietRun = Math.round(0.1 * 22050); // treat file start as quiet
+      for (let i = 0; i < pcm.length; i++) {
+        if (Math.abs(pcm[i]) > 0.15) {
+          if (quietRun > 0.1 * 22050) onsets.push(i / 22050);
+          quietRun = 0;
+        } else {
+          quietRun++;
+        }
+      }
+      console.log(
+        `[verify-drift] beep onsets: ${onsets.map((t) => t.toFixed(3)).join(",")}`,
+      );
+      expect(onsets.length).toBe(N);
+
+      // ── A/V alignment per boundary, codec-delay-invariant: compare
+      // each beep's position RELATIVE to the first beep against the
+      // video boundary's position. Pre-fix the mismatch grows ~16.7 ms
+      // per boundary (~0.38 s at k=23); post-fix it stays within one
+      // frame everywhere. ──
+      const frameS = 1 / FPS;
+      for (let k = 1; k < N; k++) {
+        const audioRel = onsets[k] - onsets[0];
+        const videoRel = switchFrames[k - 1] / FPS;
+        expect(
+          Math.abs(audioRel - videoRel),
+          `boundary ${k}: audioRel=${audioRel.toFixed(3)} videoRel=${videoRel.toFixed(3)}`,
+        ).toBeLessThanOrEqual(frameS + 0.005);
+      }
+
+      // Total duration parity within one frame (the old test only
+      // asserted < 0.1 s, which a cumulative drift passes right through).
+      const reparsed = await demuxVideoTrack(new Blob([outBytes as BlobPart]));
+      expect(reparsed).not.toBeNull();
+      expect(
+        Math.abs(reparsed!.info.durationS - N * SEG_DUR),
+      ).toBeLessThanOrEqual(frameS + 0.005);
+    },
+    180_000,
+  );
 });
