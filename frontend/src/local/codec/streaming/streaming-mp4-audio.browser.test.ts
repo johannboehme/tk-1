@@ -82,6 +82,70 @@ describe("decodeMp4AudioStreaming", () => {
   );
 });
 
+describe("decodeMp4AudioStreaming: truncated / moov-less recordings (#81)", () => {
+  // tone-3s.mp4 is faststart (moov-first): ftyp @0 (32 B), moov @32
+  // (3950 B), free @3982, mdat @3990 (50230 B). Slicing lets us build the
+  // classic crashed-phone-recording shapes from real bytes.
+  const FTYP_END = 32;
+  const MOOV_END = 3982;
+  const MDAT_START = 3990;
+
+  it("rejects (not hangs) when the file has no moov at all — ftyp + truncated mdat", async () => {
+    if (typeof AudioDecoder === "undefined") return;
+    const full = await fetchBlob(MP4_FIXTURE);
+    // Recording died mid-take: ftyp + mdat header + partial mdat body,
+    // moov trailer never written. The mdat's declared size overshoots
+    // the actual bytes, exactly like a real truncated file.
+    const truncated = new Blob([
+      full.slice(0, FTYP_END),
+      full.slice(MDAT_START, MDAT_START + 30_000),
+    ]);
+    await expect(decodeMp4AudioStreaming(truncated, 22050)).rejects.toThrow(
+      /moov/i,
+    );
+  });
+
+  it("rejects (not hangs) when the moov itself is truncated mid-box", async () => {
+    if (typeof AudioDecoder === "undefined") return;
+    const full = await fetchBlob(MP4_FIXTURE);
+    // ftyp + first 100 bytes of moov, then EOF. locateMoov finds the moov
+    // header, but mp4box can never finish parsing it: depending on where
+    // the cut lands it either errors on an invalid box (onError → "mp4box:
+    // …") or parks silently in ERR_NOT_ENOUGH_DATA (post-EOF guard →
+    // "…moov…"). Both must reject; neither may hang.
+    const truncated = new Blob([full.slice(0, FTYP_END + 100)]);
+    await expect(decodeMp4AudioStreaming(truncated, 22050)).rejects.toThrow(
+      /moov|mp4box/i,
+    );
+  });
+
+  it("rejects fast on a large moov-less body without streaming it (fail-fast)", async () => {
+    if (typeof AudioDecoder === "undefined") return;
+    const full = await fetchBlob(MP4_FIXTURE);
+    // Same moov-less shape but with a bigger body: the guard must fire
+    // before the body is streamed, so this stays well under the timeout
+    // even for multi-GB real-world files (here: quick sanity bound).
+    const mdat = full.slice(MDAT_START, MDAT_START + 30_000);
+    const truncated = new Blob([full.slice(0, FTYP_END), mdat, mdat, mdat]);
+    const t0 = performance.now();
+    await expect(decodeMp4AudioStreaming(truncated, 22050)).rejects.toThrow(
+      /moov/i,
+    );
+    expect(performance.now() - t0).toBeLessThan(2000);
+  });
+
+  it("still decodes a moov-first file whose moov is inside the head probe", async () => {
+    if (typeof AudioDecoder === "undefined") return;
+    // Control: the guard must not break the fully-valid fixture (moov
+    // sits inside the 64 KiB head probe, so the out-of-order append is
+    // skipped and onReady fires from the head alone).
+    const full = await fetchBlob(MP4_FIXTURE);
+    expect(MOOV_END).toBeLessThan(64 * 1024);
+    const result = await decodeMp4AudioStreaming(full, 22050);
+    expect(result.pcm.length).toBeGreaterThan(22050 * 2.5);
+  });
+});
+
 function rms(buf: Float32Array): number {
   let s = 0;
   for (const v of buf) s += v * v;
