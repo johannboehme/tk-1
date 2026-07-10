@@ -15,6 +15,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useArrangeStore } from "../../local/arrange/arrange-store";
 import { resolveJobAssetUrl } from "../../local/jobs";
+import { planWalkerTick } from "./arrange-walker";
 
 import { clampSeek } from "../../lib/clamp";
 const LEAD_TIME_S = 0.05;
@@ -31,7 +32,17 @@ interface AudioGraph {
 
 interface PingPongState {
   active: "A" | "B";
-  armed: { fireAtCtxTime: number; fromSide: "A" | "B"; nextItemId: string | null } | null;
+  armed: {
+    fireAtCtxTime: number;
+    fromSide: "A" | "B";
+    /** True for real hops (advance / preview-loop): pause the old side
+     *  and flip roles when the crossfade fires. False for the end-of-
+     *  arrangement stop, which pauses via timeout instead. */
+    swapSides: boolean;
+    /** Item the walker advances to when the crossfade fires. Null for
+     *  preview-loops (walker stays detached) and the end-stop. */
+    nextItemId: string | null;
+  } | null;
 }
 
 const graphCache = new WeakMap<HTMLAudioElement, AudioGraph>();
@@ -219,78 +230,69 @@ function Driver({
         // duplicate of the same chunk doesn't collapse to the same
         // index and loop forever, and a deletion in front of the
         // current item doesn't yank the playhead onto a stale chunk.
-        const items = state.arrangement;
-        const chunkById = new Map(state.chunks.map((c) => [c.id, c]));
-        const trackedId = state.playback.currentItemId;
-        const currentItemIdx = trackedId
-          ? items.findIndex((a) => a.id === trackedId)
-          : -1;
-
-        // Walker lost the item it was tracking (deleted while playing,
-        // or arrangement reset to empty). Bail safely.
-        if (state.playback.isPlaying && currentItemIdx === -1) {
+        // A non-null `previewChunkId` switches the walker into the
+        // pool-preview loop instead (chunk audition). All branching
+        // lives in the pure planner — see arrange-walker.ts.
+        const plan = planWalkerTick({
+          isPlaying: state.playback.isPlaying,
+          hasArmed: cur.armed !== null,
+          tS: t,
+          arrangement: state.arrangement,
+          chunks: state.chunks,
+          currentItemId: state.playback.currentItemId,
+          previewChunkId: state.previewChunkId,
+          leadTimeS: LEAD_TIME_S,
+        });
+        if (plan.kind === "stop") {
           setPlaying(false);
-        }
-
-        // Arm crossfade-hop near current item's end.
-        if (state.playback.isPlaying && cur.armed === null && currentItemIdx >= 0) {
-          const curItem = items[currentItemIdx];
-          const curChunk = chunkById.get(curItem.chunkId);
-          const nextItem = items[currentItemIdx + 1];
-          const nextChunk = nextItem ? chunkById.get(nextItem.chunkId) : null;
-          if (curChunk) {
-            const remaining = curChunk.endMs / 1000 - t;
-            if (remaining > 0 && remaining < LEAD_TIME_S) {
-              if (nextItem && nextChunk) {
-                // Hop to the next item's master-time slice. Same gapless
-                // ping-pong: idle element pre-plays the next chunk while
-                // the active element finishes the current one, then a
-                // gain crossfade swaps them. Crucially we record the
-                // NEXT ITEM ID — that's what advances `currentItemId`
-                // when the crossfade fires, not whatever happens to
-                // match `t * 1000` afterwards.
-                try {
-                  idle.currentTime = clampSeek(
-                    nextChunk.startMs / 1000,
-                    idle.duration,
-                  );
-                } catch {
-                  /* ignore */
-                }
-                void idle.play().catch(() => undefined);
-                const fireCtxT = g.ctx.currentTime + remaining;
-                scheduleCrossfade(g, cur.active, fireCtxT);
-                cur.armed = {
-                  fireAtCtxTime: fireCtxT,
-                  fromSide: cur.active,
-                  nextItemId: nextItem.id,
-                };
-              } else {
-                // Last item — stop at end (don't loop in arrange).
-                // Schedule a pause that fires after the current chunk end.
-                window.setTimeout(() => {
-                  setPlaying(false);
-                }, Math.max(0, remaining * 1000));
-                cur.armed = {
-                  fireAtCtxTime: g.ctx.currentTime + remaining,
-                  fromSide: cur.active,
-                  nextItemId: null,
-                };
-              }
-            }
+        } else if (plan.kind === "arm-advance" || plan.kind === "arm-loop") {
+          // Hop to the plan's master-time slice. Same gapless
+          // ping-pong: idle element pre-plays the target while the
+          // active element finishes the current stretch, then a gain
+          // crossfade swaps them. For advances we record the NEXT
+          // ITEM ID — that's what advances `currentItemId` when the
+          // crossfade fires, not whatever happens to match `t * 1000`
+          // afterwards. Preview-loops keep the walker detached.
+          try {
+            idle.currentTime = clampSeek(plan.hopToS, idle.duration);
+          } catch {
+            /* ignore */
           }
+          void idle.play().catch(() => undefined);
+          const fireCtxT = g.ctx.currentTime + plan.remainingS;
+          scheduleCrossfade(g, cur.active, fireCtxT);
+          cur.armed = {
+            fireAtCtxTime: fireCtxT,
+            fromSide: cur.active,
+            swapSides: true,
+            nextItemId: plan.kind === "arm-advance" ? plan.nextItemId : null,
+          };
+        } else if (plan.kind === "arm-end") {
+          // Last item — stop at end (don't loop in arrange).
+          // Schedule a pause that fires after the current chunk end.
+          window.setTimeout(() => {
+            setPlaying(false);
+          }, Math.max(0, plan.remainingS * 1000));
+          cur.armed = {
+            fireAtCtxTime: g.ctx.currentTime + plan.remainingS,
+            fromSide: cur.active,
+            swapSides: false,
+            nextItemId: null,
+          };
         }
 
-        // Crossfade fired — swap roles AND advance the walker.
+        // Crossfade fired — swap roles and (for advances) walk on.
         if (
           cur.armed &&
           g.ctx.currentTime >= cur.armed.fireAtCtxTime + CROSSFADE_S
         ) {
-          if (cur.armed.nextItemId !== null) {
+          if (cur.armed.swapSides) {
             active.pause();
             cur.active = cur.active === "A" ? "B" : "A";
-            // Walker advance: explicit, not via time-match.
-            setCurrentItemId(cur.armed.nextItemId);
+            if (cur.armed.nextItemId !== null) {
+              // Walker advance: explicit, not via time-match.
+              setCurrentItemId(cur.armed.nextItemId);
+            }
           }
           cur.armed = null;
         }
