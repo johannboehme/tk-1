@@ -104,3 +104,69 @@ describe("jobs-db (real Chromium IndexedDB)", () => {
     });
   });
 });
+
+// -----------------------------------------------------------------------------
+// #129 — updateJobGuarded: compare-and-set on editRev, atomic in one tx
+// -----------------------------------------------------------------------------
+
+describe("updateJobGuarded (#129)", () => {
+  beforeEach(async () => {
+    await jobsDb.wipeAll();
+  });
+
+  it("writes the patch and bumps editRev when the expected rev matches", async () => {
+    const job = makeJob({ id: "g1", title: "before" });
+    await jobsDb.saveJob(job); // no editRev yet → treated as rev 0
+
+    const res = await jobsDb.updateJobGuarded("g1", 0, { title: "after" });
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.job.title).toBe("after");
+      expect(res.job.editRev).toBe(1);
+    }
+    const back = await jobsDb.getJob("g1");
+    expect(back?.title).toBe("after");
+    expect(back?.editRev).toBe(1);
+  });
+
+  it("refuses the write and reports the current rev on mismatch", async () => {
+    await jobsDb.saveJob(makeJob({ id: "g2", title: "tab-B-version", editRev: 5 }));
+
+    const res = await jobsDb.updateJobGuarded("g2", 1, { title: "tab-A-stale" });
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.currentRev).toBe(5);
+    // Nothing was clobbered.
+    const back = await jobsDb.getJob("g2");
+    expect(back?.title).toBe("tab-B-version");
+    expect(back?.editRev).toBe(5);
+  });
+
+  it("sequential guarded writes with tracked revs all land", async () => {
+    await jobsDb.saveJob(makeJob({ id: "g3" }));
+    const r1 = await jobsDb.updateJobGuarded("g3", 0, { title: "one" });
+    expect(r1.ok).toBe(true);
+    const r2 = await jobsDb.updateJobGuarded("g3", 1, { title: "two" });
+    expect(r2.ok).toBe(true);
+    const back = await jobsDb.getJob("g3");
+    expect(back?.title).toBe("two");
+    expect(back?.editRev).toBe(2);
+  });
+
+  it("throws for a missing job", async () => {
+    await expect(jobsDb.updateJobGuarded("missing", 0, {})).rejects.toThrow(
+      /not found/i,
+    );
+  });
+
+  it("a patch cannot smuggle its own editRev/id past the guard", async () => {
+    await jobsDb.saveJob(makeJob({ id: "g4" }));
+    const res = await jobsDb.updateJobGuarded("g4", 0, {
+      editRev: 999,
+      id: "hijack",
+    } as Partial<LocalJob>);
+    expect(res.ok).toBe(true);
+    const back = await jobsDb.getJob("g4");
+    expect(back?.editRev).toBe(1);
+    expect(back?.id).toBe("g4");
+  });
+});

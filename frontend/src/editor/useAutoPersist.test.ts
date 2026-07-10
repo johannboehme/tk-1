@@ -5,9 +5,11 @@ import {
   buildPersistPatch,
   flushEditorStateNow,
   persistRelevantChanged,
+  resetEditSessionsForTest,
   useAutoPersist,
 } from "./useAutoPersist";
 import { jobsDb, type LocalJob, type VideoAsset } from "../storage/jobs-db";
+import { useConfirmStore } from "../lib/confirm";
 
 const baseJob: LocalJob = {
   id: "j1",
@@ -187,14 +189,21 @@ describe("useAutoPersist — flush semantics (#120)", () => {
     const getJob = vi
       .spyOn(jobsDb, "getJob")
       .mockResolvedValue({ ...baseJob });
+    // Auto-persist goes through the guarded CAS write (#129); these
+    // tests don't exercise conflicts, so it always succeeds.
     const updateJob = vi
-      .spyOn(jobsDb, "updateJob")
-      .mockImplementation(async (_id, patch) => ({ ...baseJob, ...patch }));
-    return { getJob, updateJob };
+      .spyOn(jobsDb, "updateJobGuarded")
+      .mockImplementation(async (_id, expectedRev, patch) => ({
+        ok: true,
+        job: { ...baseJob, ...patch, editRev: expectedRev + 1 },
+      }));
+    /** The persisted patch of call `i` (3rd arg of updateJobGuarded). */
+    const patchOfCall = (i: number) => updateJob.mock.calls[i][2];
+    return { getJob, updateJob, patchOfCall };
   }
 
   test("persists after the debounce window on an ordinary edit", async () => {
-    const { updateJob } = mockDb();
+    const { updateJob, patchOfCall } = mockDb();
     const { unmount } = renderHook(() => useAutoPersist("j1"));
     act(() => {
       useEditorStore.getState().loadJob(meta); // hydration — skipped
@@ -208,14 +217,14 @@ describe("useAutoPersist — flush semantics (#120)", () => {
       await drainMicrotasks();
     });
     expect(updateJob).toHaveBeenCalledTimes(1);
-    expect(updateJob.mock.calls[0][1]).toMatchObject({
+    expect(patchOfCall(0)).toMatchObject({
       trim: { in: 2, out: 30 },
     });
     unmount();
   });
 
   test("unmount before the debounce fires still persists the pending edit", async () => {
-    const { updateJob } = mockDb();
+    const { updateJob, patchOfCall } = mockDb();
     const { unmount } = renderHook(() => useAutoPersist("j1"));
     act(() => {
       useEditorStore.getState().loadJob(meta);
@@ -229,7 +238,7 @@ describe("useAutoPersist — flush semantics (#120)", () => {
     unmount();
     await drainMicrotasks();
     expect(updateJob).toHaveBeenCalledTimes(1);
-    expect(updateJob.mock.calls[0][1]).toMatchObject({
+    expect(patchOfCall(0)).toMatchObject({
       trim: { in: 5, out: 42 },
     });
   });
@@ -246,7 +255,7 @@ describe("useAutoPersist — flush semantics (#120)", () => {
   });
 
   test("flushEditorStateNow persists the full patch immediately and cancels the pending timer", async () => {
-    const { updateJob } = mockDb();
+    const { updateJob, patchOfCall } = mockDb();
     const { unmount } = renderHook(() => useAutoPersist("j1"));
     act(() => {
       useEditorStore.getState().loadJob(meta);
@@ -256,7 +265,7 @@ describe("useAutoPersist — flush semantics (#120)", () => {
     });
     await flushEditorStateNow("j1");
     expect(updateJob).toHaveBeenCalledTimes(1);
-    expect(updateJob.mock.calls[0][1]).toMatchObject({
+    expect(patchOfCall(0)).toMatchObject({
       trim: { in: 1, out: 9 },
     });
     // The debounced timer must not double-write afterwards.
@@ -269,7 +278,7 @@ describe("useAutoPersist — flush semantics (#120)", () => {
   });
 
   test("pagehide flushes a pending edit (tab close mid-debounce)", async () => {
-    const { updateJob } = mockDb();
+    const { updateJob, patchOfCall } = mockDb();
     const { unmount } = renderHook(() => useAutoPersist("j1"));
     act(() => {
       useEditorStore.getState().loadJob(meta);
@@ -280,7 +289,7 @@ describe("useAutoPersist — flush semantics (#120)", () => {
     window.dispatchEvent(new Event("pagehide"));
     await drainMicrotasks();
     expect(updateJob).toHaveBeenCalledTimes(1);
-    expect(updateJob.mock.calls[0][1]).toMatchObject({
+    expect(patchOfCall(0)).toMatchObject({
       trim: { in: 3, out: 33 },
     });
     unmount();
@@ -330,9 +339,12 @@ describe("useAutoPersist — write-failure retry (#124)", () => {
   test("a transient failure retries WITHOUT a further user change and lands the edit", async () => {
     vi.spyOn(jobsDb, "getJob").mockResolvedValue({ ...baseJob });
     const updateJob = vi
-      .spyOn(jobsDb, "updateJob")
+      .spyOn(jobsDb, "updateJobGuarded")
       .mockRejectedValueOnce(new DOMException("boom", "QuotaExceededError"))
-      .mockImplementation(async (_id, patch) => ({ ...baseJob, ...patch }));
+      .mockImplementation(async (_id, expectedRev, patch) => ({
+        ok: true as const,
+        job: { ...baseJob, ...patch, editRev: expectedRev + 1 },
+      }));
 
     const { unmount } = mountWithEdit();
     await advance(300); // debounce fires → attempt 1 fails
@@ -342,7 +354,7 @@ describe("useAutoPersist — write-failure retry (#124)", () => {
     // store change happens; the retry must be self-scheduled.
     await advance(5000);
     expect(updateJob.mock.calls.length).toBeGreaterThanOrEqual(2);
-    const lastPatch = updateJob.mock.calls[updateJob.mock.calls.length - 1][1];
+    const lastPatch = updateJob.mock.calls[updateJob.mock.calls.length - 1][2];
     expect(lastPatch).toMatchObject({ trim: { in: 2, out: 30 } });
     unmount();
   });
@@ -350,7 +362,7 @@ describe("useAutoPersist — write-failure retry (#124)", () => {
   test("retries are bounded and a persistent failure surfaces as an editor notice", async () => {
     vi.spyOn(jobsDb, "getJob").mockResolvedValue({ ...baseJob });
     const updateJob = vi
-      .spyOn(jobsDb, "updateJob")
+      .spyOn(jobsDb, "updateJobGuarded")
       .mockRejectedValue(new Error("connection closed"));
 
     const { unmount } = mountWithEdit();
@@ -372,9 +384,12 @@ describe("useAutoPersist — write-failure retry (#124)", () => {
   test("a retry picks up fresher state when the user edited meanwhile", async () => {
     vi.spyOn(jobsDb, "getJob").mockResolvedValue({ ...baseJob });
     const updateJob = vi
-      .spyOn(jobsDb, "updateJob")
+      .spyOn(jobsDb, "updateJobGuarded")
       .mockRejectedValueOnce(new Error("transient"))
-      .mockImplementation(async (_id, patch) => ({ ...baseJob, ...patch }));
+      .mockImplementation(async (_id, expectedRev, patch) => ({
+        ok: true as const,
+        job: { ...baseJob, ...patch, editRev: expectedRev + 1 },
+      }));
 
     const { unmount } = mountWithEdit();
     await advance(300); // attempt 1 fails with trim {2,30}
@@ -384,8 +399,211 @@ describe("useAutoPersist — write-failure retry (#124)", () => {
     });
     await advance(10_000); // retry (and/or the new debounce) lands
 
-    const lastPatch = updateJob.mock.calls[updateJob.mock.calls.length - 1][1];
+    const lastPatch = updateJob.mock.calls[updateJob.mock.calls.length - 1][2];
     expect(lastPatch).toMatchObject({ trim: { in: 7, out: 55 } });
     unmount();
+  });
+});
+
+// -----------------------------------------------------------------------------
+// #129 — same project in two tabs: unversioned last-write-wins must die
+// -----------------------------------------------------------------------------
+
+describe("useAutoPersist — cross-tab guard (#129)", () => {
+  beforeEach(() => {
+    useEditorStore.getState().reset();
+    vi.restoreAllMocks();
+    vi.useFakeTimers();
+    resetEditSessionsForTest();
+    useConfirmStore.setState({ requests: [] });
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function drainMicrotasks(rounds = 12): Promise<void> {
+    for (let i = 0; i < rounds; i++) await Promise.resolve();
+  }
+
+  async function advance(ms: number): Promise<void> {
+    await act(async () => {
+      vi.advanceTimersByTime(ms);
+      await drainMicrotasks();
+    });
+  }
+
+  /** In-memory job row with real CAS semantics, so tests can simulate a
+   *  second tab by mutating `row` behind the hook's back. */
+  function mockGuardedDb() {
+    const row: LocalJob = { ...baseJob, editRev: 0 };
+    vi.spyOn(jobsDb, "getJob").mockImplementation(async () => ({ ...row }));
+    const guarded = vi
+      .spyOn(jobsDb, "updateJobGuarded")
+      .mockImplementation(async (_id, expectedRev, patch) => {
+        const cur = row.editRev ?? 0;
+        if (cur !== expectedRev) return { ok: false, currentRev: cur };
+        Object.assign(row, patch, { editRev: expectedRev + 1, id: row.id });
+        return { ok: true, job: { ...row } };
+      });
+    return { row, guarded };
+  }
+
+  function mountWithLoad() {
+    const hook = renderHook(() => useAutoPersist("j1"));
+    act(() => {
+      useEditorStore.getState().loadJob(meta);
+    });
+    return hook;
+  }
+
+  test("a stale tab's flush is refused, saving pauses, and a loud dialog appears", async () => {
+    const { row, guarded } = mockGuardedDb();
+    const { unmount } = mountWithLoad();
+    await drainMicrotasks(); // let the baseline-rev seed settle
+
+    act(() => {
+      useEditorStore.getState().setTrim({ in: 1, out: 10 });
+    });
+    await advance(300);
+    expect(row.editRev).toBe(1); // our write landed
+
+    // Another tab saves newer edits behind our back.
+    row.editRev = 5;
+    row.trim = { in: 40, out: 50 };
+
+    act(() => {
+      useEditorStore.getState().setTrim({ in: 2, out: 20 });
+    });
+    await advance(300);
+
+    // The other tab's edits were NOT clobbered…
+    expect(row.trim).toEqual({ in: 40, out: 50 });
+    expect(row.editRev).toBe(5);
+    // …and the user is warned loudly.
+    const dialog = useConfirmStore.getState().requests[0];
+    expect(dialog).toBeDefined();
+    expect(dialog!.title.toLowerCase()).toContain("another tab");
+
+    // Saving stays paused: further edits trigger no more write attempts.
+    const callsSoFar = guarded.mock.calls.length;
+    act(() => {
+      useEditorStore.getState().setTrim({ in: 3, out: 30 });
+    });
+    await advance(1000);
+    expect(guarded.mock.calls.length).toBe(callsSoFar);
+    unmount();
+  });
+
+  test("choosing Overwrite resumes saving on top of the other tab's revision", async () => {
+    const { row } = mockGuardedDb();
+    const { unmount } = mountWithLoad();
+    await drainMicrotasks();
+
+    act(() => {
+      useEditorStore.getState().setTrim({ in: 1, out: 10 });
+    });
+    await advance(300);
+    row.editRev = 5;
+    row.trim = { in: 40, out: 50 };
+    act(() => {
+      useEditorStore.getState().setTrim({ in: 2, out: 20 });
+    });
+    await advance(300);
+
+    const dialog = useConfirmStore.getState().requests[0];
+    expect(dialog).toBeDefined();
+    await act(async () => {
+      useConfirmStore.getState().resolve(dialog!.id, true); // Overwrite
+      await drainMicrotasks();
+    });
+
+    // This tab's version won, CAS'd against the other tab's rev.
+    expect(row.trim).toEqual({ in: 2, out: 20 });
+    expect(row.editRev).toBe(6);
+
+    // And normal auto-persist works again afterwards.
+    act(() => {
+      useEditorStore.getState().setTrim({ in: 3, out: 30 });
+    });
+    await advance(300);
+    expect(row.trim).toEqual({ in: 3, out: 30 });
+    expect(row.editRev).toBe(7);
+    unmount();
+  });
+
+  test("choosing to keep the other tab's edits leaves saving paused", async () => {
+    const { row, guarded } = mockGuardedDb();
+    const { unmount } = mountWithLoad();
+    await drainMicrotasks();
+
+    act(() => {
+      useEditorStore.getState().setTrim({ in: 1, out: 10 });
+    });
+    await advance(300);
+    row.editRev = 5;
+    act(() => {
+      useEditorStore.getState().setTrim({ in: 2, out: 20 });
+    });
+    await advance(300);
+
+    const dialog = useConfirmStore.getState().requests[0];
+    await act(async () => {
+      useConfirmStore.getState().resolve(dialog!.id, false); // Keep theirs
+      await drainMicrotasks();
+    });
+
+    const callsSoFar = guarded.mock.calls.length;
+    act(() => {
+      useEditorStore.getState().setTrim({ in: 3, out: 30 });
+    });
+    await advance(1000);
+    expect(guarded.mock.calls.length).toBe(callsSoFar);
+    expect(row.editRev).toBe(5);
+    unmount();
+  });
+
+  test("warns at mount when the project is already open in another tab (Web Locks)", async () => {
+    mockGuardedDb();
+    // Simulate a held lock: the callback receives null under ifAvailable.
+    Object.defineProperty(navigator, "locks", {
+      configurable: true,
+      value: {
+        request: (_name: string, _opts: unknown, cb: (l: unknown) => unknown) =>
+          Promise.resolve(cb(null)),
+      },
+    });
+    try {
+      const { unmount } = mountWithLoad();
+      await drainMicrotasks();
+      const dialog = useConfirmStore.getState().requests[0];
+      expect(dialog).toBeDefined();
+      expect(dialog!.title.toLowerCase()).toContain("open in another tab");
+      unmount();
+    } finally {
+      delete (navigator as { locks?: unknown }).locks;
+    }
+  });
+
+  test("no warning when the lock is granted (single tab)", async () => {
+    mockGuardedDb();
+    Object.defineProperty(navigator, "locks", {
+      configurable: true,
+      value: {
+        request: (_name: string, _opts: unknown, cb: (l: unknown) => unknown) =>
+          Promise.resolve(cb({ name: "tk1-project-j1" })),
+      },
+    });
+    try {
+      const { unmount } = mountWithLoad();
+      await drainMicrotasks();
+      expect(useConfirmStore.getState().requests).toEqual([]);
+      unmount();
+      await drainMicrotasks(); // release must not throw
+    } finally {
+      delete (navigator as { locks?: unknown }).locks;
+    }
   });
 });
