@@ -1120,7 +1120,7 @@ export default function Editor() {
     id: "editor.quantize",
     keys: ["Q"],
     description:
-      "Hold to preview-snap every cut to the active grid; release commits, Esc cancels",
+      "Hold to preview-snap every cut and FX edge to the active grid; release commits, Esc cancels",
     group: "Edit",
     icon: <MagnetIcon />,
   });

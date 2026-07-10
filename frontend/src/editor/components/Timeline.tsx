@@ -934,27 +934,45 @@ export function Timeline({
     ctx.fill();
 
     // Q-hold quantize preview: ghost markers at the snapped target
-    // positions. Drawn last so they overlay every lane.
+    // positions — for cuts AND fx edges, the complete quantize scope
+    // (#70). Drawn last so they overlay every lane.
     if (quantizePreview) {
+      // Collect every pending target/origin position once so cuts and fx
+      // edges render through the same two passes.
+      const ghostTargets: number[] = [];
+      const ghostOrigins: number[] = [];
+      for (const change of quantizePreview.cuts) {
+        ghostTargets.push(change.to);
+        ghostOrigins.push(change.from);
+      }
+      for (const change of quantizePreview.fxs) {
+        if (change.in) {
+          ghostTargets.push(change.in.to);
+          ghostOrigins.push(change.in.from);
+        }
+        if (change.out) {
+          ghostTargets.push(change.out.to);
+          ghostOrigins.push(change.out.from);
+        }
+      }
       ctx.save();
-      ctx.fillStyle = "rgba(0, 102, 204, 0.85)"; // cobalt
-      ctx.strokeStyle = "rgba(0, 102, 204, 0.85)";
+      ctx.strokeStyle = "rgba(0, 102, 204, 0.85)"; // cobalt
       ctx.lineWidth = 2;
       ctx.setLineDash([4, 3]);
-      for (const change of quantizePreview.cuts) {
-        const xTo = tToX(change.to);
+      for (const t of ghostTargets) {
+        const xTo = tToX(t);
         if (xTo < -2 || xTo > canvasWidth + 2) continue;
         ctx.beginPath();
         ctx.moveTo(xTo, 0);
         ctx.lineTo(xTo, canvasH);
         ctx.stroke();
       }
-      // Faded "from" line for each off-grid cut (visual hint of the move).
+      // Faded "from" line for each off-grid marker (visual hint of the move).
       ctx.strokeStyle = "rgba(0, 0, 0, 0.25)";
       ctx.lineWidth = 1;
       ctx.setLineDash([2, 4]);
-      for (const change of quantizePreview.cuts) {
-        const xFrom = tToX(change.from);
+      for (const t of ghostOrigins) {
+        const xFrom = tToX(t);
         if (xFrom < -2 || xFrom > canvasWidth + 2) continue;
         ctx.beginPath();
         ctx.moveTo(xFrom, 0);

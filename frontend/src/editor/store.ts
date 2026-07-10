@@ -2286,11 +2286,11 @@ export const useEditorStore = create<EditorState>()(
     },
     buildAndStartQuantizePreview() {
       const s = get();
-      // Quantize is sync-aligned (snaps cut times to beat grid). Image
-      // clips don't participate — feed only video clips to the helper.
-      const videoClips = s.clips.filter(isVideoClip);
+      // Scope: cuts + fx ONLY (#70). Cam start offsets are auto-synced
+      // (snapping them would break A/V alignment) and the master trim is
+      // the user's export window — quantize must not touch either.
       const preview = buildQuantizePreview(
-        { cuts: s.cuts, clips: videoClips, trim: s.trim, fx: s.fx },
+        { cuts: s.cuts, fx: s.fx },
         s.ui.snapMode,
         {
           bpm: s.jobMeta?.bpm?.value ?? null,
@@ -2338,16 +2338,8 @@ export const useEditorStore = create<EditorState>()(
       }
       nextCuts = dedupedReverse.reverse();
 
-      // Apply clip start-offsets.
-      const nextClips = get().clips.map((c) => {
-        const change = preview.clipStartOffsets.find((p) => p.camId === c.id);
-        return change ? { ...c, startOffsetS: change.to } : c;
-      });
-
-      // Apply trim.
-      const nextTrim = preview.trim ? preview.trim.to : get().trim;
-
-      // Apply fx in/out snaps.
+      // Apply fx in/out snaps. (Cuts + fx are the ENTIRE quantize scope —
+      // cam start offsets and trim are deliberately untouched, #70.)
       let nextFx = get().fx;
       if (preview.fxs.length > 0) {
         nextFx = nextFx.map((f) => {
@@ -2365,8 +2357,6 @@ export const useEditorStore = create<EditorState>()(
 
       set({
         cuts: nextCuts,
-        clips: nextClips,
-        trim: nextTrim,
         fx: nextFx,
         quantizePreview: null,
       });

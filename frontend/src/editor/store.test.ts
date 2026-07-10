@@ -480,6 +480,33 @@ describe("useEditorStore", () => {
   });
 
   describe("Q-hold quantize actions", () => {
+    const loadWithCams = () => {
+      useEditorStore.getState().loadJob(
+        {
+          ...baseJobMeta,
+          bpm: { value: 120, confidence: 1, phase: 0, manualOverride: false },
+        },
+        {
+          clips: [
+            {
+              id: "cam-1",
+              filename: "a.mp4",
+              color: "#fff",
+              sourceDurationS: 60,
+              syncOffsetMs: 0,
+            },
+            {
+              id: "cam-2",
+              filename: "b.mp4",
+              color: "#0ff",
+              sourceDurationS: 60,
+              syncOffsetMs: 0,
+            },
+          ],
+        },
+      );
+    };
+
     test("buildAndStartQuantizePreview is no-op when mode is OFF", () => {
       useEditorStore.getState().loadJob({
         ...baseJobMeta,
@@ -489,46 +516,57 @@ describe("useEditorStore", () => {
       const p = useEditorStore.getState().quantizePreview;
       expect(p).not.toBeNull();
       expect(p!.cuts).toEqual([]);
-      expect(p!.clipStartOffsets).toEqual([]);
-      expect(p!.trim).toBeNull();
+      expect(p!.fxs).toEqual([]);
     });
 
-    test("buildAndStartQuantizePreview emits previews for off-grid trim/clips/cuts", () => {
-      useEditorStore.getState().loadJob({
-        ...baseJobMeta,
-        bpm: { value: 120, confidence: 1, phase: 0, manualOverride: false },
-      });
+    test("commitQuantizePreview snaps off-grid cuts then clears the preview", () => {
+      loadWithCams();
+      useEditorStore.getState().addCut({ atTimeS: 0.61, camId: "cam-2" });
       useEditorStore.getState().setSnapMode("1/4");
-      useEditorStore.getState().setTrim({ in: 0.21, out: 60 });
       useEditorStore.getState().buildAndStartQuantizePreview();
       const p = useEditorStore.getState().quantizePreview;
-      expect(p?.trim?.to.in).toBeCloseTo(0, 6);
-    });
-
-    test("commitQuantizePreview applies trim then clears the preview", () => {
-      useEditorStore.getState().loadJob({
-        ...baseJobMeta,
-        bpm: { value: 120, confidence: 1, phase: 0, manualOverride: false },
-      });
-      useEditorStore.getState().setSnapMode("1/4");
-      useEditorStore.getState().setTrim({ in: 0.21, out: 60 });
-      useEditorStore.getState().buildAndStartQuantizePreview();
+      expect(p?.cuts).toHaveLength(1);
+      expect(p?.cuts[0].to).toBeCloseTo(0.5, 6);
       useEditorStore.getState().commitQuantizePreview();
       expect(useEditorStore.getState().quantizePreview).toBeNull();
-      expect(useEditorStore.getState().trim.in).toBeCloseTo(0, 6);
+      expect(useEditorStore.getState().cuts[0].atTimeS).toBeCloseTo(0.5, 6);
+    });
+
+    test("commitQuantizePreview applies fx edge snaps", () => {
+      loadWithCams();
+      useEditorStore.getState().addFx("vignette", 0.21, 1.27);
+      useEditorStore.getState().setSnapMode("1/4");
+      useEditorStore.getState().buildAndStartQuantizePreview();
+      useEditorStore.getState().commitQuantizePreview();
+      const fx = useEditorStore.getState().fx[0];
+      expect(fx.inS).toBeCloseTo(0, 6);
+      expect(fx.outS).toBeCloseTo(1.5, 6);
+    });
+
+    test("quantize NEVER touches cam start offsets or the master trim (#70)", () => {
+      // Snapping auto-synced cam starts to the musical grid would break
+      // the A/V sync the whole app exists to compute — and the trim's
+      // export window must not silently jump either. Both used to be
+      // committed on Q-release with no ghost preview.
+      loadWithCams();
+      useEditorStore.getState().setClipStartOffset("cam-1", 0.21); // off-grid
+      useEditorStore.getState().setTrim({ in: 0.21, out: 60 }); // off-grid
+      useEditorStore.getState().setSnapMode("1/4");
+      useEditorStore.getState().buildAndStartQuantizePreview();
+      useEditorStore.getState().commitQuantizePreview();
+      expect(useEditorStore.getState().trim.in).toBeCloseTo(0.21, 6);
+      const cam1 = asVideo(useEditorStore.getState().clips[0]);
+      expect(cam1.startOffsetS).toBeCloseTo(0.21, 6);
     });
 
     test("cancelQuantizePreview clears without applying", () => {
-      useEditorStore.getState().loadJob({
-        ...baseJobMeta,
-        bpm: { value: 120, confidence: 1, phase: 0, manualOverride: false },
-      });
+      loadWithCams();
+      useEditorStore.getState().addCut({ atTimeS: 0.61, camId: "cam-2" });
       useEditorStore.getState().setSnapMode("1/4");
-      useEditorStore.getState().setTrim({ in: 0.21, out: 60 });
       useEditorStore.getState().buildAndStartQuantizePreview();
       useEditorStore.getState().cancelQuantizePreview();
       expect(useEditorStore.getState().quantizePreview).toBeNull();
-      expect(useEditorStore.getState().trim.in).toBeCloseTo(0.21, 6);
+      expect(useEditorStore.getState().cuts[0].atTimeS).toBeCloseTo(0.61, 6);
     });
   });
 
