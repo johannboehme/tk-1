@@ -55,7 +55,14 @@ export default defineConfig({
         // incl. UMD) is deliberately excluded so first contact stays fast.
         // It's served via runtimeCaching below: fetched on demand the first
         // time a render needs it, then cached for offline reuse.
-        globPatterns: ["**/*.{js,css,html,svg,ico,woff2}"],
+        //
+        // `wasm` is in the glob for the Rust sync core (~330 KB hashed
+        // asset fetched by wasm-bindgen glue inside the sync worker):
+        // without it, an installed PWA opened offline gets through upload
+        // and job creation, then bricks at the sync phase. `png` covers
+        // the manifest icons. ffmpeg-core's .wasm stays out via
+        // globIgnores above/below.
+        globPatterns: ["**/*.{js,css,html,svg,ico,woff2,wasm,png}"],
         globIgnores: ["**/__test_fixtures__/**", "ffmpeg-core/**"],
         navigateFallback: "/index.html",
         navigateFallbackDenylist: [/^\/ffmpeg-core/],
