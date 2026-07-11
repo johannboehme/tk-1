@@ -1,8 +1,13 @@
 /**
- * One-click demo project: synthesizes a small song plus two "cam"
- * videos entirely in the browser (no bundled media, no downloads) and
- * feeds them through the NORMAL `createJob` path, so the user lands in
- * the same sync → editor flow their own footage would take.
+ * One-click demo project: synthesizes a song plus two "cam" videos
+ * entirely in the browser (no bundled media, no downloads) and feeds
+ * them through the NORMAL `createJob` path, so the user lands in the
+ * same flow their own footage would take. Two flavours:
+ *
+ *   direct   — a compact 17 s song; sync → editor → render.
+ *   longform — a ~48 s session with silent gaps and different beat
+ *              styles at one tempo; sync → triage → arrange → editor
+ *              → render, the full long-form workflow.
  *
  * Cam B starts one bar into the song — the sync stage has a real
  * offset to find, exactly like a phone that started recording late.
@@ -11,7 +16,16 @@
 import type { Capabilities } from "../../core/capabilities";
 import type { PickedAsset } from "../asset-source";
 import { createJob } from "../jobs";
-import { DEMO_SONG, renderDemoSongPcm, songDurationS, beatDurationS } from "./demo-song";
+import {
+  DEMO_SONG,
+  DEMO_SESSION,
+  buildDemoSessionScore,
+  renderDemoSongPcm,
+  renderDemoSessionPcm,
+  songDurationS,
+  beatDurationS,
+  type DemoSessionSectionSpan,
+} from "./demo-song";
 import { encodeWavPcm16 } from "./wav-encode";
 import { synthesizeDemoVideo } from "./demo-video";
 
@@ -64,8 +78,14 @@ export interface DemoProgress {
   detail: string;
 }
 
+/** Which workflow the demo project walks. Mirrors `JobMode`. */
+export type DemoMode = "direct" | "longform";
+
 export interface CreateDemoJobOptions {
   onProgress?: (p: DemoProgress) => void;
+  /** `direct` (default): 17 s song → editor. `longform`: ~48 s session
+   *  with silent gaps + varied beats → triage → arrange → editor. */
+  mode?: DemoMode;
 }
 
 /**
@@ -77,16 +97,27 @@ export async function createDemoJob(
   opts: CreateDemoJobOptions = {},
 ): Promise<string> {
   const onProgress = opts.onProgress ?? (() => {});
+  const mode = opts.mode ?? "direct";
 
   onProgress({ stage: "song", detail: "song" });
-  const songPcm = renderDemoSongPcm(DEMO_SONG);
+  let songPcm: Float32Array;
+  let durS: number;
+  let sections: DemoSessionSectionSpan[] | undefined;
+  if (mode === "longform") {
+    const score = buildDemoSessionScore(DEMO_SESSION);
+    songPcm = renderDemoSessionPcm(DEMO_SESSION);
+    durS = score.durationS;
+    sections = score.sections;
+  } else {
+    songPcm = renderDemoSongPcm(DEMO_SONG);
+    durS = songDurationS(DEMO_SONG);
+  }
   const wav = encodeWavPcm16(songPcm, 1, DEMO_SONG.sampleRate);
   const audioPick: PickedAsset = {
     file: new File([wav], "demo-song.wav", { type: "audio/wav" }),
     handle: null,
   };
 
-  const durS = songDurationS(DEMO_SONG);
   const videoPicks: PickedAsset[] = [];
   for (const spec of DEMO_CAM_SPECS) {
     onProgress({ stage: "cam", detail: spec.label });
@@ -96,13 +127,14 @@ export async function createDemoJob(
       songPcm,
       sampleRate: DEMO_SONG.sampleRate,
       bpm: DEMO_SONG.bpm,
+      sections,
     });
     videoPicks.push({ file, handle: null });
   }
 
   onProgress({ stage: "job", detail: "job" });
   return await createJob(videoPicks, audioPick, {
-    title: "Demo session",
-    mode: "direct",
+    title: mode === "longform" ? "Demo session · long-form" : "Demo session",
+    mode,
   });
 }

@@ -10,7 +10,7 @@
  * (echtes GPU-Device, Chromium via Playwright).
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { WebGPUBackend } from "./webgpu-backend";
+import { WebGPUBackend, imageSourceDims } from "./webgpu-backend";
 import {
   getCapabilities,
   initCapabilities,
@@ -191,5 +191,32 @@ describe("WebGPUBackend — device.lost handling (issue #115)", () => {
 
     expect(onLost).not.toHaveBeenCalled();
     expect(getCapabilities().webgpu).toBe(true);
+  });
+});
+
+describe("imageSourceDims — worker-safe image source measurement", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("measures an HTMLImageElement via naturalWidth/naturalHeight", () => {
+    const img = document.createElement("img");
+    Object.defineProperty(img, "naturalWidth", { value: 320 });
+    Object.defineProperty(img, "naturalHeight", { value: 240 });
+    expect(imageSourceDims(img)).toEqual({ w: 320, h: 240 });
+  });
+
+  it("measures an ImageBitmap-like source via width/height", () => {
+    const bitmapLike = { width: 64, height: 48 } as ImageBitmap;
+    expect(imageSourceDims(bitmapLike)).toEqual({ w: 64, h: 48 });
+  });
+
+  it("does not throw in a worker-like scope without HTMLImageElement (demo-render regression)", () => {
+    // The render worker has no DOM globals — a bare `instanceof
+    // HTMLImageElement` throws a ReferenceError there and killed every
+    // export whose frame loop hit the test-pattern/image path.
+    vi.stubGlobal("HTMLImageElement", undefined);
+    const bitmapLike = { width: 8, height: 8 } as ImageBitmap;
+    expect(imageSourceDims(bitmapLike)).toEqual({ w: 8, h: 8 });
   });
 });

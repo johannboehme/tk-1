@@ -24,6 +24,10 @@ export interface SynthesizeDemoVideoOptions {
   songPcm: Float32Array;
   sampleRate: number;
   bpm: number;
+  /** Loud regions on the song timeline (long-form sessions). During the
+   *  gaps between them the test card goes "tacet" — the beat visuals
+   *  freeze, like a band that stopped playing. Omitted → always active. */
+  sections?: ReadonlyArray<{ startS: number; endS: number }>;
   width?: number;
   height?: number;
   fps?: number;
@@ -80,14 +84,19 @@ export async function synthesizeDemoVideo(
   const frameDurationUs = Math.round(1_000_000 / fps);
   for (let i = 0; i < frameCount; i++) {
     const tS = i / fps;
+    const songTimeS = opts.spec.songStartS + tS;
+    const active =
+      !opts.sections ||
+      opts.sections.some((s) => songTimeS >= s.startS && songTimeS < s.endS);
     drawDemoFrame(ctx, {
       width,
       height,
       tS,
-      songTimeS: opts.spec.songStartS + tS,
+      songTimeS,
       bpm: opts.bpm,
       label: opts.spec.label,
       theme: opts.spec.theme,
+      active,
     });
     const frame = new VideoFrame(canvas, {
       timestamp: i * frameDurationUs,
@@ -162,12 +171,16 @@ interface DemoFrameParams {
   bpm: number;
   label: string;
   theme: DemoCamTheme;
+  /** False during a session's silence gaps — beat visuals freeze. */
+  active: boolean;
 }
 
 /** One animated frame: solid backdrop, beat-pulsing disc, bar:beat
  *  counter, a block bouncing in song time, and the cam label. Everything
  *  is a pure function of song time, so both cams visibly move in lockstep
- *  once sync has lined them up. */
+ *  once sync has lined them up. During silence gaps (`active: false`)
+ *  the disc rests as an outline and the block sits still — the band
+ *  stopped playing, the camera kept rolling. */
 function drawDemoFrame(
   ctx: OffscreenCanvasRenderingContext2D,
   p: DemoFrameParams,
@@ -189,18 +202,29 @@ function drawDemoFrame(
     ctx.fillRect(Math.round(x), h - 18, 2, 10);
   }
 
-  // Beat-pulsing disc — big on the beat, eases out.
-  const pulse = 1 - Math.min(1, beatPhase * 2.2);
+  // Beat-pulsing disc — big on the beat, eases out. Tacet: outline only.
   const baseR = h * 0.16;
   ctx.beginPath();
-  ctx.arc(w * 0.32, h * 0.46, baseR * (1 + 0.35 * pulse), 0, Math.PI * 2);
-  ctx.fillStyle = theme.accent;
-  ctx.fill();
+  if (p.active) {
+    const pulse = 1 - Math.min(1, beatPhase * 2.2);
+    ctx.arc(w * 0.32, h * 0.46, baseR * (1 + 0.35 * pulse), 0, Math.PI * 2);
+    ctx.fillStyle = theme.accent;
+    ctx.fill();
+  } else {
+    ctx.arc(w * 0.32, h * 0.46, baseR, 0, Math.PI * 2);
+    ctx.strokeStyle = theme.accent;
+    ctx.lineWidth = 4;
+    ctx.stroke();
+  }
 
   // Block bouncing across in song time (one sweep per 4 beats).
-  const sweep = (p.songTimeS / (beat * 4)) % 1;
+  // Tacet: parked at the left margin, on the ground.
+  const sweep = p.active ? (p.songTimeS / (beat * 4)) % 1 : 0;
+  const bounce = p.active
+    ? Math.abs(Math.sin(p.songTimeS * Math.PI * 2)) * h * 0.1
+    : 0;
   const bx = w * 0.12 + sweep * w * 0.72;
-  const by = h * 0.72 - Math.abs(Math.sin(p.songTimeS * Math.PI * 2)) * h * 0.1;
+  const by = h * 0.72 - bounce;
   ctx.fillStyle = theme.ink;
   ctx.fillRect(Math.round(bx), Math.round(by), 26, 26);
 
@@ -213,9 +237,10 @@ function drawDemoFrame(
 
   const bar = Math.floor(beatIdx / 4) + 1;
   const beatInBar = (beatIdx % 4) + 1;
+  const counter = p.active ? `${String(bar).padStart(2, "0")}:${beatInBar}` : "--:-";
   ctx.font = `500 ${Math.round(h * 0.06)}px ui-monospace, monospace`;
   ctx.fillText(
-    `${String(bar).padStart(2, "0")}:${beatInBar} · ${p.songTimeS.toFixed(2)}s`,
+    `${counter} · ${p.songTimeS.toFixed(2)}s`,
     Math.round(w * 0.05),
     Math.round(h * 0.19),
   );

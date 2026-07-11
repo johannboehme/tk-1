@@ -175,6 +175,11 @@ export class Compositor {
     return new Compositor(opts, canvas, ctx, backendCanvas, backend);
   }
 
+  /** Which backend tier the factory picked ("webgpu" | "webgl2" | "canvas2d"). */
+  get backendId(): string {
+    return this.backend.id;
+  }
+
   /** Pre-build the ASS string (used for external download / debugging). */
   async ensureSubtitleEngine(): Promise<void> {
     if (this.opts.overlays.length === 0) return;

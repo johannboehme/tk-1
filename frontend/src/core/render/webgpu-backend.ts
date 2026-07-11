@@ -49,6 +49,22 @@ type AnyCanvas = HTMLCanvasElement | OffscreenCanvas;
  *  canvas without renegotiation. */
 const CANVAS_FORMAT: GPUTextureFormat = "bgra8unorm";
 
+/** Pixel dimensions of an image layer source. HTMLImageElement is probed
+ *  via `typeof` first — the render worker has no DOM globals, and a bare
+ *  `instanceof HTMLImageElement` is a ReferenceError there (it killed
+ *  every export whose frame loop hit the test-pattern/image path). */
+export function imageSourceDims(
+  bitmap: ImageBitmap | HTMLImageElement,
+): { w: number; h: number } {
+  if (
+    typeof HTMLImageElement !== "undefined" &&
+    bitmap instanceof HTMLImageElement
+  ) {
+    return { w: bitmap.naturalWidth, h: bitmap.naturalHeight };
+  }
+  return { w: bitmap.width, h: bitmap.height };
+}
+
 export class WebGPUBackend implements CompositorBackend {
   readonly id = "webgpu" as const;
 
@@ -707,16 +723,13 @@ export class WebGPUBackend implements CompositorBackend {
     let srcW: number;
     let srcH: number;
     switch (src.kind) {
-      case "image":
+      case "image": {
         imageSource = src.bitmap;
-        if (src.bitmap instanceof HTMLImageElement) {
-          srcW = src.bitmap.naturalWidth;
-          srcH = src.bitmap.naturalHeight;
-        } else {
-          srcW = src.bitmap.width;
-          srcH = src.bitmap.height;
-        }
+        const dims = imageSourceDims(src.bitmap);
+        srcW = dims.w;
+        srcH = dims.h;
         break;
+      }
       case "video":
         // Runtime-supplied fallback wins over a not-yet-ready <video>
         // — hides the black flash during seek/wrap.
