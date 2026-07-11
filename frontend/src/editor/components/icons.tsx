@@ -254,3 +254,17 @@ export const ArrowKeysIcon = (p: SVGProps<SVGSVGElement>) => (
     <line x1="13" y1="12" x2="20" y2="12" />
   </svg>
 );
+/** Curved arrow back onto itself — undo. */
+export const UndoIcon = (p: SVGProps<SVGSVGElement>) => (
+  <svg {...baseProps} {...p}>
+    <polyline points="8 5 3 10 8 15" />
+    <path d="M3 10h11a6 6 0 0 1 6 6v3" />
+  </svg>
+);
+/** Mirror of UndoIcon — redo. */
+export const RedoIcon = (p: SVGProps<SVGSVGElement>) => (
+  <svg {...baseProps} {...p}>
+    <polyline points="16 5 21 10 16 15" />
+    <path d="M21 10H10a6 6 0 0 0-6 6v3" />
+  </svg>
+);

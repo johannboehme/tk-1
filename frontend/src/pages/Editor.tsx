@@ -14,10 +14,21 @@ import { FxHardwarePanel } from "../editor/components/FxHardwarePanel";
 import {
   CameraIcon,
   MagnetIcon,
+  RedoIcon,
+  UndoIcon,
   VignetteIcon,
   XIcon,
 } from "../editor/components/icons";
 import { useEditorStore } from "../editor/store";
+import {
+  initEditorHistory,
+  isMacPlatform,
+  redoEdit,
+  redoKeyLabel,
+  resetEditorHistory,
+  undoEdit,
+  undoKeyLabel,
+} from "../editor/history";
 import { toggleFxPreviewLatch } from "../editor/fx-latch";
 import type { FxKind } from "../editor/fx/types";
 import type { GradeParams } from "../editor/fx/looks";
@@ -336,6 +347,8 @@ export default function Editor() {
       const mode = s.ui.programStripMode;
       if (mode === "fx" || mode === "both") s.clearAllFx();
       if (mode === "cuts" || mode === "both") s.clearCuts();
+      // The wipe is recoverable (#69) — say so at the moment it lands.
+      s.pushNotice(`Cleared — ${undoKeyLabel()} to undo`);
     }
     function tickXClear() {
       const elapsed = performance.now() - xClearStartT;
@@ -580,6 +593,70 @@ export default function Editor() {
     return () => {
       offQ();
       offEsc();
+    };
+  }, []);
+
+  // Undo/redo (#69). The history module subscribes to the store and
+  // coalesces bursts of document changes (a drag, a hold-paint, an
+  // X-clear) into single bounded-stack entries; undo/redo restore
+  // through the store so auto-persist writes the restored state.
+  // Cmd/Ctrl+Z + Shift+Cmd/Ctrl+Z registered via the keymap — standard
+  // guards (typing target, exact modifiers, modal scope) and the
+  // cheat-sheet entry come from the same declaration. Only the
+  // platform-appropriate chord carries the help entry so the overlay
+  // doesn't list both.
+  useEffect(() => {
+    const offHistory = initEditorHistory();
+    const isMac = isMacPlatform();
+    const undoHelp = {
+      keys: [undoKeyLabel()],
+      description: "Undo the last edit (hold to step back further)",
+      group: "Edit",
+      icon: <UndoIcon />,
+    };
+    const redoHelp = {
+      keys: [redoKeyLabel()],
+      description: "Redo the last undone edit",
+      group: "Edit",
+      icon: <RedoIcon />,
+    };
+    const offs = [
+      bindShortcut({
+        id: "editor.undo.meta",
+        keys: ["z", "Z"],
+        modifiers: ["meta"],
+        allowRepeat: true,
+        onDown: () => void undoEdit(),
+        help: isMac ? undoHelp : undefined,
+      }),
+      bindShortcut({
+        id: "editor.undo.ctrl",
+        keys: ["z", "Z"],
+        modifiers: ["ctrl"],
+        allowRepeat: true,
+        onDown: () => void undoEdit(),
+        help: isMac ? undefined : undoHelp,
+      }),
+      bindShortcut({
+        id: "editor.redo.meta",
+        keys: ["z", "Z"],
+        modifiers: ["meta", "shift"],
+        allowRepeat: true,
+        onDown: () => void redoEdit(),
+        help: isMac ? redoHelp : undefined,
+      }),
+      bindShortcut({
+        id: "editor.redo.ctrl",
+        keys: ["z", "Z"],
+        modifiers: ["ctrl", "shift"],
+        allowRepeat: true,
+        onDown: () => void redoEdit(),
+        help: isMac ? undefined : redoHelp,
+      }),
+    ];
+    return () => {
+      for (const off of offs) off();
+      offHistory();
     };
   }, []);
 
@@ -909,6 +986,10 @@ export default function Editor() {
           .getState()
           .seek(arrangementSegments[0].in, { segmentIdxHint: 0 });
       }
+      // Everything up to here was hydration, not user edits — the
+      // restored trim/export writes above must not become the first
+      // undo entry. Start the document's history clean from this state.
+      resetEditorHistory();
     })().catch((e) => {
       if (!cancelled) setErr(e instanceof Error ? e.message : "Could not load job");
     });

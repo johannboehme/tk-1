@@ -389,6 +389,13 @@ interface EditorState {
    *  behaviour driven by `trim.in / trim.out`. */
   arrangementSegments: Segment[];
 
+  /** Undo/redo stack depths, mirrored in by the editor history module
+   *  (`editor/history.ts`) so UI affordances (transport undo/redo
+   *  buttons) can subscribe. The stacks themselves live outside the
+   *  store — snapshots of the store must not be part of the state they
+   *  snapshot. Written exclusively by the history module. */
+  history: { undoDepth: number; redoDepth: number };
+
   // actions
   reset(): void;
   loadJob(
@@ -1169,6 +1176,7 @@ export const useEditorStore = create<EditorState>()(
     audioEnv: null,
     audioVolume: 1.0,
     arrangementSegments: [],
+    history: { undoDepth: 0, redoDepth: 0 },
 
     reset() {
       set({
@@ -1200,6 +1208,7 @@ export const useEditorStore = create<EditorState>()(
         audioEnv: null,
         audioVolume: 1.0,
         arrangementSegments: [],
+        history: { undoDepth: 0, redoDepth: 0 },
       });
     },
 

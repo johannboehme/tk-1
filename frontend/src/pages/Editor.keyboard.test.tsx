@@ -13,6 +13,7 @@ import { render, fireEvent } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import Editor from "./Editor";
 import { useEditorStore } from "../editor/store";
+import { flushPendingHistory } from "../editor/history";
 import { useShortcutRegistry } from "../editor/shortcuts/registry";
 
 // jsdom has no matchMedia — useIsNarrowViewport needs it.
@@ -108,5 +109,78 @@ describe("Editor FX hotkeys — paused audition latch (#88)", () => {
     expect(useEditorStore.getState().fx.length).toBeGreaterThan(0);
     fireEvent.keyUp(window, { key: "v" });
     expect(Object.keys(useEditorStore.getState().fxHolds)).toHaveLength(0);
+  });
+});
+
+describe("Editor undo/redo shortcuts (#69)", () => {
+  beforeEach(() => {
+    useEditorStore.getState().reset();
+    useEditorStore.getState().loadJob(baseMeta, {
+      clips: [
+        {
+          id: "cam1",
+          filename: "a.mp4",
+          color: "#f00",
+          sourceDurationS: 60,
+          syncOffsetMs: 0,
+        },
+        {
+          id: "cam2",
+          filename: "b.mp4",
+          color: "#0f0",
+          sourceDurationS: 60,
+          syncOffsetMs: 0,
+        },
+      ],
+    });
+    useShortcutRegistry.setState({ shortcuts: [] });
+  });
+
+  /** Record one cut, then wipe it — two committed history entries. */
+  function seedClearedCuts() {
+    useEditorStore.getState().addCut({ atTimeS: 1, camId: "cam2" });
+    flushPendingHistory();
+    useEditorStore.getState().clearCuts();
+    flushPendingHistory();
+    expect(useEditorStore.getState().cuts).toHaveLength(0);
+  }
+
+  it("Cmd+Z undoes a committed clear; Shift+Cmd+Z redoes", () => {
+    mountEditor();
+    seedClearedCuts();
+    fireEvent.keyDown(window, { key: "z", metaKey: true });
+    expect(useEditorStore.getState().cuts).toHaveLength(1);
+    expect(useEditorStore.getState().notice?.message).toMatch(/Undo/);
+    fireEvent.keyDown(window, { key: "Z", metaKey: true, shiftKey: true });
+    expect(useEditorStore.getState().cuts).toHaveLength(0);
+    expect(useEditorStore.getState().notice?.message).toMatch(/Redo/);
+  });
+
+  it("Ctrl+Z / Ctrl+Shift+Z work as the non-Apple chords", () => {
+    mountEditor();
+    seedClearedCuts();
+    fireEvent.keyDown(window, { key: "z", ctrlKey: true });
+    expect(useEditorStore.getState().cuts).toHaveLength(1);
+    fireEvent.keyDown(window, { key: "Z", ctrlKey: true, shiftKey: true });
+    expect(useEditorStore.getState().cuts).toHaveLength(0);
+  });
+
+  it("plain Z stays the zoom FX pad — no undo without a modifier", () => {
+    mountEditor();
+    seedClearedCuts();
+    fireEvent.keyDown(window, { key: "z" });
+    fireEvent.keyUp(window, { key: "z" });
+    // No undo happened…
+    expect(useEditorStore.getState().cuts).toHaveLength(0);
+    // …and the pad did its paused-latch job instead.
+    expect(useEditorStore.getState().selectedFxKind).toBe("zoom");
+  });
+
+  it("registers cheat-sheet entries for undo and redo", () => {
+    mountEditor();
+    const ids = useShortcutRegistry.getState().shortcuts.map((s) => s.id);
+    // jsdom is not an Apple platform — the Ctrl chords carry the help.
+    expect(ids).toContain("editor.undo.ctrl");
+    expect(ids).toContain("editor.redo.ctrl");
   });
 });
