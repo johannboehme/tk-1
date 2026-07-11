@@ -350,6 +350,71 @@ async function warnProjectOpenElsewhere(): Promise<void> {
   if (!editHere) window.history.back();
 }
 
+/** Per-project locks THIS tab already holds, refcounted across editor
+ *  mounts. The Web Lock itself releases asynchronously (when the request
+ *  callback's promise settles), so a remount in the same task — React
+ *  StrictMode in dev, fast back-and-forth navigation in prod — would see
+ *  `ifAvailable: null` from its own dying lock and mis-fire the
+ *  "open in another tab" warning. Reusing the held entry instead makes
+ *  same-tab remounts invisible to the lock manager. */
+const heldProjectLocks = new Map<
+  string,
+  {
+    refs: number;
+    release: () => void;
+    releaseTimer: ReturnType<typeof setTimeout> | null;
+  }
+>();
+
+/** Grace before actually releasing a lock nobody references anymore —
+ *  long enough to bridge a same-task remount, short enough that a real
+ *  second tab opening after this one closes barely waits. */
+const LOCK_RELEASE_GRACE_MS = 180;
+
+function acquireProjectLock(jobId: string): () => void {
+  const existing = heldProjectLocks.get(jobId);
+  if (existing) {
+    if (existing.releaseTimer !== null) {
+      clearTimeout(existing.releaseTimer);
+      existing.releaseTimer = null;
+    }
+    existing.refs++;
+    return () => derefProjectLock(jobId);
+  }
+
+  const locks = (navigator as Navigator & { locks?: LockManager }).locks;
+  if (!locks || typeof locks.request !== "function") return () => undefined;
+
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const entry = { refs: 1, release, releaseTimer: null };
+  heldProjectLocks.set(jobId, entry);
+  void Promise.resolve(
+    locks.request(`tk1-project-${jobId}`, { ifAvailable: true }, async (lock) => {
+      if (!lock) {
+        // Held by another tab. Drop our registry entry (we never owned
+        // the lock) so a later mount probes again, and warn loudly.
+        if (heldProjectLocks.get(jobId) === entry) heldProjectLocks.delete(jobId);
+        void warnProjectOpenElsewhere();
+        return;
+      }
+      await held; // hold until the last same-tab reference lets go
+    }),
+  ).catch(() => undefined);
+  return () => derefProjectLock(jobId);
+}
+
+function derefProjectLock(jobId: string): void {
+  const entry = heldProjectLocks.get(jobId);
+  if (!entry || --entry.refs > 0) return;
+  entry.releaseTimer = setTimeout(() => {
+    if (heldProjectLocks.get(jobId) === entry) heldProjectLocks.delete(jobId);
+    entry.release();
+  }, LOCK_RELEASE_GRACE_MS);
+}
+
 export function useAutoPersist(jobId: string | null): void {
   useEffect(() => {
     if (!jobId) return;
@@ -371,29 +436,11 @@ export function useAutoPersist(jobId: string | null): void {
       .catch(() => undefined);
 
     // Proactive second-tab detection via Web Locks (#129): hold an
-    // exclusive per-project lock for the lifetime of this editor; if
-    // it's already held, another tab has this project open — warn now
-    // instead of at the first refused write.
-    let releaseLock: (() => void) | null = null;
-    const locks = (navigator as Navigator & { locks?: LockManager }).locks;
-    if (locks && typeof locks.request === "function") {
-      const held = new Promise<void>((resolve) => {
-        releaseLock = resolve;
-      });
-      void Promise.resolve(
-        locks.request(
-          `tk1-project-${jobId}`,
-          { ifAvailable: true },
-          async (lock) => {
-            if (!lock) {
-              void warnProjectOpenElsewhere();
-              return;
-            }
-            await held; // hold until unmount
-          },
-        ),
-      ).catch(() => undefined);
-    }
+    // exclusive per-project lock (refcounted per tab, see
+    // acquireProjectLock) for the lifetime of this editor; if it's
+    // already held by ANOTHER tab, warn now instead of at the first
+    // refused write.
+    const releaseLock = acquireProjectLock(jobId);
 
     const clearTimer = () => {
       if (timer !== null) {
@@ -447,7 +494,7 @@ export function useAutoPersist(jobId: string | null): void {
       flushPendingNow();
       cancelled = true;
       if (cancelPendingFlush === clearTimer) cancelPendingFlush = null;
-      releaseLock?.();
+      releaseLock();
       // The session intentionally stays in the map: the final flush
       // above still consults it, and a later remount replaces it with
       // a freshly-seeded one.

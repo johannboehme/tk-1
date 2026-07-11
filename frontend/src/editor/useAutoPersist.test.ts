@@ -587,6 +587,44 @@ describe("useAutoPersist — cross-tab guard (#129)", () => {
     }
   });
 
+  test("StrictMode-style remount does not warn about its own lock", async () => {
+    mockGuardedDb();
+    // Faithful Web Locks model: exclusive per name, released only when the
+    // callback's promise settles (i.e. asynchronously after unmount). A
+    // remount in the same task must not trip over its own still-held lock.
+    const heldNames = new Set<string>();
+    Object.defineProperty(navigator, "locks", {
+      configurable: true,
+      value: {
+        request: (
+          name: string,
+          _opts: unknown,
+          cb: (l: unknown) => Promise<unknown> | unknown,
+        ) => {
+          if (heldNames.has(name)) return Promise.resolve(cb(null));
+          heldNames.add(name);
+          return Promise.resolve(cb({ name })).finally(() => {
+            heldNames.delete(name);
+          });
+        },
+      },
+    });
+    try {
+      const first = mountWithLoad();
+      await drainMicrotasks();
+      first.unmount();
+      // Immediately remount in the same task — exactly what React
+      // StrictMode does in dev, and what a fast back-and-forth
+      // navigation does in prod.
+      const second = mountWithLoad();
+      await drainMicrotasks();
+      expect(useConfirmStore.getState().requests).toEqual([]);
+      second.unmount();
+    } finally {
+      delete (navigator as { locks?: unknown }).locks;
+    }
+  });
+
   test("no warning when the lock is granted (single tab)", async () => {
     mockGuardedDb();
     Object.defineProperty(navigator, "locks", {
