@@ -3,8 +3,9 @@ import {
   nextLoopWrapMasterT,
   clampLoopToBounds,
   loopAroundPlayhead,
+  trimWindowArr,
 } from "./arrangement-loop";
-import type { Segment } from "./types";
+import type { Segment } from "../core/types";
 
 describe("loopAroundPlayhead", () => {
   test("centers the window on the arr-time playhead", () => {
@@ -127,6 +128,53 @@ describe("nextLoopWrapMasterT", () => {
     });
   });
 
+  test("loop.end exactly on an interior chunk seam → wraps at the PREVIOUS segment's out", () => {
+    // A [0,30) B [30,60) C [60,90) in arr-time. Loop = whole chunk B.
+    // The half-open segmentIndexAtArr would resolve arr=60 into chunk C
+    // and park the wrap at C's first sample — every pass would bleed
+    // chunk C's head and then double-crossfade back. The loop's last
+    // audible sample lives in B, so the wrap must fire at B's out.
+    const segs: Segment[] = [
+      { in: 100, out: 130 },
+      { in: 200, out: 230 },
+      { in: 300, out: 330 },
+    ];
+    expect(nextLoopWrapMasterT({ start: 30, end: 60 }, segs)).toEqual({
+      wrapAtMasterT: 230,
+      wrapTargetMasterT: 200,
+      wrapInSegIdx: 1,
+      targetSegIdx: 1,
+    });
+  });
+
+  test("loop.end on the FIRST interior seam (loop covers only chunk A)", () => {
+    const segs: Segment[] = [
+      { in: 10, out: 15 },
+      { in: 30, out: 35 },
+    ];
+    // Loop = whole chunk A = arr [0, 5]. arr=5 is the A/B seam.
+    expect(nextLoopWrapMasterT({ start: 0, end: 5 }, segs)).toEqual({
+      wrapAtMasterT: 15,
+      wrapTargetMasterT: 10,
+      wrapInSegIdx: 0,
+      targetSegIdx: 0,
+    });
+  });
+
+  test("loop.end strictly inside a segment is NOT treated as a seam", () => {
+    const segs: Segment[] = [
+      { in: 10, out: 15 },
+      { in: 30, out: 35 },
+    ];
+    // arr=5.5 is 0.5 into seg 1 → wrap fires in seg 1 at master 30.5.
+    expect(nextLoopWrapMasterT({ start: 0, end: 5.5 }, segs)).toEqual({
+      wrapAtMasterT: 30.5,
+      wrapTargetMasterT: 10,
+      wrapInSegIdx: 1,
+      targetSegIdx: 0,
+    });
+  });
+
   test("empty segments → null (defensive — walker should never call with empty)", () => {
     expect(nextLoopWrapMasterT({ start: 0, end: 1 }, [])).toBeNull();
   });
@@ -211,5 +259,97 @@ describe("clampLoopToBounds", () => {
     expect(
       clampLoopToBounds({ start: 5, end: 6 }, segs, { in: 0, out: 100 }),
     ).toBeNull();
+  });
+
+  // ---- #66: trim window must be projected as a RANGE, not by point-
+  // projecting its endpoints through masterToArr's nearest-edge fallback.
+  // Out-of-order or duplicated arrangements otherwise collapse the trim
+  // window and every setLoop returns null.
+
+  test("#66 out-of-order arrangement [B, A] + default whole-master trim → loop survives", () => {
+    // Chunks A=[10,40), B=[100,130) arranged [B, A] (arrTotal 60).
+    // Default trim {0, 200} lies outside every segment on both ends —
+    // the nearest-edge fallback used to collapse the window to [30, 30].
+    const segs: Segment[] = [
+      { in: 100, out: 130 },
+      { in: 10, out: 40 },
+    ];
+    expect(
+      clampLoopToBounds({ start: 5, end: 25 }, segs, { in: 0, out: 200 }),
+    ).toEqual({ start: 5, end: 25 });
+    // A loop in the second-played chunk (A at arr [30, 60)) also survives.
+    expect(
+      clampLoopToBounds({ start: 35, end: 55 }, segs, { in: 0, out: 200 }),
+    ).toEqual({ start: 35, end: 55 });
+  });
+
+  test("#66 out-of-order arrangement + derived trim {min in, max out} → full arr window", () => {
+    // Editor.tsx's first-load derivation sets trim = {min seg.in, max
+    // seg.out} = {10, 130}. trim.out === B.out (exclusive in masterToArr)
+    // used to fall to the nearest-edge fallback and collapse the window.
+    const segs: Segment[] = [
+      { in: 100, out: 130 },
+      { in: 10, out: 40 },
+    ];
+    expect(
+      clampLoopToBounds({ start: 0, end: 60 }, segs, { in: 10, out: 130 }),
+    ).toEqual({ start: 0, end: 60 });
+  });
+
+  test("#66 duplicated chunk [A, B, A] → the last occurrence is loopable", () => {
+    // arrTotal 90; masterToArr(trim.out) used to stop at the FIRST
+    // occurrence (arr 60), making the last chunk unloopable.
+    const segs: Segment[] = [
+      { in: 10, out: 40 },
+      { in: 100, out: 130 },
+      { in: 10, out: 40 },
+    ];
+    expect(
+      clampLoopToBounds({ start: 65, end: 75 }, segs, { in: 0, out: 200 }),
+    ).toEqual({ start: 65, end: 75 });
+  });
+
+  test("#66 trim window that intersects nothing → null", () => {
+    const segs: Segment[] = [{ in: 10, out: 40 }];
+    expect(
+      clampLoopToBounds({ start: 0, end: 30 }, segs, { in: 50, out: 60 }),
+    ).toBeNull();
+  });
+});
+
+describe("trimWindowArr", () => {
+  test("empty segments → identity passthrough", () => {
+    expect(trimWindowArr({ in: 3, out: 9 }, [])).toEqual({
+      startArr: 3,
+      endArr: 9,
+    });
+  });
+
+  test("in-order arrangement → hull of the trim's playable slices", () => {
+    const segs: Segment[] = [
+      { in: 10, out: 15 },
+      { in: 20, out: 25 },
+    ];
+    // Master trim {12, 22} → slices arr [2,5] + [5,7] → hull [2, 7].
+    expect(trimWindowArr({ in: 12, out: 22 }, segs)).toEqual({
+      startArr: 2,
+      endArr: 7,
+    });
+  });
+
+  test("out-of-order arrangement + whole-master trim → [0, totalArr]", () => {
+    const segs: Segment[] = [
+      { in: 100, out: 130 },
+      { in: 10, out: 40 },
+    ];
+    expect(trimWindowArr({ in: 0, out: 200 }, segs)).toEqual({
+      startArr: 0,
+      endArr: 60,
+    });
+  });
+
+  test("trim intersecting no segment → null", () => {
+    const segs: Segment[] = [{ in: 10, out: 40 }];
+    expect(trimWindowArr({ in: 50, out: 60 }, segs)).toBeNull();
   });
 });

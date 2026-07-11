@@ -101,9 +101,19 @@ export interface ArrangeState {
   /** ID of the cam the preview shows + audio is synced against. Null
    *  defaults to the first cam if any. */
   selectedCamId: string | null;
+  /** Transient pool-preview: chunk.id of an UNARRANGED chunk the user
+   *  is auditioning from the Contact Sheet. While set, playback loops
+   *  the chunk's master-time range (startMs..endMs) instead of walking
+   *  the arrangement — mirrors Triage's focusChunk loop. Cleared by
+   *  any arrangement navigation (seekToItem). */
+  previewChunkId: string | null;
 
   playback: ArrangePlayback;
   view: ArrangeView;
+  /** True while the user drag-scrolls the strip via the MiniMap. The
+   *  FilmStrip suppresses its auto-center smooth scroll for the
+   *  duration so the two don't fight over scrollLeft. */
+  stripScrubbing: boolean;
   /** In-flight drag of a chunk from the Contact Sheet onto the Strip.
    *  Null when not dragging. */
   drag: ArrangeDrag | null;
@@ -145,6 +155,12 @@ export interface ArrangeState {
   focusItem(itemId: string | null): void;
   focusRelative(delta: -1 | 1): void;
 
+  /** Enter (or exit, with null) the pool-preview loop for a chunk.
+   *  Entering seeks the master audio to the chunk start and detaches
+   *  the arrangement walker (currentItemId = null); the play state is
+   *  left untouched — no UI surface auto-starts playback on click. */
+  previewChunk(chunkId: string | null): void;
+
   // Cam.
   setSelectedCamId(camId: string | null): void;
   nudgeCamSyncOverride(camId: string, deltaMs: number): void;
@@ -162,6 +178,7 @@ export interface ArrangeState {
   // View.
   setStripScrollPx(px: number): void;
   setStripMetrics(viewportWidthPx: number, contentWidthPx: number): void;
+  setStripScrubbing(scrubbing: boolean): void;
 
   // Audio glance data.
   setAnalysis(a: AudioAnalysis | null): void;
@@ -226,8 +243,10 @@ export const useArrangeStore = create<ArrangeState>((set, get) => ({
   focusedItemId: null,
   insertionIndex: 0,
   selectedCamId: null,
+  previewChunkId: null,
   playback: INITIAL_PLAYBACK,
   view: INITIAL_VIEW,
+  stripScrubbing: false,
   drag: null,
   analysis: null,
   melByChunkId: {},
@@ -244,8 +263,10 @@ export const useArrangeStore = create<ArrangeState>((set, get) => ({
       focusedItemId: null,
       insertionIndex: args.arrangement.length,
       selectedCamId: args.cams[0]?.id ?? null,
+      previewChunkId: null,
       playback: INITIAL_PLAYBACK,
       view: INITIAL_VIEW,
+      stripScrubbing: false,
       drag: null,
       // initFromJob preserves analysis + mel data across re-keying so
       // hot reloads in dev don't re-trigger the full PCM decode.
@@ -264,8 +285,10 @@ export const useArrangeStore = create<ArrangeState>((set, get) => ({
       focusedItemId: null,
       insertionIndex: 0,
       selectedCamId: null,
+      previewChunkId: null,
       playback: INITIAL_PLAYBACK,
       view: INITIAL_VIEW,
+      stripScrubbing: false,
       drag: null,
       analysis: null,
       melByChunkId: {},
@@ -367,6 +390,28 @@ export const useArrangeStore = create<ArrangeState>((set, get) => ({
     set({ focusedItemId: s.arrangement[next].id });
   },
 
+  previewChunk(chunkId) {
+    if (chunkId === null) {
+      set({ previewChunkId: null });
+      return;
+    }
+    const s = get();
+    const ck = s.chunks.find((c) => c.id === chunkId);
+    if (!ck) return;
+    // Detach the arrangement walker: the preview loop owns playback
+    // until the user navigates back to the arrangement (seekToItem).
+    // Play state is deliberately untouched — click never toggles it.
+    set({
+      previewChunkId: chunkId,
+      focusedItemId: null,
+      playback: {
+        ...s.playback,
+        currentItemId: null,
+        currentTime: Math.max(0, ck.startMs / 1000),
+      },
+    });
+  },
+
   setSelectedCamId(camId) {
     set({ selectedCamId: camId });
   },
@@ -383,6 +428,27 @@ export const useArrangeStore = create<ArrangeState>((set, get) => ({
 
   setPlaying(p) {
     const s = get();
+    // Going false→true with an active pool-preview: resume the preview
+    // loop, NOT the arrangement. Snap back into the chunk's range if
+    // the playhead drifted out; keep the walker detached.
+    if (p && !s.playback.isPlaying && s.previewChunkId) {
+      const ck = s.chunks.find((c) => c.id === s.previewChunkId);
+      if (ck) {
+        const startS = ck.startMs / 1000;
+        const endS = ck.endMs / 1000;
+        const t = s.playback.currentTime;
+        const within = t >= startS && t < endS;
+        set({
+          playback: {
+            ...s.playback,
+            isPlaying: true,
+            currentItemId: null,
+            currentTime: within ? t : startS,
+          },
+        });
+        return;
+      }
+    }
     // Going false→true: pick which arrangement item to start from.
     // Priority: the existing currentItemId (if it still resolves) →
     // focusedItemId → arrangement[0]. Always snap currentTime to that
@@ -445,6 +511,8 @@ export const useArrangeStore = create<ArrangeState>((set, get) => ({
     if (!ck) return;
     set({
       focusedItemId: itemId,
+      // Arrangement navigation always exits a pool-preview loop.
+      previewChunkId: null,
       playback: {
         ...s.playback,
         currentItemId: itemId,
@@ -465,6 +533,10 @@ export const useArrangeStore = create<ArrangeState>((set, get) => ({
         stripContentWidthPx: contentWidthPx,
       },
     }));
+  },
+
+  setStripScrubbing(scrubbing) {
+    set({ stripScrubbing: scrubbing });
   },
 
   beginChunkDrag(args) {

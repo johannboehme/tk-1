@@ -10,8 +10,8 @@
  * its own `version` and `sampleRate`, so the cache check is a thin guard.
  */
 import { jobsDb } from "../../storage/jobs-db";
-import { type PeakPyramid, PYRAMID_VERSION } from "./peak-pyramid";
-import { buildPeakPyramidAsync } from "./build-pyramid-async";
+import { type PeakPyramid, PYRAMID_VERSION } from "../../core/waveform/peak-pyramid";
+import { buildPeakPyramidAsync } from "../../core/waveform/build-pyramid-async";
 
 /** Base bucket size for the persisted pyramid (≈2.9 ms at 22050 Hz). */
 export const PYRAMID_BASE_SAMPLES = 64;

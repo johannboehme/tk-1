@@ -38,7 +38,7 @@
  * is always the latest one.
  */
 
-import { camSourceTimeS, type CamTimeRef } from "./cam-time";
+import { camSourceTimeS, type CamTimeRef } from "../../core/timing/cam-time";
 
 export type CamPreviewAction =
   /** Cam isn't on screen yet (master playhead < cam's anchorS). */
@@ -72,6 +72,15 @@ export interface CamPreviewSyncInput {
    *  to classify the tick: a meaningful jump (focusChunk, loop wrap,
    *  scrub) versus a natural ~16 ms forward advance. */
   prevMasterT: number | null;
+  /** Explicit jump classification from the caller. The sequence walker
+   *  hops master-time forward by the inter-chunk gap — for gaps under
+   *  JUMP_FORWARD_S the delta heuristic reads as natural advance and
+   *  the resulting drift (== the gap) sits below the natural-drift
+   *  threshold, so the video would keep playing the DROPPED gap frames
+   *  and stay behind the audio for the rest of playback. The caller
+   *  knows when the walker crossed a segment boundary (focusedChunkId
+   *  changed — see `trackSegmentHop`) and forces the jump path. */
+  forceJump?: boolean;
 }
 
 /** End-of-source guard padding. Browsers fire `seeked` past `duration`
@@ -128,7 +137,9 @@ export function decideCamPreviewAction(
   const drift = Math.abs(input.videoCurrentTimeS - sourceT);
   const masterDelta = input.masterT - input.prevMasterT;
   const isJump =
-    masterDelta > JUMP_FORWARD_S || masterDelta < -JUMP_BACKWARD_S;
+    input.forceJump === true ||
+    masterDelta > JUMP_FORWARD_S ||
+    masterDelta < -JUMP_BACKWARD_S;
 
   if (isJump) {
     return drift > JUMP_DRIFT_THRESHOLD_S
@@ -138,4 +149,73 @@ export function decideCamPreviewAction(
   return drift > NATURAL_DRIFT_THRESHOLD_S
     ? { kind: "seek", sourceT }
     : { kind: "hold", sourceT };
+}
+
+// ─── Segment-hop tracking ────────────────────────────────────────────────
+//
+// Sequence playback advances by flipping `focusedChunkId` — but the
+// store update that flips the id still carries the OLD element's time
+// (the swap tick broadcasts before the ping-pong hands over), so the
+// actual time hop lands one or two ticks later. A naive "force a jump
+// on the tick where the key changed" would fire on the pre-hop tick
+// (drift still ≈ 0 → hold) and then classify the real hop as natural
+// advance again. Instead the key change ARMS a short window; the first
+// tick inside it whose forward delta exceeds a couple of frames is the
+// hop and consumes the arm. Contiguous chunks (gap ≈ 0) never produce
+// such a tick — the arm just expires, which is correct because there is
+// no drift to correct.
+
+/** Forward master-delta above which a tick inside an armed window is
+ *  the segment hop. Natural RAF advance is ~16 ms, a dropped frame
+ *  ~33 ms; two-and-a-half frames sits safely above both while catching
+ *  every audible gap. */
+const HOP_MIN_FORWARD_DELTA_S = 0.04;
+
+/** How long (master-time) an armed window stays open. The hop lands
+ *  1-2 ticks after the key flip; a full second is generous without
+ *  letting a stale arm reclassify much-later playback jitter. */
+const HOP_ARM_WINDOW_S = 1.0;
+
+export interface SegmentHopArm {
+  /** Last observed segment identity (e.g. focusedChunkId). */
+  key: string | null;
+  /** Master-time bound of the armed window; null = disarmed. */
+  armedUntilMasterT: number | null;
+}
+
+export const INITIAL_SEGMENT_HOP_ARM: SegmentHopArm = {
+  key: null,
+  armedUntilMasterT: null,
+};
+
+/** Pure per-tick reducer for the caller's hop-arm state. Returns
+ *  whether THIS tick should be classified as a jump (`forceJump`) and
+ *  the state to carry into the next tick. */
+export function trackSegmentHop(
+  arm: SegmentHopArm,
+  segmentKey: string | null,
+  masterT: number,
+  masterDelta: number | null,
+): { forceJump: boolean; arm: SegmentHopArm } {
+  const armed =
+    segmentKey !== arm.key
+      ? masterT + HOP_ARM_WINDOW_S
+      : arm.armedUntilMasterT;
+
+  if (armed === null) {
+    return { forceJump: false, arm };
+  }
+  // Backward jumps (loop wrap, backward scrub) classify as jumps on
+  // their own — a pending arm is stale after one.
+  if (masterDelta !== null && masterDelta < -JUMP_BACKWARD_S) {
+    return { forceJump: false, arm: { key: segmentKey, armedUntilMasterT: null } };
+  }
+  if (masterT > armed) {
+    return { forceJump: false, arm: { key: segmentKey, armedUntilMasterT: null } };
+  }
+  if (masterDelta !== null && masterDelta > HOP_MIN_FORWARD_DELTA_S) {
+    // This tick carries the hop — consume the arm.
+    return { forceJump: true, arm: { key: segmentKey, armedUntilMasterT: null } };
+  }
+  return { forceJump: false, arm: { key: segmentKey, armedUntilMasterT: armed } };
 }

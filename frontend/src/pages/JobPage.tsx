@@ -10,14 +10,17 @@ import {
   jobEvents,
   jobsDb,
   resolveJobAssetUrl,
+  retrySync,
   runQuickRender,
   type EditSpecLocal,
   type LocalJob,
 } from "../local/jobs";
 import { jobRoutePath, nextRouteForJob } from "../local/jobs-routing";
-import { useSyncOp } from "../local/ops-store";
+import { useOpsStore, useRenderOp, useSyncOp } from "../local/ops-store";
 import { isVideoAsset } from "../storage/jobs-db";
 import { SyncPatchPanel } from "../components/sync/SyncPatchPanel";
+import { downloadFilename } from "../lib/filenames";
+import { renderStageLabel } from "./render-stages";
 
 export default function JobPage() {
   const { id = "" } = useParams<{ id: string }>();
@@ -26,6 +29,15 @@ export default function JobPage() {
   const [err, setErr] = useState<string | null>(null);
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const syncOp = useSyncOp(id);
+  const renderOp = useRenderOp(id);
+  // Local synchronous guard for the window between the click and the
+  // render op appearing in the store (runQuickRender awaits the job
+  // lookup before it starts the op).
+  const [renderPending, setRenderPending] = useState(false);
+  // Inline rename (#143) — the title defaults to the song's name, but
+  // stays editable right where it's displayed.
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState("");
 
   // Derived state — phase comes from data + ops, never a status enum.
   const hasSyncData = useMemo(() => {
@@ -36,14 +48,17 @@ export default function JobPage() {
   const isSyncing = Boolean(syncOp) && !syncOp?.error;
   const syncFailed = Boolean(syncOp?.error);
   const hasOutput = Boolean(job?.lastRender);
+  const isRendering = Boolean(renderOp) && !renderOp?.error && !renderOp?.done;
+  const renderBusy = renderPending || isRendering;
 
   // Download filename: prefer the custom name the user set in the export panel
-  // (persisted on the last render's editSpec), falling back to the project title.
+  // (persisted on the last render's editSpec), falling back to the project
+  // title. Titles may themselves be filenames — strip any extension before
+  // appending .mp4 so the saved file isn't `take-1.mp4.mp4` (#142).
   const downloadName = useMemo(() => {
     const custom = (job?.editSpec as EditSpecLocal | undefined)?.outputFilename
       ?.trim();
-    const base = custom || job?.title || job?.id || "export";
-    return `${base}.mp4`;
+    return downloadFilename(custom || job?.title || job?.id || "export");
   }, [job?.editSpec, job?.title, job?.id]);
 
   useEffect(() => {
@@ -85,13 +100,35 @@ export default function JobPage() {
   }, [job?.lastRender, job?.id]);
 
   async function onQuickRender() {
-    if (!job) return;
+    if (!job || renderBusy) return;
+    setRenderPending(true);
     setErr(null);
     try {
       await runQuickRender(job.id);
+      // The result is persisted on the job (`lastRender`) — drop the
+      // finished op so it can't linger as a stuck RENDER badge (#92).
+      // Failed ops stay in the store until the next attempt clears them.
+      useOpsStore.getState().clearRenderOp(job.id);
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Render failed");
+    } finally {
+      setRenderPending(false);
     }
+  }
+
+  function startRename() {
+    if (!job) return;
+    setTitleDraft(job.title || "");
+    setEditingTitle(true);
+  }
+
+  async function commitRename() {
+    if (!job) return;
+    setEditingTitle(false);
+    const trimmed = titleDraft.trim();
+    if (trimmed === (job.title ?? "")) return;
+    const saved = await jobsDb.updateJob(job.id, { title: trimmed || null });
+    setJob({ ...saved });
   }
 
   async function onDelete() {
@@ -101,7 +138,16 @@ export default function JobPage() {
     navigate("/jobs");
   }
 
-  if (err) return <Banner kind="error" text={err} />;
+  async function onRunSync() {
+    if (!job) return;
+    setErr(null);
+    try {
+      await retrySync(job.id);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Could not start sync");
+    }
+  }
+
   if (!job) {
     return (
       <main className="flex-1 flex items-center justify-center">
@@ -119,6 +165,10 @@ export default function JobPage() {
   // — the sync data lets the user re-enter the editor or kick off
   // another render attempt without redoing the upload + analysis.
   const canRetry = syncFailed && hasSyncData;
+  // No sync data and nothing in flight — either a reload killed the
+  // in-memory sync op mid-run, or the run failed outright. Both used to
+  // dead-end with zero buttons (#65); now they get a Run-sync primary.
+  const needsSync = !hasSyncData && !isSyncing;
   // Quick render is the "drop video + audio → aligned MP4" shortcut —
   // skips the editor entirely. Doesn't fit the long-form workflow
   // (chunks need to be triaged, arranged, then composed in the editor),
@@ -134,12 +184,47 @@ export default function JobPage() {
           </span>
           <RuleStrip count={32} className="text-rule flex-1 max-w-[200px]" />
           <StatusBadge
-            label={statusLabel({ isSyncing, syncFailed, hasSyncData, hasOutput })}
+            label={statusLabel({
+              isSyncing,
+              isRendering,
+              syncFailed,
+              hasSyncData,
+              hasOutput,
+            })}
           />
         </div>
-        <h1 className="font-display font-semibold text-3xl sm:text-4xl text-ink truncate">
-          {job.title || job.id}
-        </h1>
+        {editingTitle ? (
+          <input
+            autoFocus
+            value={titleDraft}
+            onChange={(e) => setTitleDraft(e.target.value)}
+            onBlur={() => void commitRename()}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void commitRename();
+              } else if (e.key === "Escape") {
+                setEditingTitle(false);
+              }
+            }}
+            aria-label="Job title"
+            className="font-display font-semibold text-3xl sm:text-4xl text-ink bg-paper-hi border border-rule rounded-md px-2 py-1 w-full max-w-2xl outline-none focus:border-ink-2"
+          />
+        ) : (
+          <div className="flex items-center gap-3 min-w-0">
+            <h1 className="font-display font-semibold text-3xl sm:text-4xl text-ink truncate">
+              {job.title || job.id}
+            </h1>
+            <button
+              type="button"
+              onClick={startRename}
+              aria-label="Rename job"
+              className="shrink-0 font-mono text-[10px] tracking-label uppercase text-ink-2 bg-paper-hi border border-rule rounded-full px-2 py-0.5 hover:text-ink hover:border-ink-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-ink-2"
+            >
+              Rename
+            </button>
+          </div>
+        )}
         <JobSubtitle job={job} />
       </header>
 
@@ -168,57 +253,113 @@ export default function JobPage() {
         </AnimatePresence>
       </section>
 
+      {isRendering && renderOp && (
+        <section className="mb-6 bg-paper-hi border border-rule rounded-md p-4 flex flex-col gap-2">
+          <div className="flex items-center justify-between font-mono text-[11px] tracking-label uppercase text-ink-2">
+            <span>{renderStageLabel(renderOp.stage)}</span>
+            <span className="tabular text-ink">{Math.round(renderOp.pct)}%</span>
+          </div>
+          <div className="h-2 rounded-full bg-paper border border-rule overflow-hidden">
+            <div
+              className="h-full bg-hot transition-[width] duration-200 ease-out"
+              style={{
+                width: `${Math.min(100, Math.max(0, renderOp.pct))}%`,
+              }}
+            />
+          </div>
+        </section>
+      )}
+
       {syncFailed && syncOp?.error && (
         <Banner kind="error" text={syncOp.error} details={syncOp.errorReport} />
       )}
-      {err && <Banner kind="error" text={err} />}
-
-      {(isDone || canRetry) && (
-        <div className="flex flex-wrap gap-3 border-t border-rule pt-5">
-          {showQuickRender && (
-            <ChunkyButton variant="primary" size="lg" onClick={onQuickRender}>
-              {canRetry ? "Retry quick render" : "Quick render"}
-            </ChunkyButton>
-          )}
-          {job.mode === "longform" ? (
-            <LongformStageButtons
-              job={job}
-              isPrimary={!showQuickRender}
-              onNavigate={(route) => navigate(jobRoutePath(job.id, route))}
-            />
-          ) : (
-            <ChunkyButton
-              variant={showQuickRender ? "secondary" : "primary"}
-              size="lg"
-              onClick={() => navigate(jobRoutePath(job.id, nextRouteForJob(job)))}
-            >
-              {nextRouteLabel(nextRouteForJob(job))}
-            </ChunkyButton>
-          )}
-          {downloadUrl && (
-            <a
-              href={downloadUrl}
-              download={downloadName}
-              className="inline-flex items-center gap-2 h-12 px-5 rounded-md bg-cobalt text-paper-hi font-display tracking-label uppercase text-xs hover:bg-cobalt/90"
-            >
-              <DownloadIcon className="w-4 h-4" />
-              Download MP4
-            </a>
-          )}
-          <ChunkyButton variant="ghost" size="lg" onClick={onDelete}>
-            Delete
-          </ChunkyButton>
-        </div>
+      {err && (
+        <Banner kind="error" text={err} onDismiss={() => setErr(null)} />
       )}
 
-      {/* Sync failed without producing any data — only recovery is to delete and retry. */}
-      {syncFailed && !hasSyncData && (
-        <div className="flex flex-wrap gap-3 border-t border-rule pt-5">
-          <ChunkyButton variant="ghost" size="lg" onClick={onDelete}>
-            Delete and start over
-          </ChunkyButton>
-        </div>
+      {/* The point of the whole exercise: watch the cut without leaving
+          the app. Reuses the OPFS object URL that also feeds Download. */}
+      {hasOutput && downloadUrl && (
+        <section className="mb-6">
+          <div className="flex items-center gap-3 mb-2">
+            <span className="font-mono text-xs tracking-label uppercase text-ink-2">
+              OUTPUT
+            </span>
+            <RuleStrip count={32} className="text-rule flex-1 max-w-[200px]" />
+            {job.lastRender && (
+              <span className="font-mono text-[10px] tabular text-ink-2">
+                {new Date(job.lastRender.completedAt).toLocaleString()}
+              </span>
+            )}
+          </div>
+          <video
+            src={downloadUrl}
+            controls
+            playsInline
+            preload="metadata"
+            className="w-full max-h-[420px] bg-sunken border border-rule rounded-md"
+          />
+        </section>
       )}
+
+      <div className="flex flex-wrap gap-3 border-t border-rule pt-5">
+        {/* Re-run affordance (#65): a job without sync data (reload
+            mid-sync, or a failed run) gets a primary way forward instead
+            of a dead end. retrySync resumes from the persisted assets. */}
+        {needsSync && (
+          <ChunkyButton variant="primary" size="lg" onClick={onRunSync}>
+            {syncFailed ? "Retry sync" : "Run sync"}
+          </ChunkyButton>
+        )}
+        {(isDone || canRetry) && (
+          <>
+            {showQuickRender && (
+              <ChunkyButton
+                variant="primary"
+                size="lg"
+                onClick={onQuickRender}
+                disabled={renderBusy}
+              >
+                {renderBusy
+                  ? `Rendering… ${Math.round(renderOp?.pct ?? 0)}%`
+                  : canRetry
+                    ? "Retry quick render"
+                    : "Quick render"}
+              </ChunkyButton>
+            )}
+            {job.mode === "longform" ? (
+              <LongformStageButtons
+                job={job}
+                isPrimary={!showQuickRender}
+                onNavigate={(route) => navigate(jobRoutePath(job.id, route))}
+              />
+            ) : (
+              <ChunkyButton
+                variant={showQuickRender ? "secondary" : "primary"}
+                size="lg"
+                onClick={() => navigate(jobRoutePath(job.id, nextRouteForJob(job)))}
+              >
+                {nextRouteLabel(nextRouteForJob(job))}
+              </ChunkyButton>
+            )}
+            {downloadUrl && (
+              <a
+                href={downloadUrl}
+                download={downloadName}
+                className="inline-flex items-center gap-2 h-12 px-5 rounded-md bg-cobalt text-paper-hi font-display tracking-label uppercase text-xs hover:bg-cobalt/90"
+              >
+                <DownloadIcon className="w-4 h-4" />
+                Download MP4
+              </a>
+            )}
+          </>
+        )}
+        {/* Delete is available in every phase — a stuck or unwanted job
+            must never require spelunking through History to remove. */}
+        <ChunkyButton variant="ghost" size="lg" onClick={onDelete}>
+          Delete
+        </ChunkyButton>
+      </div>
     </main>
   );
 }
@@ -300,11 +441,13 @@ function StatusBadge({ label }: { label: string }) {
 
 function statusLabel(args: {
   isSyncing: boolean;
+  isRendering: boolean;
   syncFailed: boolean;
   hasSyncData: boolean;
   hasOutput: boolean;
 }): string {
   if (args.isSyncing) return "syncing";
+  if (args.isRendering) return "rendering";
   if (args.syncFailed) return "failed";
   if (args.hasOutput) return "rendered";
   if (args.hasSyncData) return "synced";
@@ -329,6 +472,7 @@ function Banner({
   kind,
   text,
   details,
+  onDismiss,
 }: {
   kind: "error";
   text: string;
@@ -336,6 +480,9 @@ function Banner({
    *  shows a "Show details" toggle + "Copy details" affordance so the
    *  user can ship the report to us without poking around devtools. */
   details?: string;
+  /** When set, the banner shows a "Dismiss" affordance that lets the
+   *  user clear a transient error without leaving the page. */
+  onDismiss?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -360,22 +507,35 @@ function Banner({
       ].join(" ")}
     >
       <div>{text}</div>
-      {details && (
+      {(details || onDismiss) && (
         <div className="mt-1 flex items-center gap-3 text-xs">
-          <button
-            type="button"
-            onClick={() => setOpen((v) => !v)}
-            className="underline underline-offset-2 hover:opacity-80"
-          >
-            {open ? "Hide details" : "Show details"}
-          </button>
-          <button
-            type="button"
-            onClick={copy}
-            className="underline underline-offset-2 hover:opacity-80"
-          >
-            {copied ? "Copied" : "Copy details"}
-          </button>
+          {details && (
+            <>
+              <button
+                type="button"
+                onClick={() => setOpen((v) => !v)}
+                className="underline underline-offset-2 hover:opacity-80"
+              >
+                {open ? "Hide details" : "Show details"}
+              </button>
+              <button
+                type="button"
+                onClick={copy}
+                className="underline underline-offset-2 hover:opacity-80"
+              >
+                {copied ? "Copied" : "Copy details"}
+              </button>
+            </>
+          )}
+          {onDismiss && (
+            <button
+              type="button"
+              onClick={onDismiss}
+              className="underline underline-offset-2 hover:opacity-80"
+            >
+              Dismiss
+            </button>
+          )}
         </div>
       )}
       {details && open && (

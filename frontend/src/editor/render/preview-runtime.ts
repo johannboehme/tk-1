@@ -11,13 +11,13 @@
  * shell that mounts the canvas + a parent for the video pool and
  * instantiates this class.
  */
-import { AdaptiveScaler } from "./adaptive-scaler";
-import type { CompositorBackend, LayerSource, SourcesMap } from "./backend";
-import { createBackend, type BackendCapabilities } from "./factory";
+import { AdaptiveScaler } from "../../core/render/adaptive-scaler";
+import type { CompositorBackend, LayerSource, SourcesMap } from "../../core/render/backend";
+import { createBackend, type BackendCapabilities } from "../../core/render/factory";
 import {
   buildPreviewFrameDescriptor,
   type EditorStoreSnapshot,
-} from "./build-descriptor";
+} from "../../core/render/build-descriptor";
 import {
   VideoElementPool,
   type PoolSyncTarget,
@@ -29,7 +29,7 @@ import {
   effectiveBeatPhaseS,
   effectiveBeatsPerBar,
 } from "../selectors/timing";
-import { isImageClip, isVideoClip, type Clip } from "../types";
+import { isImageClip, isVideoClip, type Clip } from "../../core/types";
 
 export type ClipUrlMap = Readonly<Record<string, { videoUrl: string }>>;
 
@@ -78,6 +78,14 @@ export interface PreviewRuntimeOptions {
   /** Test-injection — high-resolution clock. Defaults to `performance.now`.
    *  Used by the frame-budget watchdog. */
   now?: () => number;
+  /** Called when the backend's GPU device/context is lost asynchronously
+   *  (WebGPU device loss). By the time this fires the runtime has already
+   *  stopped its RAF and disposed the dead backend, and the session
+   *  capability has been downgraded (`markWebGPUUnavailable`). The host
+   *  should remount with a FRESH canvas — a canvas's context mode is
+   *  fixed on first `getContext`, so the WebGL2 fallback cannot attach
+   *  to the old element. Compositor.tsx does this via a remount key. */
+  onBackendLost?: (info: { reason: string; message: string }) => void;
 }
 
 /** Minimum gap between two snapshot refreshes for the SAME layer.
@@ -193,7 +201,30 @@ export class PreviewRuntime {
     this.ensureAllImageBitmaps(snapshot.clips);
     const caps = this.computeCaps();
     this.backend = await this.opts.createBackendFn(this.opts.canvas, caps, this.opts.capabilities);
+    this.backend.onContextLost = (info) => this.handleBackendLost(info);
     await this.backend.warmup();
+  }
+
+  /** The backend's GPU device died asynchronously (see
+   *  `CompositorBackend.onContextLost`). Drawing on it would silently
+   *  no-op forever, so: stop the RAF, drop the dead backend (tick()
+   *  no-ops without one), and hand recovery to the host. We can't
+   *  rebuild on this canvas ourselves — its context mode is claimed by
+   *  the dead webgpu context — so the host remounts a fresh canvas;
+   *  the capability downgrade already done by the backend makes that
+   *  remount land on WebGL2. */
+  private handleBackendLost(info: { reason: string; message: string }): void {
+    this.stop();
+    if (this.backend) {
+      const dead = this.backend;
+      this.backend = null;
+      try {
+        dead.dispose();
+      } catch {
+        /* device already gone — nothing left to release */
+      }
+    }
+    this.opts.onBackendLost?.(info);
   }
 
   /** Mount the video pool's `<video>`s as children of `parent`. Safe
@@ -599,7 +630,7 @@ export class PreviewRuntime {
  *  cut-switch a no-op for the decoder; the upload picks up an
  *  already-running stream. */
 function collectPoolTargets(
-  pills: readonly import("../types").Pill[] | undefined,
+  pills: readonly import("../../core/types").Pill[] | undefined,
   tTimeline: number,
 ): Map<string, PoolSyncTarget> {
   const out = new Map<string, PoolSyncTarget>();

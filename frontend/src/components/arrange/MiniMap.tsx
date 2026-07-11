@@ -14,6 +14,7 @@ import {
   effectiveBarsForChunk,
   frameWidthForBars,
 } from "../../local/arrange/arrange-store";
+import { minimapDragScroll, MINIMAP_CLICK_SLOP_PX } from "./minimap-drag";
 
 const MINIMAP_HEIGHT = 18;
 
@@ -26,6 +27,7 @@ export function MiniMap() {
   const currentItemId = useArrangeStore((s) => s.playback.currentItemId);
   const focusedItemId = useArrangeStore((s) => s.focusedItemId);
   const setStripScrollPx = useArrangeStore((s) => s.setStripScrollPx);
+  const setStripScrubbing = useArrangeStore((s) => s.setStripScrubbing);
   const seekToItem = useArrangeStore((s) => s.seekToItem);
   const jobBpm = useArrangeStore((s) => s.jobBpm);
   const jobBeatsPerBar = useArrangeStore((s) => s.jobBeatsPerBar);
@@ -34,9 +36,16 @@ export function MiniMap() {
   const camColor = cam?.color ?? "#FF5722";
 
   const wrapRef = useRef<HTMLDivElement | null>(null);
-  const draggingRef = useRef<{ startX: number; startScroll: number } | null>(
-    null,
-  );
+  // The gesture stays ambiguous until the pointer travels past the
+  // click slop: a discrete CLICK navigates (focus + seek), a DRAG only
+  // scrolls the strip viewport. `scrubbing` flips once the slop is
+  // exceeded — from then on the press can never seek.
+  const draggingRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startScroll: number;
+    scrubbing: boolean;
+  } | null>(null);
 
   // Hide when not needed.
   const overflowing = view.stripContentWidthPx > view.stripViewportWidthPx + 2;
@@ -102,30 +111,68 @@ export function MiniMap() {
   function onPointerDown(e: React.PointerEvent) {
     e.preventDefault();
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    // Don't seek or scroll yet — we can't know whether this press is
+    // a click (navigate) or a drag (scroll-only) until the pointer
+    // either lifts or travels past the slop.
     draggingRef.current = {
+      pointerId: e.pointerId,
       startX: e.clientX,
       startScroll: view.stripScrollPx,
+      scrubbing: false,
     };
-    setStripScrollPx(pointerToScroll(e.clientX));
-    // Click on a tick = focus + seek + tag as current playback item.
-    // Drag afterwards still scrolls (via pointermove). Falls through
-    // cleanly when the click landed in a gap.
-    const idx = pointerToItemIndex(e.clientX);
-    if (idx !== null) {
-      seekToItem(arrangement[idx].id);
-    }
   }
   function onPointerMove(e: React.PointerEvent) {
-    if (!draggingRef.current) return;
-    setStripScrollPx(pointerToScroll(e.clientX));
+    const d = draggingRef.current;
+    if (!d || d.pointerId !== e.pointerId) return;
+    const dx = e.clientX - d.startX;
+    if (!d.scrubbing) {
+      if (Math.abs(dx) <= MINIMAP_CLICK_SLOP_PX) return;
+      d.scrubbing = true;
+      // Freeze the strip's auto-center smooth scroll while we write
+      // scrollLeft directly — the two would fight over the scroller.
+      setStripScrubbing(true);
+    }
+    setStripScrollPx(
+      minimapDragScroll({
+        startScrollPx: d.startScroll,
+        dxPx: dx,
+        minimapWidthPx: minimapWidth,
+        contentWidthPx: view.stripContentWidthPx,
+        viewportWidthPx: view.stripViewportWidthPx,
+      }),
+    );
   }
   function onPointerUp(e: React.PointerEvent) {
+    const d = draggingRef.current;
     draggingRef.current = null;
     try {
       (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
     } catch {
       /* ignore */
     }
+    if (!d || d.pointerId !== e.pointerId) return;
+    if (d.scrubbing) {
+      setStripScrubbing(false);
+      return;
+    }
+    // Discrete click. On a tick = focus + seek + tag as current
+    // playback item; in a gap = just center the viewport there.
+    const idx = pointerToItemIndex(e.clientX);
+    if (idx !== null) {
+      seekToItem(arrangement[idx].id);
+    } else {
+      setStripScrollPx(pointerToScroll(e.clientX));
+    }
+  }
+  function onPointerCancel(e: React.PointerEvent) {
+    const d = draggingRef.current;
+    draggingRef.current = null;
+    try {
+      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+    } catch {
+      /* ignore */
+    }
+    if (d?.scrubbing) setStripScrubbing(false);
   }
 
   // Place each frame's tick.
@@ -138,12 +185,15 @@ export function MiniMap() {
         height: MINIMAP_HEIGHT,
         background:
           "linear-gradient(180deg, #1A1816 0%, #0E0D0B 100%)",
+        // Dedicated scrub surface (like a scrollbar): the pointer owns
+        // the gesture, never the browser's native pan.
+        touchAction: "none",
       }}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
-      onPointerCancel={onPointerUp}
-      title="Mini-map · drag to scroll strip"
+      onPointerCancel={onPointerCancel}
+      title="Mini-map · click to jump · drag to scroll"
     >
       {arrangement.map((item, i) => {
         const w = widths[i] * scale;

@@ -17,12 +17,12 @@
  */
 import { describe, it } from "vitest";
 import { decodeAudioToMonoPcm } from "../local/codec";
-import { buildPeakPyramidAsync } from "../local/waveform/build-pyramid-async";
+import { buildPeakPyramidAsync } from "../core/waveform/build-pyramid-async";
 import {
   getCachedPyramid,
   getOrComputePyramid,
 } from "../local/waveform/pyramid-cache";
-import { buildLoudnessEnvelope } from "./fx/audio-envelope";
+import { buildLoudnessEnvelope } from "../core/fx/audio-envelope";
 import { getOrComputeAnalysis } from "../local/render/audio-analysis";
 
 const SR = 22050;

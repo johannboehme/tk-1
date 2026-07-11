@@ -30,7 +30,9 @@ import {
   type VideoAsset,
 } from "../storage/jobs-db";
 import { useOpsStore } from "./ops-store";
-import type { GradeParams } from "../editor/fx/looks";
+import { nextCamIndex } from "./cam-ids";
+import { defaultJobTitle } from "../lib/filenames";
+import type { GradeParams } from "../core/fx/looks";
 import { camColorAt } from "../storage/migrations";
 import { opfs } from "../storage/opfs";
 import {
@@ -62,14 +64,17 @@ import type {
 import { decodeAudioToMonoPcm } from "./codec";
 import { collectSyncFailureReport } from "./diagnostics";
 import { computeEnergyCurves } from "./render/energy";
-import { buildLoudnessEnvelope } from "../editor/fx/audio-envelope";
+import { buildLoudnessEnvelope } from "../core/fx/audio-envelope";
 import { extractTimelineFrames } from "./render/frames";
 import type { TextOverlay } from "./render/ass-builder";
 import {
   installRenderUnloadGuard,
-  pruneIfQuotaTight,
+  installSyncUnloadGuard,
+  maybePromptQuotaPrune,
   removeRenderUnloadGuard,
+  removeSyncUnloadGuard,
   requestPersistentStorage,
+  sweepOrphanJobDirs,
 } from "./lifecycle";
 import { emitJobUpdate, jobEvents } from "./jobs-events";
 
@@ -209,7 +214,8 @@ async function persistImageCam(
 }
 
 interface CreateJobOptions {
-  /** Optional title; falls back to the video file name. */
+  /** Optional title; defaults to the master audio's name (the song is
+   *  the project's identity), then the first video's name. */
   title?: string | null;
   /** Workflow-Pfad. Default `"direct"` für die Legacy-Sync-Flow.
    *  `"longform"` schaltet den Triage → Arrange → Editor-Pfad frei. */
@@ -240,26 +246,40 @@ export async function createJob(
   }
 
   // Best-effort housekeeping before we commit big new files: ask for
-  // persistent storage (so the browser doesn't evict OPFS under pressure)
-  // and prune old jobs if we're close to the quota.
+  // persistent storage (so the browser doesn't evict OPFS under pressure),
+  // reclaim orphaned OPFS dirs from failed past uploads (#119), and — when
+  // storage is tight — offer to delete old finished projects. The user
+  // decides; nothing is pruned without consent (#64).
   void requestPersistentStorage();
-  await pruneIfQuotaTight().catch(() => undefined);
+  await sweepOrphanJobDirs().catch(() => undefined);
+  await maybePromptQuotaPrune().catch(() => undefined);
 
   const jobId = generateJobId();
   const audioExt = fileExtension(audioPick.file, "wav");
   const audioOpfsPath = audioPath(jobId, audioExt);
-  const audioSource = await persistPickedAsset(audioPick, audioOpfsPath);
 
+  // Persist all picks before the job row exists. If any copy fails
+  // (QuotaExceededError on Safari/Firefox where picks are byte copies),
+  // remove everything written so far — otherwise the orphaned bytes are
+  // invisible to History/delete/prune and make the quota problem that
+  // caused the failure permanently worse (#119).
+  let audioSource: AssetSource;
   const videos: VideoAsset[] = [];
-  for (let i = 0; i < videoPicks.length; i++) {
-    videos.push(await persistVideoCam(jobId, videoPicks[i], i));
+  try {
+    audioSource = await persistPickedAsset(audioPick, audioOpfsPath);
+    for (let i = 0; i < videoPicks.length; i++) {
+      videos.push(await persistVideoCam(jobId, videoPicks[i], i));
+    }
+  } catch (err) {
+    await opfs.deletePath(`jobs/${jobId}`).catch(() => undefined);
+    throw err;
   }
 
   const firstVideo = videoPicks[0].file;
 
   const job: LocalJob = {
     id: jobId,
-    title: options.title ?? firstVideo.name,
+    title: options.title ?? defaultJobTitle(audioPick.file.name, firstVideo.name),
     // Legacy V1 mirrors of cam-1 (kept for backward compat — older callers
     // may still read videoFilename / sync / dimensions at the top level).
     videoFilename: firstVideo.name,
@@ -275,19 +295,54 @@ export async function createJob(
   emitJobUpdate(job);
 
   // Kick off sync without awaiting — UI subscribes for results.
-  useOpsStore.getState().startSyncOp(jobId, { pct: 0, stage: "queued" });
-  void runSync(jobId, audioExt).catch(async (err) => {
-    // Build a rich diagnostic report so a screenshot of the banner is
-    // self-sufficient for triage — browser, capabilities, file in
-    // flight, and the original Error.name/stack survive instead of
-    // being flattened into a single opaque "File could not be read!"
-    // string. Banner shows the summary; full report ships behind a
-    // "Show details" toggle on the same banner.
-    const { summary, report } = await collectSyncFailureReport(jobId, err);
-    useOpsStore.getState().failSyncOp(jobId, summary, report);
-  });
+  startSyncRun(jobId, audioExt);
 
   return jobId;
+}
+
+/**
+ * Fire-and-forget sync launcher shared by `createJob` and `retrySync`:
+ * registers the op in the store, guards against accidental tab-close
+ * while the multi-minute pipeline runs (#65), and converts a failure
+ * into a rich diagnostic report on the op.
+ */
+function startSyncRun(jobId: string, audioExt: string): void {
+  useOpsStore.getState().startSyncOp(jobId, { pct: 0, stage: "queued" });
+  installSyncUnloadGuard(jobId);
+  void runSync(jobId, audioExt)
+    .catch(async (err) => {
+      // Build a rich diagnostic report so a screenshot of the banner is
+      // self-sufficient for triage — browser, capabilities, file in
+      // flight, and the original Error.name/stack survive instead of
+      // being flattened into a single opaque "File could not be read!"
+      // string. Banner shows the summary; full report ships behind a
+      // "Show details" toggle on the same banner.
+      const { summary, report } = await collectSyncFailureReport(jobId, err);
+      useOpsStore.getState().failSyncOp(jobId, summary, report);
+    })
+    .finally(() => {
+      removeSyncUnloadGuard(jobId);
+    });
+}
+
+/**
+ * Re-run sync for an existing job from its persisted assets (#65).
+ *
+ * Covers the two dead ends the ops-store design leaves behind: a reload
+ * mid-sync (progress lives only in memory → the row sits at "needs
+ * sync" forever) and a failed run. Cams that already carry a completed
+ * prep (sync result or frame strip) are kept as-is — see the resume
+ * logic in `runSync` — so a retry only redoes the missing work.
+ *
+ * No-op when a sync for this job is already running.
+ */
+export async function retrySync(jobId: string): Promise<void> {
+  const job = await jobsDb.getJob(jobId);
+  if (!job) throw new Error(`Job not found: ${jobId}`);
+  const running = useOpsStore.getState().ops[jobId]?.sync;
+  if (running && !running.error) return;
+  const audioExt = fileExtension(new File([], job.audioFilename), "wav");
+  startSyncRun(jobId, audioExt);
 }
 
 interface SyncProgressPatch {
@@ -528,11 +583,36 @@ async function runSync(jobId: string, audioExt: string): Promise<void> {
   for (let i = 0; i < videos.length; i++) {
     const cam = videos[i];
     const camStartPct = 5 + i * bandPerCam;
+    // Resume support (#65): a cam whose prep already completed in an
+    // earlier (partially-finished) run keeps its result instead of
+    // redoing minutes of decode+match work. Either marker counts:
+    // `sync` (matched cam) or `framesPath` (written after sync — also
+    // covers deliberately-unmatched B-roll cams).
+    if (cam.sync || cam.framesPath) {
+      updatedVideos.push(cam);
+      continue;
+    }
     const updated = await runCamPrep(jobId, cam, studioMonoPcm.pcm, {
       mapPct: (frac) =>
         Math.min(95, Math.floor(camStartPct + frac * bandPerCam)),
     });
     updatedVideos.push(updated);
+
+    // Persist this cam's result immediately (#65): a failure on a later
+    // cam — or a reload mid-sync — must not throw away the completed
+    // decode+match+frame-strip work of the cams before it.
+    try {
+      const cur = await jobsDb.getJob(jobId);
+      if (cur) {
+        const merged = (cur.videos ?? []).map((v) =>
+          v.id === updated.id ? updated : v,
+        );
+        emitJobUpdate(await jobsDb.updateJob(jobId, { videos: merged }));
+      }
+    } catch (err) {
+      // Non-fatal: the final batch write below still covers this cam.
+      console.warn(`Incremental sync persist failed for ${jobId}/${cam.id}:`, err);
+    }
   }
 
   // Mirror cam-1's stats to the legacy top-level fields so consumers that
@@ -657,7 +737,10 @@ export async function addVideoToJob(
   if (!job) throw new Error(`Job ${jobId} not found`);
 
   const existing = job.videos ?? [];
-  const newCam = await persistVideoCam(jobId, picked, existing.length);
+  // Collision-free slot: removeCamFromJob keeps survivor ids stable (no
+  // renumbering), so `existing.length` would re-issue a live id after a
+  // delete-then-add and corrupt that cam's lane + OPFS media (#68).
+  const newCam = await persistVideoCam(jobId, picked, nextCamIndex(existing));
   const camId = newCam.id;
 
   // Probe dimensions BEFORE the first persist so the editor lane appears
@@ -760,10 +843,11 @@ export async function addImageToJob(
 
   const existing = job.videos ?? [];
   const durationS = opts.durationS ?? DEFAULT_IMAGE_DURATION_S;
+  // Same collision-free slot rule as addVideoToJob (#68).
   const newAsset = await persistImageCam(
     jobId,
     picked,
-    existing.length,
+    nextCamIndex(existing),
     durationS,
   );
 
@@ -852,7 +936,7 @@ export interface EditSpecLocal {
     rotation?: number;
     flipX?: boolean;
     flipY?: boolean;
-    viewportTransform?: import("../editor/types").ViewportTransform;
+    viewportTransform?: import("../core/types").ViewportTransform;
   }>;
   /** Master-audio playback gain. 1.0 = source level. Picked up at render
    *  start from the store's `audioVolume`. Optional / undefined → 1.0. */
@@ -864,7 +948,7 @@ export interface EditSpecLocal {
    *  video by walking pills in arr-time + applying cuts on top. Empty
    *  in direct-mode, in which case the renderer falls back to the
    *  legacy per-cam contiguous-range model. */
-  pills?: import("../editor/types").Pill[];
+  pills?: import("../core/types").Pill[];
 }
 
 export interface ExportRenderOpts {

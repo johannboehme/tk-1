@@ -93,6 +93,21 @@ async function shot(page, name, opts = {}) {
   console.log(`  📸 ${path}`);
 }
 
+/** Drop real files onto the upload page's <main> via CDP drag events —
+ *  file paths travel out-of-band, so multi-GB media works and the page
+ *  sees a native drop (incl. getAsFileSystemHandle). */
+async function dropFiles(page, paths) {
+  const box = await page.locator("main").boundingBox();
+  const x = box.x + box.width / 2;
+  const y = box.y + Math.min(box.height / 2, 300);
+  const cdp = await page.context().newCDPSession(page);
+  const data = { items: [], files: paths, dragOperationsMask: 1 };
+  await cdp.send("Input.dispatchDragEvent", { type: "dragEnter", x, y, data });
+  await cdp.send("Input.dispatchDragEvent", { type: "dragOver", x, y, data });
+  await cdp.send("Input.dispatchDragEvent", { type: "drop", x, y, data });
+  await cdp.detach();
+}
+
 async function uploadAndSync(page, scenario) {
   console.log(`\n=== ${scenario.name} ===`);
   await page.goto(`${BASE}/upload`, { waitUntil: "domcontentloaded" });
@@ -106,25 +121,35 @@ async function uploadAndSync(page, scenario) {
     await shot(page, "01-upload-empty");
   }
 
-  await page.locator("#picker-audio").setInputFiles(scenario.audio);
-  await page.locator("#picker-videos").setInputFiles(scenario.videos);
-  await page.waitForTimeout(400);
+  // The upload page has no <input type=file> anymore (pickers use
+  // showOpenFilePicker, drops route by MIME) — drive the real drop path
+  // via CDP drag events carrying actual file paths.
+  await dropFiles(page, [scenario.audio, ...scenario.videos]);
+  await page.waitForTimeout(600);
   await shot(page, `${scenario.name}-upload-filled`);
 
-  await page.getByRole("button", { name: /sync.*open editor/i }).click();
+  // Two submit modes since the triage/arrange flow landed; DIRECT → EDITOR
+  // is the classic path this e2e exercises.
+  await page.locator("button", { hasText: "EDITOR" }).first().click();
   await page.waitForURL(/\/job\/[a-f0-9]+/, { timeout: 30_000 });
 
-  // Poll until synced
+  // Poll until synced. Sync state lives per-video these days
+  // (videos[i].sync), not in a job-level status field.
   const t0 = Date.now();
   let lastStatus = null;
   while (Date.now() - t0 < 600_000) {
     const job = await dumpJob(page);
-    if (job?.status !== lastStatus) {
-      console.log(`  status=${job?.status} pct=${job?.progress?.pct}`);
-      lastStatus = job?.status;
+    const vids = job?.videos ?? [];
+    const status =
+      job?.error ? "failed"
+      : vids.length > 0 && vids.every((v) => v.sync) ? "synced"
+      : "syncing";
+    if (status !== lastStatus) {
+      console.log(`  status=${status} (${vids.filter((v) => v.sync).length}/${vids.length} cams)`);
+      lastStatus = status;
     }
-    if (job?.status === "synced") return job;
-    if (job?.status === "failed") throw new Error(`sync failed: ${job.error}`);
+    if (status === "synced") return job;
+    if (status === "failed") throw new Error(`sync failed: ${job.error}`);
     await page.waitForTimeout(800);
   }
   throw new Error("timeout waiting for sync");
@@ -193,23 +218,31 @@ async function addCutsAndRender(page, jobId, cuts, name) {
   await page.waitForTimeout(3500);
   await shot(page, `${name}-editor-with-cuts`);
 
+  // A completed render is signalled by job.lastRender (completedAt +
+  // outputBytes), not a job-level status field — baseline it pre-click.
+  const prevRenderAt = (await dumpJob(page))?.lastRender?.completedAt ?? 0;
+
   // Click "Render" button in the editor.
   await page.getByRole("button", { name: /^render$|^rendering/i }).click({ timeout: 3000 });
   await page.waitForTimeout(800);
+  await shot(page, `${name}-render-screen`);
 
   // Wait for render to land.
   const t0 = Date.now();
-  let lastStatus = null;
-  while (Date.now() - t0 < 600_000) {
+  while (Date.now() - t0 < 300_000) {
     const job = await dumpJob(page);
-    if (job?.status !== lastStatus) {
-      console.log(`  render status=${job?.status} pct=${job?.progress?.pct}`);
-      lastStatus = job?.status;
-    }
-    if (job?.status === "rendered") return { ok: true, bytes: job.outputBytes };
-    if (job?.status === "failed") return { ok: false, error: job.error };
+    const lr = job?.lastRender;
+    if (lr && lr.completedAt > prevRenderAt)
+      return { ok: true, bytes: lr.outputBytes };
+    const failText = await page
+      .locator("text=/render failed|Rendering failed/i")
+      .first()
+      .textContent({ timeout: 200 })
+      .catch(() => null);
+    if (failText) return { ok: false, error: failText.trim() };
     await page.waitForTimeout(1500);
   }
+  await shot(page, `${name}-render-timeout`);
   return { ok: false, error: "render timeout" };
 }
 

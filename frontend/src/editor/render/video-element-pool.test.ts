@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { VideoElementPool, type VideoCam } from "./video-element-pool";
-import type { VideoClip } from "../types";
+import type { VideoClip } from "../../core/types";
 
 /** A controllable fake `<video>` — exposes the surface VideoElementPool
  *  reads/writes (readyState, currentTime, paused, videoWidth/Height,

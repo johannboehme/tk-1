@@ -9,26 +9,12 @@ import {
   jobsDb,
   type LocalJob,
 } from "../local/jobs";
-import { useRenderOp } from "../local/ops-store";
+import { useOpsStore, useRenderOp } from "../local/ops-store";
+import { renderStageLabel } from "./render-stages";
 
-const STAGE_LABELS: Record<string, string> = {
-  "render-prep": "Preparing",
-  "audio-decode": "Decoding audio",
-  "audio-encode": "Encoding audio",
-  "energy-curves": "Analyzing audio energy",
-  "extracting-frames": "Extracting preview frames",
-  encoding: "Encoding video",
-  "encoder-flush": "Flushing last frames",
-  muxing: "Muxing audio + video",
-  finalizing: "Finalizing file",
-  writing: "Writing MP4",
-  rendered: "Done",
-  cancelled: "Cancelled",
-};
-
-function stageLabel(stage: string): string {
-  return STAGE_LABELS[stage] ?? stage;
-}
+/** How long a missing op may stay missing after mount before the screen
+ *  switches from the progress console to "No render in progress" (#93). */
+const OP_GRACE_MS = 1500;
 
 function formatDuration(s: number): string {
   if (!isFinite(s) || s < 0) return "—";
@@ -51,6 +37,21 @@ export default function RenderScreen() {
   const samplesRef = useRef<Array<{ t: number; pct: number }>>([]);
   const [eta, setEta] = useState<number | null>(null);
   const op = useRenderOp(id);
+  // Render ops die with the tab (the store starts empty on reload), so
+  // "no op" after a refresh or a direct navigation means nothing is
+  // rendering — not "starting". The editor kicks off runEditRender
+  // right before navigating here and the op appears after a job lookup,
+  // so give it a short grace window before declaring the screen empty.
+  const [opGraceOver, setOpGraceOver] = useState(false);
+  useEffect(() => {
+    if (op) {
+      setOpGraceOver(false);
+      return;
+    }
+    const t = window.setTimeout(() => setOpGraceOver(true), OP_GRACE_MS);
+    return () => window.clearTimeout(t);
+  }, [op]);
+  const opMissing = !op && opGraceOver;
 
   useEffect(() => {
     if (!id) return;
@@ -91,10 +92,16 @@ export default function RenderScreen() {
   }, [op?.pct, op?.stage, op]);
 
   // Auto-navigate when the render finishes. We give the success path a
-  // brief moment so the user sees "Done" before the page swaps.
+  // brief moment so the user sees "Done" before the page swaps. The op
+  // is cleared on the way out — its result now lives on the job
+  // (`lastRender`), so keeping a done-op around would leave History
+  // showing a perpetual RENDER badge (#92).
   useEffect(() => {
     if (!op?.done) return;
-    const t = window.setTimeout(() => navigate(`/job/${id}`), 600);
+    const t = window.setTimeout(() => {
+      navigate(`/job/${id}`);
+      useOpsStore.getState().clearRenderOp(id);
+    }, 600);
     return () => window.clearTimeout(t);
   }, [op?.done, id, navigate]);
 
@@ -103,6 +110,10 @@ export default function RenderScreen() {
     setCancelling(true);
     try {
       await cancelEditRender(id);
+      // cancelEditRender flags the op with error:"cancelled" for any
+      // screen that's still watching; we're leaving, so drop it — a
+      // deliberate cancel must not linger as a FAIL badge (#92).
+      useOpsStore.getState().clearRenderOp(id);
     } finally {
       navigate(`/job/${id}/edit`);
     }
@@ -117,11 +128,12 @@ export default function RenderScreen() {
   const isDone = op?.done === true;
 
   const headline = useMemo(() => {
+    if (opMissing) return "No render in progress";
     if (isDone) return "Render done";
     if (isCancelled) return "Cancelled";
     if (isFailed) return "Render failed";
     return "Rendering…";
-  }, [isDone, isFailed, isCancelled]);
+  }, [opMissing, isDone, isFailed, isCancelled]);
 
   return (
     <main className="flex-1 flex items-center justify-center px-4 sm:px-6 py-10">
@@ -141,10 +153,20 @@ export default function RenderScreen() {
           )}
         </header>
 
-        {!isFailed && (
+        {opMissing && (
+          <section className="bg-paper-hi border border-rule rounded-md p-5">
+            <p className="text-sm text-ink-2 leading-relaxed">
+              Nothing is being exported for this job in this tab. A render
+              does not survive a reload — if one was running when the tab
+              closed, start it again from the editor.
+            </p>
+          </section>
+        )}
+
+        {!isFailed && !opMissing && (
           <section className="bg-paper-hi border border-rule rounded-md p-5 flex flex-col gap-3">
             <div className="flex items-center justify-between font-mono text-[11px] tracking-label uppercase text-ink-2">
-              <span>{stageLabel(stage)}</span>
+              <span>{renderStageLabel(stage)}</span>
               <span className="tabular text-ink">{Math.round(pct)}%</span>
             </div>
             <div className="h-3 rounded-full bg-paper border border-rule overflow-hidden">
@@ -185,7 +207,25 @@ export default function RenderScreen() {
         )}
 
         <div className="flex flex-wrap gap-3">
-          {!isDone && !isFailed && !isCancelled && (
+          {opMissing && (
+            <>
+              <ChunkyButton
+                variant="primary"
+                size="lg"
+                onClick={() => navigate(`/job/${id}/edit`)}
+              >
+                Back to editor
+              </ChunkyButton>
+              <ChunkyButton
+                variant="ghost"
+                size="lg"
+                onClick={() => navigate(`/job/${id}`)}
+              >
+                Job overview
+              </ChunkyButton>
+            </>
+          )}
+          {!opMissing && !isDone && !isFailed && !isCancelled && (
             <ChunkyButton
               variant="ghost"
               size="lg"

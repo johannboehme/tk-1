@@ -26,16 +26,16 @@ import {
 } from "./edit";
 import { opfs } from "../../storage/opfs";
 import { loadAsset } from "../asset-source";
-import type { BackendCapabilities } from "../../editor/render/factory";
-import { probeWebGPUVideoFrameUpload } from "../capabilities";
+import type { BackendCapabilities } from "../../core/render/factory";
+import { probeWebGPUVideoFrameUpload } from "../../core/capabilities";
 import { ShowwavesVisualizer } from "./visualizer/showwaves";
 import { ShowfreqsVisualizer } from "./visualizer/showfreqs";
 import type { Visualizer } from "./visualizer/types";
 import type { TextOverlay, EnergyCurves } from "./ass-builder";
 import type { Cut } from "../../storage/jobs-db";
-import type { PunchFx } from "../../editor/fx/types";
-import type { GradeParams } from "../../editor/fx/looks";
-import type { FilterSlot } from "../../editor/fx/types";
+import type { PunchFx } from "../../core/fx/types";
+import type { GradeParams } from "../../core/fx/looks";
+import type { FilterSlot } from "../../core/fx/types";
 
 export type VisualizerWorkerDescriptor =
   | { type: "showwaves"; pcm: Float32Array; sampleRate: number }
@@ -71,7 +71,7 @@ export interface CamWorkerInput {
   flipY?: boolean;
   /** Per-element Stage placement (cover-fit + scale + translate).
    *  Plumbed through to the compositor so render = preview placement. */
-  viewportTransform?: import("../../editor/types").ViewportTransform;
+  viewportTransform?: import("../../core/types").ViewportTransform;
 }
 
 export interface EditWorkerInput {
@@ -84,7 +84,7 @@ export interface EditWorkerInput {
   /** Long-form arrangement-mode pills. Honoured when present alongside
    *  non-empty `segments`; the renderer composes video off the pill
    *  table instead of the cams' contiguous master ranges. */
-  pills?: import("../../editor/types").Pill[];
+  pills?: import("../../core/types").Pill[];
   /** Master-timeline duration; defaults to longest cam's end. */
   masterDurationS?: number;
 
@@ -104,7 +104,7 @@ export interface EditWorkerInput {
   beatsPerBar?: number;
   /** Normalized master-loudness curve (0..1 over master seconds) for
    *  sidechain FX modulation. Transferred (Float32Array) from the host. */
-  audioEnv?: import("../../editor/fx/modulation").AudioEnvelope | null;
+  audioEnv?: import("../../core/fx/modulation").AudioEnvelope | null;
   /** The single global color grade — same shape the editor store holds. */
   colorGrade?: GradeParams;
   /** The opinionated filter stack — same shape the editor store holds; passed

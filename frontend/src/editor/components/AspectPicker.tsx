@@ -3,7 +3,7 @@
 // switches the panel into custom mode and de-selects all chips here.
 // (Keeping "custom" in the chip group made the segment overflow on
 // narrow side-panels and the bottom-sheet on phones.)
-import type { AspectRatio } from "../types";
+import type { AspectRatio } from "../../core/types";
 import { ASPECT_RATIO_PRESETS } from "../exportPresets";
 import { SegmentedControl } from "./SegmentedControl";
 

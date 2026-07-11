@@ -32,12 +32,12 @@ import { useEditorStore } from "../store";
 import {
   buildElementFitRect,
   DEFAULT_VIEWPORT_TRANSFORM,
-} from "../render/element-transform";
-import { resolveOutputDims } from "../output-frame";
+} from "../../core/render/element-transform";
+import { resolveOutputDims } from "../../core/output-frame";
 import {
   clipEffectiveDisplayDims,
   type ViewportTransform,
-} from "../types";
+} from "../../core/types";
 
 // Default speeds tuned for trackpad / scroll-wheel control. Alt-held
 // gives an extra ~4–5× precision boost for fine framing.

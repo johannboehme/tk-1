@@ -1,40 +1,16 @@
 /**
- * Pure math + side-effect-free helpers for the live A/V offset preview loop.
+ * Loop/trim region primitives shared by the editor store and the
+ * arrangement-loop helpers.
  *
- * Why this lives behind a pure interface:
- *   AudioContext can't be exercised in jsdom, so the testable "what should
- *   happen" lives here as pure functions. The thin DOM-touching part lives in
- *   useAudioMaster.ts and is validated manually with real footage.
+ * `LoopRegion`/`TrimRegion` are the store's user-facing marker shapes;
+ * `clampLoopRegion` is the legacy direct-mode clamp that
+ * `clampLoopToBounds` (arrangement-loop.ts) falls back to when no
+ * arrangement segments exist yet (pre-load store snapshot).
  *
- * Sign convention for `totalOffsetMs`:
- *   POSITIVE  = studio audio should LAG video by this many ms
- *               (= the studio sample heard at video=t was recorded at t-offset)
- *   NEGATIVE  = studio audio should LEAD video
- *
- * This matches the algorithm's existing `sync_offset_ms`.
+ * Loop *scheduling* — wrap geometry, crossfade arming, the two-`<audio>`
+ * ping-pong — lives in useAudioMaster.ts + arrangement-loop.ts. This
+ * module deliberately contains no scheduling logic.
  */
-
-export interface ComputeOffsetArgs {
-  videoTime: number;
-  totalOffsetMs: number;
-  audioDuration?: number;
-}
-
-/**
- * Given the current video time and the desired total offset (algorithm +
- * user override), return the position inside the AudioBuffer to start playing
- * from. Returns null if the requested position falls outside the buffer.
- */
-export function computeAudioStartOffset({
-  videoTime,
-  totalOffsetMs,
-  audioDuration,
-}: ComputeOffsetArgs): number | null {
-  const start = videoTime - totalOffsetMs / 1000;
-  if (start < 0) return 0;
-  if (audioDuration !== undefined && start >= audioDuration) return null;
-  return start;
-}
 
 export interface LoopRegion {
   start: number;
@@ -59,86 +35,4 @@ export function clampLoopRegion(
   const end = Math.min(loop.end, trim.out);
   if (end <= start) return null;
   return { start, end };
-}
-
-/**
- * Should we re-seek + re-schedule the audio source? Triggers on:
- *   - playhead crossed past loop.end → wrap back to start
- *   - playhead jumped before loop.start (user scrubbed) → restart loop
- *
- * `pendingWrapAt` overrides the default trigger: while it's set (non-null)
- * the only condition that matters is `videoTime >= pendingWrapAt`. Used by
- * the OP-1 style loop-shift, where the loop region jumps ahead but the
- * playhead must keep playing in the now-out-of-loop zone until it reaches
- * the *old* loop end.
- *
- * Kept as the legacy "wrap now" predicate. The new audio-master uses
- * `shouldArmCrossfade` to schedule a sample-accurate AudioContext
- * crossfade slightly *before* the wrap point — eliminating the click
- * that `currentTime`-seek-based looping can't avoid.
- */
-export function shouldRescheduleOnTick({
-  videoTime,
-  loop,
-  pendingWrapAt,
-}: {
-  videoTime: number;
-  loop: LoopRegion | null;
-  pendingWrapAt?: number | null;
-}): boolean {
-  if (!loop) return false;
-  if (pendingWrapAt != null) return videoTime >= pendingWrapAt;
-  return videoTime >= loop.end || videoTime < loop.start;
-}
-
-/**
- * Master-time at which the audio loop should wrap. Returns
- * `pendingWrapAt` when set (OP-1 deferred shift, wrap at OLD loop.end),
- * otherwise `loop.end`. `null` when no loop is configured.
- */
-export function loopWrapTime(
-  loop: LoopRegion | null,
-  pendingWrapAt: number | null | undefined,
-): number | null {
-  if (!loop) return null;
-  return pendingWrapAt ?? loop.end;
-}
-
-/**
- * Should the audio master arm a crossfade now? Used per RAF tick.
- *
- * "Arm" = schedule a sample-accurate gain crossfade on the AudioContext
- * a few tens of ms before the wrap point. The crossfade itself fires
- * later on the audio render thread; arming is the only main-thread
- * action involved in a loop wrap.
- *
- * Returns true when the playhead is within `leadTimeS` of the wrap
- * point (or has already crossed it after a RAF stall), AND we haven't
- * already armed for this wrap. Also returns true when the playhead
- * sits before `loop.start` with no pending wrap — a user-scrub-back
- * that should restart the loop ASAP.
- */
-export function shouldArmCrossfade({
-  masterT,
-  loop,
-  pendingWrapAt,
-  leadTimeS,
-  alreadyArmed,
-}: {
-  masterT: number;
-  loop: LoopRegion | null;
-  pendingWrapAt?: number | null;
-  leadTimeS: number;
-  alreadyArmed: boolean;
-}): boolean {
-  if (!loop) return false;
-  if (alreadyArmed) return false;
-
-  // User scrubbed before loop.start while no wrap is pending → arm
-  // immediately so the loop restarts at the next AudioContext-scheduled
-  // moment.
-  if (pendingWrapAt == null && masterT < loop.start) return true;
-
-  const wrapT = pendingWrapAt ?? loop.end;
-  return masterT >= wrapT - leadTimeS;
 }

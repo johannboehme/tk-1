@@ -15,8 +15,8 @@
  * Editieren passiert ausschließlich über Hotkeys + Pad-Buttons.
  */
 import { useMemo } from "react";
-import type { FxKind, PunchFx } from "../../fx/types";
-import { fxCatalog } from "../../fx/catalog";
+import type { FxKind, PunchFx } from "../../../core/fx/types";
+import { fxCatalog } from "../../../core/fx/catalog";
 
 interface Props {
   fx: readonly PunchFx[];

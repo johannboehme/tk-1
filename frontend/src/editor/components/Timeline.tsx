@@ -12,6 +12,7 @@
  * playhead a single straight line spanning every lane.
  */
 import {
+  memo,
   PointerEvent as ReactPointerEvent,
   useCallback,
   useEffect,
@@ -20,7 +21,7 @@ import {
   useState,
 } from "react";
 import { useEditorStore } from "../store";
-import { clipRangeS, isVideoClip, type Clip, type Pill } from "../types";
+import { clipRangeS, isVideoClip, type Clip, type Pill } from "../../core/types";
 import {
   arrToMaster,
   masterToArr,
@@ -29,9 +30,13 @@ import {
   segmentIndexAtArr,
   sliceByArrSegments,
   totalArrDuration,
-} from "../arrangement-time";
-import { isPillDirty } from "../arrangement-pills";
+  trimHandlesArr,
+} from "../../core/arrangement-time";
+import { trimWindowArr } from "../arrangement-loop";
+import { isPillDirty } from "../../core/arrangement-pills";
 import { LaneHeader, type CamStatus } from "./timeline/LaneHeader";
+import { createLaneCallbacksCache } from "./timeline/lane-callbacks";
+import { decidePillPointerDown } from "./timeline/pill-pointer";
 import { AddMediaButton } from "./AddMediaButton";
 import { ProgramStrip } from "./timeline/ProgramStrip";
 import { tapeHeightForMode } from "./timeline/tape-height";
@@ -39,7 +44,7 @@ import { SegmentedControl } from "./SegmentedControl";
 import { BeatRuler } from "./timeline/BeatRuler";
 import { BpmReadout } from "./BpmReadout";
 import { SnapModeButtons } from "./SnapModeButtons";
-import { snapTime, type SnapCtx, type SnapMode } from "../snap";
+import { snapTime, type SnapCtx, type SnapMode } from "../../core/snap";
 import {
   buildClipMatchPositions,
   candidateIdxNearestStart,
@@ -51,9 +56,9 @@ import {
 } from "../selectors/timing";
 import { BarsHeader } from "./timeline/BarsHeader";
 import { useIsNarrowViewport } from "../use-is-narrow";
-import { MASTER_AUDIO_ID } from "../types";
-import { drawWaveform, EDITOR_STYLE } from "../../local/waveform/draw-waveform";
-import type { PeakPyramid } from "../../local/waveform/peak-pyramid";
+import { MASTER_AUDIO_ID } from "../../core/types";
+import { drawWaveform, EDITOR_STYLE } from "../../core/waveform/draw-waveform";
+import type { PeakPyramid } from "../../core/waveform/peak-pyramid";
 
 import { clamp } from "../../lib/clamp";
 interface CamAssetInfo {
@@ -191,7 +196,17 @@ export function Timeline({
       viewport: el.clientHeight,
     });
   };
+  // Stable callback for the memo()ed VerticalFaderThumb — an inline
+  // closure would put the fader DOM back on the 60 Hz render path.
+  const faderScrollTo = useCallback((t: number) => {
+    if (laneStackRef.current) laneStackRef.current.scrollTop = t;
+  }, []);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  // Stacked playhead layer. During playback the ONLY per-frame pixel change
+  // is the playhead line, so it lives on its own transparent canvas above
+  // the scene canvas — the expensive multi-lane raster below redraws only
+  // on scroll/zoom/data changes, never per playback tick.
+  const overlayRef = useRef<HTMLCanvasElement>(null);
   const [canvasWidth, setCanvasWidth] = useState(800);
   const dragRef = useRef<DragKind | null>(null);
 
@@ -221,8 +236,6 @@ export function Timeline({
   const setPillRightEdgeArrEndS = useEditorStore(
     (s) => s.setPillRightEdgeArrEndS,
   );
-  const resetClipAlignment = useEditorStore((s) => s.resetClipAlignment);
-  const resetPillsForCam = useEditorStore((s) => s.resetPillsForCam);
   const resetPill = useEditorStore((s) => s.resetPill);
   const setSelectedCandidateIdx = useEditorStore(
     (s) => s.setSelectedCandidateIdx,
@@ -310,14 +323,18 @@ export function Timeline({
   // Trim window + audio-start marker projected into arr-time. Both are
   // master-time values that rarely change; projecting them per redraw
   // (60 Hz during playback) re-scans the whole segment list for nothing.
-  const trimProjection = useMemo(
-    () => ({
+  const trimProjection = useMemo(() => {
+    // Handle positions use the range-endpoint projector: trim.out equal
+    // to a segment's end (the loadJob default) still yields a handle,
+    // and endpoints in gaps clamp to the playable window's boundary —
+    // `mastersToArrAll`'s half-open point test would drop both (#101).
+    const handles = trimHandlesArr(trim.in, trim.out, arrangementSegments);
+    return {
       playableSlices: sliceByArrSegments(trim.in, trim.out, arrangementSegments),
-      trimInArrPositions: mastersToArrAll(trim.in, arrangementSegments),
-      trimOutArrPositions: mastersToArrAll(trim.out, arrangementSegments),
-    }),
-    [trim.in, trim.out, arrangementSegments],
-  );
+      trimInArrPositions: handles.inPositions,
+      trimOutArrPositions: handles.outPositions,
+    };
+  }, [trim.in, trim.out, arrangementSegments]);
   // Stable ProgramStrip callbacks — the strip is memo()ed, so handing it
   // fresh closures every render would defeat that and put its DOM
   // reconciliation back on the 60 Hz playback path.
@@ -376,6 +393,25 @@ export function Timeline({
   );
 
   const takePromoteTimerRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+
+  // Stable per-cam LaneHeader callbacks. LaneHeader is memo()ed to stay
+  // off the 60 Hz playback render path; fresh inline closures per render
+  // would defeat that. The cache creates each cam's five handlers once
+  // and they read live state via getState() at call time. onDeleteClip
+  // is resolved through a ref so an Editor re-render swapping the prop
+  // closure doesn't invalidate the cached identities.
+  const onDeleteClipRef = useRef(onDeleteClip);
+  useEffect(() => {
+    onDeleteClipRef.current = onDeleteClip;
+  });
+  const laneCallbacksForRef = useRef<ReturnType<typeof createLaneCallbacksCache> | null>(null);
+  if (!laneCallbacksForRef.current) {
+    laneCallbacksForRef.current = createLaneCallbacksCache(
+      takePromoteTimerRef.current,
+      () => onDeleteClipRef.current,
+    );
+  }
+  const laneCallbacksFor = laneCallbacksForRef.current;
 
   const duration = jobMeta?.duration || audioDuration || 0;
   // Composed-timeline total. arrangementSegments is invariantly non-empty
@@ -440,10 +476,18 @@ export function Timeline({
   }, [timelineT, currentTimeView, viewStart, viewEnd, timelineStartS, maxScroll, clampedScroll, setScrollX]);
 
   // ---- Layout offsets (canvas y-coordinates per lane) ----
-  const videoBands = clips.map((_, i) => ({
-    top: i * videoLaneHeight,
-    bottom: (i + 1) * videoLaneHeight,
-  }));
+  // Memoized: the bands are a dep of the scene draw effect, and a fresh
+  // array per render would invalidate that effect on EVERY component
+  // render (60 Hz during playback) even though the geometry only moves
+  // when lanes are added/removed or resized.
+  const videoBands = useMemo(
+    () =>
+      Array.from({ length: clips.length }, (_, i) => ({
+        top: i * videoLaneHeight,
+        bottom: (i + 1) * videoLaneHeight,
+      })),
+    [clips.length, videoLaneHeight],
+  );
   const audioBand = {
     top: clips.length * videoLaneHeight,
     bottom: clips.length * videoLaneHeight + audioLaneHeight,
@@ -608,6 +652,12 @@ export function Timeline({
   const stripDuration = arrTotal;
 
   // ---- Active-cam status per lane (drives LED color) ----
+  // activeCamId resolves through activeCamAtArr(cuts, t, pills, segments),
+  // so pills / segments / timelineT belong in the deps: while PAUSED
+  // (currentTime frozen) a pill drag/trim/reset under the playhead changes
+  // which cam is ON-AIR and the LED must follow immediately (#136).
+  // During playback timelineT ticks alongside currentTime, so this adds
+  // no recompute pressure over the existing 60 Hz path.
   const camStatusByCamId = useMemo(() => {
     const result: Record<string, CamStatus> = {};
     const activeId = useEditorStore.getState().activeCamId(timelineT);
@@ -623,7 +673,7 @@ export function Timeline({
       result[cam.id] = status;
     }
     return result;
-  }, [clips, cuts, currentTime]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [clips, cuts, pills, arrangementSegments, currentTime, timelineT]);
 
   // ---- Canvas drawing ----
   useEffect(() => {
@@ -900,6 +950,66 @@ export function Timeline({
       );
     }
 
+    // Playhead + quantize ghosts live on the stacked overlay canvas (see
+    // the effect below) so this scene raster never re-runs per playback
+    // frame. Deliberately NOT in the deps: playback.timelineT/currentTime.
+  }, [
+    canvasWidth,
+    canvasH,
+    audioBand.top,
+    audioLaneHeight,
+    videoLaneHeight,
+    viewStart,
+    viewEnd,
+    visibleDur,
+    pyramid,
+    arrangementSegments,
+    arrTToX,
+    loop,
+    clips,
+    cams,
+    selectedClipId,
+    camImagesReady,
+    tToX,
+    videoBands,
+    snapMode,
+    pillsByCamId,
+    selectedPillId,
+    segGeometry,
+    trimProjection,
+    // Re-draw when the audio-start marker shifts (raw or user-nudged) so
+    // the orange flag tracks the SyncTuner knob in real time.
+    audioStartArrPositions,
+    // Re-draw when overflow toggles so the audio-lane clip-rect picks up
+    // the new audioRightX. Without these, initial mount captures the
+    // pre-measure {height:0, viewport:0} state and the audio lane gets
+    // painted under the fader thumb forever.
+    laneScroll.height,
+    laneScroll.viewport,
+  ]);
+
+  // ---- Playhead overlay drawing ----
+  // Transparent canvas stacked on the scene canvas. Redraws per playback
+  // frame, but only clears + strokes one line and a 12-px grip — the
+  // per-frame raster cost of the timeline is exactly this. The scene
+  // below only redraws on scroll/zoom/data changes.
+  useEffect(() => {
+    const canvas = overlayRef.current;
+    if (!canvas || canvasWidth === 0) return;
+    const dpr = window.devicePixelRatio || 1;
+    const bsW = Math.max(1, Math.floor(canvasWidth * dpr));
+    const bsH = Math.max(1, Math.floor(canvasH * dpr));
+    // Backing-store realloc only when the geometry actually changed —
+    // assigning canvas.width clears the canvas even at the same value.
+    if (canvas.width !== bsW) canvas.width = bsW;
+    if (canvas.height !== bsH) canvas.height = bsH;
+    canvas.style.width = `${canvasWidth}px`;
+    canvas.style.height = `${canvasH}px`;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, canvasWidth, canvasH);
+
     // Playhead — spans all lanes. Snap to a half-pixel column so the
     // 1.5-px stroke renders crisply on the SAME canvas-x as the
     // BeatRuler's `Math.floor(x)` bar tick. Without the snap the
@@ -928,27 +1038,46 @@ export function Timeline({
     ctx.fill();
 
     // Q-hold quantize preview: ghost markers at the snapped target
-    // positions. Drawn last so they overlay every lane.
+    // positions — for cuts AND fx edges, the complete quantize scope
+    // (#70). On the overlay (not the scene) to keep the pre-split
+    // z-order: ghosts paint over every lane and over the playhead.
     if (quantizePreview) {
+      // Collect every pending target/origin position once so cuts and fx
+      // edges render through the same two passes.
+      const ghostTargets: number[] = [];
+      const ghostOrigins: number[] = [];
+      for (const change of quantizePreview.cuts) {
+        ghostTargets.push(change.to);
+        ghostOrigins.push(change.from);
+      }
+      for (const change of quantizePreview.fxs) {
+        if (change.in) {
+          ghostTargets.push(change.in.to);
+          ghostOrigins.push(change.in.from);
+        }
+        if (change.out) {
+          ghostTargets.push(change.out.to);
+          ghostOrigins.push(change.out.from);
+        }
+      }
       ctx.save();
-      ctx.fillStyle = "rgba(0, 102, 204, 0.85)"; // cobalt
-      ctx.strokeStyle = "rgba(0, 102, 204, 0.85)";
+      ctx.strokeStyle = "rgba(0, 102, 204, 0.85)"; // cobalt
       ctx.lineWidth = 2;
       ctx.setLineDash([4, 3]);
-      for (const change of quantizePreview.cuts) {
-        const xTo = tToX(change.to);
+      for (const t of ghostTargets) {
+        const xTo = tToX(t);
         if (xTo < -2 || xTo > canvasWidth + 2) continue;
         ctx.beginPath();
         ctx.moveTo(xTo, 0);
         ctx.lineTo(xTo, canvasH);
         ctx.stroke();
       }
-      // Faded "from" line for each off-grid cut (visual hint of the move).
+      // Faded "from" line for each off-grid marker (visual hint of the move).
       ctx.strokeStyle = "rgba(0, 0, 0, 0.25)";
       ctx.lineWidth = 1;
       ctx.setLineDash([2, 4]);
-      for (const change of quantizePreview.cuts) {
-        const xFrom = tToX(change.from);
+      for (const t of ghostOrigins) {
+        const xFrom = tToX(t);
         if (xFrom < -2 || xFrom > canvasWidth + 2) continue;
         ctx.beginPath();
         ctx.moveTo(xFrom, 0);
@@ -957,48 +1086,7 @@ export function Timeline({
       }
       ctx.restore();
     }
-  }, [
-    canvasWidth,
-    canvasH,
-    audioBand.top,
-    audioLaneHeight,
-    videoLaneHeight,
-    viewStart,
-    viewEnd,
-    visibleDur,
-    duration,
-    pyramid,
-    audioDuration,
-    trim.in,
-    trim.out,
-    arrangementSegments,
-    arrTotal,
-    arrTToX,
-    timelineT,
-    loop,
-    currentTime,
-    clips,
-    cams,
-    selectedClipId,
-    camImagesReady,
-    tToX,
-    videoBands,
-    snapMode,
-    quantizePreview,
-    pillsByCamId,
-    selectedPillId,
-    segGeometry,
-    trimProjection,
-    // Re-draw when the audio-start marker shifts (raw or user-nudged) so
-    // the orange flag tracks the SyncTuner knob in real time.
-    audioStartArrPositions,
-    // Re-draw when overflow toggles so the audio-lane clip-rect picks up
-    // the new audioRightX. Without these, initial mount captures the
-    // pre-measure {height:0, viewport:0} state and the audio lane gets
-    // painted under the fader thumb forever.
-    laneScroll.height,
-    laneScroll.viewport,
-  ]);
+  }, [canvasWidth, canvasH, timelineT, arrTToX, tToX, quantizePreview]);
 
   // ---- Hit-testing & drag ----
 
@@ -1098,13 +1186,13 @@ export function Timeline({
     // Trim handles render at every arr-time occurrence of trim.in /
     // trim.out — a chunk repeated in long-form yields N draggable
     // handles that all wire to the same master-time value. Hit-test
-    // every occurrence so any of them can start a drag.
-    const trimInArr = mastersToArrAll(trim.in, arrangementSegments);
-    for (const arrT of trimInArr) {
+    // every occurrence so any of them can start a drag. Reuses the
+    // memoized projection the draw pass renders from, so what's drawn
+    // and what's grabbable can never diverge.
+    for (const arrT of trimProjection.trimInArrPositions) {
       if (Math.abs(x - arrTToX(arrT)) <= HANDLE_HIT) return "trim-in";
     }
-    const trimOutArr = mastersToArrAll(trim.out, arrangementSegments);
-    for (const arrT of trimOutArr) {
+    for (const arrT of trimProjection.trimOutArrPositions) {
       if (Math.abs(x - arrTToX(arrT)) <= HANDLE_HIT) return "trim-out";
     }
     if (Math.abs(x - xp) <= HANDLE_HIT) return "playhead";
@@ -1278,10 +1366,17 @@ export function Timeline({
       if (pillHit) {
         const p = pills.find((pp) => pp.id === pillHit.pillId);
         if (p) {
-          // Floating ↺ reset-button → revert this pill, no drag.
-          // Allowed regardless of lock state — it's a destructive-revert
-          // action, not an edit gesture.
-          if (pillHit.zone === "reset") {
+          // Pure decision (which gesture, whether to seek) lives in
+          // pill-pointer.ts with the full behavior matrix under test —
+          // including the "loop active → select only, never seek"
+          // invariant. This block just executes the decision.
+          const decision = decidePillPointerDown({
+            zone: pillHit.zone,
+            loopActive: loop !== null,
+            lanesLocked,
+            snapMode,
+          });
+          if (decision.kind === "reset-pill") {
             resetPill(p.id);
             return;
           }
@@ -1290,21 +1385,12 @@ export function Timeline({
           // even when drag is intentionally disabled.
           setSelectedPillId(p.id);
           setSelectedClipId(p.camId);
-          if (lanesLocked) {
-            // Lock on → no drag setup. A locked pill click normally also
-            // scrubs so the playhead follows the pointer — but NOT while a
-            // loop is engaged. A scrub onto a pill outside the loop lands
-            // out of the loop region, and the audio walker's immediate-wrap
-            // (useAudioMaster) yanks playback straight back to loop.start,
-            // so the picked pill could never be auditioned. With a loop
-            // active, select only and leave the loop running untouched.
-            if (!loop) {
-              seekFromX(x, snapped(tRaw, e));
-              dragRef.current = { kind: "playhead" };
-            }
-            return;
+          if (decision.seek) {
+            seekFromX(x, snapped(tRaw, e));
           }
-          if (pillHit.zone === "left") {
+          if (decision.drag === "playhead") {
+            dragRef.current = { kind: "playhead" };
+          } else if (decision.drag === "pill-trim-in") {
             dragRef.current = {
               kind: "pill-trim-in",
               pillId: p.id,
@@ -1312,7 +1398,7 @@ export function Timeline({
               origArrEndS: p.arrEndS,
               origSourceInS: p.sourceInS,
             };
-          } else if (pillHit.zone === "right") {
+          } else if (decision.drag === "pill-trim-out") {
             dragRef.current = {
               kind: "pill-trim-out",
               pillId: p.id,
@@ -1320,40 +1406,38 @@ export function Timeline({
               origArrEndS: p.arrEndS,
               origSourceOutS: p.sourceOutS,
             };
-          } else {
-            const arrAtGrab =
-              viewStart + (x / canvasWidth) * visibleDur;
+          } else if (decision.drag === "cam-track-move") {
             // MATCH snap-mode promotes the body-drag from a single
             // pill move to a CAM-TRACK move: every pill of this
             // camera shifts in lockstep so the user can align the
             // whole take against a candidate-implied anchor.
-            if (snapMode === "match") {
-              const origStartsByPillId: Record<string, number> = {};
-              for (const sib of pills) {
-                if (sib.camId === p.camId) {
-                  origStartsByPillId[sib.id] = sib.arrStartS;
-                }
+            const arrAtGrab = viewStart + (x / canvasWidth) * visibleDur;
+            const origStartsByPillId: Record<string, number> = {};
+            for (const sib of pills) {
+              if (sib.camId === p.camId) {
+                origStartsByPillId[sib.id] = sib.arrStartS;
               }
-              const camClip = clips.find((c) => c.id === p.camId);
-              const origMasterStartS =
-                camClip && isVideoClip(camClip)
-                  ? -(camClip.syncOffsetMs + camClip.syncOverrideMs) / 1000
-                  : 0;
-              dragRef.current = {
-                kind: "cam-track-move",
-                camId: p.camId,
-                grabArrT: arrAtGrab,
-                origStartsByPillId,
-                origMasterStartS,
-              };
-            } else {
-              dragRef.current = {
-                kind: "pill-move",
-                pillId: p.id,
-                grabArrT: arrAtGrab,
-                origArrStartS: p.arrStartS,
-              };
             }
+            const camClip = clips.find((c) => c.id === p.camId);
+            const origMasterStartS =
+              camClip && isVideoClip(camClip)
+                ? -(camClip.syncOffsetMs + camClip.syncOverrideMs) / 1000
+                : 0;
+            dragRef.current = {
+              kind: "cam-track-move",
+              camId: p.camId,
+              grabArrT: arrAtGrab,
+              origStartsByPillId,
+              origMasterStartS,
+            };
+          } else if (decision.drag === "pill-move") {
+            const arrAtGrab = viewStart + (x / canvasWidth) * visibleDur;
+            dragRef.current = {
+              kind: "pill-move",
+              pillId: p.id,
+              grabArrT: arrAtGrab,
+              origArrStartS: p.arrStartS,
+            };
           }
           return;
         }
@@ -1441,22 +1525,16 @@ export function Timeline({
     } else if (drag.kind === "loop" && loop) {
       // Loop drag operates in arr-time (the composed tape). Clamp to the
       // master-trim window projected through `arrangementSegments` so
-      // the loop can't escape the export region — same trim-universal
-      // contract clampLoopToBounds enforces on the store side.
+      // the loop can't escape the export region — the SAME projection
+      // clampLoopToBounds uses on the store side (`trimWindowArr`), so
+      // drag bounds can never diverge from what setLoop/moveLoop accept.
       const len = loop.end - loop.start;
       const arrAtPointer = viewStart + (x / canvasWidth) * visibleDur;
-      const arrTotalLocal = totalArrDuration(arrangementSegments);
-      const trimInArr = Math.max(
-        0,
-        Math.min(arrTotalLocal, masterToArr(trim.in, arrangementSegments)),
-      );
-      const trimOutArr = Math.max(
-        trimInArr,
-        Math.min(arrTotalLocal, masterToArr(trim.out, arrangementSegments)),
-      );
+      const window = trimWindowArr(trim, arrangementSegments);
+      if (!window) return;
       const newStartRaw = Math.max(
-        trimInArr,
-        Math.min(trimOutArr - len, arrAtPointer - drag.offset),
+        window.startArr,
+        Math.min(window.endArr - len, arrAtPointer - drag.offset),
       );
       // Loop bounds live in arr-time; snap against the master-bar-grid
       // anchored into arr-time so a long-form arrangement still snaps
@@ -1865,78 +1943,42 @@ export function Timeline({
           onScroll={updateLaneScroll}
         >
           <div className="shrink-0 flex flex-col" style={{ width: HEADER_W }}>
-            {clips.map((clip, i) => (
-              <LaneHeader
-                key={clip.id}
-                name={`Cam ${i + 1}`}
-                filename={clip.filename}
-                color={clip.color}
-                status={camStatusByCamId[clip.id] ?? "off"}
-                hotkeyLabel={i < 9 ? String(i + 1) : undefined}
-                selected={clip.id === selectedClipId}
-                pressed={holdGesture?.camId === clip.id}
-                painting={
-                  holdGesture?.camId === clip.id && holdGesture.painting
-                }
-                onSelectClip={() => setSelectedClipId(clip.id)}
-                // onTake is intentionally omitted — the cassette-rec
-                // model fires the immediate cut inside onTakeStart so a
-                // tap and a hold use one code path.
-                onTakeStart={() => {
-                  const s = useEditorStore.getState();
-                  // Single-active-hold guard: ignore if another TAKE is
-                  // already engaged (button or keyboard).
-                  if (s.holdGesture) return;
-                  const startS = s.snapTimelineTime(s.playback.timelineT);
-                  s.beginHoldGesture(clip.id, startS);
-                  s.addCut({ atTimeS: startS, camId: clip.id });
-                  const existing = takePromoteTimerRef.current.get(clip.id);
-                  if (existing) clearTimeout(existing);
-                  const t = setTimeout(() => {
-                    useEditorStore.getState().promoteHoldToPaint();
-                  }, 500);
-                  takePromoteTimerRef.current.set(clip.id, t);
-                }}
-                onTakeFinish={() => {
-                  const promoteT = takePromoteTimerRef.current.get(clip.id);
-                  if (promoteT) {
-                    clearTimeout(promoteT);
-                    takePromoteTimerRef.current.delete(clip.id);
+            {clips.map((clip, i) => {
+              const cbs = laneCallbacksFor(clip.id);
+              return (
+                <LaneHeader
+                  key={clip.id}
+                  name={`Cam ${i + 1}`}
+                  filename={clip.filename}
+                  color={clip.color}
+                  status={camStatusByCamId[clip.id] ?? "off"}
+                  hotkeyLabel={i < 9 ? String(i + 1) : undefined}
+                  selected={clip.id === selectedClipId}
+                  pressed={holdGesture?.camId === clip.id}
+                  painting={
+                    holdGesture?.camId === clip.id && holdGesture.painting
                   }
-                  const s2 = useEditorStore.getState();
-                  const hold = s2.holdGesture;
-                  // Only act on releases that match this clip's hold —
-                  // otherwise a stale onTakeFinish (after a cancelHold
-                  // via Esc) shouldn't re-apply anything.
-                  if (!hold || hold.camId !== clip.id) return;
-                  const endS = s2.snapTimelineTime(s2.playback.timelineT);
-                  if (hold.painting) {
-                    s2.applyHoldRelease(
-                      clip.id,
-                      hold.startS,
-                      endS,
-                      hold.priorCuts,
-                    );
+                  onSelectClip={cbs.onSelectClip}
+                  // onTake is intentionally omitted — the cassette-rec
+                  // model fires the immediate cut inside onTakeStart so a
+                  // tap and a hold use one code path (lane-callbacks.ts).
+                  onTakeStart={cbs.onTakeStart}
+                  onTakeFinish={cbs.onTakeFinish}
+                  canReset={
+                    isVideoClip(clip) &&
+                    (clip.syncOverrideMs !== 0 ||
+                      clip.startOffsetS !== 0 ||
+                      clip.selectedCandidateIdx !== 0 ||
+                      (pillsByCamId.get(clip.id)?.dirty.some(Boolean) ?? false))
                   }
-                  s2.endHoldGesture();
-                }}
-                canReset={
-                  isVideoClip(clip) &&
-                  (clip.syncOverrideMs !== 0 ||
-                    clip.startOffsetS !== 0 ||
-                    clip.selectedCandidateIdx !== 0 ||
-                    (pillsByCamId.get(clip.id)?.dirty.some(Boolean) ?? false))
-                }
-                onReset={() => {
-                  resetClipAlignment(clip.id);
-                  resetPillsForCam(clip.id);
-                }}
-                preparing={preparingCamIds.has(clip.id)}
-                onDelete={() => onDeleteClip?.(clip.id)}
-                height={videoLaneHeight}
-                compact={isNarrow}
-              />
-            ))}
+                  onReset={cbs.onReset}
+                  preparing={preparingCamIds.has(clip.id)}
+                  onDelete={onDeleteClip ? cbs.onDelete : undefined}
+                  height={videoLaneHeight}
+                  compact={isNarrow}
+                />
+              );
+            })}
             {/* MASTER · AUDIO header — narrower padding + abbreviated
              *  label on phone-sized viewports so the header stays inside
              *  the 64 px column. */}
@@ -1949,7 +1991,7 @@ export function Timeline({
               </span>
             </div>
           </div>
-          <div className="flex-1" style={{ width: canvasWidth }}>
+          <div className="flex-1 relative" style={{ width: canvasWidth }}>
             <canvas
               ref={canvasRef}
               onPointerDown={onPointerDown}
@@ -1977,6 +2019,14 @@ export function Timeline({
                 userSelect: "none",
               }}
             />
+            {/* Playhead overlay — transparent, hit-through. All pointer
+             *  interaction stays on the scene canvas below. */}
+            <canvas
+              ref={overlayRef}
+              aria-hidden
+              className="absolute left-0 top-0"
+              style={{ pointerEvents: "none", display: "block" }}
+            />
           </div>
         </div>
         {/* Vertical fader-thumb sits OUTSIDE the scroll container so it
@@ -1987,9 +2037,7 @@ export function Timeline({
           scrollTop={laneScroll.top}
           scrollHeight={laneScroll.height}
           viewport={laneScroll.viewport}
-          onScrollTo={(t) => {
-            if (laneStackRef.current) laneStackRef.current.scrollTop = t;
-          }}
+          onScrollTo={faderScrollTo}
         />
         </div>
 
@@ -2015,16 +2063,10 @@ export function Timeline({
               boxShadow: "inset 0 1px 2px rgba(0,0,0,0.18)",
             }}
           >
-            {/* Tick row in the track for a fader-rail feel */}
-            <div className="absolute inset-y-[3px] left-0 right-0 flex items-center justify-between pointer-events-none">
-              {Array.from({ length: 24 }).map((_, i) => (
-                <span
-                  key={i}
-                  className="w-px h-[6px] block"
-                  style={{ background: "rgba(0,0,0,0.18)" }}
-                />
-              ))}
-            </div>
+            {/* Tick row in the track for a fader-rail feel. Hoisted to a
+             *  module constant: constant element identity lets React skip
+             *  reconciling the 24 spans on every 60 Hz playback render. */}
+            {SCROLLBAR_TICK_ROW}
             <div
               className="absolute top-[2px] bottom-[2px] rounded-sm transition-opacity"
               style={{
@@ -2038,19 +2080,9 @@ export function Timeline({
                 pointerEvents: scrollbarVisible ? "auto" : "none",
               }}
             >
-              {/* Knurled grip lines on the thumb */}
-              <span
-                className="absolute inset-y-1 left-1/2 -translate-x-1/2 flex gap-[1px]"
-                style={{ width: 14 }}
-              >
-                {Array.from({ length: 5 }).map((_, i) => (
-                  <span
-                    key={i}
-                    className="w-[1px] h-full block"
-                    style={{ background: "rgba(0,0,0,0.22)" }}
-                  />
-                ))}
-              </span>
+              {/* Knurled grip lines on the thumb (constant element — see
+               *  SCROLLBAR_TICK_ROW). */}
+              {SCROLLBAR_THUMB_KNURL}
             </div>
           </div>
         </div>
@@ -2060,6 +2092,37 @@ export function Timeline({
 }
 
 // ---- helpers ----
+
+/** Static decorative rows of the hardware-mixer scrollbar. Hoisted to
+ *  module scope so their element identity is constant — React bails out
+ *  of reconciling these span rows on every Timeline render (60 Hz during
+ *  playback) instead of diffing 24 + 5 spans per frame. */
+const SCROLLBAR_TICK_ROW = (
+  <div className="absolute inset-y-[3px] left-0 right-0 flex items-center justify-between pointer-events-none">
+    {Array.from({ length: 24 }).map((_, i) => (
+      <span
+        key={i}
+        className="w-px h-[6px] block"
+        style={{ background: "rgba(0,0,0,0.18)" }}
+      />
+    ))}
+  </div>
+);
+
+const SCROLLBAR_THUMB_KNURL = (
+  <span
+    className="absolute inset-y-1 left-1/2 -translate-x-1/2 flex gap-[1px]"
+    style={{ width: 14 }}
+  >
+    {Array.from({ length: 5 }).map((_, i) => (
+      <span
+        key={i}
+        className="w-[1px] h-full block"
+        style={{ background: "rgba(0,0,0,0.22)" }}
+      />
+    ))}
+  </span>
+);
 
 /** One sub-pill of a clip — the projection of the clip's master-time
  *  range onto a single contiguous view-space window. In direct-mode there
@@ -2351,8 +2414,10 @@ function drawVideoLane({
 
 /** Hardware-fader vertical scrollbar — mirrors the horizontal one's
  *  cassette-aesthetic but rotated 90°. Visible only when the lane
- *  stack overflows. Pointer-drag the thumb to scroll. */
-function VerticalFaderThumb({
+ *  stack overflows. Pointer-drag the thumb to scroll. memo()ed (with a
+ *  stable onScrollTo from the Timeline) so plain playback renders skip
+ *  its tick/knurl DOM. */
+const VerticalFaderThumb = memo(function VerticalFaderThumb({
   scrollTop,
   scrollHeight,
   viewport,
@@ -2447,7 +2512,7 @@ function VerticalFaderThumb({
       </div>
     </div>
   );
-}
+});
 
 function drawHandle(ctx: CanvasRenderingContext2D, x: number, top: number, h: number) {
   ctx.fillStyle = "#1A1816";

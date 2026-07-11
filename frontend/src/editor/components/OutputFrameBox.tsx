@@ -16,7 +16,7 @@ import {
   computeOutputFrameBox,
   resolveOutputAspectRatio,
   type OutputFrameBox as Box,
-} from "../output-frame";
+} from "../../core/output-frame";
 
 interface Props {
   children: ReactNode;

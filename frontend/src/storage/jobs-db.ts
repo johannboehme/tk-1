@@ -379,6 +379,10 @@ export interface LocalJob {
   ui?: {
     snapMode?: "off" | "match" | "1" | "1/2" | "1/4" | "1/8" | "1/16";
     lanesLocked?: boolean;
+    /** Triage's MIN LCD filter (bars at the song-global tempo; 0 = off).
+     *  Feeds the effectively-accepted predicate that decides which
+     *  chunks ship into Arrange — must survive a reload. */
+    minChunkBars?: number;
   };
   /** Trim region (seconds). Mirrors editSpec.segments[0] but persisted on
    *  every drag, not only at render time. */
@@ -454,10 +458,18 @@ export interface LocalJob {
    *    - "v2-timeline" → cuts/fx are already timeline-time. No
    *      migration. New jobs are created with this stamp directly. */
   editorSchema?: "v1-master" | "v2-timeline";
+
+  /** Monotonically increasing revision of the EDITOR-owned state,
+   *  bumped by `updateJobGuarded` on every successful editor persist
+   *  (#129). Lets a stale tab detect that another tab has written newer
+   *  edits and refuse to clobber them. Absent on rows never touched by
+   *  the guarded path — treated as revision 0. Plain `updateJob` writes
+   *  (sync results, triage, renames) intentionally do not bump it. */
+  editRev?: number;
 }
 
-/** Persisted shape of `Pill` (from editor/types). Mirrored here to keep
- *  the storage layer free of editor-module imports. Same field semantics
+/** Persisted shape of `Pill` (from core/types). Mirrored here to keep
+ *  the storage layer free of upper-layer module imports. Same field semantics
  *  as the runtime type. */
 export interface PillRecord {
   id: string;
@@ -813,6 +825,50 @@ async function updateJob(id: string, patch: Partial<LocalJob>): Promise<LocalJob
   return merged;
 }
 
+/** Result of a guarded (compare-and-set) job update: either the merged
+ *  row (rev bumped), or a refusal carrying the row's actual revision. */
+export type GuardedUpdateResult =
+  | { ok: true; job: LocalJob }
+  | { ok: false; currentRev: number };
+
+/**
+ * Compare-and-set variant of `updateJob` for the editor's auto-persist
+ * (#129). Applies `patch` only when the row's `editRev` (absent = 0)
+ * still equals `expectedRev`, and bumps it to `expectedRev + 1` in the
+ * same readwrite transaction — so two tabs flushing concurrently cannot
+ * silently last-write-wins each other: exactly one wins, the other gets
+ * `{ ok: false }` and can warn the user instead of clobbering.
+ *
+ * `id` and `editRev` in the patch are ignored — the guard owns both.
+ */
+async function updateJobGuarded(
+  id: string,
+  expectedRev: number,
+  patch: Partial<LocalJob>,
+): Promise<GuardedUpdateResult> {
+  const d = await db();
+  const tx = d.transaction(STORE, "readwrite");
+  const existing = (await tx.store.get(id)) as LocalJob | undefined;
+  if (!existing) {
+    await tx.done;
+    throw new Error(`Job not found: ${id}`);
+  }
+  const currentRev = existing.editRev ?? 0;
+  if (currentRev !== expectedRev) {
+    await tx.done;
+    return { ok: false, currentRev };
+  }
+  const merged: LocalJob = {
+    ...existing,
+    ...patch,
+    id: existing.id,
+    editRev: expectedRev + 1,
+  };
+  await tx.store.put(merged);
+  await tx.done;
+  return { ok: true, job: merged };
+}
+
 async function deleteJob(id: string): Promise<void> {
   const d = await db();
   await d.delete(STORE, id);
@@ -1023,6 +1079,7 @@ export const jobsDb = {
   getJob,
   listJobs,
   updateJob,
+  updateJobGuarded,
   deleteJob,
   wipeAll,
   getAudioAnalysis,

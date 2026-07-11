@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   encodeAudioFromPcm,
   isAudioCodecSupported,
+  resolveAudioCodecWithFallback,
 } from "./audio-encode";
 
 interface MockEncoderState {
@@ -126,6 +127,41 @@ describe("isAudioCodecSupported", () => {
     installMockWebCodecs({ emitChunks: 1 }, new Set(["mp4a.40.2"]));
     expect(await isAudioCodecSupported("aac", 48000, 2)).toBe(true);
     expect(await isAudioCodecSupported("opus", 48000, 2)).toBe(false);
+  });
+});
+
+describe("resolveAudioCodecWithFallback — pre-muxer codec resolution (#109)", () => {
+  // The streaming export path (editRenderMulti → streamEncodeAudioWith-
+  // Segments) constructs the mp4 muxer with the audio codec BEFORE any
+  // encoding starts, so encodeAudioFromPcm's mid-encode fallback is
+  // structurally impossible there. The codec must be resolved by probe
+  // up front — otherwise iOS Safari (AudioEncoder without AAC) hard-
+  // fails every default export even though Opus encoding works.
+
+  it("keeps the requested codec when it is supported", async () => {
+    installMockWebCodecs({ emitChunks: 1 }, new Set(["mp4a.40.2", "opus"]));
+    expect(await resolveAudioCodecWithFallback("aac", 48000, 2)).toBe("aac");
+    expect(await resolveAudioCodecWithFallback("opus", 48000, 2)).toBe("opus");
+  });
+
+  it("swaps AAC → Opus when AAC is unsupported (iOS-Safari sim)", async () => {
+    installMockWebCodecs({ emitChunks: 1 }, new Set(["opus"]));
+    expect(await resolveAudioCodecWithFallback("aac", 48000, 2)).toBe("opus");
+  });
+
+  it("swaps Opus → AAC when Opus is unsupported (mirror case)", async () => {
+    installMockWebCodecs({ emitChunks: 1 }, new Set(["mp4a.40.2"]));
+    expect(await resolveAudioCodecWithFallback("opus", 48000, 2)).toBe("aac");
+  });
+
+  it("returns the requested codec when NEITHER is supported, so the encoder surfaces its descriptive error", async () => {
+    installMockWebCodecs({ emitChunks: 1 }, new Set());
+    expect(await resolveAudioCodecWithFallback("aac", 48000, 2)).toBe("aac");
+  });
+
+  it("returns the requested codec when AudioEncoder is entirely unavailable", async () => {
+    delete (globalThis as { AudioEncoder?: unknown }).AudioEncoder;
+    expect(await resolveAudioCodecWithFallback("aac", 48000, 2)).toBe("aac");
   });
 });
 

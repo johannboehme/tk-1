@@ -18,6 +18,7 @@ import { useChunkThumbnail } from "./useChunkThumbnail";
 import { useArrangeStore } from "../../local/arrange/arrange-store";
 import { renderMelOverlay } from "../../local/arrange/chunk-mel-render";
 import { formatTime } from "../../lib/time-format";
+import { TouchLongPressArmer } from "./touch-drag";
 
 /** Image-well column count for the screen-blended mel overlay. The
  *  well is ~108 px wide on the deployed card; 96 internal columns
@@ -92,10 +93,15 @@ export function Polaroid({
     renderMelOverlay(canvas, mel, POLAROID_MEL_COLS);
   }, [mel]);
 
-  // Drag-from-Polaroid → drop-on-Strip. We start the drag on
-  // pointerdown but only after the user has moved past a small
-  // threshold — that way a plain click still routes to the preview
+  // Drag-from-Polaroid → drop-on-Strip.
+  //
+  // Mouse: start on pointerdown, arm the drag only after a small
+  // movement threshold — a plain click still routes to the preview
   // handler instead of being eaten by the drag gesture.
+  //
+  // Touch: a swipe over the card must stay a NATIVE SCROLL of the
+  // pool (touch-action: pan-y below); the drag requires intent via
+  // long-press — hold still, then the gesture promotes to a drag.
   const beginChunkDrag = useArrangeStore((s) => s.beginChunkDrag);
   const isDragSource = useArrangeStore(
     (s) => s.drag?.chunkId === chunk.id,
@@ -112,19 +118,65 @@ export function Polaroid({
   const draggedRef = useRef(false);
   const DRAG_THRESHOLD_PX = 5;
 
+  // Latest-props trampoline so the long-press armer (created once) can
+  // start the drag with the current thumb/camColor.
+  const startDragRef = useRef<(x: number, y: number) => void>(() => {});
+  startDragRef.current = (x: number, y: number) => {
+    draggedRef.current = true;
+    beginChunkDrag({
+      chunkId: chunk.id,
+      thumbUrl: thumb.url,
+      camColor,
+      cursorX: x,
+      cursorY: y,
+    });
+  };
+  const longPressRef = useRef<TouchLongPressArmer | null>(null);
+  if (longPressRef.current === null) {
+    longPressRef.current = new TouchLongPressArmer({
+      onStart: (x, y) => startDragRef.current(x, y),
+    });
+  }
+  useEffect(() => {
+    const armer = longPressRef.current;
+    return () => armer?.cancel();
+  }, []);
+
+  // React's touch listeners are passive — once the long-press promotes
+  // the gesture to a drag we must actively preventDefault touchmove or
+  // the browser starts a native pan mid-drag (which would fire
+  // pointercancel and kill the drag). Touch events keep targeting the
+  // touchstart element, so an element-level listener sees the whole
+  // gesture.
+  useEffect(() => {
+    const el = wrapperRef.current;
+    if (!el) return;
+    function onTouchMove(ev: TouchEvent) {
+      if (draggedRef.current) ev.preventDefault();
+    }
+    el.addEventListener("touchmove", onTouchMove, { passive: false });
+    return () => el.removeEventListener("touchmove", onTouchMove);
+  }, []);
+
   function onPointerDownDragArm(e: React.PointerEvent) {
     if (e.button !== 0 && e.pointerType !== "touch") return;
+    draggedRef.current = false;
     // Don't arm on the +ADD button — let it click normally.
     const target = e.target as HTMLElement;
     if (target.closest("[data-no-drag]")) return;
+    if (e.pointerType === "touch") {
+      longPressRef.current?.down(e.pointerId, e.clientX, e.clientY);
+      return;
+    }
     dragArmedRef.current = {
       pointerId: e.pointerId,
       startX: e.clientX,
       startY: e.clientY,
     };
-    draggedRef.current = false;
   }
   function onPointerMoveDragArm(e: React.PointerEvent) {
+    // Touch: swipes disarm the long-press (native scroll wins).
+    longPressRef.current?.move(e.pointerId, e.clientX, e.clientY);
     const armed = dragArmedRef.current;
     if (!armed || armed.pointerId !== e.pointerId) return;
     const dx = e.clientX - armed.startX;
@@ -142,6 +194,7 @@ export function Polaroid({
   }
   function onPointerUpDragArm() {
     dragArmedRef.current = null;
+    longPressRef.current?.cancel();
   }
   function onClickGuarded() {
     if (draggedRef.current) {
@@ -162,9 +215,10 @@ export function Polaroid({
         // Polaroid stock = warm off-white with subtle paper texture
         background:
           "linear-gradient(180deg, #FBF7EE 0%, #F2EDE2 100%)",
-        // Touch action: prevent native scroll on the polaroid so a
-        // touch-drag can hand off to the chunk-drag controller.
-        touchAction: "none",
+        // Touch action: vertical swipes over the card natively scroll
+        // the pool. Dragging a chunk to the strip requires intent —
+        // a long-press promotes the gesture to a drag (see above).
+        touchAction: "pan-y",
       }}
       onClick={onClickGuarded}
       onPointerDown={onPointerDownDragArm}
@@ -211,6 +265,18 @@ export function Polaroid({
             transition: "opacity 600ms ease-out",
           }}
         />
+        {/* Preview-loop badge — solid cobalt tag while this chunk's
+         *  transient audition loop owns playback. Pairs with the
+         *  cobalt ring on the card so the state reads from across the
+         *  room, like a tape-deck "MONITOR" lamp. */}
+        {active && (
+          <span
+            className="absolute left-1 top-1 rounded-sm bg-cobalt px-1 py-[1px] font-display text-[8px] font-semibold tracking-label uppercase text-paper-hi pointer-events-none shadow-emboss"
+            title="Preview loop — click a strip frame to exit"
+          >
+            ◁ loop
+          </span>
+        )}
         {/* Spectral fingerprint stripe — 3px on the right edge of the
          *  image well, fading at top + bottom so it doesn't slam into
          *  the corners. Reads as part of the photograph rather than a

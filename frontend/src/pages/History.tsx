@@ -5,8 +5,15 @@ import { RuleStrip } from "../editor/components/RuleStrip";
 import { TrashIcon } from "../editor/components/icons";
 import { formatDuration } from "../components/ProgressBar";
 import { jobsDb, deleteJob, jobEvents, type LocalJob } from "../local/jobs";
-import { useOpsStore, type JobOps } from "../local/ops-store";
-import { isVideoAsset } from "../storage/jobs-db";
+import { useOpsStore } from "../local/ops-store";
+import { getCachedAnalysis } from "../local/render/audio-analysis";
+import { confirmDestructive } from "../lib/confirm";
+import {
+  activePct,
+  jobBadge,
+  preferredTileDurationS,
+  type BadgeKind,
+} from "./history-model";
 
 export default function History() {
   const [jobs, setJobs] = useState<LocalJob[] | null>(null);
@@ -33,10 +40,20 @@ export default function History() {
     };
   }, []);
 
-  async function remove(id: string) {
-    if (!window.confirm("Delete this job and its files?")) return;
-    await deleteJob(id);
-    setJobs((curr) => (curr ? curr.filter((j) => j.id !== id) : curr));
+  async function remove(job: LocalJob) {
+    const ok = await confirmDestructive({
+      title: "Delete job?",
+      body: (
+        <>
+          Deletes <strong>{job.title || job.id.slice(0, 12)}</strong> and its
+          files from this device. This cannot be undone.
+        </>
+      ),
+      destructiveLabel: "Delete",
+    });
+    if (!ok) return;
+    await deleteJob(job.id);
+    setJobs((curr) => (curr ? curr.filter((j) => j.id !== job.id) : curr));
   }
 
   if (err)
@@ -80,7 +97,7 @@ export default function History() {
       ) : (
         <ul className="grid sm:grid-cols-2 xl:grid-cols-3 gap-3">
           {jobs.map((j) => (
-            <JobCard key={j.id} job={j} onDelete={() => remove(j.id)} />
+            <JobCard key={j.id} job={j} onDelete={() => remove(j)} />
           ))}
         </ul>
       )}
@@ -88,30 +105,26 @@ export default function History() {
   );
 }
 
-type BadgeKind = "queued" | "syncing" | "rendering" | "rendered" | "synced" | "failed" | "needs-sync";
-
-function jobBadge(job: LocalJob, ops: JobOps | undefined): BadgeKind {
-  if (ops?.render && !ops.render.error) return "rendering";
-  if (ops?.sync && !ops.sync.error) return "syncing";
-  if (ops?.render?.error || ops?.sync?.error) return "failed";
-  const cams = job.videos ?? [];
-  const hasSyncData =
-    cams.length > 0 && cams.every((c) => !isVideoAsset(c) || Boolean(c.sync));
-  if (job.lastRender) return "rendered";
-  if (hasSyncData) return "synced";
-  return "needs-sync";
-}
-
-function activePct(ops: JobOps | undefined): number | null {
-  if (ops?.render) return ops.render.pct;
-  if (ops?.sync) return ops.sync.pct;
-  return null;
-}
-
 function JobCard({ job, onDelete }: { job: LocalJob; onDelete: () => void }) {
   const ops = useOpsStore((s) => s.ops[job.id]);
   const pct = activePct(ops);
   const badge = jobBadge(job, ops);
+  // The tile shows the project duration = master-audio duration (#144).
+  // job.durationS only mirrors the first video take. The audio duration
+  // lives in the per-job analysis cache; fetch is cheap (IDB read).
+  const [audioDurationS, setAudioDurationS] = useState<number | null>(null);
+  useEffect(() => {
+    let active = true;
+    getCachedAnalysis(job.id)
+      .then((a) => {
+        if (active && a) setAudioDurationS(a.duration);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [job.id]);
+  const durationS = preferredTileDurationS(audioDurationS, job.durationS);
   return (
     <li className="group relative bg-paper-hi border border-rule rounded-lg overflow-hidden hover:border-ink-2 transition-colors">
       <Link to={`/job/${job.id}`} className="block">
@@ -119,9 +132,9 @@ function JobCard({ job, onDelete }: { job: LocalJob; onDelete: () => void }) {
           <div className="absolute top-2 left-2 flex items-center gap-1.5">
             <StatusBadge kind={badge} />
           </div>
-          {job.durationS != null && (
+          {durationS != null && (
             <span className="absolute bottom-2 right-2 font-mono text-[10px] tabular tracking-label uppercase text-paper-hi bg-sunken/70 px-1.5 py-0.5 rounded-sm">
-              {formatDuration(job.durationS)}
+              {formatDuration(durationS)}
             </span>
           )}
         </div>
@@ -166,7 +179,7 @@ function JobCard({ job, onDelete }: { job: LocalJob; onDelete: () => void }) {
           e.preventDefault();
           onDelete();
         }}
-        className="absolute top-2 right-2 h-7 w-7 inline-flex items-center justify-center rounded-md bg-paper-hi/90 backdrop-blur text-ink-2 hover:text-danger opacity-0 group-hover:opacity-100 transition-opacity"
+        className="absolute top-2 right-2 h-7 w-7 inline-flex items-center justify-center rounded-md bg-paper-hi border border-rule text-ink-2 hover:text-danger hover:border-danger focus-visible:outline focus-visible:outline-2 focus-visible:outline-danger transition-colors"
         aria-label="Delete job"
       >
         <TrashIcon width={14} height={14} />

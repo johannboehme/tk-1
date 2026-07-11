@@ -2,15 +2,24 @@
  * Pure quantize helpers for the Q-hold-to-quantize gesture.
  *
  * `buildQuantizePreview` returns a list of from→to deltas for every
- * off-grid marker (cuts, cam start positions, trim). The Timeline
- * component renders ghost markers at the `to` positions while Q is
- * held; on keyup, `applyQuantizePreview` mutates the store via the
- * provided actions. Esc cancels by simply discarding the preview.
+ * off-grid CUT and FX edge. The Timeline component renders ghost markers
+ * at the `to` positions while Q is held; on keyup the store commits the
+ * deltas. Esc cancels by simply discarding the preview.
+ *
+ * Scope is deliberately cuts + fx ONLY (#70). Cam start positions are
+ * auto-synced — snapping them to the musical grid would shift a camera
+ * against the master audio and destroy the sample-accurate alignment the
+ * app exists to compute. The master trim (export window) is equally off
+ * limits: both used to be silently committed on Q-release without any
+ * ghost preview.
+ *
+ * All quantized entities live in timeline-time (song axis), so a single
+ * snap context — anchored the way the BeatRuler draws its bars — applies
+ * to everything in the preview.
  */
-import { snapTime, type SnapMode, type SnapCtx } from "./snap";
-import { clipRangeS, type VideoClip } from "./types";
+import { snapTime, type SnapMode, type SnapCtx } from "../core/snap";
 import type { Cut } from "../storage/jobs-db";
-import type { PunchFx } from "./fx/types";
+import type { PunchFx } from "../core/fx/types";
 
 const ON_GRID_TOLERANCE_S = 0.001;
 
@@ -24,10 +33,6 @@ export interface FxQuantizeChange {
 
 export interface QuantizePreview {
   cuts: { from: number; to: number; camId: string }[];
-  clipStartOffsets: { camId: string; from: number; to: number }[];
-  trim:
-    | { from: { in: number; out: number }; to: { in: number; out: number } }
-    | null;
   /** Per-fx in/out snap deltas. Empty when no fx in the snapshot or all
    *  on-grid. Only the side(s) that moved are populated. */
   fxs: FxQuantizeChange[];
@@ -35,8 +40,6 @@ export interface QuantizePreview {
 
 export interface QuantizeStateSnapshot {
   cuts: Cut[];
-  clips: VideoClip[];
-  trim: { in: number; out: number };
   /** Optional — older callers (and tests) may omit. Treated as empty. */
   fx?: PunchFx[];
 }
@@ -48,7 +51,7 @@ export function buildQuantizePreview(
 ): QuantizePreview {
   // OFF / MATCH have no time-grid → no quantize. (MATCH would mean
   // "snap each marker to a cam-alignment offset" which is conceptually
-  // ill-defined for cuts and trim.)
+  // ill-defined for cuts.)
   if (mode === "off" || mode === "match") {
     return emptyPreview();
   }
@@ -63,47 +66,9 @@ export function buildQuantizePreview(
     }
   }
 
-  // Quantize cam start positions: snap the clip's visible startS, then
-  // back-solve startOffsetS while preserving sync and trim.
-  // range.startS = -totalSyncS + startOffsetS + trimInS  →
-  // startOffsetS = snappedStart + totalSyncS − trimInS.
-  const clipStartOffsets: QuantizePreview["clipStartOffsets"] = [];
-  for (const clip of state.clips) {
-    const range = clipRangeS(clip);
-    const snappedStart = snapTime(range.startS, mode, ctx);
-    if (Math.abs(snappedStart - range.startS) > ON_GRID_TOLERANCE_S) {
-      const algoSyncS = (clip.syncOffsetMs + clip.syncOverrideMs) / 1000;
-      const trimInS = clip.trimInS ?? 0;
-      const newStartOffsetS = snappedStart + algoSyncS - trimInS;
-      clipStartOffsets.push({
-        camId: clip.id,
-        from: clip.startOffsetS,
-        to: newStartOffsetS,
-      });
-    }
-  }
-
-  // Quantize trim independently for in / out.
-  let trim: QuantizePreview["trim"] = null;
-  const trimInSnapped = snapTime(state.trim.in, mode, ctx);
-  const trimOutSnapped = snapTime(state.trim.out, mode, ctx);
-  const inOff = Math.abs(trimInSnapped - state.trim.in) > ON_GRID_TOLERANCE_S;
-  const outOff =
-    Math.abs(trimOutSnapped - state.trim.out) > ON_GRID_TOLERANCE_S;
-  if (inOff || outOff) {
-    trim = {
-      from: { in: state.trim.in, out: state.trim.out },
-      to: {
-        in: inOff ? trimInSnapped : state.trim.in,
-        out: outOff ? trimOutSnapped : state.trim.out,
-      },
-    };
-  }
-
-  // Quantize fx in/out independently — same grid as cuts/clips/trim. P-FX
-  // overlap freely so we don't dedupe; if two end up colliding on the
-  // same beat, both stay (greedy lane packing in the UI surfaces them as
-  // sub-rows).
+  // Quantize fx in/out independently — same grid as cuts. P-FX overlap
+  // freely so we don't dedupe; if two end up colliding on the same beat,
+  // both stay (greedy lane packing in the UI surfaces them as sub-rows).
   const fxs: FxQuantizeChange[] = [];
   for (const f of state.fx ?? []) {
     const inSnapped = snapTime(f.inS, mode, ctx);
@@ -117,9 +82,9 @@ export function buildQuantizePreview(
     fxs.push(change);
   }
 
-  return { cuts, clipStartOffsets, trim, fxs };
+  return { cuts, fxs };
 }
 
 function emptyPreview(): QuantizePreview {
-  return { cuts: [], clipStartOffsets: [], trim: null, fxs: [] };
+  return { cuts: [], fxs: [] };
 }

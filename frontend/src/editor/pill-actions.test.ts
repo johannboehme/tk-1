@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { useEditorStore } from "./store";
-import type { Pill } from "./types";
+import type { Pill } from "../core/types";
 
 const makePill = (overrides: Partial<Pill> = {}): Pill => ({
   id: "p1",
@@ -122,6 +122,96 @@ describe("pill mutation actions", () => {
       useEditorStore.getState().setPills([p]);
       useEditorStore.getState().nudgePillSourceMs("p1", -200);
       expect(useEditorStore.getState().pills[0].sourceInS).toBe(0);
+    });
+
+    it("a clamped nudge shifts BOTH edges by the applied delta — window length is preserved (#103)", () => {
+      // Requested shift −2 s, but sourceInS can only move −1 s (to 0).
+      // The out edge must move by the SAME applied −1 s: the old code
+      // moved it the full −2 s, shrinking the 10 s window to 9 s and
+      // desyncing the pill's source window from its untouched arr window
+      // (playback then ran at 0.9× with drifting alignment).
+      const p = makePill({
+        arrStartS: 0,
+        arrEndS: 10,
+        sourceInS: 1,
+        sourceOutS: 11,
+      });
+      useEditorStore.getState().setPills([p]);
+      useEditorStore.getState().nudgePillSourceMs("p1", -2000);
+      const after = useEditorStore.getState().pills[0];
+      expect(after.sourceInS).toBeCloseTo(0, 6);
+      expect(after.sourceOutS).toBeCloseTo(10, 6);
+      expect(after.sourceOutS - after.sourceInS).toBeCloseTo(10, 6);
+    });
+  });
+
+  describe("clamped source shifts preserve window length everywhere (#103)", () => {
+    it("setClipSyncOverride shifts live AND original bounds uniformly under clamp", () => {
+      const p = makePill({
+        sourceInS: 1,
+        sourceOutS: 11,
+        originalSourceInS: 1,
+        originalSourceOutS: 11,
+      });
+      useEditorStore.getState().setPills([p]);
+      // prev override 0 → −2000 ms = −2 s shift; clamped to −1 s.
+      useEditorStore.getState().setClipSyncOverride("cam-a", -2000);
+      const after = useEditorStore.getState().pills[0];
+      expect(after.sourceInS).toBeCloseTo(0, 6);
+      expect(after.sourceOutS).toBeCloseTo(10, 6);
+      // RESET baseline must be equally consistent.
+      expect(after.originalSourceInS).toBeCloseTo(0, 6);
+      expect(after.originalSourceOutS).toBeCloseTo(10, 6);
+    });
+
+    it("setSelectedCandidateIdx shifts live AND original bounds uniformly under clamp", () => {
+      // Candidate switch 0 → 1 changes syncOffsetMs by −2000 ms, which
+      // fans a −2 s source shift out to the cam's pills; the pill can
+      // only absorb −1 s before sourceInS hits 0.
+      useEditorStore.setState({
+        clips: useEditorStore.getState().clips.map((c) =>
+          c.kind === "video" && c.id === "cam-a"
+            ? {
+                ...c,
+                candidates: [
+                  { offsetMs: 0, confidence: 1, overlapFrames: 100 },
+                  { offsetMs: -2000, confidence: 1, overlapFrames: 100 },
+                ],
+                selectedCandidateIdx: 0,
+                syncOffsetMs: 0,
+              }
+            : c,
+        ),
+      });
+      const p = makePill({
+        sourceInS: 1,
+        sourceOutS: 11,
+        originalSourceInS: 1,
+        originalSourceOutS: 11,
+      });
+      useEditorStore.getState().setPills([p]);
+      useEditorStore.getState().setSelectedCandidateIdx("cam-a", 1);
+      const after = useEditorStore.getState().pills[0];
+      expect(after.sourceOutS - after.sourceInS).toBeCloseTo(10, 6);
+      expect(
+        after.originalSourceOutS - after.originalSourceInS,
+      ).toBeCloseTo(10, 6);
+      expect(after.sourceInS).toBeCloseTo(0, 6);
+      expect(after.originalSourceInS).toBeCloseTo(0, 6);
+    });
+
+    it("setPillSourceOffsetMs clamps the offset, not just the in-edge", () => {
+      const p = makePill({
+        sourceInS: 1,
+        sourceOutS: 11,
+        originalSourceInS: 1,
+        originalSourceOutS: 11,
+      });
+      useEditorStore.getState().setPills([p]);
+      useEditorStore.getState().setPillSourceOffsetMs("p1", -2000);
+      const after = useEditorStore.getState().pills[0];
+      expect(after.sourceInS).toBeCloseTo(0, 6);
+      expect(after.sourceOutS).toBeCloseTo(10, 6);
     });
   });
 

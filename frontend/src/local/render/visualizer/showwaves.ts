@@ -9,7 +9,8 @@
 import type { Visualizer } from "./types";
 
 export interface ShowwavesOptions {
-  /** Mono PCM, time-aligned with the output video. */
+  /** Mono PCM of the FULL master audio — indexed by the master time the
+   *  compositor passes to `draw`. */
   pcm: Float32Array;
   sampleRate: number;
   /** Region of the canvas to occupy: top, height in pixels. */

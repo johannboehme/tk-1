@@ -20,7 +20,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, render } from "@testing-library/react";
 import { useEffect, useRef } from "react";
-import { useAudioMaster } from "./useAudioMaster";
+import { armParkMasterT, useAudioMaster } from "./useAudioMaster";
 import { useEditorStore } from "./store";
 
 function flushAll(): Promise<void> {
@@ -211,6 +211,24 @@ afterEach(() => {
   useEditorStore.getState().reset();
 });
 
+describe("armParkMasterT — idle pre-roll compensation (#80/#104)", () => {
+  it("parks the lead window EARLY so the clock sits on the target at fire time", () => {
+    // Armed 30 ms before the wrap: the idle plays at gain 0 for those
+    // 30 ms, so park it 30 ms before the target.
+    expect(armParkMasterT(12, 0.03)).toBeCloseTo(11.97, 9);
+    expect(armParkMasterT(110, 0.048)).toBeCloseTo(109.952, 9);
+  });
+
+  it("negative dist (stall-overshoot arm, fires immediately) parks at the target", () => {
+    expect(armParkMasterT(905, -0.04)).toBe(905);
+    expect(armParkMasterT(905, 0)).toBe(905);
+  });
+
+  it("clamps to 0 near the start of the file", () => {
+    expect(armParkMasterT(0.02, 0.05)).toBe(0);
+  });
+});
+
 describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => {
   let refs: Refs;
   let ctxHandle: ReturnType<typeof installFakeAudioContext>;
@@ -237,7 +255,7 @@ describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => 
       algoOffsetMs: 0,
       driftRatio: 1,
     });
-    render(<Harness audioUrl="/x.wav" refs={refs} />);
+    const view = render(<Harness audioUrl="/x.wav" refs={refs} />);
     await flushAll();
     const mA = mockMediaElement(refs.audioA);
     const mB = mockMediaElement(refs.audioB);
@@ -247,7 +265,9 @@ describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => 
       mA.fireLoadedMetadata();
       await flushAll();
     });
-    return { mA, mB };
+    const rerenderUrl = (url: string) =>
+      view.rerender(<Harness audioUrl={url} refs={refs} />);
+    return { mA, mB, rerenderUrl };
   }
 
   it("reports loadedmetadata duration into the handle and store", async () => {
@@ -477,6 +497,57 @@ describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => 
       expect(ramped).toBe(true);
     });
 
+    it("pending pre-metadata seek replays onto the ACTIVE side, even after swaps (#137)", async () => {
+      // Drive one crossfade swap so the active side is B, then change the
+      // audio URL (isReady resets), seek before metadata arrives, and let
+      // loadedmetadata replay the stashed seek. It must land on B — the
+      // element the user actually hears — not unconditionally on A.
+      const { mA, mB, rerenderUrl } = await setup();
+      const { ctx } = ctxHandle;
+      await act(async () => {
+        useEditorStore.getState().setLoop({ start: 0, end: 2 });
+        await flushAll();
+      });
+      await act(async () => {
+        useEditorStore.getState().setPlaying(true);
+        await flushAll();
+      });
+      // Arm + fire the wrap → roles swap, active becomes B.
+      await act(async () => {
+        mA.setCurrentTime(1.97);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      await act(async () => {
+        ctx.currentTime = 100;
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      await act(async () => {
+        useEditorStore.getState().setPlaying(false);
+        await flushAll();
+      });
+      // URL changes in place (job switch without unmount) — readiness
+      // resets, ping-pong state survives (graph is cached per element).
+      await act(async () => {
+        rerenderUrl("/y.wav");
+        await flushAll();
+      });
+      // Seek while metadata is pending — gets stashed.
+      await act(async () => {
+        useEditorStore.getState().seek(3.7);
+        await flushAll();
+      });
+      expect(useEditorStore.getState().playback.seekRequest).toBeNull();
+      // Metadata arrives → the stashed seek must hit the ACTIVE element (B).
+      await act(async () => {
+        mA.fireLoadedMetadata();
+        await flushAll();
+      });
+      expect(mB.getCurrentTime()).toBeCloseTo(3.7, 5);
+      // The muted idle (A) must NOT have swallowed the seek.
+      expect(mA.getCurrentTime()).not.toBeCloseTo(3.7, 5);
+    });
+
     it("user seek cancels any armed crossfade", async () => {
       const { mA } = await setup();
       const { ctx } = ctxHandle;
@@ -647,6 +718,64 @@ describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => 
       void mB;
     });
 
+    it("RAF stall past a chunk boundary still arms the hop — no tick landed in the lead window (#76)", async () => {
+      // Unique chunks with a fat master-time gap between them. A GC pause /
+      // hidden tab / decoder churn can swallow every tick in the 50 ms
+      // window before seg 0's out; the first tick after the stall sees
+      // t PAST the boundary (distToEnd <= 0). Without overshoot tolerance
+      // the hop never arms and the active element free-runs into master
+      // material that is NOT in the arrangement (dropped jam territory).
+      const segs = [
+        { in: 620, out: 650 }, // arr [0..30]
+        { in: 905, out: 935 }, // arr [30..60]
+      ];
+      const { mA, mB } = await setup(1000);
+      useEditorStore.getState().setArrangementSegments(segs);
+      useEditorStore.getState().seek(649, { segmentIdxHint: 0 });
+      await act(async () => {
+        await flushAll();
+      });
+      await act(async () => {
+        useEditorStore.getState().setPlaying(true);
+        await flushAll();
+      });
+      // Simulate the stall: master-time jumps from inside seg 0 straight
+      // past its out — no tick ever landed inside (out - 0.05, out].
+      await act(async () => {
+        mA.setCurrentTime(650.04);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      // Recovery: the hop arms anyway (immediate crossfade), idle parked
+      // at the next chunk's head instead of free-running into master 650+.
+      expect(mB.playSpy).toHaveBeenCalled();
+      expect(mB.getCurrentTime()).toBeCloseTo(905, 0);
+    });
+
+    it("RAF stall past the LAST segment's out still schedules the end-pause (#76)", async () => {
+      const segs = [{ in: 620, out: 650 }];
+      const { mA } = await setup(1000);
+      useEditorStore.getState().setArrangementSegments(segs);
+      useEditorStore.getState().seek(649, { segmentIdxHint: 0 });
+      await act(async () => {
+        await flushAll();
+      });
+      await act(async () => {
+        useEditorStore.getState().setPlaying(true);
+        await flushAll();
+      });
+      await act(async () => {
+        mA.setCurrentTime(650.04);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      // The pause timer fires with zero delay (we're already past out).
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 20));
+      });
+      expect(useEditorStore.getState().playback.isPlaying).toBe(false);
+    });
+
     it(
       "end of last segment does NOT swap roles (the loop-back bug). " +
         "The active element keeps playing past `out` until the timeout " +
@@ -777,6 +906,7 @@ describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => 
         { in: 30, out: 35 }, // arr [5..10]
       ];
       const { mA, mB } = await setup(60);
+      const { ctx } = ctxHandle;
       useEditorStore.getState().setArrangementSegments(segs);
       // Park inside the last segment.
       useEditorStore.getState().seek(30, { segmentIdxHint: 1 });
@@ -800,6 +930,49 @@ describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => 
       // Wrap was armed (idle play()ed); pause-at-end did NOT take over.
       expect(mB.playSpy).toHaveBeenCalled();
       expect(useEditorStore.getState().playback.isPlaying).toBe(true);
+
+      // #77: while the wrap was ARMED, further ticks ran with
+      // distToEnd inside the lead window — the end-pause branch must not
+      // schedule a setPlaying(false) timer behind the armed crossfade.
+      // Fire the crossfade, then advance real time past where that stale
+      // timer would land: playback must keep running.
+      await act(async () => {
+        ctx.currentTime = 100; // past fireAt + CROSSFADE_S
+        mB.setCurrentTime(10);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 80));
+      });
+      expect(useEditorStore.getState().playback.isPlaying).toBe(true);
+    });
+
+    it("loop.end exactly on a chunk seam — arms the WRAP, not a hop into the next chunk (#89)", async () => {
+      const segs = [
+        { in: 10, out: 15 }, // arr [0..5]
+        { in: 30, out: 35 }, // arr [5..10]
+      ];
+      const { mA, mB } = await setup(60);
+      useEditorStore.getState().setArrangementSegments(segs);
+      useEditorStore.getState().seek(10, { segmentIdxHint: 0 });
+      // Loop = whole chunk A = arr [0, 5]; end sits exactly on the A/B seam.
+      await act(async () => {
+        useEditorStore.getState().setLoop({ start: 0, end: 5 });
+        await flushAll();
+      });
+      await act(async () => {
+        useEditorStore.getState().setPlaying(true);
+        await flushAll();
+      });
+      await act(async () => {
+        mA.setCurrentTime(14.97);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      // Idle parked at the LOOP target (master 10), never at chunk B's
+      // head (master 30) — the seam-aligned loop must not hop into B.
+      expect(mB.getCurrentTime()).toBeCloseTo(10, 1);
+      expect(mB.playSpy).toHaveBeenCalled();
     });
 
     it("duplicate chunks — wrap fires only at user-marked output position", async () => {
@@ -808,11 +981,19 @@ describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => 
       //   arr=5 → seg 1 master 7 (wrap point — 5 - 3 = 2 into seg 1)
       // The wrap MUST NOT fire while still in seg 0 even though seg 0's
       // master crosses 7 too.
+      //
+      // The tail chunk matters: setLoop clamps through the master-trim
+      // projection, and masterToArr's edge fallback always lands on the
+      // FIRST occurrence of a duplicated chunk — without a distinct chunk
+      // after the duplicates, trim {0, duration} pins loop.end to arr 3
+      // (the seam) and the loop under test silently becomes a different
+      // shape than the comment claims.
       const segs = [
         { in: 5, out: 8 }, // arr [0..3]
         { in: 5, out: 8 }, // arr [3..6]
+        { in: 50, out: 60 }, // arr [6..16]
       ];
-      const { mA, mB } = await setup(20);
+      const { mA, mB } = await setup(60);
       useEditorStore.getState().setArrangementSegments(segs);
       useEditorStore.getState().seek(5, { segmentIdxHint: 0 });
       await act(async () => {
@@ -834,6 +1015,56 @@ describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => 
       });
       // Idle parked at seg 1 in = 5 (hop), NOT at wrap target (= 6).
       expect(mB.getCurrentTime()).toBeCloseTo(5, 1);
+    });
+
+    it("wrap arming parks the idle a lead-window EARLY, not at the target itself (#104)", async () => {
+      const segs = [
+        { in: 10, out: 20 }, // arr [0..10]
+      ];
+      const { mA, mB } = await setup(60);
+      useEditorStore.getState().setArrangementSegments(segs);
+      useEditorStore.getState().seek(10, { segmentIdxHint: 0 });
+      // arr loop {2, 5} → master wrap at 15, target 12.
+      await act(async () => {
+        useEditorStore.getState().setLoop({ start: 2, end: 5 });
+        await flushAll();
+      });
+      await act(async () => {
+        useEditorStore.getState().setPlaying(true);
+        await flushAll();
+      });
+      // Arm 30 ms before the wrap. The idle play()s NOW at gain 0 and
+      // advances through the lead window — parking it exactly at master
+      // 12 would make the audible loop landing overshoot loop.start.
+      await act(async () => {
+        mA.setCurrentTime(14.97);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      expect(mB.getCurrentTime()).toBeCloseTo(11.97, 3);
+      expect(mB.playSpy).toHaveBeenCalled();
+    });
+
+    it("hop arming parks the idle a lead-window EARLY, not at nextSeg.in (#80)", async () => {
+      const segs = [
+        { in: 10, out: 15 }, // arr [0..5]
+        { in: 30, out: 35 }, // arr [5..10]
+      ];
+      const { mA, mB } = await setup(60);
+      useEditorStore.getState().setArrangementSegments(segs);
+      useEditorStore.getState().seek(10, { segmentIdxHint: 0 });
+      await act(async () => {
+        useEditorStore.getState().setPlaying(true);
+        await flushAll();
+      });
+      // Arm 40 ms before the seam — idle must be parked at 30 − 0.04.
+      await act(async () => {
+        mA.setCurrentTime(14.96);
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      });
+      expect(mB.getCurrentTime()).toBeCloseTo(29.96, 3);
+      expect(mB.playSpy).toHaveBeenCalled();
     });
 
     it("no loop set — walker behaves exactly as before (regression guard)", async () => {

@@ -21,12 +21,13 @@ import { removeItemGuarded } from "../../local/arrange/arrange-guarded-actions";
 import {
   effectiveBarsForChunk,
   frameWidthForBars,
-  FRAME_MIN_PX,
 } from "../../local/arrange/arrange-store";
 import { chunkSpectralColor } from "../../local/arrange/chunk-mel";
 import type { Chunk } from "../../storage/jobs-db";
 import { Frame } from "./Frame";
 import { InsertionCursor } from "./InsertionCursor";
+import { reorderTargetIndex } from "./strip-reorder";
+import { TouchLongPressArmer } from "./touch-drag";
 
 const STRIP_HEIGHT = 132;
 const FRAME_HEIGHT = 96;
@@ -109,8 +110,15 @@ export function FilmStrip() {
   // Auto-center on focus changes: when the focused item shifts (by
   // SHIFT-buttons or PREV/NEXT or a click on an out-of-view polaroid),
   // smoothly scroll the corresponding frame into the strip's center.
+  // Suppressed while a reorder drag is in flight — each mid-drag
+  // reorderItem re-runs this effect and the smooth scroll would slide
+  // the strip underneath the user's pointer. Same for a MiniMap
+  // drag-scroll: its direct scrollLeft writes must not race a smooth
+  // scrollTo animation (e.g. when the playhead advances mid-scrub).
   useEffect(() => {
     if (!focusedItemId) return;
+    if (dragStateRef.current) return;
+    if (useArrangeStore.getState().stripScrubbing) return;
     const scroller = scrollerRef.current;
     if (!scroller) return;
     const target = scroller.querySelector<HTMLElement>(
@@ -145,47 +153,116 @@ export function FilmStrip() {
   }, [currentItemId, focusItem]);
 
   // ─── Reorder via drag ─────────────────────────────────────────────────
+  // Armed on pointerdown, ACTIVATED only after the pointer travels a
+  // small horizontal threshold — a click with a little jitter must not
+  // commit a reorder. Once active, the target position is hit-tested
+  // against the actual frame rects (frames are length-proportional, so
+  // fixed index-stepping mis-tracks the pointer on mixed-length strips).
   const dragStateRef = useRef<{
     itemId: string;
+    pointerId: number;
     startX: number;
-    startIdx: number;
-    currentIdx: number;
+    active: boolean;
   } | null>(null);
+  // Swallows the click the browser fires after a drag's pointerup so
+  // finishing a reorder doesn't also seekToItem (same pattern as the
+  // Polaroid's draggedRef guard).
+  const suppressClickRef = useRef(false);
+  const DRAG_THRESHOLD_PX = 5;
+
+  // Touch: a horizontal swipe over a frame must stay a NATIVE PAN of
+  // the strip (touch-action: manipulation on the frame wrappers) —
+  // reordering requires intent via long-press. The armer promotes a
+  // held-still touch to an active reorder drag.
+  const pendingTouchRef = useRef<{ itemId: string; pointerId: number } | null>(
+    null,
+  );
+  const longPressRef = useRef<TouchLongPressArmer | null>(null);
+  if (longPressRef.current === null) {
+    longPressRef.current = new TouchLongPressArmer({
+      onStart: (x) => {
+        const pending = pendingTouchRef.current;
+        if (!pending) return;
+        pendingTouchRef.current = null;
+        dragStateRef.current = {
+          itemId: pending.itemId,
+          pointerId: pending.pointerId,
+          startX: x,
+          active: true,
+        };
+        suppressClickRef.current = true;
+      },
+    });
+  }
+  useEffect(() => {
+    const armer = longPressRef.current;
+    return () => armer?.cancel();
+  }, []);
+
+  // Once a touch-reorder is active the browser must not start a native
+  // pan mid-drag (it would fire pointercancel and kill the reorder).
+  // React's touch listeners are passive, so preventDefault needs a
+  // native non-passive listener.
+  useEffect(() => {
+    function onTouchMove(ev: TouchEvent) {
+      if (dragStateRef.current?.active) ev.preventDefault();
+    }
+    window.addEventListener("touchmove", onTouchMove, { passive: false });
+    return () => window.removeEventListener("touchmove", onTouchMove);
+  }, []);
 
   function beginDrag(e: React.PointerEvent, itemId: string) {
     if (e.button !== 0 && e.pointerType !== "touch") return;
-    const startIdx = arrangement.findIndex((a) => a.id === itemId);
-    if (startIdx === -1) return;
+    // Pointerdowns on an InsertionCursor position the cursor — they
+    // must not arm a drag of the neighbouring frame.
+    const target = e.target as HTMLElement;
+    if (target.closest("[data-strip-cursor-index]")) return;
+    suppressClickRef.current = false;
+    if (e.pointerType === "touch") {
+      // Long-press → reorder; swipe → native strip pan.
+      pendingTouchRef.current = { itemId, pointerId: e.pointerId };
+      longPressRef.current?.down(e.pointerId, e.clientX, e.clientY);
+      return;
+    }
     dragStateRef.current = {
       itemId,
+      pointerId: e.pointerId,
       startX: e.clientX,
-      startIdx,
-      currentIdx: startIdx,
+      active: false,
     };
   }
 
   useEffect(() => {
     function onMove(e: PointerEvent) {
+      // Touch: swipes disarm the pending long-press (native pan wins).
+      longPressRef.current?.move(e.pointerId, e.clientX, e.clientY);
       const drag = dragStateRef.current;
-      if (!drag) return;
-      const dx = e.clientX - drag.startX;
-      // Each frame is roughly FRAME_MIN_PX wide; use a softer threshold
-      // so reorder feels snappy without trigger-happy snap.
-      const stepPx = FRAME_MIN_PX + 12;
-      const stepCount = Math.round(dx / stepPx);
-      const targetIdx = Math.max(
-        0,
-        Math.min(
-          arrangement.length - 1,
-          drag.startIdx + stepCount,
-        ),
-      );
-      if (targetIdx !== drag.currentIdx) {
-        drag.currentIdx = targetIdx;
-        reorderItem(drag.itemId, targetIdx);
+      if (!drag || drag.pointerId !== e.pointerId) return;
+      if (!drag.active) {
+        if (Math.abs(e.clientX - drag.startX) < DRAG_THRESHOLD_PX) return;
+        drag.active = true;
+        suppressClickRef.current = true;
       }
+      const scroller = scrollerRef.current;
+      if (!scroller) return;
+      const rects = Array.from(
+        scroller.querySelectorAll<HTMLElement>("[data-strip-frame-id]"),
+      ).map((el) => {
+        const r = el.getBoundingClientRect();
+        return {
+          id: el.getAttribute("data-strip-frame-id") ?? "",
+          left: r.left,
+          width: r.width,
+        };
+      });
+      // reorderItem no-ops when the target equals the current index.
+      reorderItem(drag.itemId, reorderTargetIndex(rects, drag.itemId, e.clientX));
     }
-    function onUp() {
+    function onUp(e: PointerEvent) {
+      longPressRef.current?.cancel();
+      pendingTouchRef.current = null;
+      const drag = dragStateRef.current;
+      if (drag && drag.pointerId !== e.pointerId) return;
       dragStateRef.current = null;
     }
     window.addEventListener("pointermove", onMove);
@@ -196,7 +273,7 @@ export function FilmStrip() {
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onUp);
     };
-  }, [arrangement, reorderItem]);
+  }, [reorderItem]);
 
   // ─── Empty state ──────────────────────────────────────────────────────
   if (arrangement.length === 0) {
@@ -256,7 +333,11 @@ export function FilmStrip() {
               data-strip-frame-id={item.id}
               className="flex items-stretch"
               onPointerDown={(e) => beginDrag(e, item.id)}
-              style={{ touchAction: "pan-y" }}
+              // Swipes pan natively (horizontal = strip scroll,
+              // vertical = page); reorder requires a long-press.
+              // `manipulation` additionally kills double-tap zoom on
+              // rapid frame taps.
+              style={{ touchAction: "manipulation" }}
             >
               <Frame
                 jobId={jobId}
@@ -270,6 +351,12 @@ export function FilmStrip() {
                 isCurrentItem={item.id === currentItemId}
                 spectralColor={chunkSpectralColor(chunk, analysis)}
                 onFocus={() => {
+                  // The pointer-gesture became a reorder drag — the
+                  // trailing click must not also relocate playback.
+                  if (suppressClickRef.current) {
+                    suppressClickRef.current = false;
+                    return;
+                  }
                   // Click on a frame = focus + seek + tag this as the
                   // current playback item. Matches PREV/NEXT in the
                   // transport bar; during playback the audio walker

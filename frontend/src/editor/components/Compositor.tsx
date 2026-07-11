@@ -16,7 +16,7 @@
  */
 import { useEffect, useRef, useState } from "react";
 import { useEditorStore } from "../store";
-import { getCapabilities } from "../../local/capabilities";
+import { getCapabilities } from "../../core/capabilities";
 import { MasterAudio } from "./MasterAudio";
 import { TestPattern } from "./TestPattern";
 import { OutputFrameBox } from "./OutputFrameBox";
@@ -70,6 +70,13 @@ function CompositorCanvas({ cams }: { cams: ClipUrlMap }) {
   const camsRef = useRef<ClipUrlMap>(cams);
   camsRef.current = cams;
   const [error, setError] = useState<string | null>(null);
+  // Bumped when the backend's GPU device is lost mid-session (issue
+  // #115). Keys the <canvas> so React replaces the DOM node — a canvas's
+  // context mode is fixed on first getContext, so the WebGL2 fallback
+  // needs a fresh element — and re-runs the mount effect to rebuild the
+  // runtime. The capability downgrade already happened in the backend,
+  // so the rebuilt ladder starts at WebGL2.
+  const [canvasEpoch, setCanvasEpoch] = useState(0);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -98,6 +105,12 @@ function CompositorCanvas({ cams }: { cams: ClipUrlMap }) {
       cssH,
       dpr,
       initialScale: COMPOSITOR_INITIAL_SCALE,
+      onBackendLost: (info) => {
+        console.warn(
+          `[compositor] render backend lost (${info.reason}) — remounting on the fallback tier`,
+        );
+        setCanvasEpoch((e) => e + 1);
+      },
     });
 
     let cancelled = false;
@@ -145,8 +158,10 @@ function CompositorCanvas({ cams }: { cams: ClipUrlMap }) {
     // / removing a cam doesn't tear down the backend / decoder pool.
     // The separate effect below pushes prop changes into the runtime so
     // newly-added cams' URLs reach the pool / bitmap loader.
+    // `canvasEpoch` DOES re-run this: after a GPU device loss the keyed
+    // <canvas> was replaced and the runtime must rebuild on it.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [canvasEpoch]);
 
   // Push cams-prop changes into the running runtime without tearing it
   // down. Without this the runtime keeps the cams map captured at mount,
@@ -181,7 +196,9 @@ function CompositorCanvas({ cams }: { cams: ClipUrlMap }) {
       ro.disconnect();
       if (pending != null) clearTimeout(pending);
     };
-  }, []);
+    // Re-attach the observer to the replacement canvas after a
+    // device-loss remount (the keyed <canvas> is a new DOM node).
+  }, [canvasEpoch]);
 
   // Page Visibility — pause the RAF when the tab is hidden so we don't
   // burn cycles in a background tab.
@@ -203,6 +220,7 @@ function CompositorCanvas({ cams }: { cams: ClipUrlMap }) {
           the layout free of these and gives the decoder a stable home. */}
       <div ref={poolHostRef} aria-hidden style={{ display: "none" }} />
       <canvas
+        key={canvasEpoch}
         ref={canvasRef}
         data-vas-compositor
         className="absolute inset-0 w-full h-full"

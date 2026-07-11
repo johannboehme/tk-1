@@ -10,7 +10,7 @@ import {
   type Pill,
   type Segment,
   type VideoClip,
-} from "./types";
+} from "../core/types";
 
 describe("clipRangeS — Video", () => {
   it("computes startS = -syncOffset/1000 for a perfectly aligned cam", () => {

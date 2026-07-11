@@ -9,7 +9,7 @@
  * The lock key is optional — surfaces that don't have a lockable thing
  * (e.g. Triage) just omit `lock` and the divider + lock key disappear.
  */
-import type { SnapMode } from "../snap";
+import type { SnapMode } from "../../core/snap";
 
 export interface SnapModeButtonsViewProps {
   snapMode: SnapMode;

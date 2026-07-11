@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test } from "vitest";
 import { useEditorStore } from "./store";
-import { isVideoClip, type MatchCandidate, type VideoClip } from "./types";
+import { isVideoClip, type MatchCandidate, type VideoClip } from "../core/types";
 
 /** Test helper: assert a clip is a VideoClip and narrow its type. Tests in
  *  this file build video clips exclusively. */
@@ -113,9 +113,29 @@ describe("useEditorStore", () => {
     useEditorStore.getState().setExport({ preset: "web" });
     const spec = useEditorStore.getState().buildEditSpec();
     expect(spec.version).toBe(1);
-    expect(spec.segments).toEqual([{ in: 1, out: 5 }]);
+    // Direct mode: arr axis == master axis, so the slice's arrStartS is
+    // just the trim-in.
+    expect(spec.segments).toEqual([{ in: 1, out: 5, arrStartS: 1 }]);
     expect(spec.sync_override_ms).toBe(-30);
     expect(spec.export?.preset).toBe("web");
+  });
+
+  test("buildEditSpec carries each slice's FULL-arrangement arrStartS through a master trim (#79)", () => {
+    useEditorStore.getState().loadJob(baseJobMeta);
+    // Arrangement: master [0..2) is arr [0..2), master [3..5) is arr
+    // [2..4). Master-trim keeps [3..5] → one slice whose arr-position
+    // on the editor's full axis is 2, NOT 0. The renderer needs that
+    // value to resolve pills/cuts/FX at the editor's coordinates.
+    useEditorStore.getState().setArrangementSegments([
+      { in: 0, out: 2 },
+      { in: 3, out: 5 },
+    ]);
+    useEditorStore.getState().setTrim({ in: 3, out: 5 });
+    const spec = useEditorStore.getState().buildEditSpec();
+    expect(spec.segments).toHaveLength(1);
+    expect(spec.segments[0].in).toBe(3);
+    expect(spec.segments[0].out).toBe(5);
+    expect(spec.segments[0].arrStartS).toBe(2);
   });
 
   describe("updateClip", () => {
@@ -302,6 +322,148 @@ describe("useEditorStore", () => {
       const committed = useEditorStore.getState().moveCut(99, "cam-X", 5);
       expect(committed).toBe(99);
     });
+
+    test("clamps against the SONG length, not master duration — duplicated chunks (#135)", () => {
+      // 60 s session arranged into a 120 s song (chunk duplicated).
+      // Cuts live in timeline-time [0, arrTotal]; the old master-duration
+      // clamp stuck every drag at 60 s and made the song's second half
+      // unreachable.
+      useEditorStore.getState().loadJob(baseJobMeta, {
+        arrangementSegments: [
+          { in: 0, out: 60 },
+          { in: 0, out: 60 },
+        ],
+      });
+      useEditorStore.setState({ cuts: [{ atTimeS: 3, camId: "cam-1" }] });
+      const committed = useEditorStore.getState().moveCut(3, "cam-1", 110);
+      expect(committed).toBe(110);
+      expect(useEditorStore.getState().cuts[0].atTimeS).toBe(110);
+    });
+
+    test("clamps against the SONG length — short song from a long session (#135)", () => {
+      // 30-min jam, 60 s song: dragging past the song end must stop at
+      // arrTotal, not sail up to the master duration into dead arr-space.
+      useEditorStore.getState().loadJob(
+        { ...baseJobMeta, duration: 1800 },
+        { arrangementSegments: [{ in: 100, out: 160 }] },
+      );
+      useEditorStore.setState({ cuts: [{ atTimeS: 3, camId: "cam-1" }] });
+      const committed = useEditorStore.getState().moveCut(3, "cam-1", 200);
+      expect(committed).toBe(60);
+      expect(useEditorStore.getState().cuts[0].atTimeS).toBe(60);
+    });
+  });
+
+  describe("addCut / hold-paint — timeline-time material guards (#75)", () => {
+    // Long-form: chunk at master [300, 330) arranged FIRST (arr [0, 30)).
+    // cam-2 joins the session late — master range [280, 400) — so its
+    // pill covers arr [0, 30) but its MASTER range contains none of the
+    // small arr-times that cuts carry. cam-3 leaves early — master range
+    // [0, 310) — so its pill covers only arr [0, 10).
+    const loadLongform = () => {
+      useEditorStore.getState().loadJob(
+        { ...baseJobMeta, duration: 400 },
+        {
+          clips: [
+            {
+              id: "cam-1",
+              filename: "a.mp4",
+              color: "#fff",
+              sourceDurationS: 400,
+              syncOffsetMs: 0,
+            },
+            {
+              id: "cam-2",
+              filename: "b.mp4",
+              color: "#0ff",
+              sourceDurationS: 120,
+              syncOffsetMs: -280000, // master range [280, 400)
+            },
+            {
+              id: "cam-3",
+              filename: "c.mp4",
+              color: "#ff0",
+              sourceDurationS: 310,
+              syncOffsetMs: 0, // master range [0, 310) → pill arr [0, 10)
+            },
+          ],
+          arrangement: [{ id: "i1", chunkId: "c1" }],
+          chunks: [
+            {
+              id: "c1",
+              startMs: 300_000,
+              endMs: 330_000,
+              bpmOctaveShift: 0 as const,
+              effectiveBpm: 120,
+              beatsPerBar: 4,
+              accepted: true,
+              trimMode: "auto" as const,
+            },
+          ],
+          arrangementSegments: [{ in: 300, out: 330 }],
+        },
+      );
+    };
+
+    test("TAKE succeeds when the cam's PILL covers the arr-time (master range doesn't)", () => {
+      loadLongform();
+      // Sanity: cam-2's pill covers the whole chunk slot.
+      const pill = useEditorStore
+        .getState()
+        .pills.find((p) => p.camId === "cam-2");
+      expect(pill?.arrStartS).toBe(0);
+      expect(pill?.arrEndS).toBe(30);
+      // arr-time 10 is nowhere near cam-2's master range [280, 400) —
+      // the old master-axis guard silently dropped this cut.
+      const ok = useEditorStore
+        .getState()
+        .addCut({ atTimeS: 10, camId: "cam-2" });
+      expect(ok).toBe(true);
+      expect(useEditorStore.getState().cuts).toEqual([
+        { atTimeS: 10, camId: "cam-2" },
+      ]);
+    });
+
+    test("TAKE is rejected when the cam has NO pill at the arr-time (even if its master range covers it)", () => {
+      loadLongform();
+      // cam-3's pill ends at arr 10; master range [0, 310) contains 20,
+      // which used to let an inert cut through.
+      const ok = useEditorStore
+        .getState()
+        .addCut({ atTimeS: 20, camId: "cam-3" });
+      expect(ok).toBe(false);
+      expect(useEditorStore.getState().cuts).toEqual([]);
+      // Inside its pill window the TAKE lands.
+      expect(
+        useEditorStore.getState().addCut({ atTimeS: 5, camId: "cam-3" }),
+      ).toBe(true);
+    });
+
+    test("applyHoldRelease resumes to the arr-time active cam, not a master-axis guess", () => {
+      loadLongform();
+      const priorCuts = [{ atTimeS: 2, camId: "cam-2" }];
+      useEditorStore.setState({ cuts: priorCuts });
+      // Hold-paint cam-1 over arr [5, 12]: the resume cut at 12 must
+      // target cam-2 (on PROGRAM there via the cut at arr 2). The old
+      // master-axis resolution thought cam-2 had no material at master 12
+      // and fell back to cam-1 — dropping both lead and resume cuts.
+      useEditorStore.getState().applyHoldRelease("cam-1", 5, 12, priorCuts);
+      expect(useEditorStore.getState().cuts).toEqual([
+        { atTimeS: 2, camId: "cam-2" },
+        { atTimeS: 5, camId: "cam-1" },
+        { atTimeS: 12, camId: "cam-2" },
+      ]);
+    });
+
+    test("overwriteCutsRange emits the in-marker on pill coverage", () => {
+      loadLongform();
+      useEditorStore.setState({ cuts: [{ atTimeS: 2, camId: "cam-2" }] });
+      useEditorStore.getState().overwriteCutsRange("cam-1", 5, 12);
+      expect(useEditorStore.getState().cuts).toEqual([
+        { atTimeS: 2, camId: "cam-2" },
+        { atTimeS: 5, camId: "cam-1" },
+      ]);
+    });
   });
 
   describe("hold-gesture cancellation", () => {
@@ -348,6 +510,33 @@ describe("useEditorStore", () => {
   });
 
   describe("Q-hold quantize actions", () => {
+    const loadWithCams = () => {
+      useEditorStore.getState().loadJob(
+        {
+          ...baseJobMeta,
+          bpm: { value: 120, confidence: 1, phase: 0, manualOverride: false },
+        },
+        {
+          clips: [
+            {
+              id: "cam-1",
+              filename: "a.mp4",
+              color: "#fff",
+              sourceDurationS: 60,
+              syncOffsetMs: 0,
+            },
+            {
+              id: "cam-2",
+              filename: "b.mp4",
+              color: "#0ff",
+              sourceDurationS: 60,
+              syncOffsetMs: 0,
+            },
+          ],
+        },
+      );
+    };
+
     test("buildAndStartQuantizePreview is no-op when mode is OFF", () => {
       useEditorStore.getState().loadJob({
         ...baseJobMeta,
@@ -357,46 +546,86 @@ describe("useEditorStore", () => {
       const p = useEditorStore.getState().quantizePreview;
       expect(p).not.toBeNull();
       expect(p!.cuts).toEqual([]);
-      expect(p!.clipStartOffsets).toEqual([]);
-      expect(p!.trim).toBeNull();
+      expect(p!.fxs).toEqual([]);
     });
 
-    test("buildAndStartQuantizePreview emits previews for off-grid trim/clips/cuts", () => {
-      useEditorStore.getState().loadJob({
-        ...baseJobMeta,
-        bpm: { value: 120, confidence: 1, phase: 0, manualOverride: false },
-      });
+    test("commitQuantizePreview snaps off-grid cuts then clears the preview", () => {
+      loadWithCams();
+      useEditorStore.getState().addCut({ atTimeS: 0.61, camId: "cam-2" });
       useEditorStore.getState().setSnapMode("1/4");
-      useEditorStore.getState().setTrim({ in: 0.21, out: 60 });
       useEditorStore.getState().buildAndStartQuantizePreview();
       const p = useEditorStore.getState().quantizePreview;
-      expect(p?.trim?.to.in).toBeCloseTo(0, 6);
-    });
-
-    test("commitQuantizePreview applies trim then clears the preview", () => {
-      useEditorStore.getState().loadJob({
-        ...baseJobMeta,
-        bpm: { value: 120, confidence: 1, phase: 0, manualOverride: false },
-      });
-      useEditorStore.getState().setSnapMode("1/4");
-      useEditorStore.getState().setTrim({ in: 0.21, out: 60 });
-      useEditorStore.getState().buildAndStartQuantizePreview();
+      expect(p?.cuts).toHaveLength(1);
+      expect(p?.cuts[0].to).toBeCloseTo(0.5, 6);
       useEditorStore.getState().commitQuantizePreview();
       expect(useEditorStore.getState().quantizePreview).toBeNull();
-      expect(useEditorStore.getState().trim.in).toBeCloseTo(0, 6);
+      expect(useEditorStore.getState().cuts[0].atTimeS).toBeCloseTo(0.5, 6);
+    });
+
+    test("commitQuantizePreview applies fx edge snaps", () => {
+      loadWithCams();
+      useEditorStore.getState().addFx("vignette", 0.21, 1.27);
+      useEditorStore.getState().setSnapMode("1/4");
+      useEditorStore.getState().buildAndStartQuantizePreview();
+      useEditorStore.getState().commitQuantizePreview();
+      const fx = useEditorStore.getState().fx[0];
+      expect(fx.inS).toBeCloseTo(0, 6);
+      expect(fx.outS).toBeCloseTo(1.5, 6);
+    });
+
+    test("quantize NEVER touches cam start offsets or the master trim (#70)", () => {
+      // Snapping auto-synced cam starts to the musical grid would break
+      // the A/V sync the whole app exists to compute — and the trim's
+      // export window must not silently jump either. Both used to be
+      // committed on Q-release with no ghost preview.
+      loadWithCams();
+      useEditorStore.getState().setClipStartOffset("cam-1", 0.21); // off-grid
+      useEditorStore.getState().setTrim({ in: 0.21, out: 60 }); // off-grid
+      useEditorStore.getState().setSnapMode("1/4");
+      useEditorStore.getState().buildAndStartQuantizePreview();
+      useEditorStore.getState().commitQuantizePreview();
+      expect(useEditorStore.getState().trim.in).toBeCloseTo(0.21, 6);
+      const cam1 = asVideo(useEditorStore.getState().clips[0]);
+      expect(cam1.startOffsetS).toBeCloseTo(0.21, 6);
     });
 
     test("cancelQuantizePreview clears without applying", () => {
-      useEditorStore.getState().loadJob({
-        ...baseJobMeta,
-        bpm: { value: 120, confidence: 1, phase: 0, manualOverride: false },
-      });
+      loadWithCams();
+      useEditorStore.getState().addCut({ atTimeS: 0.61, camId: "cam-2" });
       useEditorStore.getState().setSnapMode("1/4");
-      useEditorStore.getState().setTrim({ in: 0.21, out: 60 });
       useEditorStore.getState().buildAndStartQuantizePreview();
       useEditorStore.getState().cancelQuantizePreview();
       expect(useEditorStore.getState().quantizePreview).toBeNull();
-      expect(useEditorStore.getState().trim.in).toBeCloseTo(0.21, 6);
+      expect(useEditorStore.getState().cuts[0].atTimeS).toBeCloseTo(0.61, 6);
+    });
+
+    test("quantize snaps against the ARR-time beat anchor, same as the BeatRuler and live cuts (#94)", () => {
+      // Long-form: the first played chunk starts at master 0.2, so the
+      // arr-time grid is shifted by -0.2 vs the master grid. At 120 BPM
+      // (step 0.5) the BeatRuler's ticks sit at arr 0.3, 0.8, 1.3, … —
+      // exactly where snapTimelineTime puts live-recorded cuts. Quantize
+      // must target the SAME ticks; the master anchor would 'snap' an
+      // on-ruler cut to 1.0, actively de-quantizing the performance.
+      useEditorStore.getState().loadJob(
+        {
+          ...baseJobMeta,
+          bpm: { value: 120, confidence: 1, phase: 0, manualOverride: false },
+        },
+        { arrangementSegments: [{ in: 0.2, out: 30.2 }] },
+      );
+      useEditorStore.getState().setSnapMode("1/4");
+      // Sanity: the live-cut snap lands on the arr grid.
+      expect(
+        useEditorStore.getState().snapTimelineTime(0.85),
+      ).toBeCloseTo(0.8, 6);
+      useEditorStore.setState({ cuts: [{ atTimeS: 0.85, camId: "cam-1" }] });
+      useEditorStore.getState().addFx("vignette", 0.85, 2.35);
+      useEditorStore.getState().buildAndStartQuantizePreview();
+      const p = useEditorStore.getState().quantizePreview;
+      expect(p?.cuts).toHaveLength(1);
+      expect(p?.cuts[0].to).toBeCloseTo(0.8, 6);
+      expect(p?.fxs[0]?.in?.to).toBeCloseTo(0.8, 6);
+      expect(p?.fxs[0]?.out?.to).toBeCloseTo(2.3, 6);
     });
   });
 
@@ -564,6 +793,78 @@ describe("useEditorStore", () => {
       useEditorStore.getState().clearSeekRequest();
       useEditorStore.getState().stepByActiveSnap(1);
       expect(useEditorStore.getState().playback.currentTime).toBeCloseTo(2.0 + 1 / 30, 6);
+    });
+
+    describe("long-form arr-time stepping (#102)", () => {
+      const loadLongform = () => {
+        useEditorStore.getState().loadJob(
+          {
+            ...baseJobMeta,
+            duration: 400,
+            bpm: {
+              value: 120,
+              confidence: 1,
+              phase: 0.4,
+              manualOverride: false,
+            },
+            beatsPerBar: 4,
+          },
+          {
+            arrangementSegments: [
+              { in: 12.3, out: 42.3 }, // arr 0..30
+              { in: 100, out: 130 }, // arr 30..60
+            ],
+          },
+        );
+      };
+
+      test("bar-steps land on the BeatRuler's arr-time bars in segment ≥ 1", () => {
+        loadLongform();
+        useEditorStore.getState().setSnapMode("1");
+        // Playhead at arr 30.4 (master 100.4, inside segment 1).
+        useEditorStore.getState().seek(100.4, { segmentIdxHint: 1 });
+        useEditorStore.getState().clearSeekRequest();
+        useEditorStore.getState().stepByActiveSnap(1);
+        // arrBeatPhase = 0.4 − 12.3 = −11.9; bar ticks at arr …30.1, 32.1.
+        // The old master-anchored snap landed at arr 32.4 — visibly off
+        // the bar lines the ruler draws.
+        expect(useEditorStore.getState().playback.timelineT).toBeCloseTo(
+          32.1,
+          6,
+        );
+        expect(useEditorStore.getState().playback.currentTime).toBeCloseTo(
+          102.1,
+          6,
+        );
+      });
+
+      test("frame-step across a chunk seam hops into the next segment (no gap escape)", () => {
+        loadLongform();
+        useEditorStore.getState().setSnapMode("off");
+        // 0.01 s of arr-time before the seam at arr 30 (master 42.29).
+        useEditorStore.getState().seek(42.29, { segmentIdxHint: 0 });
+        useEditorStore.getState().clearSeekRequest();
+        useEditorStore.getState().stepByActiveSnap(1);
+        // One 1/30 frame forward crosses the seam: arr 30.0233… lives in
+        // segment 1 at master 100.0233…. The old master-axis step landed
+        // at master 42.3233 (a gap): seek's fallback then stored the raw
+        // MASTER value in timelineT and the playhead drew deep inside the
+        // second chunk's territory.
+        const pb = useEditorStore.getState().playback;
+        expect(pb.timelineT).toBeCloseTo(29.99 + 1 / 30, 5);
+        expect(pb.currentTime).toBeCloseTo(100 + (29.99 + 1 / 30 - 30), 5);
+      });
+
+      test("step clamps to the end of the song (arr axis)", () => {
+        loadLongform();
+        useEditorStore.getState().setSnapMode("1");
+        useEditorStore.getState().seek(129.5, { segmentIdxHint: 1 }); // arr 59.5
+        useEditorStore.getState().clearSeekRequest();
+        useEditorStore.getState().stepByActiveSnap(1);
+        const pb = useEditorStore.getState().playback;
+        expect(pb.timelineT).toBeCloseTo(60, 6);
+        expect(pb.currentTime).toBeCloseTo(130, 6);
+      });
     });
   });
 

@@ -1,5 +1,4 @@
 // Transport row with chunky play/pause + frame steppers + time readouts. Keyboard-aware.
-import { useEffect } from "react";
 import { useEditorStore } from "../store";
 import { effectiveAudioStartS } from "../selectors/timing";
 import {
@@ -12,9 +11,15 @@ import {
   arrToMaster,
   masterToArr,
   totalArrDuration,
-} from "../arrangement-time";
-import { useRegisterShortcut } from "../shortcuts/useRegisterShortcut";
+} from "../../core/arrangement-time";
+import { useGlobalShortcut } from "../shortcuts/keymap";
 import { useIsNarrowViewport } from "../use-is-narrow";
+import {
+  redoEdit,
+  redoKeyLabel,
+  undoEdit,
+  undoKeyLabel,
+} from "../history";
 import { ChunkyButton } from "./ChunkyButton";
 import { TransportClock } from "./TransportClock";
 import {
@@ -25,10 +30,12 @@ import {
   OutIcon,
   PauseIcon,
   PlayIcon,
+  RedoIcon,
   SkipBackIcon,
   SkipFwdIcon,
   StepBackIcon,
   StepFwdIcon,
+  UndoIcon,
 } from "./icons";
 
 type IOContextKind = "loop" | "video" | "image" | "master";
@@ -78,8 +85,7 @@ export function TransportBar() {
   const setVideoClipTrim = useEditorStore((s) => s.setVideoClipTrim);
   const setImageClipDuration = useEditorStore((s) => s.setImageClipDuration);
   const setClipStartOffset = useEditorStore((s) => s.setClipStartOffset);
-  // Read-only subscriptions to drive aria-labels + shortcut hints.
-  const selectedClipId = useEditorStore((s) => s.selectedClipId);
+  // Read-only subscription to drive aria-labels + shortcut hints.
   const ioContextKind = useEditorStore((s) => {
     if (s.playback.loop) return "loop" as const;
     if (s.selectedClipId === null) return "master" as const;
@@ -87,6 +93,10 @@ export function TransportBar() {
     if (!clip) return "master" as const;
     return clip.kind === "image" ? ("image" as const) : ("video" as const);
   });
+  // Undo/redo affordance (#69): depths are mirrored into the store by
+  // the history module, so the buttons enable/disable live. The history
+  // object only changes reference when a depth changes.
+  const history = useEditorStore((s) => s.history);
   // Phone-sized viewports get an aggressively compacted transport bar:
   // every transport stepper + Play + IN/OUT/LOOP collapses to xs
   // (h-8 ≈ 28 px wide icon-only, no min-w) so the entire 8-button
@@ -100,7 +110,6 @@ export function TransportBar() {
   const trimSize = isNarrow ? "xs" : "sm";
 
   const fps = meta?.fps && meta.fps > 0 ? meta.fps : 30;
-  const duration = meta?.duration ?? 0;
   // Visibility gates on the raw value: if the file is non-silent throughout
   // we have nothing meaningful to jump to. The seek target itself uses the
   // user-corrected (effective) start.
@@ -223,113 +232,107 @@ export function TransportBar() {
     setLoop({ start, end });
   }
 
-  // Keyboard shortcuts (skip when an input/textarea is focused)
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      const tag = (e.target as HTMLElement)?.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA" || (e.target as HTMLElement)?.isContentEditable) {
-        return;
-      }
-      // ignore if a knob is focused (it has its own handler)
-      const ae = document.activeElement as HTMLElement | null;
-      if (ae?.dataset?.knob) return;
-
-      switch (e.key) {
-        case " ":
-          e.preventDefault();
-          setPlaying(!isPlaying);
-          break;
-        case "ArrowLeft":
-          e.preventDefault();
-          if (e.altKey) shiftLoop(-1);
-          else stepByActiveSnap(-1);
-          break;
-        case "ArrowRight":
-          e.preventDefault();
-          if (e.altKey) shiftLoop(1);
-          else stepByActiveSnap(1);
-          break;
-        case "i":
-        case "I":
-          e.preventDefault();
-          setInPointAtPlayhead();
-          break;
-        case "o":
-        case "O":
-          e.preventDefault();
-          setOutPointAtPlayhead();
-          break;
-        case "l":
-        case "L":
-          e.preventDefault();
-          toggleLoop();
-          break;
-      }
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [
-    fps,
-    duration,
-    isPlaying,
-    loop,
-    setPlaying,
-    setLoop,
-    setTrim,
-    setVideoClipTrim,
-    setImageClipDuration,
-    setClipStartOffset,
-    selectedClipId,
-    trim.in,
-    trim.out,
-    stepByActiveSnap,
-    shiftLoop,
-    arrSegments,
-  ]);
-
-  useRegisterShortcut({
+  // Keyboard shortcuts. The keymap dispatcher owns the standard guards
+  // (typing target, exact-modifier policy — browser chords like Cmd/Ctrl+L
+  // or Cmd+Arrow never reach these handlers — repeat, modal scope) and
+  // registers each binding's cheat-sheet entry from the same declaration.
+  // `unlessKnobFocused` keeps the transport quiet while a Knob has focus
+  // (it owns its own arrow/step handling).
+  useGlobalShortcut({
     id: "transport.playpause",
-    keys: ["Space"],
-    description: "Play / pause",
-    group: "Transport",
-    icon: <PlayIcon />,
+    keys: [" "],
+    unlessKnobFocused: true,
+    onDown: () => setPlaying(!isPlaying),
+    help: {
+      keys: ["Space"],
+      description: "Play / pause",
+      group: "Transport",
+      icon: <PlayIcon />,
+    },
   });
-  useRegisterShortcut({
+  useGlobalShortcut({
     id: "transport.framestep",
-    keys: ["←", "→"],
-    description: "Step by snap target (frame, beat, bar, or match-point)",
-    group: "Transport",
-    icon: <ArrowKeysIcon />,
+    keys: ["ArrowLeft"],
+    allowRepeat: true,
+    unlessKnobFocused: true,
+    onDown: () => stepByActiveSnap(-1),
+    help: {
+      keys: ["←", "→"],
+      description: "Step by snap target (frame, beat, bar, or match-point)",
+      group: "Transport",
+      icon: <ArrowKeysIcon />,
+    },
   });
-  useRegisterShortcut({
+  useGlobalShortcut({
+    id: "transport.framestep.fwd",
+    keys: ["ArrowRight"],
+    allowRepeat: true,
+    unlessKnobFocused: true,
+    onDown: () => stepByActiveSnap(1),
+  });
+  useGlobalShortcut({
     id: "transport.loopshift",
-    keys: ["⌥←", "⌥→"],
-    description: "Shift loop region by its length (OP-1 style; playback continues)",
-    group: "Transport",
-    icon: <LoopIcon />,
+    keys: ["ArrowLeft"],
+    modifiers: ["alt"],
+    allowRepeat: true,
+    unlessKnobFocused: true,
+    onDown: () => shiftLoop(-1),
+    help: {
+      keys: ["⌥←", "⌥→"],
+      description:
+        "Shift loop region by its length (OP-1 style; playback continues)",
+      group: "Transport",
+      icon: <LoopIcon />,
+    },
   });
-  useRegisterShortcut({
+  useGlobalShortcut({
+    id: "transport.loopshift.fwd",
+    keys: ["ArrowRight"],
+    modifiers: ["alt"],
+    allowRepeat: true,
+    unlessKnobFocused: true,
+    onDown: () => shiftLoop(1),
+  });
+  useGlobalShortcut({
     id: "transport.in",
-    keys: ["I"],
-    description: ioInDescription(ioContextKind),
-    group: "Transport",
-    icon: <InIcon />,
+    keys: ["i", "I"],
+    shiftInsensitive: true,
+    unlessKnobFocused: true,
+    onDown: () => setInPointAtPlayhead(),
+    help: {
+      keys: ["I"],
+      description: ioInDescription(ioContextKind),
+      group: "Transport",
+      icon: <InIcon />,
+    },
   });
-  useRegisterShortcut({
+  useGlobalShortcut({
     id: "transport.out",
-    keys: ["O"],
-    description: ioOutDescription(ioContextKind),
-    group: "Transport",
-    icon: <OutIcon />,
+    keys: ["o", "O"],
+    shiftInsensitive: true,
+    unlessKnobFocused: true,
+    onDown: () => setOutPointAtPlayhead(),
+    help: {
+      keys: ["O"],
+      description: ioOutDescription(ioContextKind),
+      group: "Transport",
+      icon: <OutIcon />,
+    },
   });
-  useRegisterShortcut({
+  useGlobalShortcut({
     id: "transport.loop",
-    keys: ["L"],
-    description: loop
-      ? "Disable loop"
-      : "Loop a 2-second region from the playhead",
-    group: "Transport",
-    icon: <LoopIcon />,
+    keys: ["l", "L"],
+    shiftInsensitive: true,
+    unlessKnobFocused: true,
+    onDown: () => toggleLoop(),
+    help: {
+      keys: ["L"],
+      description: loop
+        ? "Disable loop"
+        : "Loop a 2-second region from the playhead",
+      group: "Transport",
+      icon: <LoopIcon />,
+    },
   });
 
   return (
@@ -438,6 +441,36 @@ export function TransportBar() {
           {!isNarrow && "LOOP"}
         </ChunkyButton>
       </div>
+
+      {/* Undo/redo (#69). Desktop-only: the phone transport row is
+       *  budgeted to fit 8-up at 280 px and these two would break it —
+       *  narrow layouts keep the pointer long-press flows plus the
+       *  post-clear notice instead. */}
+      {!isNarrow && (
+        <>
+          <div className="hidden sm:block h-8 w-px bg-rule mx-1" />
+          <div className="flex items-center flex-wrap gap-1">
+            <ChunkyButton
+              variant="secondary"
+              size={trimSize}
+              onClick={() => void undoEdit()}
+              disabled={history.undoDepth === 0}
+              iconLeft={<UndoIcon />}
+              aria-label="Undo the last edit"
+              title={`Undo (${undoKeyLabel()})`}
+            />
+            <ChunkyButton
+              variant="secondary"
+              size={trimSize}
+              onClick={() => void redoEdit()}
+              disabled={history.redoDepth === 0}
+              iconLeft={<RedoIcon />}
+              aria-label="Redo the last undone edit"
+              title={`Redo (${redoKeyLabel()})`}
+            />
+          </div>
+        </>
+      )}
 
       {/* Clock: hidden on phones — the timeline ruler shows the same
        *  master time, and the bezel here was eating an entire row.

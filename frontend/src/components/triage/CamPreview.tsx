@@ -15,7 +15,12 @@ import { useEffect, useRef, useState } from "react";
 import { resolveCamAssetUrl } from "../../local/jobs";
 import { useTriageStore } from "../../local/triage/triage-store";
 import { CamPickerDropdown } from "../CamPickerDropdown";
-import { decideCamPreviewAction } from "../../local/timing/cam-preview-sync";
+import {
+  INITIAL_SEGMENT_HOP_ARM,
+  decideCamPreviewAction,
+  trackSegmentHop,
+  type SegmentHopArm,
+} from "../../local/timing/cam-preview-sync";
 
 export function CamPreview() {
   const jobId = useTriageStore((s) => s.jobId);
@@ -40,8 +45,16 @@ export function CamPreview() {
   // click / scrub / loop wrap). Reset whenever the active cam changes
   // so the next tick re-snaps to the new element.
   const prevMasterTRef = useRef<number | null>(null);
+  // Segment-hop arm: a focusedChunkId change (sequence walker advance,
+  // chunk-list click) arms a short window in which the next forward
+  // time hop is classified as a JUMP even when the inter-chunk gap is
+  // below the delta heuristic's threshold — otherwise every sub-500 ms
+  // gap would be held through and the video would accumulate a
+  // persistent lag behind the audio (issue #105).
+  const hopArmRef = useRef<SegmentHopArm>(INITIAL_SEGMENT_HOP_ARM);
   useEffect(() => {
     prevMasterTRef.current = null;
+    hopArmRef.current = INITIAL_SEGMENT_HOP_ARM;
   }, [camId]);
 
   useEffect(() => {
@@ -67,6 +80,17 @@ export function CamPreview() {
 
   useEffect(() => {
     if (!videoEl) return;
+    // Non-reactive read: the tracker only needs the value per tick, and
+    // subscribing would add a render per focus change for nothing.
+    const focusedChunkId = useTriageStore.getState().focusedChunkId;
+    const prevMasterT = prevMasterTRef.current;
+    const hop = trackSegmentHop(
+      hopArmRef.current,
+      focusedChunkId,
+      currentTime,
+      prevMasterT == null ? null : currentTime - prevMasterT,
+    );
+    hopArmRef.current = hop.arm;
     const action = decideCamPreviewAction({
       masterT: currentTime,
       syncOffsetMs,
@@ -75,7 +99,8 @@ export function CamPreview() {
       videoCurrentTimeS: Number.isFinite(videoEl.currentTime)
         ? videoEl.currentTime
         : null,
-      prevMasterT: prevMasterTRef.current,
+      prevMasterT,
+      forceJump: hop.forceJump,
     });
     prevMasterTRef.current = currentTime;
 

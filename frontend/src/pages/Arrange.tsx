@@ -26,6 +26,7 @@ import { jobsDb } from "../local/jobs";
 import type { LocalJob } from "../local/jobs";
 import { jobRoutePath } from "../local/jobs-routing";
 import { isVideoAsset } from "../storage/jobs-db";
+import { isChunkEffectivelyAccepted } from "../local/triage/triage-store";
 import { useArrangeStore } from "../local/arrange/arrange-store";
 import { useArrangePersist } from "../local/arrange/useArrangePersist";
 import { useChunkMelSpecs } from "../local/arrange/useChunkMelSpecs";
@@ -88,7 +89,17 @@ export default function Arrange() {
       // list but doesn't reach into the persisted arrangement, so a
       // previously-arranged chunk that the user has since rejected
       // would otherwise still show up here. Drop those items.
-      const acceptedChunks = (j.chunks ?? []).filter((c) => c.accepted);
+      // Same effectively-accepted predicate as Triage's Continue button
+      // (accepted flag AND the persisted min-bars filter) — so entering
+      // Arrange directly agrees with Continue about which chunks ship.
+      const acceptedChunks = (j.chunks ?? []).filter((c) =>
+        isChunkEffectivelyAccepted(
+          c,
+          j.ui?.minChunkBars ?? 0,
+          j.bpm?.value ?? null,
+          j.beatsPerBar ?? 4,
+        ),
+      );
       const acceptedIds = new Set(acceptedChunks.map((c) => c.id));
       const persistedArr = j.arrangement ?? [];
       let arrangement = persistedArr.filter((it) =>

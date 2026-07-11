@@ -9,7 +9,7 @@
 // Pure helpers: no store access, no React. The TransportBar reads the
 // store imperatively and feeds the relevant slice in here.
 
-import { Clip, ImageClip, VideoClip, clipRangeS, isImageClip, isVideoClip } from "./types";
+import { Clip, ImageClip, VideoClip, clipRangeS, isImageClip, isVideoClip } from "../core/types";
 import type { LoopRegion } from "./OffsetScheduler";
 
 /** Image min-pill width — must match the clamp inside `setImageClipDuration`. */

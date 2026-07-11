@@ -11,10 +11,9 @@
  *   - Enter            → Keep focused chunk (auto-advance)
  *   - Backspace        → Drop focused chunk (auto-advance)
  */
-import { useEffect } from "react";
 import { ChunkyButton } from "../../editor/components/ChunkyButton";
 import { TransportClockView } from "../../editor/components/TransportClockView";
-import { useRegisterShortcut } from "../../editor/shortcuts/useRegisterShortcut";
+import { useGlobalShortcut } from "../../editor/shortcuts/keymap";
 import {
   PauseIcon,
   PlayIcon,
@@ -48,184 +47,187 @@ export function TriageTransportBar() {
   const insertChunkAtPlayhead = useTriageStore((s) => s.insertChunkAtPlayhead);
   const acceptedCount = chunks.filter((c) => c.accepted).length;
 
-  // ─── Shortcut registration + keydown handler ─────────────────────────
-  useRegisterShortcut({
+  // ─── Keyboard shortcuts ────────────────────────────────────────────────
+  // Declared through the central keymap: guards (typing target, exact
+  // modifiers, repeat, modal scope) live in the dispatcher, and each
+  // binding registers its cheat-sheet entry from the same declaration.
+  // Matching is by e.code (physical key) so it's layout-independent.
+  useGlobalShortcut({
     id: "triage.playpause",
-    keys: ["Space"],
-    description: "Play / pause",
-    group: "Transport",
+    codes: ["Space"],
+    onDown: () => setPlaying(!useTriageStore.getState().playback.isPlaying),
+    help: { keys: ["Space"], description: "Play / pause", group: "Transport" },
   });
-  useRegisterShortcut({
+  useGlobalShortcut({
     id: "triage.prev-chunk",
-    keys: ["⇧←"],
-    description: "Focus previous chunk",
-    group: "Triage",
+    codes: ["ArrowLeft"],
+    modifiers: ["shift"],
+    onDown: () => focusRelative(-1),
+    help: { keys: ["⇧←"], description: "Focus previous chunk", group: "Triage" },
   });
-  useRegisterShortcut({
+  useGlobalShortcut({
     id: "triage.next-chunk",
-    keys: ["⇧→"],
-    description: "Focus next chunk",
-    group: "Triage",
+    codes: ["ArrowRight"],
+    modifiers: ["shift"],
+    onDown: () => focusRelative(1),
+    help: { keys: ["⇧→"], description: "Focus next chunk", group: "Triage" },
   });
-  useRegisterShortcut({
+  useGlobalShortcut({
     id: "triage.accept",
-    keys: ["Enter"],
-    description: "Keep focused chunk (auto-advance)",
-    group: "Triage",
+    codes: ["Enter"],
+    onDown: () => acceptFocused(),
+    help: {
+      keys: ["Enter"],
+      description: "Keep focused chunk (auto-advance)",
+      group: "Triage",
+    },
   });
-  useRegisterShortcut({
+  useGlobalShortcut({
     id: "triage.reject",
-    keys: ["Backspace"],
-    description: "Drop focused chunk (auto-advance)",
-    group: "Triage",
+    codes: ["Backspace"],
+    onDown: () => void rejectFocusedGuarded(),
+    help: {
+      keys: ["Backspace"],
+      description: "Drop focused chunk (auto-advance)",
+      group: "Triage",
+    },
   });
-  useRegisterShortcut({
+  useGlobalShortcut({
     id: "triage.loop",
-    keys: ["L"],
-    description: "Cycle transport mode (Continue · Loop · Sequence)",
-    group: "Transport",
-  });
-  useRegisterShortcut({
-    id: "triage.split",
-    keys: ["S"],
-    description: "Split chunk at the playhead (or create one in empty space)",
-    group: "Triage · Edit",
-  });
-  useRegisterShortcut({
-    id: "triage.join-prev",
-    keys: ["J"],
-    description: "Merge focused chunk with previous",
-    group: "Triage · Edit",
-  });
-  useRegisterShortcut({
-    id: "triage.join-next",
-    keys: ["⇧J"],
-    description: "Merge focused chunk with next",
-    group: "Triage · Edit",
-  });
-  useRegisterShortcut({
-    id: "triage.new-chunk",
-    keys: ["N"],
-    description: "Insert a new chunk at the playhead (in silence)",
-    group: "Triage · Edit",
-  });
-  useRegisterShortcut({
-    id: "triage.conform",
-    keys: ["C"],
-    description: "Re-fit focused chunk's bar grid from its audio",
-    group: "Triage · Edit",
-  });
-  useRegisterShortcut({
-    id: "triage.reset-chunk",
-    keys: ["R"],
-    description: "Reset focused chunk to detection boundaries",
-    group: "Triage · Edit",
-  });
-  useRegisterShortcut({
-    id: "triage.seam",
-    keys: ["T"],
-    description: "Seam preview — audition the transition from the focused chunk",
-    group: "Transport",
-  });
-  useRegisterShortcut({
-    id: "triage.seam-close",
-    keys: ["Esc"],
-    description: "Close seam preview",
-    group: "Transport",
-  });
-
-  useEffect(() => {
-    function isTextInput(target: EventTarget | null): boolean {
-      if (!(target instanceof HTMLElement)) return false;
-      const tag = target.tagName;
-      return (
-        tag === "INPUT" ||
-        tag === "TEXTAREA" ||
-        tag === "SELECT" ||
-        target.isContentEditable
+    codes: ["KeyL"],
+    onDown: () => {
+      const cur = useTriageStore.getState().playback.mode;
+      setMode(
+        cur === "continue" ? "loop" : cur === "loop" ? "sequence" : "continue",
       );
-    }
-    function handler(e: KeyboardEvent) {
-      if (isTextInput(e.target)) return;
-      if (e.code === "Space") {
-        e.preventDefault();
-        setPlaying(!useTriageStore.getState().playback.isPlaying);
-      } else if (e.shiftKey && e.code === "ArrowLeft") {
-        e.preventDefault();
-        focusRelative(-1);
-      } else if (e.shiftKey && e.code === "ArrowRight") {
-        e.preventDefault();
-        focusRelative(1);
-      } else if (e.code === "Enter") {
-        e.preventDefault();
-        acceptFocused();
-      } else if (e.code === "Backspace") {
-        e.preventDefault();
-        void rejectFocusedGuarded();
-      } else if (e.code === "KeyL") {
-        e.preventDefault();
-        const cur = useTriageStore.getState().playback.mode;
-        setMode(
-          cur === "continue" ? "loop" : cur === "loop" ? "sequence" : "continue",
-        );
-      } else if (e.code === "KeyS" && !e.metaKey && !e.ctrlKey && !e.altKey) {
-        e.preventDefault();
-        const st = useTriageStore.getState();
-        const tMs = Math.round(st.playback.currentTime * 1000);
-        const focused = st.focusedChunkId
-          ? st.chunks.find((c) => c.id === st.focusedChunkId)
-          : null;
-        const insideFocused =
-          focused != null && tMs > focused.startMs + 50 && tMs < focused.endMs - 50;
-        if (insideFocused) {
-          void splitFocusedGuarded(tMs);
-        } else if (!st.chunks.some((c) => tMs > c.startMs && tMs < c.endMs)) {
-          // Empty space → create a new chunk here instead of splitting.
-          insertChunkAtPlayhead();
-        }
-      } else if (e.code === "KeyJ" && !e.metaKey && !e.ctrlKey && !e.altKey) {
-        e.preventDefault();
-        const st = useTriageStore.getState();
-        if (st.focusedChunkId) {
-          void joinFocusedGuarded(e.shiftKey ? "next" : "prev");
-        }
-      } else if (e.code === "KeyN" && !e.metaKey && !e.ctrlKey && !e.altKey) {
-        e.preventDefault();
+    },
+    help: {
+      keys: ["L"],
+      description: "Cycle transport mode (Continue · Loop · Sequence)",
+      group: "Transport",
+    },
+  });
+  useGlobalShortcut({
+    id: "triage.split",
+    codes: ["KeyS"],
+    onDown: () => {
+      const st = useTriageStore.getState();
+      const tMs = Math.round(st.playback.currentTime * 1000);
+      const focused = st.focusedChunkId
+        ? st.chunks.find((c) => c.id === st.focusedChunkId)
+        : null;
+      const insideFocused =
+        focused != null && tMs > focused.startMs + 50 && tMs < focused.endMs - 50;
+      if (insideFocused) {
+        void splitFocusedGuarded(tMs);
+      } else if (!st.chunks.some((c) => tMs > c.startMs && tMs < c.endMs)) {
+        // Empty space → create a new chunk here instead of splitting.
         insertChunkAtPlayhead();
-      } else if (e.code === "KeyC" && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
-        e.preventDefault();
-        const st = useTriageStore.getState();
-        if (st.focusedChunkId) conformChunk(st.focusedChunkId);
-      } else if (e.code === "KeyR" && !e.metaKey && !e.ctrlKey && !e.altKey) {
-        e.preventDefault();
-        const st = useTriageStore.getState();
-        if (st.focusedChunkId) resetChunk(st.focusedChunkId);
-      } else if (e.code === "KeyT" && !e.metaKey && !e.ctrlKey && !e.altKey) {
-        e.preventDefault();
-        const st = useTriageStore.getState();
-        if (st.playback.seam) closeSeam();
-        else if (st.focusedChunkId) openSeam(st.focusedChunkId);
-      } else if (e.code === "Escape") {
-        const st = useTriageStore.getState();
-        if (st.playback.seam) {
-          e.preventDefault();
-          closeSeam();
-        }
       }
-    }
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [
-    setPlaying,
-    focusRelative,
-    acceptFocused,
-    setMode,
-    openSeam,
-    closeSeam,
-    conformChunk,
-    insertChunkAtPlayhead,
-    resetChunk,
-  ]);
+    },
+    help: {
+      keys: ["S"],
+      description: "Split chunk at the playhead (or create one in empty space)",
+      group: "Triage · Edit",
+    },
+  });
+  useGlobalShortcut({
+    id: "triage.join-prev",
+    codes: ["KeyJ"],
+    onDown: () => {
+      if (useTriageStore.getState().focusedChunkId) {
+        void joinFocusedGuarded("prev");
+      }
+    },
+    help: {
+      keys: ["J"],
+      description: "Merge focused chunk with previous",
+      group: "Triage · Edit",
+    },
+  });
+  useGlobalShortcut({
+    id: "triage.join-next",
+    codes: ["KeyJ"],
+    modifiers: ["shift"],
+    onDown: () => {
+      if (useTriageStore.getState().focusedChunkId) {
+        void joinFocusedGuarded("next");
+      }
+    },
+    help: {
+      keys: ["⇧J"],
+      description: "Merge focused chunk with next",
+      group: "Triage · Edit",
+    },
+  });
+  useGlobalShortcut({
+    id: "triage.new-chunk",
+    codes: ["KeyN"],
+    onDown: () => insertChunkAtPlayhead(),
+    help: {
+      keys: ["N"],
+      description: "Insert a new chunk at the playhead (in silence)",
+      group: "Triage · Edit",
+    },
+  });
+  useGlobalShortcut({
+    id: "triage.conform",
+    codes: ["KeyC"],
+    onDown: () => {
+      const st = useTriageStore.getState();
+      if (st.focusedChunkId) conformChunk(st.focusedChunkId);
+    },
+    help: {
+      keys: ["C"],
+      description: "Re-fit focused chunk's bar grid from its audio",
+      group: "Triage · Edit",
+    },
+  });
+  useGlobalShortcut({
+    id: "triage.reset-chunk",
+    codes: ["KeyR"],
+    onDown: () => {
+      const st = useTriageStore.getState();
+      if (st.focusedChunkId) resetChunk(st.focusedChunkId);
+    },
+    help: {
+      keys: ["R"],
+      description: "Reset focused chunk to detection boundaries",
+      group: "Triage · Edit",
+    },
+  });
+  useGlobalShortcut({
+    id: "triage.seam",
+    codes: ["KeyT"],
+    onDown: () => {
+      const st = useTriageStore.getState();
+      if (st.playback.seam) closeSeam();
+      else if (st.focusedChunkId) openSeam(st.focusedChunkId);
+    },
+    help: {
+      keys: ["T"],
+      description:
+        "Seam preview — audition the transition from the focused chunk",
+      group: "Transport",
+    },
+  });
+  useGlobalShortcut({
+    id: "triage.seam-close",
+    keys: ["Escape"],
+    preventDefault: false,
+    onDown: (e) => {
+      const st = useTriageStore.getState();
+      if (st.playback.seam) {
+        e.preventDefault();
+        closeSeam();
+      }
+    },
+    help: {
+      keys: ["Esc"],
+      description: "Close seam preview",
+      group: "Transport",
+    },
+  });
 
   return (
     <div

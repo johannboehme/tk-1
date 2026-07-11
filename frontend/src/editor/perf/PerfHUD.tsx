@@ -15,7 +15,7 @@ import {
   subscribe,
   type PerfEvent,
   type PerfEventKind,
-} from "./marks";
+} from "../../core/perf/marks";
 import { tokens } from "../design-tokens";
 import { useEditorStore } from "../store";
 

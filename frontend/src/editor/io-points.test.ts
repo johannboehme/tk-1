@@ -5,7 +5,7 @@ import {
   imageOutAtPlayhead,
   videoSourceTimeAtPlayhead,
 } from "./io-points";
-import type { ImageClip, VideoClip } from "./types";
+import type { ImageClip, VideoClip } from "../core/types";
 
 function makeVideo(p: Partial<VideoClip> = {}): VideoClip {
   return {

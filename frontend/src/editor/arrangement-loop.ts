@@ -9,15 +9,21 @@
  * where the next wrap fires; the store calls `clampLoopToBounds` so the
  * user can't drag a loop outside the playable region.
  */
-import type { Segment } from "./types";
+import type { Segment } from "../core/types";
 import type { LoopRegion, TrimRegion } from "./OffsetScheduler";
 import { clampLoopRegion } from "./OffsetScheduler";
 import {
   arrToMaster,
-  masterToArr,
+  segmentArrStarts,
   segmentIndexAtArr,
-  totalArrDuration,
-} from "./arrangement-time";
+  sliceByArrSegments,
+} from "../core/arrangement-time";
+
+/** Float tolerance for "loop.end sits exactly on a segment seam". Arr-times
+ *  are accumulated float sums; a UI-derived loop.end that means "the seam"
+ *  can differ from the walker's own sum by a few ulps. Anything a real user
+ *  can place is far coarser than a nanosecond. */
+const SEAM_EPS_S = 1e-9;
 
 export interface LoopWrapGeometry {
   /** Master-time at which the wrap fires (= arr-time of `loop.end`
@@ -53,14 +59,32 @@ export function nextLoopWrapMasterT(
   // value side correctly (clamps to `last.out`).
   let wrapInSegIdx = segmentIndexAtArr(loop.end, segments);
   if (wrapInSegIdx === -1) wrapInSegIdx = segments.length - 1;
+  let wrapAtMasterT = arrToMaster(loop.end, segments);
+
+  // loop.end exactly on an INTERIOR seam: the half-open lookup resolves
+  // it into the FOLLOWING segment, i.e. wrapAtMasterT = nextSeg.in — the
+  // first sample of a chunk the loop doesn't contain. The walker would
+  // then hop INTO that chunk (wrapHere is false while playing the loop's
+  // true last segment), bleed its head every pass, and only wrap back on
+  // the next tick with a zero-lead crossfade. The loop's last audible
+  // sample lives in the PREVIOUS segment, so wrap at its `out` instead.
+  if (wrapInSegIdx > 0) {
+    const arrStartOfWrapSeg = segmentArrStarts(segments)[wrapInSegIdx];
+    if (loop.end - arrStartOfWrapSeg < SEAM_EPS_S) {
+      wrapInSegIdx -= 1;
+      wrapAtMasterT = segments[wrapInSegIdx].out;
+    }
+  }
 
   let targetSegIdx = segmentIndexAtArr(loop.start, segments);
   // Symmetric guard — loop.start clamped to 0 should map to seg 0; this
   // is only here so a caller passing an unclamped loop doesn't crash.
+  // (A loop.start ON a seam is correct as-is: the loop re-enters at the
+  // FOLLOWING segment's first sample, which is what half-open gives us.)
   if (targetSegIdx === -1) targetSegIdx = 0;
 
   return {
-    wrapAtMasterT: arrToMaster(loop.end, segments),
+    wrapAtMasterT,
     wrapTargetMasterT: arrToMaster(loop.start, segments),
     wrapInSegIdx,
     targetSegIdx,
@@ -93,11 +117,44 @@ export function loopAroundPlayhead(
   return { start, end };
 }
 
+/** Project the master-trim WINDOW into arr-time: the hull of the trim's
+ *  playable slices (`sliceByArrSegments`), i.e. [first slice's arrStartS,
+ *  last slice's arrEndS].
+ *
+ *  This must be a RANGE projection, never a point projection of the two
+ *  endpoints through `masterToArr`: the default trim {0, duration} (and
+ *  the first-load derivation {min seg.in, max seg.out}) has both endpoints
+ *  outside every segment, and masterToArr's nearest-edge fallback picks
+ *  the edge closest in MASTER distance — which is only the arrangement's
+ *  start/end when chunks play in source order. Out-of-order or duplicated
+ *  arrangements would collapse the window (loop dead everywhere).
+ *
+ *  Empty `segments` → identity passthrough ({trim.in, trim.out}), matching
+ *  the other arr-time helpers. Returns null when the trim window
+ *  intersects no segment (nothing playable). */
+export function trimWindowArr(
+  trim: TrimRegion,
+  segments: readonly Segment[],
+): { startArr: number; endArr: number } | null {
+  if (segments.length === 0) {
+    return { startArr: trim.in, endArr: trim.out };
+  }
+  const slices = sliceByArrSegments(trim.in, trim.out, segments);
+  if (slices.length === 0) return null;
+  // Slices come back in playback order and the arr cursor is monotonic,
+  // so the hull is simply first-start .. last-end.
+  return {
+    startArr: slices[0].arrStartS,
+    endArr: slices[slices.length - 1].arrEndS,
+  };
+}
+
 /** Clamp the loop to the playable arr-time window: the intersection of
  *  the segments' totalArrDuration and the master-trim's projection into
- *  arr-time. Master-trim universally narrows the loop in both single-take
- *  (where arr-time == master-time) and long-form (where trim cuts across
- *  chunks). Returns null when the loop collapses to zero length.
+ *  arr-time (`trimWindowArr`). Master-trim universally narrows the loop
+ *  in both single-take (where arr-time == master-time) and long-form
+ *  (where trim cuts across chunks). Returns null when the loop collapses
+ *  to zero length.
  *
  *  Defensive: with empty segments falls back to legacy trim-clamp so a
  *  pre-load store snapshot doesn't crash. */
@@ -108,11 +165,10 @@ export function clampLoopToBounds(
 ): LoopRegion | null {
   if (!loop) return null;
   if (segments.length === 0) return clampLoopRegion(loop, trim);
-  const total = totalArrDuration(segments);
-  const trimInArr = Math.max(0, Math.min(total, masterToArr(trim.in, segments)));
-  const trimOutArr = Math.max(trimInArr, Math.min(total, masterToArr(trim.out, segments)));
-  const start = Math.max(trimInArr, loop.start);
-  const end = Math.min(trimOutArr, loop.end);
+  const window = trimWindowArr(trim, segments);
+  if (!window) return null;
+  const start = Math.max(window.startArr, loop.start);
+  const end = Math.min(window.endArr, loop.end);
   if (end <= start) return null;
   return { start, end };
 }

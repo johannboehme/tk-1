@@ -14,7 +14,7 @@
  *
  * Plus a playhead overlay and zoom/pan affordances.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import {
   chunkBeatPhaseS,
@@ -22,20 +22,26 @@ import {
   effectiveChunkBpm,
   useTriageStore,
 } from "../../local/triage/triage-store";
-import { snapTime } from "../../editor/snap";
+import { snapTime } from "../../core/snap";
 import type { Chunk } from "../../storage/jobs-db";
 import { autoFollowScrollX } from "./triage-auto-follow";
 import {
   buildPyramidFromEnvelope,
   type PeakPyramid,
-} from "../../local/waveform/peak-pyramid";
-import { buildPeakPyramidAsync } from "../../local/waveform/build-pyramid-async";
-import { drawWaveform, TRIAGE_STYLE } from "../../local/waveform/draw-waveform";
+} from "../../core/waveform/peak-pyramid";
+import { buildPeakPyramidAsync } from "../../core/waveform/build-pyramid-async";
+import { drawWaveform, TRIAGE_STYLE } from "../../core/waveform/draw-waveform";
 import {
   getCachedPyramid,
   savePyramid,
 } from "../../local/waveform/pyramid-cache";
 import { formatTime } from "../../lib/time-format";
+import type { RulerTick as GridTick } from "../../editor/components/timeline/beat-ruler-ticks";
+import {
+  buildTimeRulerTicks,
+  type TimeRulerTick,
+} from "../../editor/components/timeline/time-ruler-ticks";
+import { buildChunkGridTicks } from "./chunk-ruler-ticks";
 
 // Visual hierarchy (top to bottom):
 //   Time ruler — secondary, MM:SS for absolute reference, faint
@@ -84,7 +90,12 @@ export function TriageTimeline() {
   const focusChunk = useTriageStore((s) => s.focusChunk);
   const seek = useTriageStore((s) => s.seek);
   const updateChunk = useTriageStore((s) => s.updateChunk);
-  const currentTime = useTriageStore((s) => s.playback.currentTime);
+  // NOTE: deliberately NOT subscribed to playback.currentTime — during
+  // playback that field updates at ~60 Hz, and re-rendering the whole
+  // timeline subtree (per-chunk framer-motion blocks, ruler tick maps)
+  // per tick made triage playback sluggish on long-form jams. The
+  // playhead lives in its own tiny child (TimelinePlayhead below) that
+  // alone subscribes to the ticking value.
   const playbackMode = useTriageStore((s) => s.playback.mode);
   const sliceReveal = useTriageStore((s) => s.sliceReveal);
   const clearSliceReveal = useTriageStore((s) => s.clearSliceReveal);
@@ -191,10 +202,9 @@ export function TriageTimeline() {
   }, [focusedChunkId]);
 
   // Stable identities — both sit in effect dependency arrays (waveform
-  // redraw, window drag listeners). As plain functions they'd get a fresh
-  // identity on every render, and this component re-renders on every
-  // playhead tick (`playback.currentTime` above) — the waveform would
-  // redraw its full hi-res body 60×/s during playback for nothing.
+  // redraw, window drag listeners) and in the memoized ChunkBlock's
+  // props. As plain functions they'd get a fresh identity on every
+  // render and defeat both.
   const timeToX = useCallback(
     (tS: number): number => (tS - viewStartS) * pxPerSec,
     [viewStartS, pxPerSec],
@@ -392,22 +402,23 @@ export function TriageTimeline() {
     seek(snapTimeS(tRaw, e));
   }
 
-  function startTrimDrag(
-    e: React.MouseEvent,
-    chunk: Chunk,
-    edge: "left" | "right",
-  ) {
-    if (e.button !== 0) return;
-    e.preventDefault();
-    e.stopPropagation();
-    movedRef.current = false;
-    dragRef.current = {
-      kind: "trim",
-      chunkId: chunk.id,
-      edge,
-      anchorS: chunkBeatPhaseS(chunk),
-    };
-  }
+  // Stable identity (refs only) so the memoized ChunkBlock's props
+  // don't churn — the block passes its own chunk back in.
+  const startTrimDrag = useCallback(
+    (chunk: Chunk, edge: "left" | "right", e: React.MouseEvent) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      movedRef.current = false;
+      dragRef.current = {
+        kind: "trim",
+        chunkId: chunk.id,
+        edge,
+        anchorS: chunkBeatPhaseS(chunk),
+      };
+    },
+    [],
+  );
 
   useEffect(() => {
     function onMove(ev: MouseEvent) {
@@ -731,22 +742,23 @@ export function TriageTimeline() {
         }}
       >
         {barTicks.map((tick, i) => {
-          const dim = tick.extension;
+          const dim = tick.extension === true;
+          const barMajor = tick.kind === "bar" && tick.labeled === true;
           // Five tiers of marker, each with its own stroke + height so
           // the eye reads the hierarchy at every zoom:
-          //   bar-major: 2px,   100%, labeled with bar number
-          //   bar-minor: 1.5px,  70%, no label
-          //   beat:      1px,    40%
-          //   div8:      1px,    25%
-          //   div16:     1px,    15%
+          //   bar labeled:   2px,   100%, labeled with bar number
+          //   bar unlabeled: 1.5px,  70%, no label
+          //   beat:          1px,    40%
+          //   div8:          1px,    25%
+          //   div16:         1px,    15%
           let tickWidth = 1;
           let tickHeight = "40%";
           let tickColor = dim ? "#FF572233" : "#FF5722B0";
-          if (tick.kind === "bar-major") {
+          if (barMajor) {
             tickWidth = 2;
             tickHeight = "100%";
             tickColor = dim ? "#FF572266" : HOT_COLOR;
-          } else if (tick.kind === "bar-minor") {
+          } else if (tick.kind === "bar") {
             tickWidth = 1.5;
             tickHeight = "70%";
             tickColor = dim ? "#FF572255" : "#FF5722CC";
@@ -757,7 +769,7 @@ export function TriageTimeline() {
             tickHeight = "15%";
             tickColor = dim ? "#FF572218" : "#FF572266";
           }
-          const x = timeToX(tick.tS);
+          const x = timeToX(tick.t);
           return (
             <span key={`b-${i}`}>
               <span
@@ -770,7 +782,7 @@ export function TriageTimeline() {
                   marginLeft: -tickWidth / 2,
                 }}
               />
-              {tick.kind === "bar-major" && (
+              {barMajor && (
                 <span
                   className="absolute font-display tracking-[0.05em] uppercase tabular leading-none select-none"
                   style={{
@@ -781,7 +793,7 @@ export function TriageTimeline() {
                     fontWeight: dim ? 400 : 700,
                   }}
                 >
-                  {tick.barIndex}
+                  {tick.barNumber}
                 </span>
               )}
             </span>
@@ -878,7 +890,7 @@ export function TriageTimeline() {
               chunk.accepted &&
               chunkPassesFilter(chunk, minChunkBars, jobBpm?.value ?? null, beatsPerBar)
             }
-            onTrimStart={(edge, e) => startTrimDrag(e, chunk, edge)}
+            onTrimStart={startTrimDrag}
           />
           );
         })}
@@ -916,19 +928,44 @@ export function TriageTimeline() {
           })}
       </AnimatePresence>
 
-      {currentTime >= viewStartS && currentTime <= viewEndS && (
-        <div
-          className="absolute top-0 pointer-events-none"
-          style={{
-            left: timeToX(currentTime),
-            height: totalHeight,
-            width: 2,
-            background: PLAYHEAD_COLOR,
-            boxShadow: "0 0 4px rgba(255,87,34,0.6)",
-          }}
-        />
-      )}
+      <TimelinePlayhead
+        viewStartS={viewStartS}
+        viewEndS={viewEndS}
+        timeToX={timeToX}
+        heightPx={totalHeight}
+      />
     </div>
+  );
+}
+
+/** The one element that tracks the 60 Hz playback clock. Isolated in
+ *  its own component so the per-tick store update re-renders exactly
+ *  this line — never the chunk lane or the rulers above. */
+function TimelinePlayhead({
+  viewStartS,
+  viewEndS,
+  timeToX,
+  heightPx,
+}: {
+  viewStartS: number;
+  viewEndS: number;
+  timeToX: (t: number) => number;
+  heightPx: number;
+}) {
+  const currentTime = useTriageStore((s) => s.playback.currentTime);
+  if (currentTime < viewStartS || currentTime > viewEndS) return null;
+  return (
+    <div
+      data-testid="triage-playhead"
+      className="absolute top-0 pointer-events-none"
+      style={{
+        left: timeToX(currentTime),
+        height: heightPx,
+        width: 2,
+        background: PLAYHEAD_COLOR,
+        boxShadow: "0 0 4px rgba(255,87,34,0.6)",
+      }}
+    />
   );
 }
 
@@ -947,10 +984,14 @@ interface ChunkBlockProps {
    *  staggered "deal" animation. */
   revealIndex: number | null;
   reducedMotion: boolean;
-  onTrimStart: (edge: "left" | "right", e: React.MouseEvent) => void;
+  onTrimStart: (chunk: Chunk, edge: "left" | "right", e: React.MouseEvent) => void;
 }
 
-function ChunkBlock({
+/** Memoized: on focus / filter / single-chunk edits only the affected
+ *  blocks re-render — with 100+ chunks per long-form jam the untouched
+ *  framer-motion blocks are the expensive part of the lane. All props
+ *  are identity-stable (store chunk objects, useCallback handlers). */
+const ChunkBlock = memo(function ChunkBlock({
   chunk,
   timeToX,
   visibleStart,
@@ -1096,7 +1137,7 @@ function ChunkBlock({
             data-trim-handle="left"
             className="absolute left-0 top-0 bottom-0 cursor-ew-resize"
             style={{ width: handleHitPx }}
-            onMouseDown={(e) => onTrimStart("left", e)}
+            onMouseDown={(e) => onTrimStart(chunk, "left", e)}
             title="Drag to trim start (Shift = bypass snap)"
           >
             <div
@@ -1115,7 +1156,7 @@ function ChunkBlock({
             data-trim-handle="right"
             className="absolute right-0 top-0 bottom-0 cursor-ew-resize"
             style={{ width: handleHitPx }}
-            onMouseDown={(e) => onTrimStart("right", e)}
+            onMouseDown={(e) => onTrimStart(chunk, "right", e)}
             title="Drag to trim end (Shift = bypass snap)"
           >
             <div
@@ -1134,53 +1175,17 @@ function ChunkBlock({
       )}
     </motion.div>
   );
-}
+});
 
-interface RulerTick {
-  t: number;
-  label: string;
-  major: boolean;
-}
-
-function useTimeRuler(viewStartS: number, viewEndS: number, widthPx: number): RulerTick[] {
-  return useMemo(() => {
-    const visible = viewEndS - viewStartS;
-    if (visible <= 0 || widthPx <= 0) return [];
-    const targetMajorPx = 120;
-    const targetCount = Math.max(2, widthPx / targetMajorPx);
-    const rawSpacing = visible / targetCount;
-    const majorStep = niceStep(rawSpacing);
-    const minorStep = majorStep / 5;
-    const ticks: RulerTick[] = [];
-    const t0 = Math.floor(viewStartS / minorStep) * minorStep;
-    for (let t = t0; t <= viewEndS + minorStep; t += minorStep) {
-      const isMajor = Math.abs(t / majorStep - Math.round(t / majorStep)) < 0.001;
-      ticks.push({
-        t,
-        label: isMajor ? formatTime(t) : "",
-        major: isMajor,
-      });
-    }
-    return ticks;
-  }, [viewStartS, viewEndS, widthPx]);
-}
-
-interface BarTick {
-  tS: number;
-  /** Visual category — drives stroke + label rendering.
-   *  - "bar-major": labeled downbeat (e.g. bar 1, 5, 9 at stride 4)
-   *  - "bar-minor": unlabeled downbeat between major bars
-   *  - "beat":      sub-bar beat tick (mid–high zoom)
-   *  - "div8":      half-beat tick (high zoom)
-   *  - "div16":     quarter-beat tick (very high zoom)
-   */
-  kind: "bar-major" | "bar-minor" | "beat" | "div8" | "div16";
-  /** Bar number — 1 at the chunk's audio-start anchor. Only rendered
-   *  for `bar-major` ticks. */
-  barIndex: number;
-  /** True when this tick lies outside the chunk's current bounds — a
-   *  potential snap target if the user trims outwards. */
-  extension: boolean;
+function useTimeRuler(
+  viewStartS: number,
+  viewEndS: number,
+  widthPx: number,
+): TimeRulerTick[] {
+  return useMemo(
+    () => buildTimeRulerTicks(viewStartS, viewEndS, widthPx),
+    [viewStartS, viewEndS, widthPx],
+  );
 }
 
 /** Bar/beat ticks for the FOCUSED chunk only.
@@ -1192,27 +1197,9 @@ interface BarTick {
  *  bar grid of whatever they're trimming or scrubbing. Other chunks
  *  show up as colored lane blocks below; that's enough to navigate.
  *
- *  Density is adaptive to zoom — picks the smallest power-of-2 stride
- *  such that labeled downbeats sit at least 56 px apart. In between
- *  we render minor unlabeled bar ticks while there's room (≥ 6 px),
- *  and beat sub-ticks only at high zoom (≥ 8 px per beat).
- *
- *  When a chunk is focused, its grid projects across the FULL view
- *  with `extension: true` flag for ticks outside the chunk's current
- *  bounds — so trim-dragging outwards has visible snap targets. */
-const TARGET_LABEL_PX = 56;
-const MIN_MINOR_BAR_PX = 6;
-const MIN_BEAT_PX = 8;
-const MIN_DIV8_PX = 32; // px per beat — enough room to slot a 1/8 tick mid-beat
-const MIN_DIV16_PX = 64; // px per beat — room for 1/16 quarters
-
-function pickBarStride(pxPerBar: number): number {
-  if (pxPerBar >= TARGET_LABEL_PX) return 1;
-  if (pxPerBar <= 0) return 1;
-  const need = TARGET_LABEL_PX / pxPerBar;
-  return Math.pow(2, Math.ceil(Math.log2(need)));
-}
-
+ *  The grid math (adaptive label stride, zoom-gated beats/subdivisions,
+ *  extension flags outside the chunk's half-open span) lives in the
+ *  canonical `buildRulerTicks` — see `chunk-ruler-ticks.ts`. */
 function usePerChunkBarTicks(
   chunks: Chunk[],
   focusedChunkId: string | null,
@@ -1221,97 +1208,19 @@ function usePerChunkBarTicks(
   viewStartS: number,
   viewEndS: number,
   pxPerSec: number,
-): BarTick[] {
+): GridTick[] {
   return useMemo(() => {
     if (!focusedChunkId) return [];
     const chunk = chunks.find((c) => c.id === focusedChunkId);
     if (!chunk) return [];
-    const bpm = effectiveChunkBpm(chunk, jobBpm);
-    if (bpm <= 0) return [];
-
-    const sPerBeat = 60 / bpm;
-    const sPerBar = sPerBeat * beatsPerBar;
-    const pxPerBar = sPerBar * pxPerSec;
-    const pxPerBeat = sPerBeat * pxPerSec;
-    if (pxPerBar < 0.25) return [];
-
-    const stride = pickBarStride(pxPerBar);
-    const showMinorBars = stride > 1 && pxPerBar >= MIN_MINOR_BAR_PX;
-    const showBeats = stride === 1 && pxPerBeat >= MIN_BEAT_PX;
-    const showDiv8 = stride === 1 && pxPerBeat >= MIN_DIV8_PX;
-    const showDiv16 = stride === 1 && pxPerBeat >= MIN_DIV16_PX;
-
-    const startS = chunk.startMs / 1000;
-    const endS = chunk.endMs / 1000;
-    // The focused chunk's grid projects across the full visible view
-    // so trim-dragging outwards has visible snap targets.
-    const renderStart = viewStartS;
-    const renderEnd = viewEndS;
-    const anchorS = chunkBeatPhaseS(chunk);
-
-    const ticks: BarTick[] = [];
-    const firstBeatI = Math.ceil((renderStart - anchorS) / sPerBeat - 1e-9);
-    const lastBeatI = Math.floor((renderEnd - anchorS) / sPerBeat + 1e-9);
-    for (let i = firstBeatI; i <= lastBeatI; i++) {
-      const t = anchorS + i * sPerBeat;
-      const beatInBar = ((i % beatsPerBar) + beatsPerBar) % beatsPerBar;
-      const isDownbeat = beatInBar === 0;
-      const barIndex = Math.floor(i / beatsPerBar) + 1;
-      const isLabeled =
-        isDownbeat && (((barIndex - 1) % stride) + stride) % stride === 0;
-
-      // Beat-aligned tick (bar-major / bar-minor / beat).
-      if (t >= renderStart - 1e-9 && t <= renderEnd + 1e-9) {
-        let kind: BarTick["kind"] | null = null;
-        if (isLabeled) kind = "bar-major";
-        else if (isDownbeat) {
-          if (showMinorBars) kind = "bar-minor";
-        } else {
-          if (showBeats) kind = "beat";
-        }
-        if (kind) {
-          // Half-open chunk span: the downbeat sitting exactly on endS opens
-          // the *next* bar (e.g. bar 5 of a 4-bar chunk), so it belongs to the
-          // extension, not the primary grid.
-          const extension = t < startS - 1e-9 || t > endS - 1e-9;
-          ticks.push({ tS: t, kind, barIndex, extension });
-        }
-      }
-
-      // Sub-beat ticks (1/8 + 1/16 subdivisions) only emit when zoom
-      // gives them enough room to be readable.
-      if (showDiv8) {
-        const halfT = t + sPerBeat / 2;
-        if (halfT >= renderStart - 1e-9 && halfT <= renderEnd + 1e-9) {
-          const extension = halfT < startS || halfT > endS;
-          ticks.push({ tS: halfT, kind: "div8", barIndex, extension });
-        }
-      }
-      if (showDiv16) {
-        const q1 = t + sPerBeat / 4;
-        const q3 = t + (3 * sPerBeat) / 4;
-        if (q1 >= renderStart - 1e-9 && q1 <= renderEnd + 1e-9) {
-          const extension = q1 < startS || q1 > endS;
-          ticks.push({ tS: q1, kind: "div16", barIndex, extension });
-        }
-        if (q3 >= renderStart - 1e-9 && q3 <= renderEnd + 1e-9) {
-          const extension = q3 < startS || q3 > endS;
-          ticks.push({ tS: q3, kind: "div16", barIndex, extension });
-        }
-      }
-    }
-    return ticks;
+    return buildChunkGridTicks(
+      chunk,
+      jobBpm,
+      beatsPerBar,
+      viewStartS,
+      viewEndS,
+      pxPerSec,
+    );
   }, [chunks, focusedChunkId, jobBpm, beatsPerBar, viewStartS, viewEndS, pxPerSec]);
-}
-
-function niceStep(raw: number): number {
-  if (raw <= 0) return 1;
-  const candidates = [
-    0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1200, 1800, 3600,
-  ];
-  for (const c of candidates) {
-    if (c >= raw) return c;
-  }
-  return Math.ceil(raw / 3600) * 3600;
 }
 

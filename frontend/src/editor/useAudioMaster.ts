@@ -1,40 +1,31 @@
 /**
- * Master-clock hook — gapless loop via two-`<audio>` ping-pong + WebAudio
- * crossfade. Replaces the older single-`<audio>` design where loop wrap
- * was a `currentTime`-seek (never gapless on HTMLMediaElement; the
- * browser pauses the decoder to repoint, audible click).
+ * Master-clock hook — gapless loop via the shared two-`<audio>`
+ * ping-pong + WebAudio crossfade engine (local/audio/pingpong-engine).
+ * Replaces the older single-`<audio>` design where loop wrap was a
+ * `currentTime`-seek (never gapless on HTMLMediaElement; the browser
+ * pauses the decoder to repoint, audible click).
  *
  * Architecture:
  *   The caller mounts TWO hidden `<audio>` elements with the same `src`,
- *   passes both refs in. The hook:
+ *   passes both refs in. The PingPongEngine owns the WebAudio graph
+ *   (per-element cached — StrictMode safe), the active/idle side
+ *   bookkeeping and the crossfade arming/firing mechanics. This hook
+ *   owns the EDITOR's walker on top:
  *
- *     - Builds one shared `AudioContext`. Each `<audio>` is wrapped in a
- *       `MediaElementAudioSourceNode` → individual `GainNode` →
- *       `masterGain` → `destination`.
- *     - Picks one side as "active" (audible). Plays via the active
- *       element. The idle element is `paused` and parked at
- *       `loop.start` when a loop is set.
  *     - Per RAF tick, reads `activeEl.currentTime` and mirrors it into
- *       `playback.currentTime`. Within `LEAD_TIME_S` of `loop.end` (or
- *       `pendingWrapAt`), arms a sample-accurate crossfade in the
- *       AudioContext: schedules `linearRampToValueAtTime(...)` on both
- *       gains so that AT the wrap point the audible source flips from
- *       active → idle over `CROSSFADE_S`.
- *     - The crossfade fires entirely on the audio render thread —
- *       independent of main-thread CPU pressure. After it fires the
- *       hook swaps roles, re-parks the now-idle (formerly active) side
- *       at `loop.start`, and clears any `pendingWrapAt`.
+ *       `playback.currentTime` (+ the arr-time pill position derived
+ *       from the authoritative segment index).
+ *     - Walks `arrangementSegments` with an authoritative
+ *       `currentSegmentIdx` (duplicate chunks share master-time ranges,
+ *       so time-scan lookups are forbidden — see PingPongState docs).
+ *     - Within `LEAD_TIME_S` of a loop wrap / segment seam (or
+ *       `pendingWrapAt`), asks the engine to arm a sample-accurate
+ *       crossfade; when the engine reports it fired, advances the
+ *       walker and re-parks the former active element.
  *
  *   Memory cost: two `<audio>` elements + their decoder buffers.
  *   Constant — does NOT decode the file into RAM, so 1h+ takes work
  *   the same as 5-min songs.
- *
- * Why two elements: each `<audio>` element has independent decoder +
- * output buffer. Switching the audible source via gain crossfade is
- * gapless because neither decoder is interrupted at the wrap point.
- * A single-element seek (`el.currentTime = X`) ALWAYS interrupts the
- * decoder and is audible. Crossfade window (5–10ms) is far below
- * click-perception thresholds for musical material.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useEditorStore } from "./store";
@@ -43,8 +34,18 @@ import {
   arrToMaster,
   segmentArrStarts,
   segmentIndexAtArr,
-} from "./arrangement-time";
+} from "../core/arrangement-time";
 import { attachLoopGlitchProbe, isProbeEnabled } from "./audio-glitch-probe";
+import { clampSeek } from "../lib/clamp";
+import {
+  LEAD_TIME_S,
+  getOrCreatePingPongEngine,
+  type PingPongEngine,
+} from "../local/audio/pingpong-engine";
+
+// Re-exported so regression tests (and future walkers) can pin the
+// pre-roll compensation math where it has historically been imported.
+export { armParkMasterT } from "../local/audio/pingpong-engine";
 
 export interface AudioMasterHandle {
   isReady: boolean;
@@ -52,72 +53,26 @@ export interface AudioMasterHandle {
   error: string | null;
 }
 
-/** Seconds before the wrap point at which we ARM the crossfade. The
- *  idle element is `play()`'d at this point so it's running by the
- *  time the gain ramp hits. 50 ms is conservative — `<audio>.play()`
- *  → first sample is typically 10–30 ms. */
-const LEAD_TIME_S = 0.05;
-
-/** Crossfade duration. 8 ms is below click-perception (~10 ms) for
- *  most material yet long enough to absorb any inter-element decode
- *  jitter (sub-millisecond). */
-const CROSSFADE_S = 0.008;
-
 interface AudioRefs {
   a: React.RefObject<HTMLAudioElement | null>;
   b: React.RefObject<HTMLAudioElement | null>;
 }
 
-interface AudioGraph {
-  ctx: AudioContext;
-  srcA: MediaElementAudioSourceNode;
-  srcB: MediaElementAudioSourceNode;
-  gainA: GainNode;
-  gainB: GainNode;
-  master: GainNode;
-}
-
-/**
- * Cache of WebAudio graphs keyed by the A-side `<audio>` element.
- *
- * `MediaElementAudioSourceNode` permanently captures its source
- * element — calling `createMediaElementSource` twice for the same
- * element throws. React 18 StrictMode runs effects twice in dev, so a
- * naive teardown-then-rebuild on cleanup would crash the second time.
- *
- * Solution: cache the graph keyed by the A-side ref. On the second
- * effect invocation we reuse the cached graph instead of rebuilding.
- * The WeakMap entries auto-clean when the audio element is GC'd
- * (i.e. when the component truly unmounts and React releases the ref),
- * so this doesn't leak across editor mount/unmount cycles.
- *
- * The AudioContext intentionally is NOT closed on effect cleanup.
- * Closing it would render the cached source nodes unusable for the
- * StrictMode re-mount; the context is naturally garbage-collected
- * when the audio elements (and thus the graph) become unreachable.
- */
-const graphCache = new WeakMap<HTMLAudioElement, AudioGraph>();
-
-interface PingPongState {
-  /** Which side is currently audible (gain ramped to 1). */
-  active: "A" | "B";
-  /** Crossfade scheduled but not yet fired. `fireAtCtxTime` is
-   *  `audioContext.currentTime` at which the gain ramps START.
-   *  `wrapTarget` overrides the post-fire seek destination for
-   *  arrangement-segment hops (where we land at the next segment's
-   *  `in` instead of the current loop's `start`). `nextSegmentIdx`
-   *  is the index we're hopping INTO — used by the walker so it
+/** Payload the walker attaches to an armed crossfade. Interpreted when
+ *  the engine reports the fade fired. */
+interface EditorArmPayload {
+  /** Post-fire seek destination for the former active element —
+   *  loop.start (as master-time) for wraps, the next segment's `in`
+   *  for arrangement-segment hops. */
+  wrapTarget: number;
+  /** The segment index we're hopping INTO — used by the walker so it
    *  advances explicitly through duplicate segments instead of
    *  re-deriving from master-time (which would lock into the FIRST
    *  matching duplicate forever). */
-  armed:
-    | {
-        fireAtCtxTime: number;
-        fromSide: "A" | "B";
-        wrapTarget?: number;
-        nextSegmentIdx?: number;
-      }
-    | null;
+  nextSegmentIdx: number | undefined;
+}
+
+interface WalkerState {
   /** The arrangement segment we're currently playing through. Tracked
    *  as authoritative state — set by user-seek (re-derived from master
    *  time), advanced on every crossfade-hop. Without this the walker
@@ -158,10 +113,8 @@ export function useAudioMaster(
   const audioVolume = useEditorStore((s) => s.audioVolume);
   const loop = useEditorStore((s) => s.playback.loop);
 
-  const graphRef = useRef<AudioGraph | null>(null);
-  const stateRef = useRef<PingPongState>({
-    active: "A",
-    armed: null,
+  const engineRef = useRef<PingPongEngine<EditorArmPayload> | null>(null);
+  const walkerRef = useRef<WalkerState>({
     currentSegmentIdx: null,
     endPauseTimer: null,
     endPauseSegmentIdx: null,
@@ -194,10 +147,19 @@ export function useAudioMaster(
       setIsReady(true);
       const pending = pendingSeekRef.current;
       if (pending !== null) {
-        try {
-          el.currentTime = clampSeek(pending, el.duration);
-        } catch {
-          /* element not ready */
+        // Replay onto the ACTIVE side. The ping-pong state survives URL
+        // changes (the engine is cached per element), so after an odd
+        // number of crossfade swaps the audible element is B — writing
+        // the stashed seek to A would land it on the muted idle and the
+        // playhead would silently resume from B's stale position.
+        const eng = engineRef.current;
+        const active = eng ? eng.activeEl : refsStable.a.current;
+        if (active) {
+          try {
+            active.currentTime = clampSeek(pending, active.duration);
+          } catch {
+            /* element not ready */
+          }
         }
         pendingSeekRef.current = null;
       }
@@ -214,72 +176,44 @@ export function useAudioMaster(
     };
   }, [refsStable.a, audioUrl]);
 
-  // Build the WebAudio graph once both elements are mounted. Idempotent
-  // under React 18 StrictMode (which double-invokes effects in dev): a
-  // module-level WeakMap caches the graph by the A-side element so the
-  // second effect run reuses the existing context instead of trying to
-  // re-wrap an already-captured `<audio>` (which would throw).
+  // Build (or reuse) the shared ping-pong engine once both elements are
+  // mounted. Idempotent under React 18 StrictMode — the engine module
+  // caches per element, so the second effect run reuses the existing
+  // graph instead of re-wrapping an already-captured `<audio>`.
   useEffect(() => {
     const a = refsStable.a.current;
     const b = refsStable.b.current;
     if (!a || !b) return;
-    if (graphRef.current) return;
+    if (engineRef.current) return;
 
-    const cached = graphCache.get(a);
-    if (cached) {
-      graphRef.current = cached;
-      // Don't reset active/armed — playback may already be in flight.
+    const res = getOrCreatePingPongEngine<EditorArmPayload>(a, b, {
+      initialMasterGain: audioVolume,
+    });
+    if (!res.ok) {
+      setError(res.error);
       return;
     }
-
-    let ctx: AudioContext;
-    try {
-      ctx = new AudioContext();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "AudioContext failed");
+    engineRef.current = res.engine;
+    if (!res.fresh) {
+      // Cached engine (StrictMode re-run) — don't reset the walker,
+      // playback may already be in flight.
       return;
     }
-    let srcA: MediaElementAudioSourceNode;
-    let srcB: MediaElementAudioSourceNode;
-    try {
-      srcA = ctx.createMediaElementSource(a);
-      srcB = ctx.createMediaElementSource(b);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "MediaElementSource failed");
-      try {
-        void ctx.close();
-      } catch {
-        /* ignore */
-      }
-      return;
-    }
-    const gainA = ctx.createGain();
-    const gainB = ctx.createGain();
-    const master = ctx.createGain();
-    gainA.gain.value = 1;
-    gainB.gain.value = 0;
-    master.gain.value = clampVolume(audioVolume);
-    srcA.connect(gainA).connect(master);
-    srcB.connect(gainB).connect(master);
-    master.connect(ctx.destination);
-    const graph: AudioGraph = { ctx, srcA, srcB, gainA, gainB, master };
-    graphCache.set(a, graph);
-    graphRef.current = graph;
-    stateRef.current = {
-      active: "A",
-      armed: null,
+    walkerRef.current = {
       currentSegmentIdx: null,
       endPauseTimer: null,
       endPauseSegmentIdx: null,
     };
-
     if (isProbeEnabled()) {
-      void attachLoopGlitchProbe(ctx, master).catch((err) => {
+      void attachLoopGlitchProbe(
+        res.engine.graph.ctx,
+        res.engine.graph.master,
+      ).catch((err) => {
         // eslint-disable-next-line no-console
         console.warn("[loop-glitch-probe]", err);
       });
     }
-    // No teardown returned — see graphCache JSDoc. The context is
+    // No teardown returned — see the engine-cache JSDoc. The context is
     // GC'd alongside the audio elements when the component truly
     // unmounts.
   }, [refsStable.a, refsStable.b]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -287,11 +221,7 @@ export function useAudioMaster(
   // Mirror master volume onto the master GainNode (with a tiny ramp to
   // avoid zipper noise on slider drag).
   useEffect(() => {
-    const g = graphRef.current;
-    if (!g) return;
-    const t = g.ctx.currentTime;
-    g.master.gain.cancelScheduledValues(t);
-    g.master.gain.setTargetAtTime(clampVolume(audioVolume), t, 0.01);
+    engineRef.current?.setMasterVolume(audioVolume);
   }, [audioVolume]);
 
   // Apply seek requests. The seek hits the ACTIVE element only; the
@@ -306,7 +236,8 @@ export function useAudioMaster(
       clear();
       return;
     }
-    const active = stateRef.current.active === "A" ? a : b;
+    const eng = engineRef.current;
+    const active = eng ? eng.activeEl : a;
     try {
       active.currentTime = clampSeek(seekRequest, active.duration);
     } catch {
@@ -314,7 +245,8 @@ export function useAudioMaster(
     }
     // Cancel any armed crossfade — user seek invalidates it (the loop
     // boundary may now be far away or behind us).
-    cancelArmedCrossfade(graphRef.current, stateRef.current);
+    cancelEndPause(walkerRef.current);
+    eng?.cancelArmed();
     // Re-bind currentSegmentIdx — prefer the caller-supplied
     // `seekSegmentIdxHint` (the only correct answer when the master-time
     // appears in multiple segments) and fall back to a master-time scan
@@ -326,7 +258,7 @@ export function useAudioMaster(
     const hint = stateNow.playback.seekSegmentIdxHint;
     if (segs.length > 0) {
       if (hint != null && hint >= 0 && hint < segs.length) {
-        stateRef.current.currentSegmentIdx = hint;
+        walkerRef.current.currentSegmentIdx = hint;
       } else {
         let idx = -1;
         for (let i = 0; i < segs.length; i++) {
@@ -335,10 +267,10 @@ export function useAudioMaster(
             break;
           }
         }
-        stateRef.current.currentSegmentIdx = idx === -1 ? null : idx;
+        walkerRef.current.currentSegmentIdx = idx === -1 ? null : idx;
       }
     } else {
-      stateRef.current.currentSegmentIdx = null;
+      walkerRef.current.currentSegmentIdx = null;
     }
     clear();
   }, [seekRequest, isReady, refsStable.a, refsStable.b]);
@@ -347,15 +279,11 @@ export function useAudioMaster(
   // at the new loop.start and reset any armed crossfade. This handles
   // user-IN/OUT, OP-1 loop-shift, and loop-clear in one path.
   useEffect(() => {
-    const g = graphRef.current;
-    if (!g) return;
-    cancelArmedCrossfade(g, stateRef.current);
+    const eng = engineRef.current;
+    if (!eng) return;
+    cancelEndPause(walkerRef.current);
+    eng.cancelArmed();
     if (!loop) return;
-    const idleEl =
-      stateRef.current.active === "A"
-        ? refsStable.b.current
-        : refsStable.a.current;
-    if (!idleEl) return;
     // `loop.start` is arr-time on the composed tape; the <audio> clock is
     // master-time. Project before parking — Identity for single-take, but
     // off by the segment offset in long-form (the tick re-parks at the
@@ -366,19 +294,8 @@ export function useAudioMaster(
       loop.start,
       useEditorStore.getState().arrangementSegments,
     );
-    try {
-      idleEl.currentTime = clampSeek(parkMasterT, idleEl.duration);
-    } catch {
-      /* not ready yet — next tick will catch up */
-    }
-    if (!idleEl.paused) {
-      try {
-        idleEl.pause();
-      } catch {
-        /* ignore */
-      }
-    }
-  }, [loop, refsStable.a, refsStable.b]);
+    eng.parkIdle(parkMasterT);
+  }, [loop]);
 
   /** Stop the per-frame loop. Idempotent. */
   const stopRaf = useCallback(() => {
@@ -392,58 +309,32 @@ export function useAudioMaster(
   // (autoplay policy: must be inside a user gesture; the transport-bar
   // click handler is the typical caller of setPlaying(true)).
   useEffect(() => {
-    const g = graphRef.current;
-    const a = refsStable.a.current;
-    const b = refsStable.b.current;
-    if (!g || !a || !b || !isReady) return;
+    const eng = engineRef.current;
+    if (!eng || !isReady) return;
 
     if (!isPlaying) {
       stopRaf();
       // Defensive pause both sides + cancel any pending fade. Reset
       // gains so the next play() starts cleanly with the active side
       // audible.
-      cancelArmedCrossfade(g, stateRef.current);
-      const active = stateRef.current.active;
-      if (!a.paused) {
-        try {
-          a.pause();
-        } catch {
-          /* ignore */
-        }
-      }
-      if (!b.paused) {
-        try {
-          b.pause();
-        } catch {
-          /* ignore */
-        }
-      }
-      const tNow = g.ctx.currentTime;
-      g.gainA.gain.cancelScheduledValues(tNow);
-      g.gainB.gain.cancelScheduledValues(tNow);
-      g.gainA.gain.setValueAtTime(active === "A" ? 1 : 0, tNow);
-      g.gainB.gain.setValueAtTime(active === "B" ? 1 : 0, tNow);
+      cancelEndPause(walkerRef.current);
+      eng.cancelArmed();
+      eng.pauseBoth();
+      eng.snapGainsToActive();
       return;
     }
 
     // Resume the context if a previous setPlaying(false) had no effect
     // on it. resume() is idempotent.
-    if (g.ctx.state === "suspended") {
-      g.ctx.resume().catch(() => {
-        /* user-gesture timing issue — surface but don't crash */
-      });
-    }
+    eng.resumeContext();
 
-    const activeEl = stateRef.current.active === "A" ? a : b;
-    activeEl.play().catch((err) => {
+    eng.playActive().catch((err) => {
       setError(err instanceof Error ? err.message : "audio.play() failed");
     });
 
     function tick() {
-      const graph = graphRef.current;
-      const refA = refsStable.a.current;
-      const refB = refsStable.b.current;
-      if (!graph || !refA || !refB) {
+      const engine = engineRef.current;
+      if (!engine) {
         rafRef.current = null;
         return;
       }
@@ -452,9 +343,8 @@ export function useAudioMaster(
         rafRef.current = null;
         return;
       }
-      const state = stateRef.current;
-      const active = state.active === "A" ? refA : refB;
-      const idle = state.active === "A" ? refB : refA;
+      const walker = walkerRef.current;
+      const active = engine.activeEl;
       const t = active.currentTime;
       // Compute timeline-time from the authoritative segment idx so
       // duplicate-source pills don't snap to the first occurrence's
@@ -465,8 +355,8 @@ export function useAudioMaster(
       {
         const segs = store.arrangementSegments;
         let pillT = t;
-        if (segs.length > 0 && state.currentSegmentIdx != null) {
-          const idx = state.currentSegmentIdx;
+        if (segs.length > 0 && walker.currentSegmentIdx != null) {
+          const idx = walker.currentSegmentIdx;
           if (idx >= 0 && idx < segs.length) {
             const arrStarts = segmentArrStarts(segs);
             pillT = arrStarts[idx] + Math.max(0, t - segs[idx].in);
@@ -475,57 +365,34 @@ export function useAudioMaster(
         store.setPlayhead(t, pillT);
       }
 
-      // Has an armed crossfade fired already? Detect by
-      // audioContext.currentTime — on the audio render thread the
-      // ramp completed at fireAtCtxTime + CROSSFADE_S, so any tick
-      // observing that bound has already heard the swap.
-      if (
-        state.armed &&
-        graph.ctx.currentTime >= state.armed.fireAtCtxTime + CROSSFADE_S
-      ) {
-        // Swap roles. The new idle = the former active, which is
-        // still playing past the wrap point and must be paused +
-        // re-parked at the wrap target (loop.start for normal loops,
-        // wrapTarget for arrangement-segment hops) so it's ready for
-        // the NEXT wrap.
+      // Has an armed crossfade fired already? The engine detects it by
+      // audioContext.currentTime — on the audio render thread the ramp
+      // completed at fireAtCtxTime + CROSSFADE_S, so any tick observing
+      // that bound has already heard the swap.
+      const fired = engine.consumeFired();
+      if (fired) {
+        // Swap roles. The new idle = the former active, which is still
+        // playing past the wrap point and must be paused + re-parked at
+        // the wrap target (loop.start for normal loops, the next
+        // segment's `in` for arrangement-segment hops) so it's ready
+        // for the NEXT wrap.
         const wrapLoop = store.playback.loop;
-        const armedTarget = state.armed.wrapTarget;
-        const armedNextSegmentIdx = state.armed.nextSegmentIdx;
-        const formerActive = active;
-        state.active = state.active === "A" ? "B" : "A";
-        state.armed = null;
+        // A fired wrap/hop invalidates any scheduled end-of-arrangement
+        // pause — we've just crossfaded away from the segment it was
+        // scheduled for. Without this a stale timer stops playback
+        // milliseconds after a loop wrap at the arrangement's end.
+        cancelEndPause(walker);
         // Authoritative segment-walker advance: the listener is now
         // hearing the segment whose `in` we crossfaded into. Stamp it
         // into state so the next tick's segment lookup doesn't snap
         // backward to a duplicate of an earlier chunk that happens to
         // share the same master-time range.
-        if (armedNextSegmentIdx !== undefined) {
-          state.currentSegmentIdx = armedNextSegmentIdx;
+        if (fired.payload.nextSegmentIdx !== undefined) {
+          walker.currentSegmentIdx = fired.payload.nextSegmentIdx;
         }
-        try {
-          formerActive.pause();
-        } catch {
-          /* ignore */
-        }
-        if (armedTarget != null) {
-          try {
-            formerActive.currentTime = clampSeek(
-              armedTarget,
-              formerActive.duration,
-            );
-          } catch {
-            /* ignore */
-          }
-        } else if (wrapLoop) {
-          try {
-            formerActive.currentTime = clampSeek(
-              wrapLoop.start,
-              formerActive.duration,
-            );
-          } catch {
-            /* ignore */
-          }
-        }
+        engine.swapSides(
+          fired.payload.wrapTarget ?? (wrapLoop ? wrapLoop.start : undefined),
+        );
         // Clear any pendingWrapAt — the deferred wrap just happened.
         if (store.playback.pendingWrapAt != null) {
           store.clearPendingWrap();
@@ -541,7 +408,7 @@ export function useAudioMaster(
       // equals master-time for single-take and the user's loop markers
       // map straight through.
       //
-      // The walker uses an AUTHORITATIVE state.currentSegmentIdx instead
+      // The walker uses an AUTHORITATIVE walker.currentSegmentIdx instead
       // of re-deriving from master-time on every tick — duplicate chunks
       // (same master-time range used multiple times in the arrangement)
       // share master-time bounds, so a "scan-for-first-match" lookup
@@ -549,7 +416,7 @@ export function useAudioMaster(
       // index advances on each crossfade hop and re-binds on user-seek.
       const segs = store.arrangementSegments;
       if (segs.length > 0) {
-        let curIdx = state.currentSegmentIdx ?? -1;
+        let curIdx = walker.currentSegmentIdx ?? -1;
         // The cached index is AUTHORITATIVE — set on user-seek and on
         // every crossfade hop. We do NOT invalidate it just because the
         // browser nudged `t` past `seg.out` for a tick; that would scan
@@ -566,7 +433,7 @@ export function useAudioMaster(
               break;
             }
           }
-          if (curIdx !== -1) state.currentSegmentIdx = curIdx;
+          if (curIdx !== -1) walker.currentSegmentIdx = curIdx;
         }
         if (curIdx === -1) {
           // The playhead is in a "gap" between segments (or before the
@@ -582,7 +449,7 @@ export function useAudioMaster(
           if (nextIdx === -1) {
             // Past the last segment — stop.
             store.setPlaying(false);
-            state.currentSegmentIdx = null;
+            walker.currentSegmentIdx = null;
             rafRef.current = null;
             return;
           }
@@ -592,7 +459,7 @@ export function useAudioMaster(
           } catch {
             /* ignore */
           }
-          state.currentSegmentIdx = nextIdx;
+          walker.currentSegmentIdx = nextIdx;
           const arrStarts = segmentArrStarts(segs);
           store.setPlayhead(target, arrStarts[nextIdx]);
           rafRef.current = requestAnimationFrame(tick);
@@ -616,7 +483,7 @@ export function useAudioMaster(
         const wrapHere =
           loopWrap !== null && loopWrap.wrapInSegIdx === curIdx;
         const pendingWrapAt = store.playback.pendingWrapAt;
-        if (loop && state.armed === null) {
+        if (loop && !engine.isArmed) {
           // arr-time of the playhead WITHIN this specific segment
           // occurrence. segmentArrStarts handles duplicates correctly —
           // we anchor to curIdx, not to a master-time scan.
@@ -642,44 +509,14 @@ export function useAudioMaster(
                 curSeg.in + (pendingWrapAt - arrStarts[curIdx]);
               const distMaster = masterTAtPending - t;
               if (distMaster <= LEAD_TIME_S) {
-                const fireAtCtxTime =
-                  graph.ctx.currentTime + Math.max(0, distMaster);
-                try {
-                  if (
-                    Math.abs(idle.currentTime - loopWrap.wrapTargetMasterT) >
-                    0.01
-                  ) {
-                    idle.currentTime = clampSeek(
-                      loopWrap.wrapTargetMasterT,
-                      idle.duration,
-                    );
-                  }
-                } catch {
-                  /* ignore */
-                }
-                if (idle.paused) idle.play().catch(() => undefined);
-                const activeGain =
-                  state.active === "A" ? graph.gainA : graph.gainB;
-                const idleGain =
-                  state.active === "A" ? graph.gainB : graph.gainA;
-                activeGain.gain.cancelScheduledValues(graph.ctx.currentTime);
-                idleGain.gain.cancelScheduledValues(graph.ctx.currentTime);
-                activeGain.gain.setValueAtTime(1, fireAtCtxTime);
-                activeGain.gain.linearRampToValueAtTime(
-                  0,
-                  fireAtCtxTime + CROSSFADE_S,
-                );
-                idleGain.gain.setValueAtTime(0, fireAtCtxTime);
-                idleGain.gain.linearRampToValueAtTime(
-                  1,
-                  fireAtCtxTime + CROSSFADE_S,
-                );
-                state.armed = {
-                  fireAtCtxTime,
-                  fromSide: state.active,
-                  wrapTarget: loopWrap.wrapTargetMasterT,
-                  nextSegmentIdx: loopWrap.targetSegIdx,
-                };
+                engine.armCrossfade({
+                  distS: distMaster,
+                  targetS: loopWrap.wrapTargetMasterT,
+                  payload: {
+                    wrapTarget: loopWrap.wrapTargetMasterT,
+                    nextSegmentIdx: loopWrap.targetSegIdx,
+                  },
+                });
                 rafRef.current = requestAnimationFrame(tick);
                 return;
               }
@@ -698,41 +535,14 @@ export function useAudioMaster(
           if (pendingWrapAt == null && !insideLoop && loopWrap) {
             // User scrubbed outside the loop region (before-start or
             // past-end) — wrap immediately. Crossfade with zero distance.
-            const fireAtCtxTime = graph.ctx.currentTime;
-            try {
-              if (
-                Math.abs(idle.currentTime - loopWrap.wrapTargetMasterT) > 0.01
-              ) {
-                idle.currentTime = clampSeek(
-                  loopWrap.wrapTargetMasterT,
-                  idle.duration,
-                );
-              }
-            } catch {
-              /* ignore */
-            }
-            if (idle.paused) idle.play().catch(() => undefined);
-            const activeGain =
-              state.active === "A" ? graph.gainA : graph.gainB;
-            const idleGain = state.active === "A" ? graph.gainB : graph.gainA;
-            activeGain.gain.cancelScheduledValues(graph.ctx.currentTime);
-            idleGain.gain.cancelScheduledValues(graph.ctx.currentTime);
-            activeGain.gain.setValueAtTime(1, fireAtCtxTime);
-            activeGain.gain.linearRampToValueAtTime(
-              0,
-              fireAtCtxTime + CROSSFADE_S,
-            );
-            idleGain.gain.setValueAtTime(0, fireAtCtxTime);
-            idleGain.gain.linearRampToValueAtTime(
-              1,
-              fireAtCtxTime + CROSSFADE_S,
-            );
-            state.armed = {
-              fireAtCtxTime,
-              fromSide: state.active,
-              wrapTarget: loopWrap.wrapTargetMasterT,
-              nextSegmentIdx: loopWrap.targetSegIdx,
-            };
+            engine.armCrossfade({
+              distS: 0,
+              targetS: loopWrap.wrapTargetMasterT,
+              payload: {
+                wrapTarget: loopWrap.wrapTargetMasterT,
+                nextSegmentIdx: loopWrap.targetSegIdx,
+              },
+            });
             rafRef.current = requestAnimationFrame(tick);
             return;
           }
@@ -741,44 +551,14 @@ export function useAudioMaster(
             const distToWrap = loopWrap.wrapAtMasterT - t;
             if (distToWrap <= LEAD_TIME_S) {
               // Within lead window (or briefly past on RAF stall) — arm.
-              const fireAtCtxTime =
-                graph.ctx.currentTime + Math.max(0, distToWrap);
-              try {
-                if (
-                  Math.abs(idle.currentTime - loopWrap.wrapTargetMasterT) >
-                  0.01
-                ) {
-                  idle.currentTime = clampSeek(
-                    loopWrap.wrapTargetMasterT,
-                    idle.duration,
-                  );
-                }
-              } catch {
-                /* ignore */
-              }
-              if (idle.paused) idle.play().catch(() => undefined);
-              const activeGain =
-                state.active === "A" ? graph.gainA : graph.gainB;
-              const idleGain =
-                state.active === "A" ? graph.gainB : graph.gainA;
-              activeGain.gain.cancelScheduledValues(graph.ctx.currentTime);
-              idleGain.gain.cancelScheduledValues(graph.ctx.currentTime);
-              activeGain.gain.setValueAtTime(1, fireAtCtxTime);
-              activeGain.gain.linearRampToValueAtTime(
-                0,
-                fireAtCtxTime + CROSSFADE_S,
-              );
-              idleGain.gain.setValueAtTime(0, fireAtCtxTime);
-              idleGain.gain.linearRampToValueAtTime(
-                1,
-                fireAtCtxTime + CROSSFADE_S,
-              );
-              state.armed = {
-                fireAtCtxTime,
-                fromSide: state.active,
-                wrapTarget: loopWrap.wrapTargetMasterT,
-                nextSegmentIdx: loopWrap.targetSegIdx,
-              };
+              engine.armCrossfade({
+                distS: distToWrap,
+                targetS: loopWrap.wrapTargetMasterT,
+                payload: {
+                  wrapTarget: loopWrap.wrapTargetMasterT,
+                  nextSegmentIdx: loopWrap.targetSegIdx,
+                },
+              });
               rafRef.current = requestAnimationFrame(tick);
               return;
             }
@@ -791,8 +571,7 @@ export function useAudioMaster(
         // its own arming branch above and shouldn't suppress hops.
         const wrapBlocksHop = pendingWrapAt == null && wrapHere;
         if (
-          state.armed === null &&
-          distToEnd > 0 &&
+          !engine.isArmed &&
           distToEnd <= LEAD_TIME_S &&
           nextSeg &&
           !wrapBlocksHop
@@ -800,39 +579,35 @@ export function useAudioMaster(
           // Approaching a segment boundary with another chunk to hop
           // into — arm a sample-accurate gain crossfade. The idle is
           // pre-played at nextSeg.in so its decoder is hot by the time
-          // the ramp fires; armed.nextSegmentIdx tells the swap block
-          // which index to advance into (handles duplicate chunks).
-          const fireAtCtxTime = graph.ctx.currentTime + distToEnd;
-          try {
-            if (Math.abs(idle.currentTime - nextSeg.in) > 0.01) {
-              idle.currentTime = clampSeek(nextSeg.in, idle.duration);
-            }
-          } catch {
-            /* ignore */
-          }
-          if (idle.paused) {
-            idle.play().catch(() => undefined);
-          }
-          const activeGain = state.active === "A" ? graph.gainA : graph.gainB;
-          const idleGain = state.active === "A" ? graph.gainB : graph.gainA;
-          activeGain.gain.cancelScheduledValues(graph.ctx.currentTime);
-          idleGain.gain.cancelScheduledValues(graph.ctx.currentTime);
-          activeGain.gain.setValueAtTime(1, fireAtCtxTime);
-          activeGain.gain.linearRampToValueAtTime(0, fireAtCtxTime + CROSSFADE_S);
-          idleGain.gain.setValueAtTime(0, fireAtCtxTime);
-          idleGain.gain.linearRampToValueAtTime(1, fireAtCtxTime + CROSSFADE_S);
-          state.armed = {
-            fireAtCtxTime,
-            fromSide: state.active,
-            wrapTarget: nextSeg.in,
-            nextSegmentIdx: curIdx + 1,
-          };
+          // the ramp fires; payload.nextSegmentIdx tells the fired
+          // branch which index to advance into (handles duplicates).
+          //
+          // No lower bound on distToEnd: like the loop-wrap path, this
+          // tolerates a tick landing AT or PAST the boundary (RAF stall,
+          // GC pause, hidden tab). The crossfade then fires immediately —
+          // without this the hop would never arm, the authoritative index
+          // would never advance, and the active element would free-run
+          // into master material that is not in the arrangement.
+          engine.armCrossfade({
+            distS: distToEnd,
+            targetS: nextSeg.in,
+            payload: { wrapTarget: nextSeg.in, nextSegmentIdx: curIdx + 1 },
+          });
         } else if (
+          !engine.isArmed &&
           !nextSeg &&
-          distToEnd > 0 &&
           distToEnd <= LEAD_TIME_S &&
-          state.endPauseSegmentIdx !== curIdx
+          walker.endPauseSegmentIdx !== curIdx
         ) {
+          // `!engine.isArmed`: while a loop-wrap crossfade is armed
+          // in this segment (loop.end at/near the last segment's out),
+          // ticks inside the lead window would otherwise schedule a
+          // setPlaying(false) timer that fires right after the wrap and
+          // kills the loop's next pass.
+          // No lower bound on distToEnd here either: a stall can carry t
+          // past the last segment's out without a tick in the lead
+          // window — the timer then fires with zero delay instead of the
+          // playhead sailing to the end of the master file.
           // Last segment — schedule a pause when the active element
           // reaches its `out`. We do NOT engage the crossfade machinery
           // here: a fake-arm would trip the swap block on the next tick
@@ -843,8 +618,8 @@ export function useAudioMaster(
           // playing past `out` for ~LEAD_TIME until the timeout fires
           // is fine — the master audio runs out of arrangement, the
           // user hears the natural tail of the chunk for a few ms.
-          state.endPauseSegmentIdx = curIdx;
-          state.endPauseTimer = setTimeout(() => {
+          walker.endPauseSegmentIdx = curIdx;
+          walker.endPauseTimer = setTimeout(() => {
             useEditorStore.getState().setPlaying(false);
           }, Math.max(0, distToEnd * 1000));
         }
@@ -860,20 +635,7 @@ export function useAudioMaster(
     rafRef.current = requestAnimationFrame(tick);
     return () => {
       stopRaf();
-      if (a && !a.paused) {
-        try {
-          a.pause();
-        } catch {
-          /* ignore */
-        }
-      }
-      if (b && !b.paused) {
-        try {
-          b.pause();
-        } catch {
-          /* ignore */
-        }
-      }
+      eng.pauseBoth();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isPlaying, isReady]);
@@ -881,34 +643,10 @@ export function useAudioMaster(
   return { isReady, audioDuration, error };
 }
 
-function clampSeek(t: number, duration: number): number {
-  if (!Number.isFinite(duration) || duration <= 0) return Math.max(0, t);
-  return Math.max(0, Math.min(duration, t));
-}
-
-function clampVolume(v: number): number {
-  return Math.max(0, Math.min(1, v));
-}
-
-function cancelArmedCrossfade(
-  graph: AudioGraph | null,
-  state: PingPongState,
-): void {
-  cancelEndPause(state);
-  if (!graph || !state.armed) return;
-  const t = graph.ctx.currentTime;
-  graph.gainA.gain.cancelScheduledValues(t);
-  graph.gainB.gain.cancelScheduledValues(t);
-  // Snap gains back to current active/idle config.
-  graph.gainA.gain.setValueAtTime(state.active === "A" ? 1 : 0, t);
-  graph.gainB.gain.setValueAtTime(state.active === "B" ? 1 : 0, t);
-  state.armed = null;
-}
-
-function cancelEndPause(state: PingPongState): void {
-  if (state.endPauseTimer != null) {
-    clearTimeout(state.endPauseTimer);
-    state.endPauseTimer = null;
+function cancelEndPause(walker: WalkerState): void {
+  if (walker.endPauseTimer != null) {
+    clearTimeout(walker.endPauseTimer);
+    walker.endPauseTimer = null;
   }
-  state.endPauseSegmentIdx = null;
+  walker.endPauseSegmentIdx = null;
 }

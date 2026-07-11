@@ -10,8 +10,8 @@
  * Pure function — no IO, no React.
  */
 import type { ArrangementItem, Chunk, LocalJob } from "../storage/jobs-db";
-import { arrangementToSegments } from "../local/arrange/chunks-to-segments";
-import type { Segment } from "./types";
+import { arrangementToSegments } from "../core/arrange/chunks-to-segments";
+import type { Segment } from "../core/types";
 
 /** Stable arrangement-item id for the synthetic single-take wrapper.
  *  Pill ids are `${camId}::${arrangementItemId}` ([arrangement-pills.ts]),

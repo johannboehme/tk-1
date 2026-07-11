@@ -22,6 +22,7 @@ import {
   applyAudioOffsetInterleaved,
   applyDriftStretchInterleaved,
 } from "./audio-fx";
+import { createSingleFlight } from "./single-flight";
 
 export interface QuickRenderInput {
   /** Phone-recorded video. We keep this video stream byte-for-byte. */
@@ -75,7 +76,21 @@ async function decodeStudioAudioInterleaved(
   };
 }
 
+/**
+ * In-flight guard: a second quickRender while one is running would race
+ * the first into the same OPFS output path (the slower one silently
+ * wins) and interleave progress updates on the same render op. Reject
+ * it up front instead — mirrors runEditRender's activeRenders check.
+ */
+const singleFlight = createSingleFlight(
+  "A quick render is already in progress.",
+);
+
 export async function quickRender(input: QuickRenderInput): Promise<QuickRenderResult> {
+  return singleFlight(() => quickRenderInner(input));
+}
+
+async function quickRenderInner(input: QuickRenderInput): Promise<QuickRenderResult> {
   // 1. Demux video.
   const video = await demuxVideoTrack(input.videoFile);
   if (!video) throw new Error("Quick render: video file has no video track.");

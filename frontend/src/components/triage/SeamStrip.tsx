@@ -24,16 +24,17 @@ import {
   effectiveChunkBpm,
   useTriageStore,
 } from "../../local/triage/triage-store";
-import { snapTime } from "../../editor/snap";
+import { snapTime } from "../../core/snap";
 import type { Chunk } from "../../storage/jobs-db";
 import {
   buildPyramidFromEnvelope,
   type PeakPyramid,
-} from "../../local/waveform/peak-pyramid";
-import { buildPeakPyramidAsync } from "../../local/waveform/build-pyramid-async";
-import { drawWaveform, TRIAGE_STYLE } from "../../local/waveform/draw-waveform";
+} from "../../core/waveform/peak-pyramid";
+import { buildPeakPyramidAsync } from "../../core/waveform/build-pyramid-async";
+import { drawWaveform, TRIAGE_STYLE } from "../../core/waveform/draw-waveform";
 import { getCachedPyramid } from "../../local/waveform/pyramid-cache";
 import { clamp } from "../../lib/clamp";
+import { buildSeamBarTicks } from "./chunk-ruler-ticks";
 
 const HOT = "#FF5722";
 const BRASS = "#C9A95A";
@@ -374,7 +375,7 @@ function SeamLane({
   }, [pyramid, pcm, startS, winEndS, width, laneH]);
 
   const ticks = useMemo(
-    () => barTicks(chunk, jobBpm, beatsPerBar, startS, winEndS, pxPerSec),
+    () => buildSeamBarTicks(chunk, jobBpm, beatsPerBar, startS, winEndS, pxPerSec),
     [chunk, jobBpm, beatsPerBar, startS, winEndS, pxPerSec],
   );
 
@@ -573,38 +574,3 @@ function handleTitle(kind: HandleKind): string {
   }
 }
 
-interface Tick {
-  tS: number;
-  downbeat: boolean;
-  bar: number | null;
-}
-
-function barTicks(
-  chunk: Chunk,
-  jobBpm: number | null,
-  beatsPerBar: number,
-  winStartS: number,
-  winEndS: number,
-  pxPerSec: number,
-): Tick[] {
-  const bpm = effectiveChunkBpm(chunk, jobBpm);
-  if (bpm <= 0 || beatsPerBar <= 0) return [];
-  const sPerBeat = 60 / bpm;
-  const pxPerBeat = sPerBeat * pxPerSec;
-  if (pxPerBeat < 4) return [];
-  const showBeats = pxPerBeat >= 14;
-  const anchorS = chunkBeatPhaseS(chunk);
-  const ticks: Tick[] = [];
-  const first = Math.ceil((winStartS - anchorS) / sPerBeat - 1e-9);
-  const last = Math.floor((winEndS - anchorS) / sPerBeat + 1e-9);
-  for (let i = first; i <= last; i++) {
-    const downbeat = (((i % beatsPerBar) + beatsPerBar) % beatsPerBar) === 0;
-    if (!downbeat && !showBeats) continue;
-    ticks.push({
-      tS: anchorS + i * sPerBeat,
-      downbeat,
-      bar: downbeat ? Math.floor(i / beatsPerBar) + 1 : null,
-    });
-  }
-  return ticks;
-}

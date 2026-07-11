@@ -20,8 +20,8 @@ import {
   useState,
 } from "react";
 import type { Cut } from "../../../storage/jobs-db";
-import { activeCamAt } from "../../cuts";
-import type { PunchFx } from "../../fx/types";
+import { activeCamAt } from "../../../core/cuts";
+import type { PunchFx } from "../../../core/fx/types";
 import { FxStripLayer } from "./FxStripLayer";
 import { tapeHeightForMode } from "./tape-height";
 import { useLongPressClear } from "./useLongPressClear";

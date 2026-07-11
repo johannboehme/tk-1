@@ -11,7 +11,7 @@ import {
   RESOLUTION_LONG_SIDE_PRESETS,
   deriveResolution,
 } from "../exportPresets";
-import type { AspectRatio } from "../types";
+import type { AspectRatio } from "../../core/types";
 
 interface Props {
   /** Active aspect, drives long-side → {w,h} derivation. `"custom"` =

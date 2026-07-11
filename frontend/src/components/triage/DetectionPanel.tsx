@@ -5,16 +5,22 @@
  * counter doubles as a passive readout: as the user drags the
  * threshold the kept count + summed duration update live.
  *
- * Slider changes re-run silence detection on the cached envelope
- * (cheap, sub-ms) and write the new chunks back to the Triage store +
- * IDB.
+ * Slider changes re-run silence detection on the cached envelope. The
+ * silence pass itself is cheap, but with PCM loaded each chunk gets a
+ * main-thread tempo/onset analysis — seconds of work on a long-form
+ * jam, so runs are debounced and stale resolutions are discarded via a
+ * generation counter. Persistence is NOT done here: the store writes
+ * flow through useTriagePersist (single writer), which snapshots
+ * chunks + silenceConfig together after the detection has landed.
  *
  * BPM lives on the brass plate inside ChunkInspector — this panel
  * is purely about "where do chunks begin and end".
  */
 import { useCallback, useRef } from "react";
 import { detectChunksFromEnvelope } from "../../local/triage/chunk-detect";
+import { mergeRedetectedChunks } from "../../local/triage/redetect-merge";
 import { jobsDb } from "../../local/jobs";
+import { confirmDestructive } from "../../lib/confirm";
 import {
   isChunkEffectivelyAccepted,
   useTriageStore,
@@ -39,6 +45,11 @@ export function DetectionPanel() {
   const setMinChunkBars = useTriageStore((s) => s.setMinChunkBars);
   const jobBpmValue = useTriageStore((s) => s.jobBpm?.value ?? null);
   const beatsPerBar = useTriageStore((s) => s.beatsPerBar);
+  // Cached opens seed the store with an empty PCM and decode the real
+  // one in the background. A re-detect in that window would run without
+  // per-chunk analysis (no BPM, no onset anchor, no bar-snapped ends) —
+  // hold the sliders until the decode lands.
+  const pcmDecoding = useTriageStore((s) => s.pcmDecoding);
   // "Kept" counts only chunks that survive both the user's manual
   // accept AND the active min-bars filter. Toggling the filter back
   // off restores the count without touching anyone's accept flag.
@@ -52,77 +63,100 @@ export function DetectionPanel() {
   );
 
   const liveDebounceRef = useRef<number | null>(null);
-  const persistDebounceRef = useRef<number | null>(null);
+  /** Monotonic id per detection kick-off. Two in-flight detections from
+   *  a slow slider drag can resolve out of order; only the newest one
+   *  may write its chunks. */
+  const redetectGenRef = useRef(0);
+  /** One-shot session gate: the first slider tweak with downstream work
+   *  (persisted arrangement, manual chunk edits) goes through the same
+   *  confirmDestructive() dialog as reject/split/join. Once approved,
+   *  subsequent tweaks in this Triage session run freely. */
+  const redetectApprovedRef = useRef(false);
+  /** Deduplicates concurrent approval checks during a slider drag —
+   *  every onPointerMove would otherwise open its own dialog. */
+  const approvalPromiseRef = useRef<Promise<boolean> | null>(null);
 
   const reDetect = useCallback(
     (config: SilenceConfig) => {
       const state = useTriageStore.getState();
       if (!state.envelope || !state.jobId) return;
+      const gen = ++redetectGenRef.current;
       void detectChunksFromEnvelope(
         state.pcm ?? new Float32Array(0),
         state.pcmSampleRate,
         state.envelope,
         config,
       ).then((result) => {
-        // Preserve the user's per-chunk accept/reject decisions AND
-        // the chunk id across re-detection. The id match keeps any
-        // arrangement / pill references pointing at the right chunk
-        // so a slider tweak that re-detects the same chunk geometry
-        // doesn't quietly empty the user's arrangement.
-        const merged = result.chunks.map((c) => {
-          const prev = state.chunks.find(
-            (p) => p.startMs === c.startMs && p.endMs === c.endMs,
-          );
-          if (prev) {
-            return {
-              ...c,
-              id: prev.id,
-              accepted: prev.accepted,
-              bpmOctaveShift: prev.bpmOctaveShift,
-              detectedBpm: c.detectedBpm ?? prev.detectedBpm,
-              effectiveBpm: c.detectedBpm ? c.effectiveBpm : prev.effectiveBpm,
-              audioStartMs: c.audioStartMs ?? prev.audioStartMs,
-            };
-          }
-          return c;
-        });
-        setChunks(merged);
+        // A newer detection was kicked off while this one ran — its
+        // geometry belongs to a superseded config. Drop it.
+        if (gen !== redetectGenRef.current) return;
+        // Reconcile against the CURRENT chunk list (not the kickoff
+        // snapshot) via the overlap merge: keep/drop decisions, ids and
+        // manual edits survive the boundary shifts every parameter
+        // change produces — so arrangement / pill references stay
+        // valid and a slider tweak doesn't quietly empty the user's
+        // arrangement.
+        const prev = useTriageStore.getState().chunks;
+        setChunks(mergeRedetectedChunks(prev, result.chunks));
       });
     },
     [setChunks],
   );
 
-  const persist = useCallback((config: SilenceConfig) => {
-    const state = useTriageStore.getState();
-    if (!state.jobId) return;
-    if (persistDebounceRef.current !== null) {
-      window.clearTimeout(persistDebounceRef.current);
-    }
-    persistDebounceRef.current = window.setTimeout(() => {
-      void jobsDb.updateJob(state.jobId!, {
-        silenceConfig: config,
-        chunks: state.chunks,
+  const ensureRedetectApproved = useCallback((): Promise<boolean> => {
+    if (redetectApprovedRef.current) return Promise.resolve(true);
+    if (approvalPromiseRef.current) return approvalPromiseRef.current;
+    const pending = (async () => {
+      const state = useTriageStore.getState();
+      const hasManualEdits = state.chunks.some(
+        (c) => c.trimMode !== "auto" || !c.accepted,
+      );
+      let hasArrangement = false;
+      if (state.jobId) {
+        const job = await jobsDb.getJob(state.jobId).catch(() => undefined);
+        hasArrangement = (job?.arrangement ?? []).length > 0;
+      }
+      if (!hasManualEdits && !hasArrangement) {
+        // Nothing downstream to protect — don't nag.
+        redetectApprovedRef.current = true;
+        return true;
+      }
+      const ok = await confirmDestructive({
+        title: "Re-run detection?",
+        body:
+          "Changing detection settings re-segments the audio. Kept/dropped flags and manual edits carry over where chunks still overlap, but chunks the new segmentation drops disappear from the arrangement too.",
+        destructiveLabel: "Re-detect",
       });
-      persistDebounceRef.current = null;
-    }, 250);
+      if (ok) redetectApprovedRef.current = true;
+      return ok;
+    })().finally(() => {
+      approvalPromiseRef.current = null;
+    });
+    approvalPromiseRef.current = pending;
+    return pending;
   }, []);
 
   function onChange(patch: Partial<SilenceConfig>) {
-    const next = { ...silenceConfig, ...patch };
-    setSilenceConfig(next);
-    if (liveDebounceRef.current !== null) {
-      window.clearTimeout(liveDebounceRef.current);
-    }
-    liveDebounceRef.current = window.setTimeout(() => {
-      reDetect(next);
-      persist(next);
-      liveDebounceRef.current = null;
-    }, 50);
+    void ensureRedetectApproved().then((approved) => {
+      if (!approved) return;
+      // Read the config fresh — during a drag several onChange calls
+      // can await the same approval, and each must stack on the latest
+      // applied value, not on its own stale render snapshot.
+      const next = { ...useTriageStore.getState().silenceConfig, ...patch };
+      setSilenceConfig(next);
+      if (liveDebounceRef.current !== null) {
+        window.clearTimeout(liveDebounceRef.current);
+      }
+      liveDebounceRef.current = window.setTimeout(() => {
+        reDetect(next);
+        liveDebounceRef.current = null;
+      }, 50);
+    });
   }
 
   return (
     <div className="flex-1 grid grid-cols-1 sm:grid-cols-[1fr_auto_auto] gap-3 sm:gap-4 items-center">
-      <div className="flex flex-col gap-1.5 min-w-0">
+      <div className="relative flex flex-col gap-1.5 min-w-0">
         <SliderRow
           label="Threshold"
           value={silenceConfig.thresholdDb}
@@ -131,6 +165,7 @@ export function DetectionPanel() {
           step={1}
           unit="dBFS"
           format={(v) => `${v} dB`}
+          disabled={pcmDecoding}
           onChange={(v) => onChange({ thresholdDb: v })}
         />
         <SliderRow
@@ -143,8 +178,17 @@ export function DetectionPanel() {
           format={(v) =>
             v >= 1000 ? `${(v / 1000).toFixed(v % 1000 === 0 ? 0 : 1)} s` : `${v} ms`
           }
+          disabled={pcmDecoding}
           onChange={(v) => onChange({ minPauseMs: v })}
         />
+        {pcmDecoding && (
+          <span
+            className="font-mono text-[9px] tracking-label uppercase"
+            style={{ color: "#B8865A" }}
+          >
+            decoding audio… sliders unlock when it's done
+          </span>
+        )}
       </div>
       <BarCountLcd
         label="MIN"
@@ -171,6 +215,9 @@ interface SliderRowProps {
   unit: string;
   /** Optional formatter — e.g. "ms" → "1.5 s" once the value crosses 1000. */
   format?: (value: number) => string;
+  /** Freeze the fader (pointer + keyboard) — used while the background
+   *  PCM decode is still running and a re-detect would be lossy. */
+  disabled?: boolean;
   onChange: (v: number) => void;
 }
 
@@ -180,7 +227,7 @@ interface SliderRowProps {
  *  keyboard semantics; the visual surface intercepts pointer events
  *  for the polished feel. Tick marks along the track give the scale a
  *  hardware-instrument vibe without crowding the panel. */
-function SliderRow({ label, value, min, max, step, unit, format, onChange }: SliderRowProps) {
+function SliderRow({ label, value, min, max, step, unit, format, disabled, onChange }: SliderRowProps) {
   const fraction = (value - min) / Math.max(1e-9, max - min);
   const trackRef = useRef<HTMLDivElement | null>(null);
   const draggingRef = useRef(false);
@@ -197,6 +244,7 @@ function SliderRow({ label, value, min, max, step, unit, format, onChange }: Sli
   }
 
   function onPointerDown(e: React.PointerEvent) {
+    if (disabled) return;
     if (e.button !== 0) return;
     e.preventDefault();
     draggingRef.current = true;
@@ -204,7 +252,7 @@ function SliderRow({ label, value, min, max, step, unit, format, onChange }: Sli
     onChange(pickFromClientX(e.clientX));
   }
   function onPointerMove(e: React.PointerEvent) {
-    if (!draggingRef.current) return;
+    if (disabled || !draggingRef.current) return;
     onChange(pickFromClientX(e.clientX));
   }
   function onPointerUp(e: React.PointerEvent) {
@@ -238,18 +286,24 @@ function SliderRow({ label, value, min, max, step, unit, format, onChange }: Sli
       >
         <div
           ref={trackRef}
-          className="relative w-full h-full cursor-ew-resize"
+          className={
+            disabled
+              ? "relative w-full h-full cursor-default"
+              : "relative w-full h-full cursor-ew-resize"
+          }
           role="slider"
           aria-label={label}
           aria-valuemin={min}
           aria-valuemax={max}
           aria-valuenow={value}
-          tabIndex={0}
+          aria-disabled={disabled ? "true" : undefined}
+          tabIndex={disabled ? -1 : 0}
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
           onPointerCancel={onPointerUp}
           onKeyDown={(e) => {
+            if (disabled) return;
             const big = e.shiftKey ? 10 : 1;
             if (e.key === "ArrowLeft" || e.key === "ArrowDown") {
               e.preventDefault();
@@ -277,14 +331,16 @@ function SliderRow({ label, value, min, max, step, unit, format, onChange }: Sli
             overflow: "hidden",
           }}
         >
-          {/* Phosphor fill from left edge to current fraction. */}
+          {/* Phosphor fill from left edge to current fraction. Goes cold
+           *  (solid slate, no glow) while the control is frozen. */}
           <div
             className="absolute top-0 bottom-0 left-0 pointer-events-none"
             style={{
               width: `${fraction * 100}%`,
-              background:
-                "linear-gradient(180deg, rgba(255,179,71,0.35) 0%, rgba(255,87,34,0.55) 100%)",
-              boxShadow: "0 0 8px rgba(255,138,79,0.55)",
+              background: disabled
+                ? "linear-gradient(180deg, #4A443B 0%, #5D5546 100%)"
+                : "linear-gradient(180deg, rgba(255,179,71,0.35) 0%, rgba(255,87,34,0.55) 100%)",
+              boxShadow: disabled ? undefined : "0 0 8px rgba(255,138,79,0.55)",
             }}
           />
           {/* Tick marks across the full track. */}
