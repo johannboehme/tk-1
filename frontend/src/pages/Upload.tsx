@@ -13,6 +13,7 @@ import {
 import {
   canSynthesizeDemo,
   createDemoJob,
+  type DemoMode,
   type DemoProgress,
 } from "../local/demo/demo-project";
 import {
@@ -41,6 +42,8 @@ export default function Upload() {
   const [dragZone, setDragZone] = useState<"audio" | "video" | null>(null);
   /** Demo synthesis in flight; holds the current stage for the button. */
   const [demoStage, setDemoStage] = useState<DemoProgress | null>(null);
+  /** Which demo flavour is being synthesized (labels the right button). */
+  const [demoMode, setDemoMode] = useState<DemoMode | null>(null);
 
   // Snapshot once at mount: capabilities are static within a tab.
   const caps = useMemo(getCapabilities, []);
@@ -51,16 +54,18 @@ export default function Upload() {
   const demoSupported = canSynthesizeDemo(caps);
   const demoBusy = demoStage !== null;
 
-  async function runDemo() {
+  async function runDemo(mode: DemoMode) {
     if (demoBusy || busy || !demoSupported) return;
     setErr(null);
+    setDemoMode(mode);
     setDemoStage({ stage: "song", detail: "song" });
     try {
-      const jobId = await createDemoJob({ onProgress: setDemoStage });
+      const jobId = await createDemoJob({ onProgress: setDemoStage, mode });
       navigate(`/job/${jobId}`);
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Could not build the demo session");
       setDemoStage(null);
+      setDemoMode(null);
     }
   }
 
@@ -379,6 +384,7 @@ export default function Upload() {
           <DemoStrip
             supported={demoSupported}
             stage={demoStage}
+            runningMode={demoMode}
             disabled={!demoSupported || demoBusy || busy}
             onRun={runDemo}
           />
@@ -388,18 +394,22 @@ export default function Upload() {
   );
 }
 
-/** "No footage yet?" strip — synthesizes a tiny demo session client-side
- *  and pushes it through the normal createJob → sync → editor flow. */
+/** "No footage yet?" strip — synthesizes a demo project client-side and
+ *  pushes it through the normal createJob flow. Two flavours, matching
+ *  the two mode cards above: a compact song for the direct editor flow,
+ *  and a multi-part session take for the Triage → Arrange workflow. */
 function DemoStrip({
   supported,
   stage,
+  runningMode,
   disabled,
   onRun,
 }: {
   supported: boolean;
   stage: DemoProgress | null;
+  runningMode: DemoMode | null;
   disabled: boolean;
-  onRun: () => void;
+  onRun: (mode: DemoMode) => void;
 }) {
   const stageLabel =
     stage === null
@@ -409,6 +419,12 @@ function DemoStrip({
         : stage.stage === "cam"
           ? `SYNTH · ${stage.detail}`
           : "STARTING…";
+  const buttonClasses = [
+    "h-11 px-5 shrink-0 rounded-md font-display tracking-label uppercase text-[12px] transition-all",
+    disabled
+      ? "bg-paper-deep text-ink-3 cursor-not-allowed"
+      : "bg-paper-hi text-ink shadow-emboss hover:bg-paper-deep active:shadow-pressed active:translate-y-[1px] cursor-pointer",
+  ].join(" ");
   return (
     <div className="flex flex-col sm:flex-row sm:items-center gap-3 border border-rule rounded-md px-4 py-3 bg-paper-hi">
       <div className="flex-1 min-w-0">
@@ -417,24 +433,29 @@ function DemoStrip({
         </span>
         <p className="font-mono text-xs text-ink-3 mt-0.5 leading-relaxed">
           {supported
-            ? "A 17-second song + two cams, synthesized right here, then run " +
-              "through the real sync — nothing to download."
+            ? "A synthesized song + two cams, built right here and run " +
+              "through the real pipeline — nothing to download. Pick the " +
+              "direct cut or a full session for the Triage workflow."
             : "The demo session needs WebCodecs encoders — try Chrome, Edge or Brave."}
         </p>
       </div>
       <button
         type="button"
         id="demo-button"
-        onClick={onRun}
+        onClick={() => onRun("direct")}
         disabled={disabled}
-        className={[
-          "h-11 px-5 shrink-0 rounded-md font-display tracking-label uppercase text-[12px] transition-all",
-          disabled
-            ? "bg-paper-deep text-ink-3 cursor-not-allowed"
-            : "bg-paper-hi text-ink shadow-emboss hover:bg-paper-deep active:shadow-pressed active:translate-y-[1px] cursor-pointer",
-        ].join(" ")}
+        className={buttonClasses}
       >
-        {stageLabel ?? "Try the demo"}
+        {runningMode === "direct" && stageLabel ? stageLabel : "Demo · Direct"}
+      </button>
+      <button
+        type="button"
+        id="demo-button-session"
+        onClick={() => onRun("longform")}
+        disabled={disabled}
+        className={buttonClasses}
+      >
+        {runningMode === "longform" && stageLabel ? stageLabel : "Demo · Session"}
       </button>
     </div>
   );

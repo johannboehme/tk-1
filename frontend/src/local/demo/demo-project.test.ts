@@ -5,7 +5,12 @@ import {
   createDemoJob,
   type DemoProgress,
 } from "./demo-project";
-import { DEMO_SONG, songDurationS } from "./demo-song";
+import {
+  DEMO_SONG,
+  DEMO_SESSION,
+  sessionDurationS,
+  songDurationS,
+} from "./demo-song";
 import type { Capabilities } from "../../core/capabilities";
 import { createJob } from "../jobs";
 import { synthesizeDemoVideo } from "./demo-video";
@@ -108,6 +113,31 @@ describe("createDemoJob", () => {
       expect(s).toBeGreaterThanOrEqual(0);
       expect(s).toBeLessThan(dur - 1);
     }
+  });
+
+  it("longform mode: session song, sections forwarded, job mode longform", async () => {
+    await createDemoJob({ mode: "longform" });
+
+    const dur = sessionDurationS(DEMO_SESSION);
+    for (const [i, spec] of DEMO_CAM_SPECS.entries()) {
+      const call = vi.mocked(synthesizeDemoVideo).mock.calls[i][0];
+      expect(call.durationS).toBeCloseTo(dur - spec.songStartS, 6);
+      expect(call.songPcm.length).toBe(Math.round(dur * DEMO_SESSION.sampleRate));
+      // Silence gaps drive the cams' tacet visuals.
+      expect(call.sections).toHaveLength(DEMO_SESSION.sections.length);
+    }
+
+    const [, , options] = vi.mocked(createJob).mock.calls[0];
+    expect(options).toMatchObject({
+      title: "Demo session · long-form",
+      mode: "longform",
+    });
+  });
+
+  it("direct mode does not pass sections (visuals always active)", async () => {
+    await createDemoJob();
+    const call = vi.mocked(synthesizeDemoVideo).mock.calls[0][0];
+    expect(call.sections).toBeUndefined();
   });
 
   it("reports progress stages in order: song → cams → job", async () => {

@@ -224,38 +224,55 @@ describe("Upload page — demo session", () => {
     );
   }
 
-  it("offers a one-click demo that runs through the normal job flow", async () => {
+  it("offers a one-click direct demo that runs through the normal job flow", async () => {
     vi.spyOn(caps, "getCapabilities").mockReturnValue(FULL_SUPPORT);
     demo.createDemoJob.mockResolvedValue("demo42");
     renderWithJobRoute();
-    const button = screen.getByRole("button", { name: /try the demo/i });
+    const button = screen.getByRole("button", { name: /demo · direct/i });
     expect(button).toBeEnabled();
     fireEvent.click(button);
     await waitFor(() => {
       expect(screen.getByText("JOB PAGE STUB")).toBeInTheDocument();
     });
     expect(demo.createDemoJob).toHaveBeenCalledTimes(1);
+    expect(demo.createDemoJob.mock.calls[0][0]).toMatchObject({
+      mode: "direct",
+    });
+  });
+
+  it("offers a session demo that requests the long-form workflow", async () => {
+    vi.spyOn(caps, "getCapabilities").mockReturnValue(FULL_SUPPORT);
+    demo.createDemoJob.mockResolvedValue("demo43");
+    renderWithJobRoute();
+    fireEvent.click(screen.getByRole("button", { name: /demo · session/i }));
+    await waitFor(() => {
+      expect(screen.getByText("JOB PAGE STUB")).toBeInTheDocument();
+    });
+    expect(demo.createDemoJob).toHaveBeenCalledTimes(1);
+    expect(demo.createDemoJob.mock.calls[0][0]).toMatchObject({
+      mode: "longform",
+    });
   });
 
   it("surfaces synthesis failures without leaving the page", async () => {
     vi.spyOn(caps, "getCapabilities").mockReturnValue(FULL_SUPPORT);
     demo.createDemoJob.mockRejectedValue(new Error("encoder exploded"));
     renderWithJobRoute();
-    fireEvent.click(screen.getByRole("button", { name: /try the demo/i }));
+    fireEvent.click(screen.getByRole("button", { name: /demo · direct/i }));
     await waitFor(() => {
       expect(screen.getByText(/encoder exploded/i)).toBeInTheDocument();
     });
-    // Still on the Upload page, button usable again.
-    expect(
-      screen.getByRole("button", { name: /try the demo/i }),
-    ).toBeEnabled();
+    // Still on the Upload page, buttons usable again.
+    expect(screen.getByRole("button", { name: /demo · direct/i })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /demo · session/i })).toBeEnabled();
   });
 
   it("disables the demo when the browser lacks WebCodecs encoders", () => {
     vi.spyOn(caps, "getCapabilities").mockReturnValue(FULL_SUPPORT);
     demo.supported = false;
     renderWithJobRoute();
-    expect(screen.getByRole("button", { name: /try the demo/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /demo · direct/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /demo · session/i })).toBeDisabled();
     expect(screen.getByText(/Chrome, Edge or Brave/i)).toBeInTheDocument();
   });
 });
