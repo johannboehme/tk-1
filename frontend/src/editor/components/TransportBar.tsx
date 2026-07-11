@@ -14,12 +14,6 @@ import {
 } from "../../core/arrangement-time";
 import { useGlobalShortcut } from "../shortcuts/keymap";
 import { useIsNarrowViewport } from "../use-is-narrow";
-import {
-  redoEdit,
-  redoKeyLabel,
-  undoEdit,
-  undoKeyLabel,
-} from "../history";
 import { ChunkyButton } from "./ChunkyButton";
 import { TransportClock } from "./TransportClock";
 import {
@@ -30,12 +24,10 @@ import {
   OutIcon,
   PauseIcon,
   PlayIcon,
-  RedoIcon,
   SkipBackIcon,
   SkipFwdIcon,
   StepBackIcon,
   StepFwdIcon,
-  UndoIcon,
 } from "./icons";
 
 type IOContextKind = "loop" | "video" | "image" | "master";
@@ -93,10 +85,6 @@ export function TransportBar() {
     if (!clip) return "master" as const;
     return clip.kind === "image" ? ("image" as const) : ("video" as const);
   });
-  // Undo/redo affordance (#69): depths are mirrored into the store by
-  // the history module, so the buttons enable/disable live. The history
-  // object only changes reference when a depth changes.
-  const history = useEditorStore((s) => s.history);
   // Phone-sized viewports get an aggressively compacted transport bar:
   // every transport stepper + Play + IN/OUT/LOOP collapses to xs
   // (h-8 ≈ 28 px wide icon-only, no min-w) so the entire 8-button
@@ -441,36 +429,6 @@ export function TransportBar() {
           {!isNarrow && "LOOP"}
         </ChunkyButton>
       </div>
-
-      {/* Undo/redo (#69). Desktop-only: the phone transport row is
-       *  budgeted to fit 8-up at 280 px and these two would break it —
-       *  narrow layouts keep the pointer long-press flows plus the
-       *  post-clear notice instead. */}
-      {!isNarrow && (
-        <>
-          <div className="hidden sm:block h-8 w-px bg-rule mx-1" />
-          <div className="flex items-center flex-wrap gap-1">
-            <ChunkyButton
-              variant="secondary"
-              size={trimSize}
-              onClick={() => void undoEdit()}
-              disabled={history.undoDepth === 0}
-              iconLeft={<UndoIcon />}
-              aria-label="Undo the last edit"
-              title={`Undo (${undoKeyLabel()})`}
-            />
-            <ChunkyButton
-              variant="secondary"
-              size={trimSize}
-              onClick={() => void redoEdit()}
-              disabled={history.redoDepth === 0}
-              iconLeft={<RedoIcon />}
-              aria-label="Redo the last undone edit"
-              title={`Redo (${redoKeyLabel()})`}
-            />
-          </div>
-        </>
-      )}
 
       {/* Clock: hidden on phones — the timeline ruler shows the same
        *  master time, and the bezel here was eating an entire row.
