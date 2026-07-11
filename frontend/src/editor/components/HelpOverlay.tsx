@@ -97,7 +97,7 @@ export function HelpOverlay() {
   // the keymap's modal scope suppresses every binding not marked
   // `inModal` (Space, cam digits, I/O/L, FX pads, …). Trying a key while
   // reading the cheat sheet must never edit the project behind the
-  // dialog — there is no undo. Only ?/Esc below stay live.
+  // dialog. Only ?/Esc below stay live.
   useEffect(() => {
     if (!open) return;
     return acquireModalScope("help-overlay");
