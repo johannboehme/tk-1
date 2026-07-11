@@ -36,6 +36,7 @@ import { trimWindowArr } from "../arrangement-loop";
 import { isPillDirty } from "../arrangement-pills";
 import { LaneHeader, type CamStatus } from "./timeline/LaneHeader";
 import { createLaneCallbacksCache } from "./timeline/lane-callbacks";
+import { decidePillPointerDown } from "./timeline/pill-pointer";
 import { AddMediaButton } from "./AddMediaButton";
 import { ProgramStrip } from "./timeline/ProgramStrip";
 import { tapeHeightForMode } from "./timeline/tape-height";
@@ -1365,10 +1366,17 @@ export function Timeline({
       if (pillHit) {
         const p = pills.find((pp) => pp.id === pillHit.pillId);
         if (p) {
-          // Floating ↺ reset-button → revert this pill, no drag.
-          // Allowed regardless of lock state — it's a destructive-revert
-          // action, not an edit gesture.
-          if (pillHit.zone === "reset") {
+          // Pure decision (which gesture, whether to seek) lives in
+          // pill-pointer.ts with the full behavior matrix under test —
+          // including the "loop active → select only, never seek"
+          // invariant. This block just executes the decision.
+          const decision = decidePillPointerDown({
+            zone: pillHit.zone,
+            loopActive: loop !== null,
+            lanesLocked,
+            snapMode,
+          });
+          if (decision.kind === "reset-pill") {
             resetPill(p.id);
             return;
           }
@@ -1377,21 +1385,12 @@ export function Timeline({
           // even when drag is intentionally disabled.
           setSelectedPillId(p.id);
           setSelectedClipId(p.camId);
-          if (lanesLocked) {
-            // Lock on → no drag setup. A locked pill click normally also
-            // scrubs so the playhead follows the pointer — but NOT while a
-            // loop is engaged. A scrub onto a pill outside the loop lands
-            // out of the loop region, and the audio walker's immediate-wrap
-            // (useAudioMaster) yanks playback straight back to loop.start,
-            // so the picked pill could never be auditioned. With a loop
-            // active, select only and leave the loop running untouched.
-            if (!loop) {
-              seekFromX(x, snapped(tRaw, e));
-              dragRef.current = { kind: "playhead" };
-            }
-            return;
+          if (decision.seek) {
+            seekFromX(x, snapped(tRaw, e));
           }
-          if (pillHit.zone === "left") {
+          if (decision.drag === "playhead") {
+            dragRef.current = { kind: "playhead" };
+          } else if (decision.drag === "pill-trim-in") {
             dragRef.current = {
               kind: "pill-trim-in",
               pillId: p.id,
@@ -1399,7 +1398,7 @@ export function Timeline({
               origArrEndS: p.arrEndS,
               origSourceInS: p.sourceInS,
             };
-          } else if (pillHit.zone === "right") {
+          } else if (decision.drag === "pill-trim-out") {
             dragRef.current = {
               kind: "pill-trim-out",
               pillId: p.id,
@@ -1407,40 +1406,38 @@ export function Timeline({
               origArrEndS: p.arrEndS,
               origSourceOutS: p.sourceOutS,
             };
-          } else {
-            const arrAtGrab =
-              viewStart + (x / canvasWidth) * visibleDur;
+          } else if (decision.drag === "cam-track-move") {
             // MATCH snap-mode promotes the body-drag from a single
             // pill move to a CAM-TRACK move: every pill of this
             // camera shifts in lockstep so the user can align the
             // whole take against a candidate-implied anchor.
-            if (snapMode === "match") {
-              const origStartsByPillId: Record<string, number> = {};
-              for (const sib of pills) {
-                if (sib.camId === p.camId) {
-                  origStartsByPillId[sib.id] = sib.arrStartS;
-                }
+            const arrAtGrab = viewStart + (x / canvasWidth) * visibleDur;
+            const origStartsByPillId: Record<string, number> = {};
+            for (const sib of pills) {
+              if (sib.camId === p.camId) {
+                origStartsByPillId[sib.id] = sib.arrStartS;
               }
-              const camClip = clips.find((c) => c.id === p.camId);
-              const origMasterStartS =
-                camClip && isVideoClip(camClip)
-                  ? -(camClip.syncOffsetMs + camClip.syncOverrideMs) / 1000
-                  : 0;
-              dragRef.current = {
-                kind: "cam-track-move",
-                camId: p.camId,
-                grabArrT: arrAtGrab,
-                origStartsByPillId,
-                origMasterStartS,
-              };
-            } else {
-              dragRef.current = {
-                kind: "pill-move",
-                pillId: p.id,
-                grabArrT: arrAtGrab,
-                origArrStartS: p.arrStartS,
-              };
             }
+            const camClip = clips.find((c) => c.id === p.camId);
+            const origMasterStartS =
+              camClip && isVideoClip(camClip)
+                ? -(camClip.syncOffsetMs + camClip.syncOverrideMs) / 1000
+                : 0;
+            dragRef.current = {
+              kind: "cam-track-move",
+              camId: p.camId,
+              grabArrT: arrAtGrab,
+              origStartsByPillId,
+              origMasterStartS,
+            };
+          } else if (decision.drag === "pill-move") {
+            const arrAtGrab = viewStart + (x / canvasWidth) * visibleDur;
+            dragRef.current = {
+              kind: "pill-move",
+              pillId: p.id,
+              grabArrT: arrAtGrab,
+              origArrStartS: p.arrStartS,
+            };
           }
           return;
         }
