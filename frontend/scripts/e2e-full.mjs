@@ -218,23 +218,31 @@ async function addCutsAndRender(page, jobId, cuts, name) {
   await page.waitForTimeout(3500);
   await shot(page, `${name}-editor-with-cuts`);
 
+  // A completed render is signalled by job.lastRender (completedAt +
+  // outputBytes), not a job-level status field — baseline it pre-click.
+  const prevRenderAt = (await dumpJob(page))?.lastRender?.completedAt ?? 0;
+
   // Click "Render" button in the editor.
   await page.getByRole("button", { name: /^render$|^rendering/i }).click({ timeout: 3000 });
   await page.waitForTimeout(800);
+  await shot(page, `${name}-render-screen`);
 
   // Wait for render to land.
   const t0 = Date.now();
-  let lastStatus = null;
-  while (Date.now() - t0 < 600_000) {
+  while (Date.now() - t0 < 300_000) {
     const job = await dumpJob(page);
-    if (job?.status !== lastStatus) {
-      console.log(`  render status=${job?.status} pct=${job?.progress?.pct}`);
-      lastStatus = job?.status;
-    }
-    if (job?.status === "rendered") return { ok: true, bytes: job.outputBytes };
-    if (job?.status === "failed") return { ok: false, error: job.error };
+    const lr = job?.lastRender;
+    if (lr && lr.completedAt > prevRenderAt)
+      return { ok: true, bytes: lr.outputBytes };
+    const failText = await page
+      .locator("text=/render failed|Rendering failed/i")
+      .first()
+      .textContent({ timeout: 200 })
+      .catch(() => null);
+    if (failText) return { ok: false, error: failText.trim() };
     await page.waitForTimeout(1500);
   }
+  await shot(page, `${name}-render-timeout`);
   return { ok: false, error: "render timeout" };
 }
 
