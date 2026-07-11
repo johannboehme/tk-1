@@ -5,7 +5,7 @@ import {
   loopAroundPlayhead,
   trimWindowArr,
 } from "./arrangement-loop";
-import type { Segment } from "./types";
+import type { Segment } from "../core/types";
 
 describe("loopAroundPlayhead", () => {
   test("centers the window on the arr-time playhead", () => {

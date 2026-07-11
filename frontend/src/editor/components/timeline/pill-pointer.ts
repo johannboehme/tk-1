@@ -1,4 +1,4 @@
-import type { SnapMode } from "../../snap";
+import type { SnapMode } from "../../../core/snap";
 
 /** Hit zone reported by Timeline's pill hit-testing. */
 export type PillHitZone = "left" | "right" | "body" | "reset";

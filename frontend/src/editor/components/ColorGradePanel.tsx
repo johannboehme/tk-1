@@ -3,7 +3,7 @@
 // no looks): grouped grading controls in pipeline order, each writing the
 // `colorGrade` GradeParams vector. Reuses the panel's card + slider idioms.
 import { useEditorStore } from "../store";
-import type { GradeParams } from "../fx/looks";
+import type { GradeParams } from "../../core/fx/looks";
 import { ChunkyButton } from "./ChunkyButton";
 import { ParamSlider } from "./ParamSlider";
 

@@ -21,7 +21,7 @@
  * real browser) said it was available — that branch handles unit
  * tests that exercise the factory under jsdom.
  */
-import { markWebGPUUnavailable } from "../../local/capabilities";
+import { markWebGPUUnavailable } from "../capabilities";
 import { Canvas2DBackend } from "./canvas2d-backend";
 import { WebGL2Backend } from "./webgl2-backend";
 import { WebGPUBackend } from "./webgpu-backend";

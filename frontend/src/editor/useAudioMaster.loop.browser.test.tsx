@@ -35,8 +35,8 @@ import { useEffect, useRef } from "react";
 import { userEvent } from "@vitest/browser/context";
 import { useAudioMaster } from "./useAudioMaster";
 import { useEditorStore } from "./store";
-import { arrToMaster, segmentArrStarts, totalArrDuration } from "./arrangement-time";
-import type { Segment } from "./types";
+import { arrToMaster, segmentArrStarts, totalArrDuration } from "../core/arrangement-time";
+import type { Segment } from "../core/types";
 
 // This suite deliberately observes LIVE async playback (RAF ticks, audio
 // thread crossfades) — act()-wrapping would defeat its purpose. Tell

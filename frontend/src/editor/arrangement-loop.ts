@@ -9,7 +9,7 @@
  * where the next wrap fires; the store calls `clampLoopToBounds` so the
  * user can't drag a loop outside the playable region.
  */
-import type { Segment } from "./types";
+import type { Segment } from "../core/types";
 import type { LoopRegion, TrimRegion } from "./OffsetScheduler";
 import { clampLoopRegion } from "./OffsetScheduler";
 import {
@@ -17,7 +17,7 @@ import {
   segmentArrStarts,
   segmentIndexAtArr,
   sliceByArrSegments,
-} from "./arrangement-time";
+} from "../core/arrangement-time";
 
 /** Float tolerance for "loop.end sits exactly on a segment seam". Arr-times
  *  are accumulated float sums; a UI-derived loop.end that means "the seam"

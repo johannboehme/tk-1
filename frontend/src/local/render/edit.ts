@@ -45,19 +45,19 @@ import {
   applyDriftStretchInterleaved,
 } from "./audio-fx";
 import { Compositor } from "./compositor";
-import type { BackendCapabilities } from "../../editor/render/factory";
+import type { BackendCapabilities } from "../../core/render/factory";
 import { CamFrameStream } from "./cam-frame-stream";
 import { makeTestPatternBitmap } from "./test-pattern";
-import { activeCamAt } from "../../editor/cuts";
-import { activeCamAtArr as activeCamAtArrLocal } from "../../editor/arrangement-pills";
+import { activeCamAt } from "../../core/cuts";
+import { activeCamAtArr as activeCamAtArrLocal } from "../../core/arrangement-pills";
 import { planSegmentFrames, outputTimestampUs } from "./frame-timing";
 import type { Cut } from "../../storage/jobs-db";
-import type { PunchFx } from "../../editor/fx/types";
-import type { GradeParams } from "../../editor/fx/looks";
-import type { FilterSlot } from "../../editor/fx/types";
+import type { PunchFx } from "../../core/fx/types";
+import type { GradeParams } from "../../core/fx/looks";
+import type { FilterSlot } from "../../core/fx/types";
 import type { TextOverlay, EnergyCurves } from "./ass-builder";
 import type { Visualizer } from "./visualizer/types";
-import { camSourceTimeUs } from "../timing/cam-time";
+import { camSourceTimeUs } from "../../core/timing/cam-time";
 
 export interface Segment {
   in: number; // seconds (master-time)
@@ -105,7 +105,7 @@ export interface EditRenderInput {
   beatPhaseS?: number;
   beatsPerBar?: number;
   /** Normalized master-loudness curve for sidechain FX modulation. */
-  audioEnv?: import("../../editor/fx/modulation").AudioEnvelope | null;
+  audioEnv?: import("../../core/fx/modulation").AudioEnvelope | null;
   /** The single global color grade. Same data the live preview reads. */
   colorGrade?: GradeParams;
   /** The opinionated filter stack. Same data the live preview reads; applied
@@ -571,7 +571,7 @@ export interface CamSourceInput {
   flipY?: boolean;
   /** Per-element Stage placement (cover-fit + scale + translate). When
    *  omitted, the compositor uses the cover-fit default. */
-  viewportTransform?: import("../../editor/types").ViewportTransform;
+  viewportTransform?: import("../../core/types").ViewportTransform;
 }
 
 export interface MultiCamRenderInput
@@ -595,7 +595,7 @@ export interface MultiCamRenderInput
    * Direct-mode jobs leave this empty and fall back to the legacy
    * `activeCamAt` resolver against `camRanges`.
    */
-  pills?: import("../../editor/types").Pill[];
+  pills?: import("../../core/types").Pill[];
 }
 
 /**
@@ -944,7 +944,7 @@ export async function editRenderMulti(
         // in direct-mode. Pills also yield the active pill so we can
         // pull source-time directly from its sourceIn/Out window.
         let camId: string | null;
-        let activePill: import("../../editor/types").Pill | null = null;
+        let activePill: import("../../core/types").Pill | null = null;
         if (pillMode) {
           const active = activeCamAtArrLocal(
             input.cuts,
@@ -972,7 +972,7 @@ export async function editRenderMulti(
                 rotation?: number;
                 flipX?: boolean;
                 flipY?: boolean;
-                viewportTransform?: import("../../editor/types").ViewportTransform;
+                viewportTransform?: import("../../core/types").ViewportTransform;
               };
             }
           | {
@@ -985,7 +985,7 @@ export async function editRenderMulti(
                 rotation?: number;
                 flipX?: boolean;
                 flipY?: boolean;
-                viewportTransform?: import("../../editor/types").ViewportTransform;
+                viewportTransform?: import("../../core/types").ViewportTransform;
               };
             };
         let src: Src;

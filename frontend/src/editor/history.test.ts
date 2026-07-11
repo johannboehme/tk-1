@@ -15,7 +15,7 @@ import {
   undoEdit,
 } from "./history";
 import { persistRelevantChanged } from "./useAutoPersist";
-import type { Pill } from "./types";
+import type { Pill } from "../core/types";
 
 const baseJobMeta = {
   id: "j1",

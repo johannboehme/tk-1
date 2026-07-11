@@ -4,7 +4,7 @@ import {
   type PillHitZone,
   type PillPointerDecision,
 } from "./pill-pointer";
-import type { SnapMode } from "../../snap";
+import type { SnapMode } from "../../../core/snap";
 
 const ZONES: PillHitZone[] = ["left", "right", "body", "reset"];
 const SNAP_MODES: SnapMode[] = ["off", "match", "1", "1/2", "1/4", "1/8", "1/16"];

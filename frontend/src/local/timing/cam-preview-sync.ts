@@ -38,7 +38,7 @@
  * is always the latest one.
  */
 
-import { camSourceTimeS, type CamTimeRef } from "./cam-time";
+import { camSourceTimeS, type CamTimeRef } from "../../core/timing/cam-time";
 
 export type CamPreviewAction =
   /** Cam isn't on screen yet (master playhead < cam's anchorS). */

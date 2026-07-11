@@ -21,26 +21,26 @@ import {
   clipEffectiveDisplayDims,
   clipRangeS,
   isVideoClip,
-} from "./types";
+} from "../core/types";
 import {
   activeCamAtArr,
   camHasPillAt,
   reconcilePills,
-} from "./arrangement-pills";
+} from "../core/arrangement-pills";
 import {
   arrToMaster,
   masterToArr,
   segmentIndexAtArr,
   sliceByArrSegments,
   totalArrDuration,
-} from "./arrangement-time";
+} from "../core/arrangement-time";
 import type { ArrangementItem, Chunk } from "../storage/jobs-db";
 import { classifyAspectRatio } from "./exportPresets";
-import { DEFAULT_VIEWPORT_TRANSFORM } from "./render/element-transform";
+import { DEFAULT_VIEWPORT_TRANSFORM } from "../core/render/element-transform";
 import { LoopRegion } from "./OffsetScheduler";
 import { clampLoopToBounds } from "./arrangement-loop";
-import { activeCamAt, type CamRange } from "./cuts";
-import { gridStepSeconds, snapTime, type SnapMode } from "./snap";
+import { activeCamAt, type CamRange } from "../core/cuts";
+import { gridStepSeconds, snapTime, type SnapMode } from "../core/snap";
 import { buildClipMatchPositions } from "./match-snap";
 import { buildQuantizePreview, type QuantizePreview } from "./quantize";
 import {
@@ -50,11 +50,11 @@ import {
   arrBeatPhaseS,
 } from "./selectors/timing";
 import type { Cut } from "../storage/jobs-db";
-import type { FilterSlot, FxKind, PunchFx } from "./fx/types";
-import { defaultColorGrade, type GradeParams } from "./fx/looks";
-import { defaultTapLengthS, fxCatalog } from "./fx/catalog";
-import type { ADSREnvelope } from "./fx/envelope";
-import { INSTANT_ENVELOPE } from "./fx/envelope";
+import type { FilterSlot, FxKind, PunchFx } from "../core/fx/types";
+import { defaultColorGrade, type GradeParams } from "../core/fx/looks";
+import { defaultTapLengthS, fxCatalog } from "../core/fx/catalog";
+import type { ADSREnvelope } from "../core/fx/envelope";
+import { INSTANT_ENVELOPE } from "../core/fx/envelope";
 import {
   DEFAULT_MOD_CONFIG,
   type AudioEnvelope,
@@ -62,7 +62,7 @@ import {
   type ModConfig,
   type Modulation,
   type SidechainConfig,
-} from "./fx/modulation";
+} from "../core/fx/modulation";
 
 import { clamp } from "../lib/clamp";
 export interface BpmInfo {

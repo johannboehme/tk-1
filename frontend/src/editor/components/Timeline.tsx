@@ -21,7 +21,7 @@ import {
   useState,
 } from "react";
 import { useEditorStore } from "../store";
-import { clipRangeS, isVideoClip, type Clip, type Pill } from "../types";
+import { clipRangeS, isVideoClip, type Clip, type Pill } from "../../core/types";
 import {
   arrToMaster,
   masterToArr,
@@ -31,9 +31,9 @@ import {
   sliceByArrSegments,
   totalArrDuration,
   trimHandlesArr,
-} from "../arrangement-time";
+} from "../../core/arrangement-time";
 import { trimWindowArr } from "../arrangement-loop";
-import { isPillDirty } from "../arrangement-pills";
+import { isPillDirty } from "../../core/arrangement-pills";
 import { LaneHeader, type CamStatus } from "./timeline/LaneHeader";
 import { createLaneCallbacksCache } from "./timeline/lane-callbacks";
 import { decidePillPointerDown } from "./timeline/pill-pointer";
@@ -44,7 +44,7 @@ import { SegmentedControl } from "./SegmentedControl";
 import { BeatRuler } from "./timeline/BeatRuler";
 import { BpmReadout } from "./BpmReadout";
 import { SnapModeButtons } from "./SnapModeButtons";
-import { snapTime, type SnapCtx, type SnapMode } from "../snap";
+import { snapTime, type SnapCtx, type SnapMode } from "../../core/snap";
 import {
   buildClipMatchPositions,
   candidateIdxNearestStart,
@@ -56,9 +56,9 @@ import {
 } from "../selectors/timing";
 import { BarsHeader } from "./timeline/BarsHeader";
 import { useIsNarrowViewport } from "../use-is-narrow";
-import { MASTER_AUDIO_ID } from "../types";
-import { drawWaveform, EDITOR_STYLE } from "../../local/waveform/draw-waveform";
-import type { PeakPyramid } from "../../local/waveform/peak-pyramid";
+import { MASTER_AUDIO_ID } from "../../core/types";
+import { drawWaveform, EDITOR_STYLE } from "../../core/waveform/draw-waveform";
+import type { PeakPyramid } from "../../core/waveform/peak-pyramid";
 
 import { clamp } from "../../lib/clamp";
 interface CamAssetInfo {

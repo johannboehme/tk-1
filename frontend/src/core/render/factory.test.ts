@@ -6,7 +6,7 @@ import {
   getCapabilities,
   initCapabilities,
   _resetWebGPUProbeForTest,
-} from "../../local/capabilities";
+} from "../capabilities";
 
 /** Mock canvas with a getContext that returns a hand-rolled 2D ctx
  *  (jsdom doesn't ship one). Matches the pattern used in

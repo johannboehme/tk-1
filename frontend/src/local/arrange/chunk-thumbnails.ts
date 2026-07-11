@@ -28,7 +28,7 @@ import type { Chunk, VideoAsset } from "../../storage/jobs-db";
 import { loadAssetFile } from "../asset-source";
 import { resolveCamAssetUrl } from "../jobs";
 import { planTileStrip } from "../render/frames/strategy";
-import { camSourceTimeS } from "../timing/cam-time";
+import { camSourceTimeS } from "../../core/timing/cam-time";
 
 /** Target output width for tier-3 (on-demand seek) thumbnails — drawn
  *  from the full-res video, so we can pick a number that's plenty

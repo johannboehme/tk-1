@@ -11,7 +11,7 @@ import {
   arrToMaster,
   masterToArr,
   totalArrDuration,
-} from "../arrangement-time";
+} from "../../core/arrangement-time";
 import { useGlobalShortcut } from "../shortcuts/keymap";
 import { useIsNarrowViewport } from "../use-is-narrow";
 import {

@@ -13,7 +13,7 @@
  * Pure function — no IO.
  */
 import type { ArrangementItem, Chunk } from "../../storage/jobs-db";
-import type { Segment } from "../../editor/types";
+import type { Segment } from "../types";
 
 export interface ChunkSegmentOptions {
   /** Trim end-of-chunk by this many ms before the segment cuts to next.

@@ -27,7 +27,7 @@ import {
   type LocalJob,
   type MediaAsset,
 } from "../storage/jobs-db";
-import { isVideoClip } from "./types";
+import { isVideoClip } from "../core/types";
 import { confirmDestructive } from "../lib/confirm";
 
 const DEBOUNCE_MS = 300;

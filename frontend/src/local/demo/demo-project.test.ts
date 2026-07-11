@@ -6,7 +6,7 @@ import {
   type DemoProgress,
 } from "./demo-project";
 import { DEMO_SONG, songDurationS } from "./demo-song";
-import type { Capabilities } from "../capabilities";
+import type { Capabilities } from "../../core/capabilities";
 import { createJob } from "../jobs";
 import { synthesizeDemoVideo } from "./demo-video";
 

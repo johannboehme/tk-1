@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, test } from "vitest";
 import { useEditorStore } from "./store";
-import { ENGINE_DEFAULTS } from "./fx/looks";
-import { fxCatalog } from "./fx/catalog";
+import { ENGINE_DEFAULTS } from "../core/fx/looks";
+import { fxCatalog } from "../core/fx/catalog";
 
 const baseJobMeta = {
   id: "j1",

@@ -1,4 +1,4 @@
-import { type Capabilities, describeCapability } from "../local/capabilities";
+import { type Capabilities, describeCapability } from "../core/capabilities";
 
 interface Props {
   missing: ReadonlyArray<keyof Capabilities>;

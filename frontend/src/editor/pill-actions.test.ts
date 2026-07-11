@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { useEditorStore } from "./store";
-import type { Pill } from "./types";
+import type { Pill } from "../core/types";
 
 const makePill = (overrides: Partial<Pill> = {}): Pill => ({
   id: "p1",

@@ -468,8 +468,8 @@ export interface LocalJob {
   editRev?: number;
 }
 
-/** Persisted shape of `Pill` (from editor/types). Mirrored here to keep
- *  the storage layer free of editor-module imports. Same field semantics
+/** Persisted shape of `Pill` (from core/types). Mirrored here to keep
+ *  the storage layer free of upper-layer module imports. Same field semantics
  *  as the runtime type. */
 export interface PillRecord {
   id: string;

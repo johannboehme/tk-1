@@ -17,9 +17,9 @@
  * snap context — anchored the way the BeatRuler draws its bars — applies
  * to everything in the preview.
  */
-import { snapTime, type SnapMode, type SnapCtx } from "./snap";
+import { snapTime, type SnapMode, type SnapCtx } from "../core/snap";
 import type { Cut } from "../storage/jobs-db";
-import type { PunchFx } from "./fx/types";
+import type { PunchFx } from "../core/fx/types";
 
 const ON_GRID_TOLERANCE_S = 0.001;
 

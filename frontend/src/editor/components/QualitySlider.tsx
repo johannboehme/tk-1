@@ -2,7 +2,7 @@
 // "Tiny / Low / Good / High / Pristine" mean — actual bitrates are derived
 // in `exportPresets.qualityToBitrates` so the panel never re-encodes that
 // table here.
-import type { QualityStep } from "../types";
+import type { QualityStep } from "../../core/types";
 
 const STEPS: { value: Exclude<QualityStep, "custom">; label: string }[] = [
   { value: "tiny", label: "Tiny" },

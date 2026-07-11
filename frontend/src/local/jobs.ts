@@ -32,7 +32,7 @@ import {
 import { useOpsStore } from "./ops-store";
 import { nextCamIndex } from "./cam-ids";
 import { defaultJobTitle } from "../lib/filenames";
-import type { GradeParams } from "../editor/fx/looks";
+import type { GradeParams } from "../core/fx/looks";
 import { camColorAt } from "../storage/migrations";
 import { opfs } from "../storage/opfs";
 import {
@@ -64,7 +64,7 @@ import type {
 import { decodeAudioToMonoPcm } from "./codec";
 import { collectSyncFailureReport } from "./diagnostics";
 import { computeEnergyCurves } from "./render/energy";
-import { buildLoudnessEnvelope } from "../editor/fx/audio-envelope";
+import { buildLoudnessEnvelope } from "../core/fx/audio-envelope";
 import { extractTimelineFrames } from "./render/frames";
 import type { TextOverlay } from "./render/ass-builder";
 import {
@@ -936,7 +936,7 @@ export interface EditSpecLocal {
     rotation?: number;
     flipX?: boolean;
     flipY?: boolean;
-    viewportTransform?: import("../editor/types").ViewportTransform;
+    viewportTransform?: import("../core/types").ViewportTransform;
   }>;
   /** Master-audio playback gain. 1.0 = source level. Picked up at render
    *  start from the store's `audioVolume`. Optional / undefined → 1.0. */
@@ -948,7 +948,7 @@ export interface EditSpecLocal {
    *  video by walking pills in arr-time + applying cuts on top. Empty
    *  in direct-mode, in which case the renderer falls back to the
    *  legacy per-cam contiguous-range model. */
-  pills?: import("../editor/types").Pill[];
+  pills?: import("../core/types").Pill[];
 }
 
 export interface ExportRenderOpts {

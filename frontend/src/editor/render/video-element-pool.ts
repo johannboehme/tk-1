@@ -32,7 +32,7 @@
  *   - Play/pause based on whether the source-time is inside the cam's
  *     `[0, sourceDurationS)` range AND the master clock is playing.
  */
-import type { VideoClip } from "../types";
+import type { VideoClip } from "../../core/types";
 
 export interface VideoCam {
   clip: VideoClip;

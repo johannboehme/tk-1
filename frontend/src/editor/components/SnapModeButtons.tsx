@@ -7,7 +7,7 @@
  * own state, so the visual chrome lives in exactly one place.
  */
 import { useEditorStore } from "../store";
-import { isVideoClip } from "../types";
+import { isVideoClip } from "../../core/types";
 import { SnapModeButtonsView } from "./SnapModeButtonsView";
 
 export function SnapModeButtons() {

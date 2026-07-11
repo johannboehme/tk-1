@@ -6,8 +6,8 @@
 // top→bottom is the serial compose order. Reuses the panel's card + slider
 // idioms.
 import { useEditorStore } from "../store";
-import { fxCatalog } from "../fx/catalog";
-import type { FilterSlot, FxKind } from "../fx/types";
+import { fxCatalog } from "../../core/fx/catalog";
+import type { FilterSlot, FxKind } from "../../core/fx/types";
 import { ChunkyButton } from "./ChunkyButton";
 import { ParamSlider } from "./ParamSlider";
 import { ChevronLeftIcon, PlusIcon, TrashIcon } from "./icons";

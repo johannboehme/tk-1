@@ -10,9 +10,9 @@
 // offset instead of the whole cam — so a single chunk can be tuned without
 // disturbing the rest of the take.
 import { useEditorStore } from "../store";
-import { segmentIndexAtArr, totalArrDuration } from "../arrangement-time";
+import { segmentIndexAtArr, totalArrDuration } from "../../core/arrangement-time";
 import { loopAroundPlayhead } from "../arrangement-loop";
-import { isVideoClip, MASTER_AUDIO_ID, type Clip } from "../types";
+import { isVideoClip, MASTER_AUDIO_ID, type Clip } from "../../core/types";
 import { ChunkyButton } from "./ChunkyButton";
 import { Knob } from "./Knob";
 import { MonoReadout, formatMs } from "./MonoReadout";

@@ -9,7 +9,7 @@
  * (which mirrors `syncOffsetMs`) and zero out `startOffsetS` so the cam
  * sits exactly on the candidate's implied position.
  */
-import type { MatchCandidate, VideoClip } from "./types";
+import type { MatchCandidate, VideoClip } from "../core/types";
 
 /** Default threshold for filtering low-confidence candidates *when the
  *  caller asks for filtering*. The default in the helpers themselves is

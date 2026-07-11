@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { loadMasterAudio, type LoadMasterAudioDeps } from "./load-master-audio";
-import type { PeakPyramid } from "../local/waveform/peak-pyramid";
+import type { PeakPyramid } from "../core/waveform/peak-pyramid";
 
 /** Minimal pyramid stand-in — only the fields the loader reads. */
 function fakePyramid(durationS: number, sampleRate = 22050): PeakPyramid {

@@ -4,7 +4,7 @@ import {
   detectCapabilities,
   initCapabilities,
   meetsMinRequirements,
-} from "./local/capabilities";
+} from "./core/capabilities";
 import { HelpOverlay } from "./editor/components/HelpOverlay";
 import { RecMark } from "./editor/components/RuleStrip";
 import { Footer } from "./components/Footer";

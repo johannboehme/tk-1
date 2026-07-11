@@ -8,15 +8,10 @@
  */
 import { useState, useRef, useEffect } from "react";
 import { HardwarePopover } from "./HardwarePopover";
+import type { BpmValue } from "../../core/bpm";
 
 const MIN_BPM = 30;
 const MAX_BPM = 240;
-
-export interface BpmValue {
-  value: number;
-  manualOverride: boolean;
-  confidence?: number;
-}
 
 export interface BpmReadoutViewProps {
   /** Current BPM. Null = no BPM yet (fresh job, detection not run). */

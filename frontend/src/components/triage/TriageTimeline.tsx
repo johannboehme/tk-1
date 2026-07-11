@@ -22,15 +22,15 @@ import {
   effectiveChunkBpm,
   useTriageStore,
 } from "../../local/triage/triage-store";
-import { snapTime } from "../../editor/snap";
+import { snapTime } from "../../core/snap";
 import type { Chunk } from "../../storage/jobs-db";
 import { autoFollowScrollX } from "./triage-auto-follow";
 import {
   buildPyramidFromEnvelope,
   type PeakPyramid,
-} from "../../local/waveform/peak-pyramid";
-import { buildPeakPyramidAsync } from "../../local/waveform/build-pyramid-async";
-import { drawWaveform, TRIAGE_STYLE } from "../../local/waveform/draw-waveform";
+} from "../../core/waveform/peak-pyramid";
+import { buildPeakPyramidAsync } from "../../core/waveform/build-pyramid-async";
+import { drawWaveform, TRIAGE_STYLE } from "../../core/waveform/draw-waveform";
 import {
   getCachedPyramid,
   savePyramid,

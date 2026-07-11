@@ -40,10 +40,10 @@ import {
   type Clip,
   type Pill,
   type TextOverlay,
-} from "./types";
+} from "../core/types";
 import type { Cut } from "../storage/jobs-db";
-import type { FilterSlot, PunchFx } from "./fx/types";
-import type { GradeParams } from "./fx/looks";
+import type { FilterSlot, PunchFx } from "../core/fx/types";
+import type { GradeParams } from "../core/fx/looks";
 import type { LoopRegion } from "./OffsetScheduler";
 import { clamp } from "../lib/clamp";
 

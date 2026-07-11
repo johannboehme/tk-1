@@ -1,16 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 import { PreviewRuntime } from "./preview-runtime";
-import type { CompositorBackend, SourcesMap } from "./backend";
-import type { FrameDescriptor } from "./frame-descriptor";
+import type { CompositorBackend, SourcesMap } from "../../core/render/backend";
+import type { FrameDescriptor } from "../../core/render/frame-descriptor";
 import {
   VideoElementPool,
   type VideoCam,
   type VideoElementPoolOptions,
 } from "./video-element-pool";
-import type { Clip, ImageClip, VideoClip } from "../types";
-import type { EditorStoreSnapshot } from "./build-descriptor";
+import type { Clip, ImageClip, VideoClip } from "../../core/types";
+import type { EditorStoreSnapshot } from "../../core/render/build-descriptor";
 import { useEditorStore } from "../store";
-import { generatePills } from "../arrangement-pills";
+import { generatePills } from "../../core/arrangement-pills";
 
 function videoClip(id: string, more: Partial<VideoClip> = {}): VideoClip {
   return {
