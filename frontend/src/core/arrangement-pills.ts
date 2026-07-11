@@ -14,7 +14,7 @@
  * Pure helpers — no store, no IO, no React.
  */
 import type { ArrangementItem, Chunk, Cut } from "../storage/jobs-db";
-import { camSourceTimeS } from "../local/timing/cam-time";
+import { camSourceTimeS } from "./timing/cam-time";
 import {
   isImageClip,
   isVideoClip,

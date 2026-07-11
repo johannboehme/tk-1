@@ -9,15 +9,15 @@
  * multi-pill long-form. This test pins all three.
  */
 import { describe, expect, test } from "vitest";
-import type { Segment } from "./types";
+import type { Segment } from "../core/types";
 import {
   arrToMaster,
   segmentArrStarts,
   timelineVisibleWindow,
   totalArrDuration,
-} from "./arrangement-time";
-import { buildLoudnessEnvelope } from "./fx/audio-envelope";
-import { sampleEnv } from "./fx/modulation";
+} from "../core/arrangement-time";
+import { buildLoudnessEnvelope } from "../core/fx/audio-envelope";
+import { sampleEnv } from "../core/fx/modulation";
 
 /** Replica of Timeline.tsx's inline `mapXToTime` arr→master projection — the
  *  ground truth the scope must match. */

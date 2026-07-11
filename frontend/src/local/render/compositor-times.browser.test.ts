@@ -20,9 +20,9 @@
  */
 import { describe, expect, it } from "vitest";
 import { Compositor, type FrameTimes } from "./compositor";
-import type { PunchFx } from "../../editor/fx/types";
-import type { AudioEnvelope, Modulation } from "../../editor/fx/modulation";
-import { INSTANT_ENVELOPE } from "../../editor/fx/envelope";
+import type { PunchFx } from "../../core/fx/types";
+import type { AudioEnvelope, Modulation } from "../../core/fx/modulation";
+import { INSTANT_ENVELOPE } from "../../core/fx/envelope";
 import type { Visualizer } from "./visualizer/types";
 import type { TextOverlay } from "./ass-builder";
 

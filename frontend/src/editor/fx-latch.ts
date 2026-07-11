@@ -10,7 +10,7 @@
  * Nothing is written to `fx[]` — preview holds are overlay-only (see
  * beginFxHold's paused branch in store.ts).
  */
-import type { FxKind } from "./fx/types";
+import type { FxKind } from "../core/fx/types";
 import type { FxHoldEntry } from "./store";
 
 /** The slice of the editor store the latch gesture needs. Callers pass

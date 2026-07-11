@@ -4,7 +4,7 @@
  * Pipeline per output frame:
  *   1. Layer + FX pass via the shared CompositorBackend
  *      (WebGPU → WebGL2 → Canvas2D fallback ladder, picked by
- *      `createBackend()` from `editor/render/factory.ts`). The
+ *      `createBackend()` from `core/render/factory.ts`). The
  *      backend writes its result into an internal `OffscreenCanvas`.
  *   2. The internal backend canvas is blitted into the final 2D
  *      `OffscreenCanvas` via `drawImage()` — once per frame.
@@ -29,41 +29,41 @@ import type { TextOverlay, EnergyCurves } from "./ass-builder";
 import { buildAss } from "./ass-builder";
 import { renderOverlays } from "./ass-renderer";
 import type { Visualizer } from "./visualizer/types";
-import type { FilterSlot, PunchFx } from "../../editor/fx/types";
-import type { ViewportTransform } from "../../editor/types";
-import { activeFxAt } from "../../editor/fx/active";
-import { fxCatalog } from "../../editor/fx/catalog";
-import { INSTANT_ENVELOPE } from "../../editor/fx/envelope";
+import type { FilterSlot, PunchFx } from "../../core/fx/types";
+import type { ViewportTransform } from "../../core/types";
+import { activeFxAt } from "../../core/fx/active";
+import { fxCatalog } from "../../core/fx/catalog";
+import { INSTANT_ENVELOPE } from "../../core/fx/envelope";
 import {
   computeIntensity,
   followerFor,
   legacyModulation,
   type AudioEnvelope,
-} from "../../editor/fx/modulation";
-import type { GradeParams } from "../../editor/fx/looks";
+} from "../../core/fx/modulation";
+import type { GradeParams } from "../../core/fx/looks";
 import {
   colorGradeFrameFx,
   filterFrameFx,
-} from "../../editor/render/build-descriptor";
+} from "../../core/render/build-descriptor";
 import {
   createBackend,
   type BackendCapabilities,
-} from "../../editor/render/factory";
+} from "../../core/render/factory";
 import type {
   CompositorBackend,
   LayerSource,
   SourcesMap,
-} from "../../editor/render/backend";
-import { WebGPUBackend } from "../../editor/render/webgpu-backend";
+} from "../../core/render/backend";
+import { WebGPUBackend } from "../../core/render/webgpu-backend";
 import {
   buildElementFitRect,
   DEFAULT_VIEWPORT_TRANSFORM,
-} from "../../editor/render/element-transform";
+} from "../../core/render/element-transform";
 import type {
   FrameDescriptor,
   FrameFx,
   FrameLayer,
-} from "../../editor/render/frame-descriptor";
+} from "../../core/render/frame-descriptor";
 
 export interface CompositorOptions {
   /** Output canvas dimensions — what's encoded. Overlays + visualizers are
@@ -99,7 +99,7 @@ export interface CompositorOptions {
 }
 
 // Per-element placement is shared with the live preview via
-// `buildElementFitRect` from `editor/render/element-transform.ts` —
+// `buildElementFitRect` from `core/render/element-transform.ts` —
 // don't reintroduce a local letterbox helper here. The two pipelines
 // MUST stay byte-identical on placement.
 

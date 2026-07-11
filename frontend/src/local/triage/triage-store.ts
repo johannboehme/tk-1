@@ -17,8 +17,8 @@
  * wrong octave on one chunk).
  */
 import { create } from "zustand";
-import type { BpmValue } from "../../editor/components/BpmReadoutView";
-import { gridStepSeconds, snapTime, type SnapMode } from "../../editor/snap";
+import type { BpmValue } from "../../core/bpm";
+import { gridStepSeconds, snapTime, type SnapMode } from "../../core/snap";
 import { analyzeAudio } from "../render/audio-analysis/analyze";
 import type { Chunk, SilenceConfig, VideoAsset } from "../../storage/jobs-db";
 import { snapChunkEndToBar } from "./chunk-bar-grid";

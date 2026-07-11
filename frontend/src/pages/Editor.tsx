@@ -30,8 +30,8 @@ import {
   undoKeyLabel,
 } from "../editor/history";
 import { toggleFxPreviewLatch } from "../editor/fx-latch";
-import type { FxKind } from "../editor/fx/types";
-import type { GradeParams } from "../editor/fx/looks";
+import type { FxKind } from "../core/fx/types";
+import type { GradeParams } from "../core/fx/looks";
 import { bindShortcut } from "../editor/shortcuts/keymap";
 import {
   jobEvents,
@@ -45,8 +45,8 @@ import {
 } from "../local/jobs";
 import { isVideoAsset, type MediaAsset, type VideoAsset } from "../storage/jobs-db";
 import { synthesizeJobLoadShape } from "../editor/job-synth";
-import { masterToArr } from "../editor/arrangement-time";
-import type { Segment } from "../editor/types";
+import { masterToArr } from "../core/arrangement-time";
+import type { Segment } from "../core/types";
 
 /** Project a master-time `t` to its FIRST occurrence's timeline-time
  *  for the cut/fx schema migration. `masterToArr` already does that —
@@ -58,17 +58,17 @@ function masterToArrFirst(t: number, segments: readonly Segment[]): number {
 import { decodeAudioToMonoPcm } from "../local/codec";
 import { confirmDestructive } from "../lib/confirm";
 import { countEditsAffectedByCamRemoval } from "../local/edits-impact";
-import type { PeakPyramid } from "../local/waveform/peak-pyramid";
+import type { PeakPyramid } from "../core/waveform/peak-pyramid";
 import {
   getCachedPyramid,
   getOrComputePyramid,
 } from "../local/waveform/pyramid-cache";
 import { loadMasterAudio } from "../editor/load-master-audio";
-import { buildLoudnessEnvelopeAsync } from "../editor/fx/audio-envelope";
+import { buildLoudnessEnvelopeAsync } from "../core/fx/audio-envelope";
 import { exportSpecToRenderOpts } from "../editor/exportPresets";
 import { loadAssetFile } from "../local/asset-source";
 import type { ClipInit } from "../editor/store";
-import type { ExportSpec } from "../editor/types";
+import type { ExportSpec } from "../core/types";
 import { flushEditorStateNow, useAutoPersist } from "../editor/useAutoPersist";
 import {
   getCachedAnalysis,
@@ -80,7 +80,7 @@ import {
   trackCamSwitchToPaint,
   beginFxFirstRender,
   PERF_ENABLED,
-} from "../editor/perf/marks";
+} from "../core/perf/marks";
 
 interface WaveformData {
   pyramid: PeakPyramid;

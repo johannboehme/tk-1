@@ -21,8 +21,8 @@ import {
   type Clip,
   type ImageClip,
   type VideoClip,
-} from "../types";
-import { isPillDirty } from "../arrangement-pills";
+} from "../../core/types";
+import { isPillDirty } from "../../core/arrangement-pills";
 import { ChunkyButton } from "./ChunkyButton";
 import { Knob } from "./Knob";
 import { MonoReadout } from "./MonoReadout";

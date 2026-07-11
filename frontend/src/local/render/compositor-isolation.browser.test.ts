@@ -15,7 +15,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { Compositor } from "./compositor";
-import type { BackendCapabilities } from "../../editor/render/factory";
+import type { BackendCapabilities } from "../../core/render/factory";
 
 const HAS_WEBGPU = typeof navigator !== "undefined" && "gpu" in navigator;
 

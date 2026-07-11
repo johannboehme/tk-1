@@ -11,13 +11,13 @@
  * shell that mounts the canvas + a parent for the video pool and
  * instantiates this class.
  */
-import { AdaptiveScaler } from "./adaptive-scaler";
-import type { CompositorBackend, LayerSource, SourcesMap } from "./backend";
-import { createBackend, type BackendCapabilities } from "./factory";
+import { AdaptiveScaler } from "../../core/render/adaptive-scaler";
+import type { CompositorBackend, LayerSource, SourcesMap } from "../../core/render/backend";
+import { createBackend, type BackendCapabilities } from "../../core/render/factory";
 import {
   buildPreviewFrameDescriptor,
   type EditorStoreSnapshot,
-} from "./build-descriptor";
+} from "../../core/render/build-descriptor";
 import {
   VideoElementPool,
   type PoolSyncTarget,
@@ -29,7 +29,7 @@ import {
   effectiveBeatPhaseS,
   effectiveBeatsPerBar,
 } from "../selectors/timing";
-import { isImageClip, isVideoClip, type Clip } from "../types";
+import { isImageClip, isVideoClip, type Clip } from "../../core/types";
 
 export type ClipUrlMap = Readonly<Record<string, { videoUrl: string }>>;
 
@@ -630,7 +630,7 @@ export class PreviewRuntime {
  *  cut-switch a no-op for the decoder; the upload picks up an
  *  already-running stream. */
 function collectPoolTargets(
-  pills: readonly import("../types").Pill[] | undefined,
+  pills: readonly import("../../core/types").Pill[] | undefined,
   tTimeline: number,
 ): Map<string, PoolSyncTarget> {
   const out = new Map<string, PoolSyncTarget>();

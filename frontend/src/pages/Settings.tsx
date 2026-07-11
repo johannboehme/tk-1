@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { type Capabilities, describeCapability, meetsMinRequirements } from "../local/capabilities";
+import { type Capabilities, describeCapability, meetsMinRequirements } from "../core/capabilities";
 import { ChunkyButton } from "../editor/components/ChunkyButton";
 import {
   exportProjectArchive,

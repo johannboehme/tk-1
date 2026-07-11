@@ -35,14 +35,14 @@ import {
 } from "react";
 import { useEditorStore } from "../store";
 import { toggleFxPreviewLatch } from "../fx-latch";
-import { fxCatalog, defaultTapLengthS } from "../fx/catalog";
-import type { FxKind, FxParamDef } from "../fx/types";
-import { INSTANT_ENVELOPE, type ADSREnvelope } from "../fx/envelope";
+import { fxCatalog, defaultTapLengthS } from "../../core/fx/catalog";
+import type { FxKind, FxParamDef } from "../../core/fx/types";
+import { INSTANT_ENVELOPE, type ADSREnvelope } from "../../core/fx/envelope";
 import {
   bipolarRateLabel,
   DEFAULT_MOD_CONFIG,
   type LfoShape,
-} from "../fx/modulation";
+} from "../../core/fx/modulation";
 import { SidechainScope } from "./SidechainScope";
 import { SegmentedControl } from "./SegmentedControl";
 import { useIsNarrowViewport } from "../use-is-narrow";

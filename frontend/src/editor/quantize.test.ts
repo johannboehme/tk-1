@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { buildQuantizePreview } from "./quantize";
 import type { Cut } from "../storage/jobs-db";
-import type { PunchFx } from "./fx/types";
+import type { PunchFx } from "../core/fx/types";
 
 const BPM = 120;
 const PHASE = 0;

@@ -6,7 +6,7 @@
  * own state, so the brass-plate visual lives in exactly one place.
  */
 import { useEditorStore } from "../store";
-import { totalArrDuration } from "../arrangement-time";
+import { totalArrDuration } from "../../core/arrangement-time";
 import { TransportClockView } from "./TransportClockView";
 
 export function TransportClock({ className = "" }: { className?: string }) {

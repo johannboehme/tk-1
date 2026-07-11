@@ -4,7 +4,7 @@ import {
   candidateIdxNearestStart,
   filterCandidatesByConfidence,
 } from "./match-snap";
-import type { MatchCandidate, VideoClip } from "./types";
+import type { MatchCandidate, VideoClip } from "../core/types";
 
 const cands: MatchCandidate[] = [
   { offsetMs: 250, confidence: 0.9, overlapFrames: 1024 },

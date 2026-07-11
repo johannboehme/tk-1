@@ -12,7 +12,7 @@
  * arr-time project the result through `masterToArr` at the call site.
  */
 import type { JobMeta } from "../store";
-import type { Segment } from "../types";
+import type { Segment } from "../../core/types";
 
 const DEFAULT_BEATS_PER_BAR = 4;
 

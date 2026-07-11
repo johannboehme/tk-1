@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { Settings } from "./Settings";
-import type { Capabilities } from "../local/capabilities";
+import type { Capabilities } from "../core/capabilities";
 import {
   exportProjectArchive,
   importProjectArchive,

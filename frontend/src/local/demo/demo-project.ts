@@ -8,7 +8,7 @@
  * offset to find, exactly like a phone that started recording late.
  */
 
-import type { Capabilities } from "../capabilities";
+import type { Capabilities } from "../../core/capabilities";
 import type { PickedAsset } from "../asset-source";
 import { createJob } from "../jobs";
 import { DEMO_SONG, renderDemoSongPcm, songDurationS, beatDurationS } from "./demo-song";

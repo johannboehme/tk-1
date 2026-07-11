@@ -14,7 +14,7 @@ import {
   effectiveBeatsPerBar,
   effectiveBarOffsetBeats,
 } from "../../selectors/timing";
-import { arrToMaster } from "../../arrangement-time";
+import { arrToMaster } from "../../../core/arrangement-time";
 import { buildRulerTicks } from "./beat-ruler-ticks";
 
 interface BeatRulerProps {

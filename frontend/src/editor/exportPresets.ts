@@ -15,7 +15,7 @@ import type {
   ExportPreset,
   ExportSpec,
   QualityStep,
-} from "./types";
+} from "../core/types";
 
 export interface SourceProbe {
   w: number;

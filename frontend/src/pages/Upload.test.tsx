@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import Upload from "./Upload";
-import * as caps from "../local/capabilities";
+import * as caps from "../core/capabilities";
 import * as picker from "../local/file-picker";
 
 vi.mock("../local/jobs", () => ({

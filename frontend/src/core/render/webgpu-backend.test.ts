@@ -15,7 +15,7 @@ import {
   getCapabilities,
   initCapabilities,
   _resetWebGPUProbeForTest,
-} from "../../local/capabilities";
+} from "../capabilities";
 
 function mockCanvas(): HTMLCanvasElement {
   const canvas = document.createElement("canvas");

@@ -8,7 +8,7 @@ import {
   arrBeatPhaseS,
 } from "./timing";
 import type { JobMeta } from "../store";
-import type { Segment } from "../types";
+import type { Segment } from "../../core/types";
 
 const baseMeta: JobMeta = {
   id: "j",

@@ -24,7 +24,7 @@ import {
   getCapabilities,
   LEGACY_BROWSER_MAX_FILE_BYTES,
   supportsLargeMediaFiles,
-} from "../local/capabilities";
+} from "../core/capabilities";
 
 export default function Upload() {
   const navigate = useNavigate();

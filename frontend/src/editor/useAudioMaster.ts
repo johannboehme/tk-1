@@ -34,7 +34,7 @@ import {
   arrToMaster,
   segmentArrStarts,
   segmentIndexAtArr,
-} from "./arrangement-time";
+} from "../core/arrangement-time";
 import { attachLoopGlitchProbe, isProbeEnabled } from "./audio-glitch-probe";
 import { clampSeek } from "../lib/clamp";
 import {

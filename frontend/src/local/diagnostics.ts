@@ -14,7 +14,7 @@
  * "Show details" aus-/eingeklappt.
  */
 
-import { getCapabilities, type Capabilities } from "./capabilities";
+import { getCapabilities, type Capabilities } from "../core/capabilities";
 import { useOpsStore, type SyncOpFileContext } from "./ops-store";
 
 const STACK_FRAME_LIMIT = 5;

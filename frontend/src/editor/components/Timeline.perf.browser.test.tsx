@@ -18,7 +18,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { act, cleanup, render } from "@testing-library/react";
 import { Timeline } from "./Timeline";
 import { useEditorStore } from "../store";
-import { buildPeakPyramid } from "../../local/waveform/peak-pyramid";
+import { buildPeakPyramid } from "../../core/waveform/peak-pyramid";
 
 const SR = 22050;
 

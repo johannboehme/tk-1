@@ -23,7 +23,7 @@
  *     pass is a 100-300 ms block that would freeze the preview/audio-walker
  *     rAF if it landed while the user is already playing).
  */
-import { yieldToEventLoop } from "../../local/waveform/build-pyramid-async";
+import { yieldToEventLoop } from "../waveform/build-pyramid-async";
 import type { AudioEnvelope } from "./modulation";
 
 /** Derived per-build constants shared by the sync and async builders. */

@@ -26,7 +26,7 @@ import {
   resolveResolution,
 } from "../exportPresets";
 import { useEditorStore } from "../store";
-import type { AspectRatio, ExportPreset, ExportSpec, QualityStep } from "../types";
+import type { AspectRatio, ExportPreset, ExportSpec, QualityStep } from "../../core/types";
 import { AdvancedDrawer } from "./AdvancedDrawer";
 import { AspectPicker } from "./AspectPicker";
 import { ChunkyButton } from "./ChunkyButton";

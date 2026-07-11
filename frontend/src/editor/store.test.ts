@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test } from "vitest";
 import { useEditorStore } from "./store";
-import { isVideoClip, type MatchCandidate, type VideoClip } from "./types";
+import { isVideoClip, type MatchCandidate, type VideoClip } from "../core/types";
 
 /** Test helper: assert a clip is a VideoClip and narrow its type. Tests in
  *  this file build video clips exclusively. */

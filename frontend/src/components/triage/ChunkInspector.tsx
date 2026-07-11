@@ -25,7 +25,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ChunkyButton } from "../../editor/components/ChunkyButton";
 import { BpmReadoutView } from "../../editor/components/BpmReadoutView";
-import type { SnapMode } from "../../editor/snap";
+import type { SnapMode } from "../../core/snap";
 import {
   JoinNextIcon,
   JoinPrevIcon,

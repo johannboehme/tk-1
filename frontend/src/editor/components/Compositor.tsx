@@ -16,7 +16,7 @@
  */
 import { useEffect, useRef, useState } from "react";
 import { useEditorStore } from "../store";
-import { getCapabilities } from "../../local/capabilities";
+import { getCapabilities } from "../../core/capabilities";
 import { MasterAudio } from "./MasterAudio";
 import { TestPattern } from "./TestPattern";
 import { OutputFrameBox } from "./OutputFrameBox";

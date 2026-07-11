@@ -19,7 +19,7 @@
  * HTMLVideoElement, VideoFrame). `importExternalTexture` als
  * Zero-Copy-Optimierung für Video ist ein Phase-2/3-Follow-up.
  */
-import { markWebGPUUnavailable } from "../../local/capabilities";
+import { markWebGPUUnavailable } from "../capabilities";
 import { fxCatalog } from "../fx/catalog";
 import { FX_WEBGPU_SPECS } from "../fx/webgpu/registry";
 import type { PunchFx } from "../fx/types";

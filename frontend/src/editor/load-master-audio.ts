@@ -1,4 +1,4 @@
-import type { PeakPyramid } from "../local/waveform/peak-pyramid";
+import type { PeakPyramid } from "../core/waveform/peak-pyramid";
 
 export interface MasterAudioWave {
   pyramid: PeakPyramid;

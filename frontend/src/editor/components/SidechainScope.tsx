@@ -16,19 +16,19 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useEditorStore } from "../store";
-import { fxCatalog } from "../fx/catalog";
-import type { FxKind } from "../fx/types";
+import { fxCatalog } from "../../core/fx/catalog";
+import type { FxKind } from "../../core/fx/types";
 import {
   followerFor,
   sampleEnv,
   DEFAULT_SIDECHAIN,
-} from "../fx/modulation";
+} from "../../core/fx/modulation";
 import { arrBeatPhaseS, effectiveBeatsPerBar } from "../selectors/timing";
 import {
   arrToMaster,
   timelineVisibleWindow,
   totalArrDuration,
-} from "../arrangement-time";
+} from "../../core/arrangement-time";
 
 import { clamp01 } from "../../lib/clamp";
 const LCD_GREEN = "#9FE08E";
