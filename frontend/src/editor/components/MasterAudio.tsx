@@ -43,11 +43,17 @@ export function MasterAudio({ audioUrl }: Props) {
         style={{ display: "none" }}
       />
       {!handle.isReady && (
-        <div className="absolute inset-0 flex items-center justify-center bg-sunken/90 text-paper-hi pointer-events-none">
-          <div className="flex flex-col items-center gap-3">
-            <div className="h-2 w-32 rounded-full bg-sunken-soft overflow-hidden">
-              <div className="h-full w-1/3 bg-hot animate-pulse" />
-            </div>
+        // z-10: the compositor canvas is a LATER sibling inside the same
+        // stacking context, so without an explicit z-index it paints over
+        // this overlay and the decoding/error state is invisible — on a
+        // stuck load the stage just looks black with a live transport.
+        <div className="absolute inset-0 z-10 flex items-center justify-center bg-sunken/90 text-paper-hi pointer-events-none">
+          <div className="flex flex-col items-center gap-3 px-6 text-center">
+            {!handle.error && (
+              <div className="h-2 w-32 rounded-full bg-sunken-soft overflow-hidden">
+                <div className="h-full w-1/3 bg-hot animate-pulse" />
+              </div>
+            )}
             <span className="font-mono text-xs text-paper-hi/70 tracking-label uppercase">
               Decoding studio audio
             </span>
