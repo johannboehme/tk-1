@@ -42,6 +42,10 @@ import {
   getOrCreatePingPongEngine,
   type PingPongEngine,
 } from "../local/audio/pingpong-engine";
+import {
+  createStallDetector,
+  STALL_POLL_MS,
+} from "../local/audio/stall-detector";
 
 // Re-exported so regression tests (and future walkers) can pin the
 // pre-roll compensation math where it has historically been imported.
@@ -52,6 +56,12 @@ export interface AudioMasterHandle {
   audioDuration: number | null;
   error: string | null;
 }
+
+/** How long `loadedmetadata` may take before the load is declared dead
+ *  and an error is surfaced. Local OPFS/blob sources report metadata in
+ *  milliseconds; 5 s of silence means the media pipeline is not coming
+ *  back. */
+export const METADATA_TIMEOUT_MS = 5000;
 
 interface AudioRefs {
   a: React.RefObject<HTMLAudioElement | null>;
@@ -175,6 +185,52 @@ export function useAudioMaster(
       a.removeEventListener("error", onError);
     };
   }, [refsStable.a, audioUrl]);
+
+  // Metadata timeout. `loadedmetadata` normally lands within
+  // milliseconds for an OPFS/blob source — when it hasn't after 5 s the
+  // load is not slow, it is dead (a wedged browser media pipeline fires
+  // `loadstart` and then nothing: no `progress`, no `error`, ever).
+  // Without this timeout the "Decoding studio audio" overlay pulses
+  // forever with no explanation. isReady flips the effect off; a URL
+  // change re-arms it via the reset effect above.
+  useEffect(() => {
+    if (!audioUrl || isReady) return;
+    const id = window.setTimeout(() => {
+      const a = refsStable.a.current;
+      if (a && a.readyState === 0) {
+        setError(
+          "audio never loaded — the browser is not delivering media data (try reloading the tab, or restarting the browser)",
+        );
+      }
+    }, METADATA_TIMEOUT_MS);
+    return () => window.clearTimeout(id);
+  }, [audioUrl, isReady, refsStable.a]);
+
+  // Stall watchdog — the third failure channel. play()-rejection covers
+  // autoplay policy, the `error` event covers resource errors; neither
+  // fires when the element accepts the src and then never produces a
+  // frame (play()'s promise stays PENDING forever in that state). This
+  // runs on store INTENT (isPlaying), deliberately not gated on isReady:
+  // the not-ready case is exactly where the play effect below no-ops and
+  // the transport would otherwise show a phantom "playing" state with a
+  // frozen clock. setInterval, not RAF — RAF pauses in background tabs
+  // and would false-positive on a healthy backgrounded transport.
+  useEffect(() => {
+    if (!isPlaying) return;
+    const detector = createStallDetector();
+    const id = window.setInterval(() => {
+      const eng = engineRef.current;
+      const el = eng ? eng.activeEl : refsStable.a.current;
+      if (!el) return;
+      if (detector.sample(el.currentTime, performance.now())) {
+        setError("audio playback stalled — no clock progress");
+        const store = useEditorStore.getState();
+        store.pushNotice("AUDIO STALLED — PLAYBACK STOPPED");
+        store.setPlaying(false);
+      }
+    }, STALL_POLL_MS);
+    return () => window.clearInterval(id);
+  }, [isPlaying, refsStable.a]);
 
   // Build (or reuse) the shared ping-pong engine once both elements are
   // mounted. Idempotent under React 18 StrictMode — the engine module

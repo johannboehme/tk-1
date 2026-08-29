@@ -24,6 +24,7 @@ import {
   getOrCreatePingPongEngine,
   type PingPongEngine,
 } from "./pingpong-engine";
+import { createStallDetector, STALL_POLL_MS } from "./stall-detector";
 
 export function usePingPongTransport<P>(args: {
   aRef: React.RefObject<HTMLAudioElement | null>;
@@ -33,6 +34,13 @@ export function usePingPongTransport<P>(args: {
   /** play() on the active element rejected (autoplay policy) — flip the
    *  store's isPlaying back so the UI doesn't show a phantom transport. */
   onPlayRejected: () => void;
+  /** The store says "playing" but the active element's clock has been
+   *  frozen for STALL_AFTER_MS — the element accepted the src and then
+   *  never delivered data (play()'s promise stays pending forever in
+   *  that state, so onPlayRejected can't catch it). Default: fall back
+   *  to onPlayRejected, which flips isPlaying back — an honest stopped
+   *  transport instead of a phantom playing one. */
+  onStalled?: () => void;
   /** Subscribe to external playhead writes (user seeks). Must be
    *  referentially stable (wrap in useCallback); the subscription is
    *  torn down and re-created when it changes. */
@@ -47,6 +55,8 @@ export function usePingPongTransport<P>(args: {
   const engineRef = useRef<PingPongEngine<P> | null>(null);
   const onPlayRejectedRef = useRef(args.onPlayRejected);
   onPlayRejectedRef.current = args.onPlayRejected;
+  const onStalledRef = useRef(args.onStalled);
+  onStalledRef.current = args.onStalled;
 
   // Resolve the master-audio URL for the job.
   useEffect(() => {
@@ -114,6 +124,25 @@ export function usePingPongTransport<P>(args: {
     } else {
       el.pause();
     }
+  }, [isPlaying, aRef]);
+
+  // Stall watchdog. Polls the active element's clock while the store
+  // intends playback; a clock frozen past STALL_AFTER_MS means the
+  // media pipeline silently died (see stall-detector.ts for the failure
+  // mode this covers). setInterval, not RAF: RAF pauses in background
+  // tabs and would false-positive on a healthy backgrounded transport.
+  useEffect(() => {
+    if (!isPlaying) return;
+    const detector = createStallDetector();
+    const id = window.setInterval(() => {
+      const eng = engineRef.current;
+      const el = eng ? eng.activeEl : aRef.current;
+      if (!el) return;
+      if (detector.sample(el.currentTime, performance.now())) {
+        (onStalledRef.current ?? onPlayRejectedRef.current)();
+      }
+    }, STALL_POLL_MS);
+    return () => window.clearInterval(id);
   }, [isPlaying, aRef]);
 
   // Honor external seeks. Compare against the active element's clock to

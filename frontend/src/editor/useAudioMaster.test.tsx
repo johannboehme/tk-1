@@ -20,7 +20,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, render } from "@testing-library/react";
 import { useEffect, useRef } from "react";
-import { armParkMasterT, useAudioMaster } from "./useAudioMaster";
+import {
+  METADATA_TIMEOUT_MS,
+  armParkMasterT,
+  useAudioMaster,
+} from "./useAudioMaster";
+import {
+  STALL_AFTER_MS,
+  STALL_POLL_MS,
+} from "../local/audio/stall-detector";
 import { useEditorStore } from "./store";
 
 function flushAll(): Promise<void> {
@@ -168,6 +176,7 @@ interface Refs {
   audioB: HTMLAudioElement;
   ready: boolean;
   duration: number | null;
+  error: string | null;
 }
 
 function Harness({
@@ -188,6 +197,7 @@ function Harness({
     if (audioBRef.current) refs.audioB = audioBRef.current;
     refs.ready = handle.isReady;
     refs.duration = handle.audioDuration;
+    refs.error = handle.error;
   });
   return (
     <>
@@ -238,6 +248,7 @@ describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => 
       audioB: undefined as unknown as HTMLAudioElement,
       ready: false,
       duration: null,
+      error: null,
     };
     ctxHandle = installFakeAudioContext();
   });
@@ -1086,5 +1097,145 @@ describe("useAudioMaster — two-element ping-pong + WebAudio crossfade", () => 
       // Hops to seg 1.in normally — loop logic must be a no-op when no loop.
       expect(mB.getCurrentTime()).toBeCloseTo(30, 1);
     });
+  });
+});
+
+describe("useAudioMaster — stall watchdog + metadata timeout", () => {
+  // The silent-stall failure mode: the element accepts the src, fires
+  // `loadstart`, and then never delivers a byte. No `error` event, and
+  // play()'s promise stays pending forever — so neither existing error
+  // channel fires. These tests pin the third channel: the watchdog on
+  // the element's clock, and the loadedmetadata timeout.
+  let refs: Refs;
+  let ctxHandle: ReturnType<typeof installFakeAudioContext>;
+
+  beforeEach(() => {
+    refs = {
+      audioA: undefined as unknown as HTMLAudioElement,
+      audioB: undefined as unknown as HTMLAudioElement,
+      ready: false,
+      duration: null,
+      error: null,
+    };
+    ctxHandle = installFakeAudioContext();
+    vi.useFakeTimers({
+      toFake: [
+        "setTimeout",
+        "clearTimeout",
+        "setInterval",
+        "clearInterval",
+        "performance",
+      ],
+    });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    ctxHandle.restore();
+  });
+
+  /** Render + mock both elements WITHOUT firing loadedmetadata — the
+   *  wedged-pipeline shape. */
+  async function setupStalled() {
+    render(<Harness audioUrl="/x.wav" refs={refs} />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const mA = mockMediaElement(refs.audioA);
+    const mB = mockMediaElement(refs.audioB);
+    return { mA, mB };
+  }
+
+  it("flips isPlaying back and surfaces an error when the clock never moves", async () => {
+    await setupStalled();
+    await act(async () => {
+      useEditorStore.getState().setPlaying(true);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(useEditorStore.getState().playback.isPlaying).toBe(true);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(STALL_AFTER_MS + 2 * STALL_POLL_MS);
+    });
+
+    expect(useEditorStore.getState().playback.isPlaying).toBe(false);
+    expect(refs.error).toMatch(/stalled/i);
+    expect(useEditorStore.getState().notice?.message).toMatch(
+      /AUDIO STALLED/,
+    );
+  });
+
+  it("does not trip while the clock advances", async () => {
+    const { mA } = await setupStalled();
+    mA.setDuration(10);
+    await act(async () => {
+      mA.fireLoadedMetadata();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await act(async () => {
+      useEditorStore.getState().setPlaying(true);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    // Healthy playback: nudge the clock between polls, well past the
+    // stall threshold in total.
+    for (let i = 0; i < 10; i++) {
+      await act(async () => {
+        mA.setCurrentTime(0.3 * (i + 1));
+        await vi.advanceTimersByTimeAsync(STALL_POLL_MS);
+      });
+    }
+
+    expect(useEditorStore.getState().playback.isPlaying).toBe(true);
+    expect(refs.error).toBeNull();
+  });
+
+  it("re-arms cleanly: a stopped stall does not insta-kill the next play", async () => {
+    const { mA } = await setupStalled();
+    await act(async () => {
+      useEditorStore.getState().setPlaying(true);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(STALL_AFTER_MS + 2 * STALL_POLL_MS);
+    });
+    expect(useEditorStore.getState().playback.isPlaying).toBe(false);
+
+    // Second attempt: the pipeline recovered (clock moves now). The
+    // watchdog must start from a fresh baseline, not the stale window.
+    await act(async () => {
+      useEditorStore.getState().setPlaying(true);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    for (let i = 0; i < 8; i++) {
+      await act(async () => {
+        mA.setCurrentTime(0.3 * (i + 1));
+        await vi.advanceTimersByTimeAsync(STALL_POLL_MS);
+      });
+    }
+    expect(useEditorStore.getState().playback.isPlaying).toBe(true);
+  });
+
+  it("surfaces an error when loadedmetadata never fires", async () => {
+    await setupStalled();
+    expect(refs.error).toBeNull();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(METADATA_TIMEOUT_MS + 10);
+    });
+    expect(refs.ready).toBe(false);
+    expect(refs.error).toMatch(/never loaded/i);
+  });
+
+  it("does not raise the metadata timeout when metadata arrives in time", async () => {
+    const { mA } = await setupStalled();
+    mA.setDuration(10);
+    await act(async () => {
+      mA.fireLoadedMetadata();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(METADATA_TIMEOUT_MS + 10);
+    });
+    expect(refs.ready).toBe(true);
+    expect(refs.error).toBeNull();
   });
 });
